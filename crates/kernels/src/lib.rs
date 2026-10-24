@@ -42,3 +42,15 @@ mod conv;
 mod conv_ops;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 pub use conv_ops::causal_conv;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod update;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod update_ops;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+pub use update_ops::{adamw_update, gradient_square_sum};
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod cross_entropy;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod cross_entropy_ops;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+pub use cross_entropy_ops::cross_entropy_rows;
