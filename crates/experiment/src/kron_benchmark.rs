@@ -258,13 +258,13 @@ fn cpu_directional_check(
         scale: epsilon,
         index: 0,
     });
-    let plus_loss = model::scalar(model::loss(plus.forward(batch), batch))?;
+    let plus_loss = model::scalar(plus.loss(plus.forward(batch), batch))?;
     drop(plus);
     let minus = base.valid().map(&mut PerturbParameters {
         scale: -epsilon,
         index: 0,
     });
-    let minus_loss = model::scalar(model::loss(minus.forward(batch), batch))?;
+    let minus_loss = model::scalar(minus.loss(minus.forward(batch), batch))?;
     let numerical = (plus_loss - minus_loss) / (2. * epsilon);
     let error = (analytic - numerical).abs();
     let tolerance = 3e-3 + 0.03 * analytic.abs();
@@ -296,7 +296,7 @@ fn cpu_reference(c: &Config, arm: &Arm, rows: &[Example]) -> Result<CpuReference
         let initial = parameters(&base, None)?;
         let batch = Batch::new(rows, &device);
         let logits = base.forward(&batch);
-        let objective = model::loss(logits.clone(), &batch);
+        let objective = base.loss(logits.clone(), &batch);
         let loss = model::scalar(objective.clone())?;
         let gradients = model::checked_gradients(&base, objective)?;
         let gradient_values = parameters(&base, Some(&gradients))?;
@@ -358,6 +358,8 @@ fn prepare_model_case(
         .collect::<Vec<_>>();
     let mut cpu_config = config.clone();
     cpu_config.head_backend = crate::config::HeadBackend::Native;
+    cpu_config.loss_backend = crate::config::LossBackend::Tensor;
+    cpu_config.update_backend = crate::config::UpdateBackend::Tensor;
     let reference = cpu_reference(&cpu_config, &arm, &rows)?;
     let train_device = device.clone().autodiff();
     // Fork detaches the CPU graph: no model/input transfers occur in the GPU step.
@@ -393,6 +395,8 @@ fn prepare_model_case(
         model.set_projection_backend(c.projection_backend);
         model.set_normalization_backend(c.normalization_backend);
         model.set_head_backend(c.head_backend);
+        model.set_loss_backend(c.loss_backend);
+        model.set_update_backend(c.update_backend);
         let initial_error = compare_parameters(
             "identical CPU initialization",
             &parameters(&model, None)?,
@@ -405,7 +409,7 @@ fn prepare_model_case(
         runtime::sync(device)?;
         let clock = Instant::now();
         let logits = model.forward(&batch);
-        let objective = model::loss(logits.clone(), &batch);
+        let objective = model.loss(logits.clone(), &batch);
         let loss = model::scalar(objective.clone())?;
         let grads = model::checked_gradients(&model, objective)?;
         runtime::sync(device)?;
@@ -434,6 +438,7 @@ fn prepare_model_case(
         checks.push(json!({"scan_backend":backend,"hola_backend":hola_backend,
             "projection_backend":c.projection_backend,"normalization_backend":c.normalization_backend,
             "head_backend":c.head_backend,
+            "update_backend":c.update_backend,"loss_backend":c.loss_backend,
             "reference":"CPU TensorSolver/Tensor/Separate/Tensor normalization",
             "initial_parameters_max_abs":initial_error,"logits_max_abs":output_error,
             "all_parameter_gradients_max_abs":gradient_error,"AdamW_parameters_max_abs":update_error,
@@ -557,7 +562,7 @@ impl Runner {
         runtime::sync(device)?;
         let clock = Instant::now();
         let model = self.model.take().expect("benchmark model");
-        let loss = model::loss(model.forward(batch), batch);
+        let loss = model.loss(model.forward(batch), batch);
         let _ = model::scalar(loss.clone())?;
         let grads = model::checked_gradients(&model, loss)?;
         self.model = Some(self.optim.step(c.learning_rate, model, grads));

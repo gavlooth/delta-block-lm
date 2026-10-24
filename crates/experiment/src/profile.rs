@@ -96,7 +96,7 @@ impl Runner {
         let model = self.model.take().expect("profile runner model");
         let logits = model.forward_profiled(&batch, profile);
         let objective = profile.section("Loss: log-softmax and gather", || {
-            model::loss(logits, &batch)
+            model.loss(logits, &batch)
         });
         profile.section("Host/device: loss readback", || {
             model::scalar(objective.clone())
@@ -202,8 +202,8 @@ fn instrumentation_check(
         &[a.clone().into_data().try_to_vec::<f32>().unwrap()],
         &[b.clone().into_data().try_to_vec::<f32>().unwrap()],
     )?;
-    let ga = model::checked_gradients(&plain, model::loss(a, batch))?;
-    let gb = model::checked_gradients_profiled(&traced, model::loss(b, batch), &mut profile)?;
+    let ga = model::checked_gradients(&plain, plain.loss(a, batch))?;
+    let gb = model::checked_gradients_profiled(&traced, traced.loss(b, batch), &mut profile)?;
     let gradients = equivalent(&snapshot(&plain, Some(&ga)), &snapshot(&traced, Some(&gb)))?;
     let a = train::optimizer(c).step(c.learning_rate, plain, ga);
     let b = train::optimizer(c).step(c.learning_rate, traced, gb);
@@ -547,7 +547,7 @@ fn comparison_run(
             let rows = data::examples(&config, corpus.as_ref(), c.seed, 0, c.batch_size, "train")?;
             let batch = Batch::new(&rows, &train_device);
             let logits = base.forward(&batch);
-            let gradients = model::checked_gradients(&base, model::loss(logits.clone(), &batch))?;
+            let gradients = model::checked_gradients(&base, base.loss(logits.clone(), &batch))?;
             let reference_logits = vec![logits.into_data().try_to_vec::<f32>().unwrap()];
             let reference_gradients = snapshot(&base, Some(&gradients));
             let updated = train::optimizer(&config).step(c.learning_rate, base.clone(), gradients);
@@ -561,7 +561,7 @@ fn comparison_run(
                 mode.apply(&mut candidate);
                 let logits = candidate.forward(&batch);
                 let gradients =
-                    model::checked_gradients(&candidate, model::loss(logits.clone(), &batch))?;
+                    model::checked_gradients(&candidate, candidate.loss(logits.clone(), &batch))?;
                 let logits_error = equivalent(
                     &[logits.into_data().try_to_vec::<f32>().unwrap()],
                     &reference_logits,

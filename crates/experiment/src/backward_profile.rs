@@ -2,7 +2,7 @@
 use crate::{
     config::{Arm, Config},
     data::{self, Batch},
-    model::{self, LanguageModel},
+    model::LanguageModel,
     profile::{Runner, median},
     runtime, train,
 };
@@ -209,7 +209,10 @@ pub fn run(
             && mixer_config.cache_policy != CachePolicy::None
             && c.scan_backend == ScanBackend::FusedGpu
             && c.hola_backend == HolaBackend::FusedGpu
-            && matches!(c.projection_backend, ProjectionBackend::Merged | ProjectionBackend::MergedHeuristicOutput)
+            && matches!(
+                c.projection_backend,
+                ProjectionBackend::Merged | ProjectionBackend::MergedHeuristicOutput
+            )
             && c.normalization_backend.is_tensor(),
         "backward attribution requires KronLSTM + HOLA, fused scan/read, merged projections and tensor normalization"
     );
@@ -376,7 +379,7 @@ pub fn run(
                 components.push(result);
             }
             let mut final_row = benchmark(&device, &bound, 1, warmups, trials, |_| {
-                model::loss(
+                base.loss(
                     base.head_forward(
                         base.normalization_backend
                             .rms(&base.norm, hidden[0].clone()),
