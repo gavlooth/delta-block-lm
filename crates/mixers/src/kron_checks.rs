@@ -12,6 +12,7 @@ pub struct KronCheck {
     pub scan_backend: ScanBackend,
     pub tokens: usize,
     pub objective: &'static str,
+    pub strided_inputs: bool,
     pub output_max_abs: f64,
     pub state_max_abs: f64,
     pub score_max_abs: f64,
@@ -56,7 +57,7 @@ pub fn kron_numerical_checks_selected(
         return Err("Kron reference objective must be 0..=3".into());
     }
     let device = device.clone().autodiff();
-    if backend == ScanBackend::FusedGpu {
+    if backend.is_fused() {
         chunk::assert_fused_device(&device);
     }
     let times = tokens.map_or_else(|| vec![1, 7, 35], |n| vec![n]);
@@ -66,7 +67,7 @@ pub fn kron_numerical_checks_selected(
             if objective.is_some_and(|selected| selected != mode) {
                 continue;
             }
-            reports.push(check(&device, backend, time, mode).map_err(|error| {
+            reports.push(check(&device, backend, time, mode, false).map_err(|error| {
                 let objective = match mode {
                     0 => "output+final_state+score",
                     1 => "output_only",
@@ -77,6 +78,9 @@ pub fn kron_numerical_checks_selected(
             })?);
         }
     }
+    if tokens.is_none() && objective.is_none() {
+        reports.push(check(&device, backend, 35, 0, true)?);
+    }
     Ok(reports)
 }
 
@@ -85,6 +89,7 @@ fn check(
     backend: ScanBackend,
     time: usize,
     mode: usize,
+    strided: bool,
 ) -> Result<KronCheck, String> {
     let mut f = Fixture::new(MixerKind::KronLstm, time);
     // Both non-reset initial-state dependence and reset-discarded initial state are exercised.
@@ -227,10 +232,47 @@ fn check(
             }
         }
     }
-    let x = f.inputs(device);
-    let initial = Tensor::from_data(TensorData::new(initial_data, [f.b, f.h, f.k, f.v]), device)
-        .require_grad();
-    let (valid, reset) = f.metadata(device);
+    let inputs = || {
+        if strided {
+            f.data
+                .iter()
+                .zip(f.widths)
+                .map(|(data, width)| {
+                    strided_upload(data.clone(), [f.b, time, f.h, width], 1, 2, device)
+                        .require_grad()
+                })
+                .collect::<Vec<_>>()
+        } else {
+            f.inputs(device)
+        }
+    };
+    let x = inputs();
+    let initial = if strided {
+        strided_upload(initial_data, [f.b, f.h, f.k, f.v], 2, 3, device)
+    } else {
+        Tensor::from_data(TensorData::new(initial_data, [f.b, f.h, f.k, f.v]), device)
+    }
+    .require_grad();
+    let (valid, reset) = if strided {
+        (
+            strided_upload(
+                f.valid.iter().map(|&x| if x { 1. } else { 0. }).collect(),
+                [f.b, time],
+                0,
+                1,
+                device,
+            ),
+            strided_upload(
+                f.reset.iter().map(|&x| if x { 1. } else { 0. }).collect(),
+                [f.b, time],
+                0,
+                1,
+                device,
+            ),
+        )
+    } else {
+        f.metadata(device)
+    };
     let out = chunk::scan_selected(
         backend,
         MixerKind::KronLstm,
@@ -319,7 +361,7 @@ fn check(
         RTOL,
     )?;
     let (continuation_error, continuation_gradient_error) = if time > 1 {
-        let x = f.inputs(device);
+        let x = inputs();
         let initial = initial.clone().detach().require_grad();
         let split = 3.min(time - 1);
         let section = |start, end| {
@@ -439,6 +481,7 @@ fn check(
     Ok(KronCheck {
         scan_backend: backend,
         tokens: time,
+        strided_inputs: strided,
         objective: match mode {
             0 => "output+final_state+score",
             1 => "output_only",
@@ -453,4 +496,33 @@ fn check(
         continuation_max_abs: continuation_error,
         continuation_gradient_max_abs: continuation_gradient_error,
     })
+}
+
+/// Pack a transposed physical buffer on the CPU, then expose the original
+/// logical axes as a genuine noncontiguous device view.
+fn strided_upload<const D: usize>(
+    data: Vec<f32>,
+    shape: [usize; D],
+    a: usize,
+    b: usize,
+    device: &Device,
+) -> Tensor<D> {
+    let mut physical = shape;
+    physical.swap(a, b);
+    let mut packed = vec![0.; data.len()];
+    for (index, value) in data.into_iter().enumerate() {
+        let mut coordinates = [0; D];
+        let mut remaining = index;
+        for axis in (0..D).rev() {
+            coordinates[axis] = remaining % shape[axis];
+            remaining /= shape[axis];
+        }
+        coordinates.swap(a, b);
+        let offset = coordinates
+            .iter()
+            .zip(physical)
+            .fold(0, |offset, (&x, width)| offset * width + x);
+        packed[offset] = value;
+    }
+    Tensor::from_data(TensorData::new(packed, physical), device).swap_dims(a, b)
 }

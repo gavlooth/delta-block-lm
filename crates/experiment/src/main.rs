@@ -11,6 +11,7 @@ mod lm_retrieval;
 mod model;
 mod profile;
 mod runtime;
+mod scan_benchmark;
 mod soft;
 mod train;
 use anyhow::{Context, Result, ensure};
@@ -28,7 +29,7 @@ fn execute() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     ensure!(
         args.len() >= 2,
-        "usage: delta-experiment <reference|normalization-reference|kron-reference|hola-reference|kron-model-check|soft|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|normalization-benchmark|kron-benchmark|kron-model-benchmark|hola-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu]"
+        "usage: delta-experiment <reference|normalization-reference|kron-reference|hola-reference|kron-model-check|soft|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|normalization-benchmark|scan-benchmark|kron-benchmark|kron-model-benchmark|hola-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu]"
     );
     let command = &args[0];
     let c = Config::load(Path::new(&args[1]))?;
@@ -104,14 +105,22 @@ fn execute() -> Result<()> {
     ensure!(
         matches!(
             command.as_str(),
-            "profile" | "backward-profile" | "projection-benchmark" | "normalization-benchmark"
+            "profile"
+                | "backward-profile"
+                | "projection-benchmark"
+                | "normalization-benchmark"
+                | "scan-benchmark"
         ) || profile_contexts.is_none(),
         "--contexts is only valid for profile/backward-profile/projection-benchmark/normalization-benchmark"
     );
     ensure!(
         !matches!(
             command.as_str(),
-            "profile" | "backward-profile" | "projection-benchmark" | "normalization-benchmark"
+            "profile"
+                | "backward-profile"
+                | "projection-benchmark"
+                | "normalization-benchmark"
+                | "scan-benchmark"
         ) || (resume.is_none() && seed == c.seed),
         "profiles use configured seed and fresh scratch state, not --seed/--resume"
     );
@@ -139,6 +148,7 @@ fn execute() -> Result<()> {
                 | "backward-profile"
                 | "projection-benchmark"
                 | "normalization-benchmark"
+                | "scan-benchmark"
                 | "gemm-micro"
                 | "gemm-step"
         ) || benchmark_warmups.is_none(),
@@ -154,6 +164,7 @@ fn execute() -> Result<()> {
                 | "backward-profile"
                 | "projection-benchmark"
                 | "normalization-benchmark"
+                | "scan-benchmark"
                 | "gemm-micro"
                 | "gemm-step"
         ) || benchmark_trials.is_none(),
@@ -238,7 +249,11 @@ fn execute() -> Result<()> {
             benchmark_warmups.unwrap_or(2),
             benchmark_trials.unwrap_or(1),
         )?,
-        "profile" | "backward-profile" | "projection-benchmark" | "normalization-benchmark" => {
+        "profile"
+        | "backward-profile"
+        | "projection-benchmark"
+        | "normalization-benchmark"
+        | "scan-benchmark" => {
             let arm = if let Some(name) = arm_name {
                 c.arms
                     .iter()
@@ -251,7 +266,9 @@ fn execute() -> Result<()> {
                 "profile" => profile::run,
                 "backward-profile" => backward_profile::run,
                 "projection-benchmark" => profile::projection_run,
-                _ => profile::normalization_run,
+                "normalization-benchmark" => profile::normalization_run,
+                "scan-benchmark" => scan_benchmark::run,
+                _ => unreachable!(),
             };
             let configured_context = [c.context];
             let default_contexts: &[usize] = if command == "backward-profile" {
@@ -351,6 +368,7 @@ fn execute() -> Result<()> {
                 | "backward-profile"
                 | "projection-benchmark"
                 | "normalization-benchmark"
+                | "scan-benchmark"
                 | "gemm-micro"
                 | "gemm-step"
         ) || result["completed"] == true,

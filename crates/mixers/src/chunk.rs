@@ -37,7 +37,7 @@ pub fn scan_selected(
 ) -> ScanOutput {
     match backend {
         ScanBackend::TensorSolver => scan(kind, input, valid, reset, chunk_size, initial),
-        ScanBackend::FusedGpu => {
+        ScanBackend::FusedGpu | ScanBackend::FusedParallel128 | ScanBackend::FusedParallel256 => {
             assert_eq!(
                 kind,
                 MixerKind::KronLstm,
@@ -51,7 +51,7 @@ pub fn scan_selected(
                 let initial = initial.unwrap_or_else(|| {
                     Tensor::zeros([batch, heads, keys, values], &input.q.device())
                 });
-                let result = delta_kernels::kron_scan(
+                let result = delta_kernels::kron_scan_partitioned(
                     input.q,
                     input.k,
                     input.v,
@@ -62,6 +62,7 @@ pub fn scan_selected(
                     reset,
                     initial,
                     chunk_size,
+                    backend.partitions(),
                 );
                 ScanOutput {
                     output: result.output,
