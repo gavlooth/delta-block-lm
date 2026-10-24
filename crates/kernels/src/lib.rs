@@ -11,7 +11,9 @@ mod kron;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 mod kron_ops;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
-pub use kron_ops::{KronScanOutput, kron_scan};
+mod kron_parallel;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+pub use kron_ops::{KronScanOutput, kron_scan, kron_scan_partitioned};
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 mod hola;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
