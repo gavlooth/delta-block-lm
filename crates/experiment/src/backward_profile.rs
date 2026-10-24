@@ -9,7 +9,7 @@ use crate::{
 use anyhow::{Result, ensure};
 use burn::{
     prelude::*,
-    tensor::{Distribution, activation::silu},
+    tensor::Distribution,
 };
 use delta_mixers::{
     attribution::{Component, Fixture},
@@ -361,7 +361,7 @@ pub fn run(
                     if mlp {
                         block
                             .down
-                            .forward(silu(block.up.forward(hidden[i].clone())))
+                            .forward(base.epilogue_backend.silu(block.up.forward(hidden[i].clone())))
                             .flatten(0, 2)
                     } else {
                         base.normalization_backend

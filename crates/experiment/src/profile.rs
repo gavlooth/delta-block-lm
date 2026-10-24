@@ -437,6 +437,7 @@ enum ExecutionChoice {
     Normalization(delta_mixers::NormalizationBackend),
     Hola(delta_mixers::HolaBackend),
     Convolution(delta_mixers::ConvolutionBackend),
+    Epilogue(crate::config::EpilogueBackend),
     Optimization(OptimizationBundle),
 }
 impl ExecutionChoice {
@@ -446,6 +447,7 @@ impl ExecutionChoice {
             Self::Normalization(mode) => model.set_normalization_backend(mode),
             Self::Hola(mode) => model.set_hola_backend(mode),
             Self::Convolution(mode) => model.set_convolution_backend(mode),
+            Self::Epilogue(mode) => model.set_epilogue_backend(mode),
             Self::Optimization(bundle) => {
                 model.set_scan_backend(bundle.scan_backend);
                 model.set_hola_backend(bundle.hola_backend);
@@ -493,6 +495,17 @@ pub fn normalization_run(
         trials,
         Comparison::Normalization,
     )
+}
+
+pub fn epilogue_run(
+    c: &Config,
+    arm: &Arm,
+    device: &Device,
+    contexts: &[usize],
+    warmups: usize,
+    trials: usize,
+) -> Result<Value> {
+    comparison_run(c, arm, device, contexts, warmups, trials, Comparison::Epilogue)
 }
 
 pub fn hola_run(
@@ -563,6 +576,7 @@ enum Comparison {
     Normalization,
     Hola,
     Convolution,
+    Epilogue,
     Optimization,
 }
 
@@ -580,8 +594,9 @@ fn comparison_run(
     let convolution = comparison == Comparison::Convolution;
     let hola = comparison == Comparison::Hola;
     let optimization = comparison == Comparison::Optimization;
+    let epilogue = comparison == Comparison::Epilogue;
     ensure!(
-        !(normalization || convolution || hola || optimization)
+        !(normalization || convolution || hola || optimization || epilogue)
             || matches!(c.backend.as_str(), "vulkan" | "cuda"),
         "custom operator comparison requires a GPU; no CPU fallback"
     );
@@ -601,6 +616,8 @@ fn comparison_run(
         "convolution-benchmark"
     } else if normalization {
         "normalization-benchmark"
+    } else if epilogue {
+        "epilogue-benchmark"
     } else {
         "projection-benchmark"
     };
@@ -612,6 +629,8 @@ fn comparison_run(
         "convolution_backend"
     } else if normalization {
         "normalization_backend"
+    } else if epilogue {
+        "epilogue_backend"
     } else {
         "projection_backend"
     };
@@ -623,6 +642,8 @@ fn comparison_run(
         "convolution_forward_samples_ms"
     } else if normalization {
         "normalization_forward_samples_ms"
+    } else if epilogue {
+        "epilogue_forward_section_samples_ms"
     } else {
         "projection_forward_samples_ms"
     };
@@ -634,6 +655,8 @@ fn comparison_run(
         "convolution_forward_median_ms"
     } else if normalization {
         "normalization_forward_median_ms"
+    } else if epilogue {
+        "epilogue_forward_section_median_ms"
     } else {
         "projection_forward_median_ms"
     };
@@ -673,6 +696,8 @@ fn comparison_run(
             NormalizationBackend::FusedNormsGates,
         ]
         .map(ExecutionChoice::Normalization)
+    } else if epilogue {
+        crate::epilogues::MODES.map(ExecutionChoice::Epilogue)
     } else {
         [
             ProjectionBackend::Separate,
@@ -709,6 +734,8 @@ fn comparison_run(
                 delta_mixers::normalization::numerical_checks(device)
                     .map_err(anyhow::Error::msg)?,
             )?;
+        } else if epilogue {
+            report["independent_epilogue_reference"] = crate::epilogues::numerical_checks(device)?;
         } else {
             report["independent_projection_reference"] = serde_json::to_value(
                 delta_mixers::projection_numerical_checks(device).map_err(anyhow::Error::msg)?,
@@ -727,6 +754,8 @@ fn comparison_run(
                 config.convolution_backend = ConvolutionBackend::Tensor;
             } else if normalization {
                 config.normalization_backend = NormalizationBackend::Tensor;
+            } else if epilogue {
+                config.epilogue_backend = crate::config::EpilogueBackend::Native;
             } else {
                 config.projection_backend = ProjectionBackend::Separate;
             }
@@ -755,6 +784,8 @@ fn comparison_run(
                     )
                     .map_err(anyhow::Error::msg)?,
                 )?
+            } else if epilogue {
+                crate::epilogues::benchmark(device, context, c.batch_size, c.d_model, warmups, trials)?
             } else {
                 serde_json::to_value(
                     delta_mixers::projection_benchmark(
@@ -893,6 +924,8 @@ fn comparison_run(
                                     name.contains("RMSNorm")
                                         || name.starts_with("L2 ")
                                         || **name == "Residual adds"
+                                } else if epilogue {
+                                    **name == "MLP: SiLU" || **name == "Residual adds"
                                 } else {
                                     name.starts_with("Projection:")
                                 }
@@ -918,7 +951,7 @@ fn comparison_run(
             report["cases"].as_array_mut().unwrap().push(json!({"context":context,
                 "fixture_sha256":data::fixture_hash(&rows),"parameters":base.num_params(),
                 "equivalence":checks,"trial_orders":orders,
-                (if optimization { "isolated_optimization" } else if hola { "isolated_hola" } else if convolution { "isolated_convolutions" } else if normalization { "isolated_normalization" } else { "isolated_input_projections" }):isolated,
+                (if optimization { "isolated_optimization" } else if hola { "isolated_hola" } else if convolution { "isolated_convolutions" } else if normalization { "isolated_normalization" } else if epilogue { "isolated_epilogues" } else { "isolated_input_projections" }):isolated,
                 "results":results}));
             runtime::write_json(&report_path, &report)?;
         }
