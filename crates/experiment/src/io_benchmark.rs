@@ -81,8 +81,11 @@ fn shape(c: &Config, arm: &Arm, corpus: &Corpus, device: &Device, directory: &Pa
     let validation = train::evaluations(c, Some(corpus), "validation")?;
     let initial_evaluation = train::evaluate(&initial, c, &validation, device)?;
     let (base, cold_step_ms) = timed(device, || step(c, initial, &mut optimizer, &resident))?;
-    let optimizer_bytes = optimizer.into_bytes()?;
-    let before_signature = checkpoint::optimizer_signature(c, optimizer_bytes.clone())?;
+    let before_signature = checkpoint::optimizer_signature(c, optimizer.into_bytes()?)?;
+    let base_path = directory.join("resident-base.burnpack");
+    base.clone().save_file(&base_path)?;
+    checkpoint::validate_model(&base, &base_path)
+        .context("resident base serialization self-check before any comparison")?;
     ensure!(before_signature["tensors"].as_object().is_some_and(|v| !v.is_empty()), "checkpoint fixture must contain real optimizer moments");
     let state = train::State {
         schema: 1,
@@ -119,30 +122,57 @@ fn shape(c: &Config, arm: &Arm, corpus: &Corpus, device: &Device, directory: &Pa
         for mode in order {
             deadline(c, start)?;
             let model = base.clone();
-            let mut optim = train::optimizer(c).from_bytes(optimizer_bytes.clone())?;
-            let (updated, ms) = timed(device, || {
-                if mode == "resident" { step(c, model, &mut optim, &next_resident) } else {
+            // A resident comparison must not silently include an unchecked optimizer restore.
+            // Clone the real state; the file-restore design is measured separately below.
+            let mut optim = optimizer.clone();
+            checkpoint::validate_model(&model, &base_path)
+                .with_context(|| format!("iteration {iteration}, {mode}: pre-step resident parameters"))?;
+            ensure!(checkpoint::optimizer_signature(c, optim.into_bytes()?)? == before_signature,
+                "iteration {iteration}, {mode}: pre-step resident optimizer differs");
+            let ((updated, owned_batch), ms) = timed(device, || {
+                if mode == "resident" {
+                    Ok((step(c, model, &mut optim, &next_resident)?, None))
+                } else {
                     let rows = data::examples(c, Some(corpus), c.seed, c.batch_size, c.batch_size, "train")?;
                     let batch = if mode == "legacy" { legacy_batch(&rows, &train_device) } else { Batch::new(&rows, &train_device) };
-                    step(c, model, &mut optim, &batch)
+                    let updated = step(c, model, &mut optim, &batch)?;
+                    // Training holds its batch through the completion barrier. Match that lifetime
+                    // rather than dropping uploaded tensors before timed() synchronizes.
+                    Ok((updated, Some(batch)))
                 }
             })?;
+            exact_batch(owned_batch.as_ref().unwrap_or(&next_resident), &generated)
+                .with_context(|| format!("iteration {iteration}, {mode}: actual timed batch values"))?;
+            checkpoint::validate_model(&base, &base_path)
+                .with_context(|| format!("iteration {iteration}, {mode}: retained base mutated after step"))?;
+            ensure!(checkpoint::optimizer_signature(c, optimizer.into_bytes()?)? == before_signature,
+                "iteration {iteration}, {mode}: retained optimizer mutated after step");
             record(&mut samples, &format!("full_optimizer_step_{mode}"), ms, measured);
             if let Some(bytes) = runtime::sampled_reserved(device) { peak_reserved = Some(peak_reserved.unwrap_or(0).max(bytes)); }
             // Exact logical parameters including IDs, and all optimizer tensors/scalars/metadata.
             // Every iteration is a same-state, same-next-row comparison, not diverging trajectories.
             let signature = checkpoint::optimizer_signature(c, optim.into_bytes()?)?;
             if let Some(expected) = &expected_optimizer {
-                checkpoint::validate_model(&updated, &reference_path)?;
-                ensure!(&signature == expected, "input design changed next-step optimizer state");
+                if let Err(error) = checkpoint::validate_model(&updated, &reference_path) {
+                    let actual_path = directory.join(format!("continuation-{mode}-{iteration}.burnpack"));
+                    updated.clone().save_file(&actual_path)?;
+                    runtime::write_json(&directory.join("continuation-mismatch.json"),
+                        &json!({"iteration":iteration,"mode":mode,"phase":"input-design comparison before checkpoint save/load","reference":reference_path,"actual":actual_path,"reference_optimizer":expected,"actual_optimizer":signature}))?;
+                    return Err(error).with_context(|| format!("iteration {iteration}, {mode}: input-design next-step mismatch before checkpoint transaction; actual record retained"));
+                }
+                ensure!(&signature == expected, "iteration {iteration}, {mode}: input design changed next-step optimizer state");
             } else {
-                updated.save_file(&reference_path)?;
+                updated.clone().save_file(&reference_path)?;
+                checkpoint::validate_model(&updated, &reference_path)
+                    .with_context(|| format!("iteration {iteration}, {mode}: continuation reference serialization self-check"))?;
                 expected_optimizer = Some(signature);
             }
         }
         deadline(c, start)?;
         let saved = directory.join(format!("checkpoint-{iteration}"));
         let (_, save_ms) = timed(device, || train::checkpoint(c, &saved, &base, &optimizer, &state))?;
+        checkpoint::validate_model(&base, saved.join("model.burnpack"))
+            .context("atomic save differs from the retained pre-update fixture")?;
         let (loaded_state, state_ms) = timed(device, || {
             let value: Value = serde_json::from_slice(&std::fs::read(saved.join("state.json"))?)?;
             ensure!(value == expected_state, "checkpoint config/data/counters changed");
@@ -151,13 +181,15 @@ fn shape(c: &Config, arm: &Arm, corpus: &Corpus, device: &Device, directory: &Pa
             Ok(value)
         })?;
         let (target, initialize_ms) = timed(device, || LanguageModel::new(c, arm, &train_device))?;
-        let (loaded, load_ms) = timed(device, || checkpoint::load_model(target, saved.join("model.burnpack"), device))?;
+        let (loaded, load_ms) = timed(device, || checkpoint::load_model(target, saved.join("model.burnpack"), device))
+            .context("guarded checkpoint model restore")?;
         let (_, validate_ms) = timed(device, || checkpoint::validate_model(&loaded, saved.join("model.burnpack")))?;
         let (mut restored_optimizer, optimizer_ms) = timed(device, || checkpoint::load_optimizer(c, saved.join("optimizer.burnpack")))?;
         let restored_signature = checkpoint::optimizer_signature(c, restored_optimizer.into_bytes()?)?;
         ensure!(before_signature == restored_signature, "checkpoint optimizer IDs/moments/counters changed");
         let (continued, continuation_ms) = timed(device, || step(c, loaded, &mut restored_optimizer, &next_resident))?;
-        checkpoint::validate_model(&continued, &reference_path)?;
+        checkpoint::validate_model(&continued, &reference_path)
+            .context("restored checkpoint next-step continuation")?;
         ensure!(Some(checkpoint::optimizer_signature(c, restored_optimizer.into_bytes()?)?) == expected_optimizer, "checkpoint next-step optimizer continuation differs");
         for (name, ms) in [("checkpoint_atomic_save", save_ms), ("checkpoint_state_validation", state_ms), ("checkpoint_target_initialization", initialize_ms), ("checkpoint_guarded_model_load_including_validation", load_ms), ("checkpoint_model_validation_standalone", validate_ms), ("checkpoint_optimizer_load_including_validation", optimizer_ms), ("checkpoint_restored_continuation", continuation_ms)] {
             record(&mut samples, name, ms, measured);
