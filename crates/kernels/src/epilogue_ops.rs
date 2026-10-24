@@ -40,7 +40,12 @@ impl<B: Backend + EpilogueOps, C: CheckpointStrategy> EpilogueOps for Autodiff<B
         struct SiluBackward;
         impl<B: Backend + EpilogueOps> Backward<B, 1> for SiluBackward {
             type State = FloatTensor<B>;
-            fn backward(self, ops: Ops<Self::State, 1>, grads: &mut Gradients, _: &mut Checkpointer) {
+            fn backward(
+                self,
+                ops: Ops<Self::State, 1>,
+                grads: &mut Gradients,
+                _: &mut Checkpointer,
+            ) {
                 let dy = grads.consume::<B>(&ops.node);
                 if let Some(parent) = &ops.parents[0] {
                     grads.register::<B>(parent.id, B::silu_vjp(ops.state, dy));
@@ -49,7 +54,11 @@ impl<B: Backend + EpilogueOps, C: CheckpointStrategy> EpilogueOps for Autodiff<B
         }
         let parents = [x.node()];
         let x = x.into_primitive();
-        match SiluBackward.prepare::<C>(parents).compute_bound().stateful() {
+        match SiluBackward
+            .prepare::<C>(parents)
+            .compute_bound()
+            .stateful()
+        {
             OpsKind::Tracked(prep) => {
                 let y = B::silu_analytic(x.clone(), fused_forward);
                 prep.finish(x, y)
@@ -64,9 +73,15 @@ impl<B: Backend + EpilogueOps, C: CheckpointStrategy> EpilogueOps for Autodiff<B
 /// First-order f32 GPU SiLU; retains the input only, recomputing sigmoid in one VJP kernel.
 /// `fused_forward=false` keeps CubeBackend's library sigmoid/multiply forward.
 pub fn silu_analytic(x: Tensor<3>, fused_forward: bool) -> Tensor<3> {
-    Tensor::from_dispatch(<Dispatch as EpilogueOps>::silu_analytic(x.into_dispatch(), fused_forward))
+    Tensor::from_dispatch(<Dispatch as EpilogueOps>::silu_analytic(
+        x.into_dispatch(),
+        fused_forward,
+    ))
 }
 /// Explicit VJP entry point for noncontiguous upstream reference checks.
 pub fn silu_vjp(x: Tensor<3>, dy: Tensor<3>) -> Tensor<3> {
-    Tensor::from_dispatch(<Dispatch as EpilogueOps>::silu_vjp(x.into_dispatch(), dy.into_dispatch()))
+    Tensor::from_dispatch(<Dispatch as EpilogueOps>::silu_vjp(
+        x.into_dispatch(),
+        dy.into_dispatch(),
+    ))
 }

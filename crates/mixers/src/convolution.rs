@@ -98,21 +98,21 @@ pub fn benchmark(
     let device = device.clone().autodiff();
     device.seed(731);
     let fixtures: [_; 4] = core::array::from_fn(|_| {
-            [128, 128, 256].map(|c| {
-                (
-                    Tensor::<3>::random(
-                        [batch, tokens, c],
-                        burn::tensor::Distribution::Uniform(-0.5, 0.5),
-                        &device,
-                    ),
-                    Tensor::<2>::random(
-                        [4, c],
-                        burn::tensor::Distribution::Uniform(-0.1, 0.1),
-                        &device,
-                    ),
-                )
-            })
-        });
+        [128, 128, 256].map(|c| {
+            (
+                Tensor::<3>::random(
+                    [batch, tokens, c],
+                    burn::tensor::Distribution::Uniform(-0.5, 0.5),
+                    &device,
+                ),
+                Tensor::<2>::random(
+                    [4, c],
+                    burn::tensor::Distribution::Uniform(-0.1, 0.1),
+                    &device,
+                ),
+            )
+        })
+    });
     let valid = Tensor::ones([batch, tokens], &device);
     let docs = Tensor::zeros([batch, tokens], &device);
     let mut results = Vec::new();
@@ -127,11 +127,17 @@ pub fn benchmark(
                 device.sync().map_err(|e| format!("{e:?}"))?;
                 let start = Instant::now();
                 for layer in &fixtures {
-                    let leaves = layer.each_ref().map(|(x,w)| (
-                        x.clone().detach().require_grad(), w.clone().detach().require_grad()
-                    ));
-                    let roots = leaves.each_ref().map(|(x,w)| backend
-                        .forward(x.clone(), w.clone(), valid.clone(), docs.clone()).sum());
+                    let leaves = layer.each_ref().map(|(x, w)| {
+                        (
+                            x.clone().detach().require_grad(),
+                            w.clone().detach().require_grad(),
+                        )
+                    });
+                    let roots = leaves.each_ref().map(|(x, w)| {
+                        backend
+                            .forward(x.clone(), w.clone(), valid.clone(), docs.clone())
+                            .sum()
+                    });
                     let root = roots.into_iter().reduce(|a, b| a + b).unwrap();
                     if mode == 1 {
                         let grads = root.backward();
@@ -163,6 +169,10 @@ pub fn benchmark(
             forward_backward_samples_ms,
         });
     }
-    Ok(Benchmark { layers: 4, channels: [128,128,256], results })
+    Ok(Benchmark {
+        layers: 4,
+        channels: [128, 128, 256],
+        results,
+    })
 }
 use ConvolutionBackend as SelfBackend;

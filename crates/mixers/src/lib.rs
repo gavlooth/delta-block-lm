@@ -521,12 +521,22 @@ impl Mixer {
                 )
             });
             let exact = if P::CAPTURE_CACHE_MEMBERSHIP {
-                assert_eq!(self.hola_backend, HolaBackend::Tensor,
-                    "cache membership diagnostic requires the tensor HOLA path");
+                assert_eq!(
+                    self.hola_backend,
+                    HolaBackend::Tensor,
+                    "cache membership diagnostic requires the tensor HOLA path"
+                );
                 let (read, memberships) = profile.section("HOLA read", || {
                     hola::read_with_membership(
-                        cache_q, cache_k, raw_v, recurrent.scores, valid.clone(),
-                        documents, self.cache_capacity, self.chunk_size, self.cache_policy,
+                        cache_q,
+                        cache_k,
+                        raw_v,
+                        recurrent.scores,
+                        valid.clone(),
+                        documents,
+                        self.cache_capacity,
+                        self.chunk_size,
+                        self.cache_policy,
                         cache.sink.val(),
                     )
                 });

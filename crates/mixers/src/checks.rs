@@ -9,7 +9,9 @@ use serde::Serialize;
 use std::time::Instant;
 #[path = "kron_checks.rs"]
 mod kron;
-pub use kron::{KronCheck, gdn_numerical_checks_selected, kron_numerical_checks, kron_numerical_checks_selected};
+pub use kron::{
+    KronCheck, gdn_numerical_checks_selected, kron_numerical_checks, kron_numerical_checks_selected,
+};
 #[path = "hola_checks.rs"]
 mod hola;
 pub use hola::{
@@ -473,9 +475,8 @@ pub fn numerical_checks(device: &Device) -> Result<NumericalReport, String> {
         }
     }
     let fused_kron = kron_numerical_checks(&device)?;
-    let mut fused_gdn = gdn_numerical_checks_selected(
-        &device, ScanBackend::TensorSolver, None, None,
-    )?;
+    let mut fused_gdn =
+        gdn_numerical_checks_selected(&device, ScanBackend::TensorSolver, None, None)?;
     let mut fused_hola = Vec::new();
     #[cfg(any(feature = "vulkan", feature = "cuda"))]
     if matches!(
@@ -483,11 +484,22 @@ pub fn numerical_checks(device: &Device) -> Result<NumericalReport, String> {
         burn::backend::DispatchDevice::Cube(_)
     ) {
         fused_gdn.extend(gdn_numerical_checks_selected(
-            &device, ScanBackend::FusedGdn2, None, None,
+            &device,
+            ScanBackend::FusedGdn2,
+            None,
+            None,
         )?);
-        for policy in [CachePolicy::None, CachePolicy::Surprise, CachePolicy::Recency] {
+        for policy in [
+            CachePolicy::None,
+            CachePolicy::Surprise,
+            CachePolicy::Recency,
+        ] {
             layer.push(layer_check(
-                &device, MixerKind::Gdn2, policy, ScanBackend::FusedGdn2, HolaBackend::Tensor,
+                &device,
+                MixerKind::Gdn2,
+                policy,
+                ScanBackend::FusedGdn2,
+                HolaBackend::Tensor,
             )?);
         }
         for policy in [

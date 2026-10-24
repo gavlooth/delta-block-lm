@@ -30,9 +30,13 @@ fn validate(x: &CubeTensor) {
     assert_eq!(x.dtype, DType::F32);
     let dims = x.shape().dims::<3>();
     assert!(dims.iter().all(|&n| n > 0));
-    let span = dims.iter().zip(x.meta.strides().iter()).try_fold(1usize, |span, (&n, &s)| {
-        (n - 1).checked_mul(s).and_then(|v| span.checked_add(v))
-    }).expect("SiLU address overflow");
+    let span = dims
+        .iter()
+        .zip(x.meta.strides().iter())
+        .try_fold(1usize, |span, (&n, &s)| {
+            (n - 1).checked_mul(s).and_then(|v| span.checked_add(v))
+        })
+        .expect("SiLU address overflow");
     assert!(span <= u32::MAX as usize);
 }
 pub(crate) fn launch(x: CubeTensor, dy: Option<CubeTensor>) -> CubeTensor {

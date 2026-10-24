@@ -10,7 +10,8 @@ pub trait Sections {
         _chunk_start: usize,
         _used_by_later_chunk: bool,
         _positions: &burn::prelude::Tensor<3>,
-    ) {}
+    ) {
+    }
 
     fn block(&mut self, _index: Option<usize>) {}
 

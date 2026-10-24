@@ -190,14 +190,27 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
                         values(w.grad(&grads).ok_or("missing dw")?),
                         &dw,
                     )?);
-                    cases.push(Case { backend, batch: b, tokens: t, channels: c, width, zero,
+                    cases.push(Case {
+                        backend,
+                        batch: b,
+                        tokens: t,
+                        channels: c,
+                        width,
+                        zero,
                         strided_inputs_weights_masks_adjoints: strided,
-                        resets_internal_tail_padding: true, max_abs_error: error });
+                        resets_internal_tail_padding: true,
+                        max_abs_error: error,
+                    });
                 }
             }
         }
     }
-    Ok(Report { passed: true, absolute_tolerance: 2e-5, relative_tolerance: 3e-4, cases })
+    Ok(Report {
+        passed: true,
+        absolute_tolerance: 2e-5,
+        relative_tolerance: 3e-4,
+        cases,
+    })
 }
 #[cfg(test)]
 #[test]
@@ -211,5 +224,6 @@ fn fused_convolution_never_falls_back_to_cpu() {
     crate::MixerConfig {
         convolution_backend: Backend::FusedGpu,
         ..Default::default()
-    }.init(&Device::ndarray());
+    }
+    .init(&Device::ndarray());
 }

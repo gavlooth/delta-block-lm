@@ -7,10 +7,7 @@ use crate::{
     runtime, train,
 };
 use anyhow::{Result, ensure};
-use burn::{
-    prelude::*,
-    tensor::Distribution,
-};
+use burn::{prelude::*, tensor::Distribution};
 use delta_mixers::{
     attribution::{Component, Fixture},
     profile::{Sections, Unprofiled},
@@ -360,7 +357,10 @@ pub fn run(
                     if mlp {
                         block
                             .down
-                            .forward(base.epilogue_backend.silu(block.up.forward(hidden[i].clone())))
+                            .forward(
+                                base.epilogue_backend
+                                    .silu(block.up.forward(hidden[i].clone())),
+                            )
                             .flatten(0, 2)
                     } else {
                         base.normalization_backend

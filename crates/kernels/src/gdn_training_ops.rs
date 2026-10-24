@@ -81,9 +81,7 @@ impl GdnTrainingOps for CubeBackend {
         initial: FloatTensor<Self>,
         chunk: usize,
     ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
-        crate::gdn_training::run_scan(
-            q, k, v, alpha, erase, write, valid, reset, initial, chunk,
-        )
+        crate::gdn_training::run_scan(q, k, v, alpha, erase, write, valid, reset, initial, chunk)
     }
 
     fn gdn_training_backward(
@@ -153,7 +151,8 @@ impl<B: Backend + GdnTrainingOps, C: CheckpointStrategy> GdnTrainingOps for Auto
                 let (q, k, v, alpha, erase, write, checkpoint, auxiliary, valid, reset, chunk) =
                     ops.state;
                 let (dq, dk, dv, da, de, dw, ds) = B::gdn_training_backward(
-                    q, k, v, alpha, erase, write, upstream, checkpoint, auxiliary, valid, reset, chunk,
+                    q, k, v, alpha, erase, write, upstream, checkpoint, auxiliary, valid, reset,
+                    chunk,
                 );
                 let [nq, nk, nv, na, ne, nw, ns] = ops.parents;
                 if let Some(node) = nq {
@@ -287,9 +286,16 @@ pub struct GdnTrainingOutput {
 /// Key/value widths are 32/64. Chunk size 1..=16 bounds checkpoint replay memory.
 /// Zero physical edits choose the zero norm subgradient. First derivatives only.
 pub fn gdn_training_scan(
-    q: Tensor<4>, k: Tensor<4>, v: Tensor<4>, alpha: Tensor<4>,
-    erase: Tensor<4>, write: Tensor<4>, valid: Tensor<2>, reset: Tensor<2>,
-    initial: Tensor<4>, chunk_size: usize,
+    q: Tensor<4>,
+    k: Tensor<4>,
+    v: Tensor<4>,
+    alpha: Tensor<4>,
+    erase: Tensor<4>,
+    write: Tensor<4>,
+    valid: Tensor<2>,
+    reset: Tensor<2>,
+    initial: Tensor<4>,
+    chunk_size: usize,
 ) -> GdnTrainingOutput {
     let [batch, time, heads, keys] = q.dims();
     let values = v.dims()[3];

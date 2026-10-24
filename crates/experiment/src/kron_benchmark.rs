@@ -72,8 +72,11 @@ impl Raw {
     }
     fn new_kind(device: &Device, batch: usize, time: usize, seed: u64, kind: MixerKind) -> Self {
         let heads = 4;
-        let widths = if kind == MixerKind::Gdn2 { [32, 32, 64, 32, 32, 64] }
-            else { [32, 32, 64, 32, 1, 1] };
+        let widths = if kind == MixerKind::Gdn2 {
+            [32, 32, 64, 32, 32, 64]
+        } else {
+            [32, 32, 64, 32, 1, 1]
+        };
         let mut rng = data::Rng(seed);
         let x = widths
             .into_iter()
@@ -364,8 +367,18 @@ fn prepare_model_case_kind(
     let arm = Arm {
         name: if kind == MixerKind::Gdn2 {
             if hola { "gdn-hola" } else { "gdn" }
-        } else if hola { "kron-hola" } else { "kron" }.into(),
-        mixer: if kind == MixerKind::Gdn2 { "gdn2" } else { "kronlstm" }.into(),
+        } else if hola {
+            "kron-hola"
+        } else {
+            "kron"
+        }
+        .into(),
+        mixer: if kind == MixerKind::Gdn2 {
+            "gdn2"
+        } else {
+            "kronlstm"
+        }
+        .into(),
         cache: if hola { "surprise" } else { "none" }.into(),
     };
     let rows = (0..c.batch_size)
@@ -391,7 +404,11 @@ fn prepare_model_case_kind(
     let base = reference.base.clone().fork(&train_device);
     runtime::sync(device)?;
     let batch = Batch::new(&rows, &train_device);
-    let fused = if kind == MixerKind::Gdn2 { ScanBackend::FusedGdn2 } else { ScanBackend::FusedGpu };
+    let fused = if kind == MixerKind::Gdn2 {
+        ScanBackend::FusedGdn2
+    } else {
+        ScanBackend::FusedGpu
+    };
     let paths = if let Some(path) = selected {
         vec![path]
     } else if c.backend == "vulkan" {
@@ -974,20 +991,31 @@ pub fn run(c: &Config, device: &Device, warmups: usize, trials: usize) -> Result
 
 /// Paired GDN-2 training paths; original tolerances, independent CPU model oracle.
 pub fn gdn_run(c: &Config, device: &Device, warmups: usize, trials: usize) -> Result<Value> {
-    ensure!((1..=20).contains(&warmups) && (3..=31).contains(&trials),
-        "warmups 1..20 and trials 3..31 required");
-    ensure!(c.backend == "vulkan" || c.backend == "cpu", "GDN benchmark is local CPU/Vulkan only");
-    ensure!(c.heads == 4 && c.key_dim == 32 && c.value_dim == 64 && c.chunk_size == 16,
-        "GDN benchmark fixture requires H4/K32/V64/chunk16");
+    ensure!(
+        (1..=20).contains(&warmups) && (3..=31).contains(&trials),
+        "warmups 1..20 and trials 3..31 required"
+    );
+    ensure!(
+        c.backend == "vulkan" || c.backend == "cpu",
+        "GDN benchmark is local CPU/Vulkan only"
+    );
+    ensure!(
+        c.heads == 4 && c.key_dim == 32 && c.value_dim == 64 && c.chunk_size == 16,
+        "GDN benchmark fixture requires H4/K32/V64/chunk16"
+    );
     let started = Instant::now();
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let directory = c.artifact_dir.join(format!("gdn-benchmark-{}-{nonce}", std::process::id()));
+    let directory = c
+        .artifact_dir
+        .join(format!("gdn-benchmark-{}-{nonce}", std::process::id()));
     std::fs::create_dir_all(&directory)?;
     let report_path = directory.join("report.json");
     let td = device.clone().autodiff();
     let backends = if c.backend == "vulkan" {
         vec![ScanBackend::TensorSolver, ScanBackend::FusedGdn2]
-    } else { vec![ScanBackend::TensorSolver] };
+    } else {
+        vec![ScanBackend::TensorSolver]
+    };
     let mut result = json!({"schema":1,"command":"gdn-benchmark","completed":false,
         "config":c,"device":runtime::identity(device),"report_path":report_path,
         "absolute_tolerance":ATOL,"relative_tolerance":RTOL,"warmups":warmups,"trials":trials,
@@ -1001,7 +1029,10 @@ pub fn gdn_run(c: &Config, device: &Device, warmups: usize, trials: usize) -> Re
         runtime::write_json(&report_path, &result)?;
         let gate = delta_mixers::checks::gdn_numerical_checks_selected(&td, backend, None, None)
             .map_err(anyhow::Error::msg)?;
-        result["numerical_gate"].as_array_mut().unwrap().push(json!(gate));
+        result["numerical_gate"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(gate));
         runtime::write_json(&report_path, &result)?;
     }
     for time in [128usize, 512] {
@@ -1020,16 +1051,24 @@ pub fn gdn_run(c: &Config, device: &Device, warmups: usize, trials: usize) -> Re
                     let index = (iteration + offset) % backends.len();
                     for (mode, backward) in [false, true].into_iter().enumerate() {
                         let ms = raw_timed(&raw, backends[index], backward, device)?;
-                        if iteration >= warmups { timings[index][mode].push(ms); }
+                        if iteration >= warmups {
+                            timings[index][mode].push(ms);
+                        }
                     }
                 }
             }
-            let measurements = backends.iter().enumerate().map(|(i, backend)| json!({
-                "scan_backend":backend,"forward_ms":timings[i][0],
-                "forward_median_ms":median(&timings[i][0]),
-                "forward_backward_ms":timings[i][1],
-                "forward_backward_median_ms":median(&timings[i][1])
-            })).collect::<Vec<_>>();
+            let measurements = backends
+                .iter()
+                .enumerate()
+                .map(|(i, backend)| {
+                    json!({
+                        "scan_backend":backend,"forward_ms":timings[i][0],
+                        "forward_median_ms":median(&timings[i][0]),
+                        "forward_backward_ms":timings[i][1],
+                        "forward_backward_median_ms":median(&timings[i][1])
+                    })
+                })
+                .collect::<Vec<_>>();
             result["raw"].as_array_mut().unwrap().push(json!({
                 "batch":batch_size,"context":time,"heads":4,"key_dim":32,"value_dim":64,"chunk_size":16,
                 "first_shape_use_after_numerical_gate":first_use,"measurements":measurements,
@@ -1045,26 +1084,39 @@ pub fn gdn_run(c: &Config, device: &Device, warmups: usize, trials: usize) -> Re
         }
         for hola in [false, true] {
             deadline(started, c)?;
-            result["active_case"] = json!({"scope":"CPU full-model oracle and steps","context":time,"hola":hola});
+            result["active_case"] =
+                json!({"scope":"CPU full-model oracle and steps","context":time,"hola":hola});
             runtime::write_json(&report_path, &result)?;
             let mut config = c.clone();
             config.batch_size = 8;
-            let PreparedModelCase { config, batch, mut runners, mut report } =
-                prepare_model_case_kind(&config, device, time, hola, None, MixerKind::Gdn2)?;
+            let PreparedModelCase {
+                config,
+                batch,
+                mut runners,
+                mut report,
+            } = prepare_model_case_kind(&config, device, time, hola, None, MixerKind::Gdn2)?;
             let mut samples = vec![Vec::new(); runners.len()];
             for iteration in 0..warmups + trials {
                 for offset in 0..runners.len() {
                     deadline(started, c)?;
                     let index = (iteration + offset) % runners.len();
                     let ms = runners[index].step(&config, &batch, device)?;
-                    if iteration >= warmups { samples[index].push(ms); }
+                    if iteration >= warmups {
+                        samples[index].push(ms);
+                    }
                 }
             }
-            report["measurements"] = json!(runners.iter().enumerate().map(|(i, runner)| json!({
-                "scan_backend":runner.backend,"hola_backend":runner.hola_backend,
-                "step_ms":samples[i],"median_step_ms":median(&samples[i]),
-                "tokens_per_second":(8*time) as f64/(median(&samples[i])/1000.)
-            })).collect::<Vec<_>>());
+            report["measurements"] = json!(
+                runners
+                    .iter()
+                    .enumerate()
+                    .map(|(i, runner)| json!({
+                        "scan_backend":runner.backend,"hola_backend":runner.hola_backend,
+                        "step_ms":samples[i],"median_step_ms":median(&samples[i]),
+                        "tokens_per_second":(8*time) as f64/(median(&samples[i])/1000.)
+                    }))
+                    .collect::<Vec<_>>()
+            );
             result["full_model"].as_array_mut().unwrap().push(report);
             runtime::write_json(&report_path, &result)?;
         }
@@ -1090,37 +1142,63 @@ struct MembershipEntry {
 }
 impl delta_mixers::profile::Sections for MembershipTrace {
     const CAPTURE_CACHE_MEMBERSHIP: bool = true;
-    fn block(&mut self, index: Option<usize>) { self.layer = index; }
-    fn section<T>(&mut self, _name: &'static str, run: impl FnOnce() -> T) -> T { run() }
+    fn block(&mut self, index: Option<usize>) {
+        self.layer = index;
+    }
+    fn section<T>(&mut self, _name: &'static str, run: impl FnOnce() -> T) -> T {
+        run()
+    }
     fn cache_membership(&mut self, chunk_start: usize, used: bool, positions: &Tensor<3>) {
         let shape = positions.dims();
-        let ordered = values(positions.clone()).into_iter().map(|x| x as i32).collect::<Vec<_>>();
+        let ordered = values(positions.clone())
+            .into_iter()
+            .map(|x| x as i32)
+            .collect::<Vec<_>>();
         let mut members = ordered.clone();
         // Sorting separately within each batch/head distinguishes rank reorder
         // from a change in the set that the following chunk actually reads.
-        for row in members.chunks_exact_mut(shape[2]) { row.sort_unstable(); }
+        for row in members.chunks_exact_mut(shape[2]) {
+            row.sort_unstable();
+        }
         self.entries.push(MembershipEntry {
-            layer: self.layer, chunk_start, used, shape, ordered, members,
+            layer: self.layer,
+            chunk_start,
+            used,
+            shape,
+            ordered,
+            members,
         });
     }
 }
 impl MembershipTrace {
     fn report(&self) -> Result<Value> {
-        Ok(json!(self.entries.iter().map(|entry| -> Result<Value> {
-            Ok(json!({
-                "layer":entry.layer,"chunk_start":entry.chunk_start,
-                "used_by_later_chunk":entry.used,"shape":entry.shape,
-                "ordered_positions_sha256":data::hash(&serde_json::to_vec(&entry.ordered)?),
-                "membership_set_sha256":data::hash(&serde_json::to_vec(&entry.members)?)
-            }))
-        }).collect::<Result<Vec<_>>>()?))
+        Ok(json!(
+            self.entries
+                .iter()
+                .map(|entry| -> Result<Value> {
+                    Ok(json!({
+                        "layer":entry.layer,"chunk_start":entry.chunk_start,
+                        "used_by_later_chunk":entry.used,"shape":entry.shape,
+                        "ordered_positions_sha256":data::hash(&serde_json::to_vec(&entry.ordered)?),
+                        "membership_set_sha256":data::hash(&serde_json::to_vec(&entry.members)?)
+                    }))
+                })
+                .collect::<Result<Vec<_>>>()?
+        ))
     }
     fn changes_from(&self, base: &Self) -> Result<Value> {
-        ensure!(self.entries.len() == base.entries.len(), "membership trace length changed");
+        ensure!(
+            self.entries.len() == base.entries.len(),
+            "membership trace length changed"
+        );
         let mut changes = Vec::new();
         for (entry, previous) in self.entries.iter().zip(&base.entries) {
-            ensure!(entry.layer == previous.layer && entry.chunk_start == previous.chunk_start
-                && entry.shape == previous.shape, "membership trace layout changed");
+            ensure!(
+                entry.layer == previous.layer
+                    && entry.chunk_start == previous.chunk_start
+                    && entry.shape == previous.shape,
+                "membership trace layout changed"
+            );
             if entry.ordered != previous.ordered {
                 changes.push(json!({
                     "layer":entry.layer,"chunk_start":entry.chunk_start,
@@ -1141,7 +1219,9 @@ pub fn directional_diagnostic(c: &Config, device: &Device) -> Result<Value> {
     ensure!(c.backend == "cpu", "directional diagnostic is CPU-only");
     let started = Instant::now();
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let path = c.artifact_dir.join(format!("directional-diagnostic-{nonce}.json"));
+    let path = c
+        .artifact_dir
+        .join(format!("directional-diagnostic-{nonce}.json"));
     std::fs::create_dir_all(&c.artifact_dir)?;
     let mut config = c.clone();
     config.scan_backend = ScanBackend::TensorSolver;
@@ -1161,31 +1241,52 @@ pub fn directional_diagnostic(c: &Config, device: &Device) -> Result<Value> {
     });
     runtime::write_json(&path, &report)?;
     let td = device.clone().autodiff();
-    for (kind, batch_size) in [(MixerKind::Gdn2, 8usize), (MixerKind::KronLstm, 1), (MixerKind::KronLstm, 8)] {
+    for (kind, batch_size) in [
+        (MixerKind::Gdn2, 8usize),
+        (MixerKind::KronLstm, 1),
+        (MixerKind::KronLstm, 8),
+    ] {
         deadline(started, c)?;
         config.batch_size = batch_size;
         let arm = Arm {
             name: format!("{kind:?}-hola"),
-            mixer: if kind == MixerKind::Gdn2 { "gdn2" } else { "kronlstm" }.into(),
+            mixer: if kind == MixerKind::Gdn2 {
+                "gdn2"
+            } else {
+                "kronlstm"
+            }
+            .into(),
             cache: "surprise".into(),
         };
         td.seed(c.seed);
         let base = LanguageModel::new(&config, &arm, &td)?;
-        let rows = (0..batch_size).map(|row| Example {
-            input: (0..c.context).map(|t| ((t * 17 + row * 11 + c.seed as usize) % config.vocab()) as i32).collect(),
-            target: (0..c.context).map(|t| (((t + 1) * 17 + row * 11 + c.seed as usize) % config.vocab()) as i32).collect(),
-            weight: vec![1.; c.context], groups: vec![None; c.context],
-        }).collect::<Vec<_>>();
+        let rows = (0..batch_size)
+            .map(|row| Example {
+                input: (0..c.context)
+                    .map(|t| ((t * 17 + row * 11 + c.seed as usize) % config.vocab()) as i32)
+                    .collect(),
+                target: (0..c.context)
+                    .map(|t| (((t + 1) * 17 + row * 11 + c.seed as usize) % config.vocab()) as i32)
+                    .collect(),
+                weight: vec![1.; c.context],
+                groups: vec![None; c.context],
+            })
+            .collect::<Vec<_>>();
         let batch = Batch::new(&rows, &td);
         let ordinary_loss = base.loss(base.forward(&batch), &batch);
         let ordinary_loss_value = model::scalar(ordinary_loss.clone())?;
         let grads = model::checked_gradients(&base, ordinary_loss)?;
         let snapshot = parameters(&base, Some(&grads))?;
-        let analytic = snapshot.iter().enumerate().flat_map(|(p, (_, values))| {
-            values.iter().enumerate().map(move |(i, &g)| {
-                f64::from(g) * f64::from(parameter_direction(p, i))
+        let analytic = snapshot
+            .iter()
+            .enumerate()
+            .flat_map(|(p, (_, values))| {
+                values
+                    .iter()
+                    .enumerate()
+                    .map(move |(i, &g)| f64::from(g) * f64::from(parameter_direction(p, i)))
             })
-        }).sum::<f64>();
+            .sum::<f64>();
         let tolerance = 3e-3 + 0.03 * analytic.abs();
         let mut base_trace = MembershipTrace::default();
         let inference = base.valid();
@@ -1204,12 +1305,18 @@ pub fn directional_diagnostic(c: &Config, device: &Device) -> Result<Value> {
         for epsilon in [5e-4, 1e-3, 2e-3, 4e-3] {
             deadline(started, c)?;
             let mut plus_trace = MembershipTrace::default();
-            let plus = base.valid().map(&mut PerturbParameters { scale: epsilon, index: 0 });
+            let plus = base.valid().map(&mut PerturbParameters {
+                scale: epsilon,
+                index: 0,
+            });
             let logits = plus.forward_profiled(&batch, &mut plus_trace);
             let plus_loss = model::scalar(plus.loss(logits, &batch))?;
             drop(plus);
             let mut minus_trace = MembershipTrace::default();
-            let minus = base.valid().map(&mut PerturbParameters { scale: -epsilon, index: 0 });
+            let minus = base.valid().map(&mut PerturbParameters {
+                scale: -epsilon,
+                index: 0,
+            });
             let logits = minus.forward_profiled(&batch, &mut minus_trace);
             let minus_loss = model::scalar(minus.loss(logits, &batch))?;
             let numerical = (plus_loss - minus_loss) / (2. * epsilon);

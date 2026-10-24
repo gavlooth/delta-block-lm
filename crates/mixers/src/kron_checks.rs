@@ -95,18 +95,24 @@ pub fn gdn_numerical_checks_selected(
     if !backend.supports(MixerKind::Gdn2) {
         return Err("GDN-2 requires tensor_solver or fused_gdn2".into());
     }
-    if tokens.is_some_and(|n| !(1..=512).contains(&n))
-        || objective.is_some_and(|mode| mode > 3) {
+    if tokens.is_some_and(|n| !(1..=512).contains(&n)) || objective.is_some_and(|mode| mode > 3) {
         return Err("GDN-2 reference expects tokens 1..=512 and objective 0..=3".into());
     }
     let device = device.clone().autodiff();
-    if backend.is_fused() { chunk::assert_fused_device(&device); }
+    if backend.is_fused() {
+        chunk::assert_fused_device(&device);
+    }
     let mut reports = Vec::new();
     for time in tokens.map_or_else(|| vec![1, 7, 35], |n| vec![n]) {
         for mode in 0..4 {
-            if objective.is_some_and(|selected| selected != mode) { continue; }
-            reports.push(check(&device, backend, MixerKind::Gdn2, time, mode, false)
-                .map_err(|error| format!("GDN-2 {backend:?} T{time} objective={mode}: {error}"))?);
+            if objective.is_some_and(|selected| selected != mode) {
+                continue;
+            }
+            reports.push(
+                check(&device, backend, MixerKind::Gdn2, time, mode, false).map_err(|error| {
+                    format!("GDN-2 {backend:?} T{time} objective={mode}: {error}")
+                })?,
+            );
         }
     }
     if tokens.is_none() && objective.is_none() {
@@ -219,8 +225,7 @@ fn check(
                 .collect::<Vec<_>>();
             let valid = &f.valid[row * time..(row + 1) * time];
             let reset = &f.reset[row * time..(row + 1) * time];
-            let forward =
-                reference::scan(kind, &tokens, valid, reset, Some(&initial));
+            let forward = reference::scan(kind, &tokens, valid, reset, Some(&initial));
             let upstream = (0..time)
                 .map(|p| {
                     let first = ((row * time + p) * f.h + head) * f.v;
@@ -414,25 +419,9 @@ fn check(
             )
         };
         let (a, av, ar) = section(0, split);
-        let a = chunk::scan_selected(
-            backend,
-            kind,
-            a,
-            av,
-            ar,
-            16,
-            Some(initial.clone()),
-        );
+        let a = chunk::scan_selected(backend, kind, a, av, ar, 16, Some(initial.clone()));
         let (b, bv, br) = section(split, time);
-        let b = chunk::scan_selected(
-            backend,
-            kind,
-            b,
-            bv,
-            br,
-            16,
-            Some(a.final_state),
-        );
+        let b = chunk::scan_selected(backend, kind, b, bv, br, 16, Some(a.final_state));
         let output = Tensor::cat(vec![a.output, b.output], 1);
         let scores = Tensor::cat(vec![a.scores, b.scores], 1);
         let mut error = compare(

@@ -48,8 +48,16 @@ pub fn scan_selected(
                     Tensor::zeros([batch, heads, keys, values], &input.q.device())
                 });
                 let result = delta_kernels::gdn_training_scan(
-                    input.q, input.k, input.v, input.alpha, input.erase, input.write,
-                    valid, reset, initial, chunk_size,
+                    input.q,
+                    input.k,
+                    input.v,
+                    input.alpha,
+                    input.erase,
+                    input.write,
+                    valid,
+                    reset,
+                    initial,
+                    chunk_size,
                 );
                 ScanOutput {
                     output: result.output,

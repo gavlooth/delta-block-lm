@@ -83,7 +83,13 @@ impl HostBatch {
             weight.extend_from_slice(&example.weight);
             reset[row * t] = 1.0;
         }
-        Self { shape: [b, t], input, target, weight, reset }
+        Self {
+            shape: [b, t],
+            input,
+            target,
+            weight,
+            reset,
+        }
     }
     pub(crate) fn upload(self, device: &Device) -> Batch {
         Batch {
@@ -292,8 +298,18 @@ mod tests {
     #[test]
     fn host_batch_preserves_row_order_sparse_weights_and_resets() {
         let rows = vec![
-            Example { input: vec![256, 7, 8], target: vec![7, 8, 9], weight: vec![0.0, 0.5, 1.0], groups: vec![None; 3] },
-            Example { input: vec![256, 3, 4], target: vec![3, 4, 5], weight: vec![1.0, 0.0, 0.25], groups: vec![None; 3] },
+            Example {
+                input: vec![256, 7, 8],
+                target: vec![7, 8, 9],
+                weight: vec![0.0, 0.5, 1.0],
+                groups: vec![None; 3],
+            },
+            Example {
+                input: vec![256, 3, 4],
+                target: vec![3, 4, 5],
+                weight: vec![1.0, 0.0, 0.25],
+                groups: vec![None; 3],
+            },
         ];
         let host = HostBatch::new(&rows);
         assert_eq!(host.shape, [2, 3]);
@@ -303,11 +319,26 @@ mod tests {
         assert_eq!(host.reset, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
         let batch = host.upload(&Device::ndarray());
         assert_eq!(batch.input.dims(), [2, 3]);
-        assert_eq!(batch.input.into_data().try_to_vec_as::<i32>().unwrap(), [256, 7, 8, 256, 3, 4]);
-        assert_eq!(batch.target.into_data().try_to_vec_as::<i32>().unwrap(), [7, 8, 9, 3, 4, 5]);
-        assert_eq!(batch.weight.into_data().try_to_vec::<f32>().unwrap(), [0.0, 0.5, 1.0, 1.0, 0.0, 0.25]);
-        assert_eq!(batch.valid.into_data().try_to_vec::<f32>().unwrap(), [1.0; 6]);
-        assert_eq!(batch.reset.into_data().try_to_vec::<f32>().unwrap(), [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(
+            batch.input.into_data().try_to_vec_as::<i32>().unwrap(),
+            [256, 7, 8, 256, 3, 4]
+        );
+        assert_eq!(
+            batch.target.into_data().try_to_vec_as::<i32>().unwrap(),
+            [7, 8, 9, 3, 4, 5]
+        );
+        assert_eq!(
+            batch.weight.into_data().try_to_vec::<f32>().unwrap(),
+            [0.0, 0.5, 1.0, 1.0, 0.0, 0.25]
+        );
+        assert_eq!(
+            batch.valid.into_data().try_to_vec::<f32>().unwrap(),
+            [1.0; 6]
+        );
+        assert_eq!(
+            batch.reset.into_data().try_to_vec::<f32>().unwrap(),
+            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+        );
     }
     #[test]
     fn recall_is_fixed_disjoint_and_causal() {

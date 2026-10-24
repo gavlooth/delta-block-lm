@@ -505,7 +505,15 @@ pub fn epilogue_run(
     warmups: usize,
     trials: usize,
 ) -> Result<Value> {
-    comparison_run(c, arm, device, contexts, warmups, trials, Comparison::Epilogue)
+    comparison_run(
+        c,
+        arm,
+        device,
+        contexts,
+        warmups,
+        trials,
+        Comparison::Epilogue,
+    )
 }
 
 pub fn hola_run(
@@ -516,15 +524,7 @@ pub fn hola_run(
     warmups: usize,
     trials: usize,
 ) -> Result<Value> {
-    comparison_run(
-        c,
-        arm,
-        device,
-        contexts,
-        warmups,
-        trials,
-        Comparison::Hola,
-    )
+    comparison_run(c, arm, device, contexts, warmups, trials, Comparison::Hola)
 }
 
 pub fn convolution_run(
@@ -785,7 +785,14 @@ fn comparison_run(
                     .map_err(anyhow::Error::msg)?,
                 )?
             } else if epilogue {
-                crate::epilogues::benchmark(device, context, c.batch_size, c.d_model, warmups, trials)?
+                crate::epilogues::benchmark(
+                    device,
+                    context,
+                    c.batch_size,
+                    c.d_model,
+                    warmups,
+                    trials,
+                )?
             } else {
                 serde_json::to_value(
                     delta_mixers::projection_benchmark(

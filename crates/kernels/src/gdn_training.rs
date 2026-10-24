@@ -1,26 +1,37 @@
 //! Stateful GDN-2 training recurrence. One value column per lane, bounded replay.
+use crate::kron::ix;
 use burn::backend::{TensorMetadata, ops::FloatTensorOps};
 use burn::{prelude::Shape, tensor::DType};
 use burn_cubecl::{CubeBackend, tensor::CubeTensor};
 use cubecl::frontend::Tensor as View;
 use cubecl::prelude::*;
-use crate::kron::ix;
 const K: usize = 32;
 const V: usize = 64;
 const AUX: usize = V + 2;
 
 #[cube(launch)]
 fn forward_kernel(
-    q: &View<f32>, k: &View<f32>, v: &View<f32>, alpha: &View<f32>,
-    erase: &View<f32>, write: &View<f32>, valid: &View<f32>, reset: &View<f32>,
-    initial: &View<f32>, packed: &mut View<f32>, checkpoint: &mut View<f32>,
-    auxiliary: &mut View<f32>, #[comptime] chunk: usize,
+    q: &View<f32>,
+    k: &View<f32>,
+    v: &View<f32>,
+    alpha: &View<f32>,
+    erase: &View<f32>,
+    write: &View<f32>,
+    valid: &View<f32>,
+    reset: &View<f32>,
+    initial: &View<f32>,
+    packed: &mut View<f32>,
+    checkpoint: &mut View<f32>,
+    auxiliary: &mut View<f32>,
+    #[comptime] chunk: usize,
 ) {
     let j = UNIT_POS as usize;
     let head = CUBE_POS as usize;
     let h = head % q.shape(2);
     let b = head / q.shape(2);
-    if b >= q.shape(0) { terminate!(); }
+    if b >= q.shape(0) {
+        terminate!();
+    }
     let time = q.shape(1);
     let heads = q.shape(2);
     let chunks = (time + chunk - 1) / chunk;
@@ -30,7 +41,10 @@ fn forward_kernel(
     let mut reduction = Shared::<[f32]>::new_slice(V);
     let mut i = 0usize;
     while i < K {
-        state[i] = initial[b * initial.stride(0) + h * initial.stride(1) + i * initial.stride(2) + j * initial.stride(3)];
+        state[i] = initial[b * initial.stride(0)
+            + h * initial.stride(1)
+            + i * initial.stride(2)
+            + j * initial.stride(3)];
         i += 1;
     }
     let mut t = 0usize;
@@ -52,7 +66,11 @@ fn forward_kernel(
             i = 0;
             while i < K {
                 let key = k[ix(k, b, t, h, i)];
-                state[i] = if restarting { 0.0f32 } else { state[i] * alpha[ix(alpha, b, t, h, i)] };
+                state[i] = if restarting {
+                    0.0f32
+                } else {
+                    state[i] * alpha[ix(alpha, b, t, h, i)]
+                };
                 delta -= erase[ix(erase, b, t, h, i)] * key * state[i];
                 key_square += key * key;
                 i += 1;
@@ -63,7 +81,9 @@ fn forward_kernel(
         sync_cube();
         let mut stride = 32usize;
         while stride > 0 {
-            if j < stride { reduction[j] += reduction[j + stride]; }
+            if j < stride {
+                reduction[j] += reduction[j + stride];
+            }
             sync_cube();
             stride /= 2;
         }
@@ -96,18 +116,34 @@ fn forward_kernel(
 
 #[cube(launch)]
 fn backward_kernel(
-    q: &View<f32>, k: &View<f32>, v: &View<f32>, alpha: &View<f32>,
-    erase: &View<f32>, write: &View<f32>, valid: &View<f32>, reset: &View<f32>,
-    checkpoint: &View<f32>, auxiliary: &View<f32>, upstream: &View<f32>,
-    replay: &mut View<f32>, dq: &mut View<f32>, dk: &mut View<f32>,
-    dv: &mut View<f32>, da: &mut View<f32>, de: &mut View<f32>,
-    dw: &mut View<f32>, ds: &mut View<f32>, #[comptime] chunk: usize,
+    q: &View<f32>,
+    k: &View<f32>,
+    v: &View<f32>,
+    alpha: &View<f32>,
+    erase: &View<f32>,
+    write: &View<f32>,
+    valid: &View<f32>,
+    reset: &View<f32>,
+    checkpoint: &View<f32>,
+    auxiliary: &View<f32>,
+    upstream: &View<f32>,
+    replay: &mut View<f32>,
+    dq: &mut View<f32>,
+    dk: &mut View<f32>,
+    dv: &mut View<f32>,
+    da: &mut View<f32>,
+    de: &mut View<f32>,
+    dw: &mut View<f32>,
+    ds: &mut View<f32>,
+    #[comptime] chunk: usize,
 ) {
     let j = UNIT_POS as usize;
     let head = CUBE_POS as usize;
     let h = head % q.shape(2);
     let b = head / q.shape(2);
-    if b >= q.shape(0) { terminate!(); }
+    if b >= q.shape(0) {
+        terminate!();
+    }
     let time = q.shape(1);
     let heads = q.shape(2);
     let chunks = (time + chunk - 1) / chunk;
@@ -140,7 +176,11 @@ fn backward_kernel(
             while i < K {
                 replay[((head * chunk + r) * K + i) * V + j] = state[i];
                 if active {
-                    let bar = if restarting { 0.0f32 } else { alpha[ix(alpha, b, t, h, i)] * state[i] };
+                    let bar = if restarting {
+                        0.0f32
+                    } else {
+                        alpha[ix(alpha, b, t, h, i)] * state[i]
+                    };
                     state[i] = bar + k[ix(k, b, t, h, i)] * auxiliary[token * AUX + j];
                 }
                 i += 1;
@@ -189,7 +229,9 @@ fn backward_kernel(
                     key_grad = adjoint[i] * delta - erase_gate * bar * dd;
                     erase_grad = -key * bar * dd;
                     let dbar = adjoint[i] - erase_gate * key * dd;
-                    if restarting { adjoint[i] = 0.0f32; } else {
+                    if restarting {
+                        adjoint[i] = 0.0f32;
+                    } else {
                         decay_grad = dbar * previous;
                         adjoint[i] = decay * dbar;
                     }
@@ -216,7 +258,9 @@ fn backward_kernel(
             if j < K {
                 dq[token * K + j] = channels[j * V];
                 let mut direct = 0.0f32;
-                if active { direct = key_scale * k[ix(k, b, t, h, j)]; }
+                if active {
+                    direct = key_scale * k[ix(k, b, t, h, j)];
+                }
                 dk[token * K + j] = channels[(K + j) * V] + direct;
                 da[token * K + j] = channels[(2 * K + j) * V];
                 de[token * K + j] = channels[(3 * K + j) * V];
@@ -240,23 +284,45 @@ fn backward_kernel(
 }
 
 fn checked_elements(dims: &[usize]) -> usize {
-    let elements = dims.iter().try_fold(1usize, |n, &d| n.checked_mul(d))
+    let elements = dims
+        .iter()
+        .try_fold(1usize, |n, &d| n.checked_mul(d))
         .expect("GDN-2 element count overflows usize");
-    assert!(elements <= u32::MAX as usize, "GDN-2 exceeds 32-bit addressing");
+    assert!(
+        elements <= u32::MAX as usize,
+        "GDN-2 exceeds 32-bit addressing"
+    );
     elements
 }
 
 fn assert_u32_tensor(tensor: &CubeTensor) {
     checked_elements(tensor.meta.shape().as_slice());
     let mut span = 1usize;
-    for (&dim, &stride) in tensor.meta.shape().as_slice().iter().zip(tensor.meta.strides().iter()) {
-        assert!(stride <= u32::MAX as usize, "GDN-2 stride exceeds 32-bit addressing");
-        span = dim.saturating_sub(1).checked_mul(stride)
-            .and_then(|offset| span.checked_add(offset)).expect("GDN-2 address span overflow");
+    for (&dim, &stride) in tensor
+        .meta
+        .shape()
+        .as_slice()
+        .iter()
+        .zip(tensor.meta.strides().iter())
+    {
+        assert!(
+            stride <= u32::MAX as usize,
+            "GDN-2 stride exceeds 32-bit addressing"
+        );
+        span = dim
+            .saturating_sub(1)
+            .checked_mul(stride)
+            .and_then(|offset| span.checked_add(offset))
+            .expect("GDN-2 address span overflow");
     }
-    assert!(span <= u32::MAX as usize, "GDN-2 span exceeds 32-bit addressing");
-    assert!(tensor.handle.size() / tensor.elem_size() as u64 <= u32::MAX as u64,
-        "GDN-2 backing buffer exceeds 32-bit addressing");
+    assert!(
+        span <= u32::MAX as usize,
+        "GDN-2 span exceeds 32-bit addressing"
+    );
+    assert!(
+        tensor.handle.size() / tensor.elem_size() as u64 <= u32::MAX as u64,
+        "GDN-2 backing buffer exceeds 32-bit addressing"
+    );
 }
 
 fn empty(reference: &CubeTensor, dims: impl Into<Shape>) -> CubeTensor {
@@ -276,12 +342,22 @@ fn count(reference: &CubeTensor, heads: usize) -> CubeCount {
 }
 
 pub(crate) fn run_scan(
-    q: CubeTensor, k: CubeTensor, v: CubeTensor, alpha: CubeTensor,
-    erase: CubeTensor, write: CubeTensor, valid: CubeTensor, reset: CubeTensor,
-    initial: CubeTensor, chunk: usize,
+    q: CubeTensor,
+    k: CubeTensor,
+    v: CubeTensor,
+    alpha: CubeTensor,
+    erase: CubeTensor,
+    write: CubeTensor,
+    valid: CubeTensor,
+    reset: CubeTensor,
+    initial: CubeTensor,
+    chunk: usize,
 ) -> (CubeTensor, CubeTensor, CubeTensor) {
     let [batch, time, heads, keys] = q.shape().dims::<4>();
-    assert!(batch > 0 && time > 0 && heads > 0, "GDN-2 requires nonempty axes");
+    assert!(
+        batch > 0 && time > 0 && heads > 0,
+        "GDN-2 requires nonempty axes"
+    );
     assert_eq!(keys, K, "fused GDN-2 requires key width 32");
     assert_eq!(k.shape().dims::<4>(), [batch, time, heads, K]);
     assert_eq!(v.shape().dims::<4>(), [batch, time, heads, V]);
@@ -291,9 +367,16 @@ pub(crate) fn run_scan(
     assert_eq!(valid.shape().dims::<2>(), [batch, time]);
     assert_eq!(reset.shape().dims::<2>(), [batch, time]);
     assert_eq!(initial.shape().dims::<4>(), [batch, heads, K, V]);
-    assert!((1..=16).contains(&chunk), "GDN-2 checkpoint chunk must be 1..=16");
+    assert!(
+        (1..=16).contains(&chunk),
+        "GDN-2 checkpoint chunk must be 1..=16"
+    );
     for tensor in [&q, &k, &v, &alpha, &erase, &write, &valid, &reset, &initial] {
-        assert_eq!(tensor.dtype, DType::F32, "fused GDN-2 supports f32 tensors only");
+        assert_eq!(
+            tensor.dtype,
+            DType::F32,
+            "fused GDN-2 supports f32 tensors only"
+        );
         assert_eq!(tensor.device, q.device, "GDN-2 inputs must share a device");
         assert_u32_tensor(tensor);
     }
@@ -302,29 +385,69 @@ pub(crate) fn run_scan(
     checked_elements(&[batch, time, heads, AUX]);
     let state_len = checked_elements(&[batch, heads, K, V]);
     let packed_len = checked_elements(&[batch, time, heads, V + 1])
-        .checked_add(state_len).expect("GDN-2 packed length overflow");
+        .checked_add(state_len)
+        .expect("GDN-2 packed length overflow");
     checked_elements(&[packed_len]);
     let packed = empty(&q, [packed_len]);
     let checkpoint = empty(&q, [batch, heads, time.div_ceil(chunk), K, V]);
     let auxiliary = empty(&q, [batch, time, heads, AUX]);
     forward_kernel::launch(
-        &q.client, count(&q, batch * heads), CubeDim::new_1d(V as u32),
-        q.clone().into_tensor_arg(), k.into_tensor_arg(), v.into_tensor_arg(),
-        alpha.into_tensor_arg(), erase.into_tensor_arg(), write.into_tensor_arg(),
-        valid.into_tensor_arg(), reset.into_tensor_arg(), initial.into_tensor_arg(),
-        packed.clone().into_tensor_arg(), checkpoint.clone().into_tensor_arg(),
-        auxiliary.clone().into_tensor_arg(), chunk,
+        &q.client,
+        count(&q, batch * heads),
+        CubeDim::new_1d(V as u32),
+        q.clone().into_tensor_arg(),
+        k.into_tensor_arg(),
+        v.into_tensor_arg(),
+        alpha.into_tensor_arg(),
+        erase.into_tensor_arg(),
+        write.into_tensor_arg(),
+        valid.into_tensor_arg(),
+        reset.into_tensor_arg(),
+        initial.into_tensor_arg(),
+        packed.clone().into_tensor_arg(),
+        checkpoint.clone().into_tensor_arg(),
+        auxiliary.clone().into_tensor_arg(),
+        chunk,
     );
     (packed, checkpoint, auxiliary)
 }
 
 pub(crate) fn run_backward(
-    q: CubeTensor, k: CubeTensor, v: CubeTensor, alpha: CubeTensor,
-    erase: CubeTensor, write: CubeTensor, upstream: CubeTensor, checkpoint: CubeTensor,
-    auxiliary: CubeTensor, valid: CubeTensor, reset: CubeTensor, chunk: usize,
-) -> (CubeTensor, CubeTensor, CubeTensor, CubeTensor, CubeTensor, CubeTensor, CubeTensor) {
+    q: CubeTensor,
+    k: CubeTensor,
+    v: CubeTensor,
+    alpha: CubeTensor,
+    erase: CubeTensor,
+    write: CubeTensor,
+    upstream: CubeTensor,
+    checkpoint: CubeTensor,
+    auxiliary: CubeTensor,
+    valid: CubeTensor,
+    reset: CubeTensor,
+    chunk: usize,
+) -> (
+    CubeTensor,
+    CubeTensor,
+    CubeTensor,
+    CubeTensor,
+    CubeTensor,
+    CubeTensor,
+    CubeTensor,
+) {
     let [batch, _, heads, _] = q.shape().dims::<4>();
-    for tensor in [&q, &k, &v, &alpha, &erase, &write, &upstream, &checkpoint, &auxiliary, &valid, &reset] {
+    for tensor in [
+        &q,
+        &k,
+        &v,
+        &alpha,
+        &erase,
+        &write,
+        &upstream,
+        &checkpoint,
+        &auxiliary,
+        &valid,
+        &reset,
+    ] {
         assert_u32_tensor(tensor);
     }
     let replay = empty(&q, [batch, heads, chunk, K, V]);
@@ -336,14 +459,29 @@ pub(crate) fn run_backward(
     let dw = empty(&q, write.shape());
     let ds = empty(&q, [batch, heads, K, V]);
     backward_kernel::launch(
-        &q.client, count(&q, batch * heads), CubeDim::new_1d(V as u32),
-        q.clone().into_tensor_arg(), k.into_tensor_arg(), v.into_tensor_arg(),
-        alpha.into_tensor_arg(), erase.into_tensor_arg(), write.into_tensor_arg(),
-        valid.into_tensor_arg(), reset.into_tensor_arg(), checkpoint.into_tensor_arg(),
-        auxiliary.into_tensor_arg(), upstream.into_tensor_arg(), replay.into_tensor_arg(),
-        dq.clone().into_tensor_arg(), dk.clone().into_tensor_arg(), dv.clone().into_tensor_arg(),
-        da.clone().into_tensor_arg(), de.clone().into_tensor_arg(), dw.clone().into_tensor_arg(),
-        ds.clone().into_tensor_arg(), chunk,
+        &q.client,
+        count(&q, batch * heads),
+        CubeDim::new_1d(V as u32),
+        q.clone().into_tensor_arg(),
+        k.into_tensor_arg(),
+        v.into_tensor_arg(),
+        alpha.into_tensor_arg(),
+        erase.into_tensor_arg(),
+        write.into_tensor_arg(),
+        valid.into_tensor_arg(),
+        reset.into_tensor_arg(),
+        checkpoint.into_tensor_arg(),
+        auxiliary.into_tensor_arg(),
+        upstream.into_tensor_arg(),
+        replay.into_tensor_arg(),
+        dq.clone().into_tensor_arg(),
+        dk.clone().into_tensor_arg(),
+        dv.clone().into_tensor_arg(),
+        da.clone().into_tensor_arg(),
+        de.clone().into_tensor_arg(),
+        dw.clone().into_tensor_arg(),
+        ds.clone().into_tensor_arg(),
+        chunk,
     );
     (dq, dk, dv, da, de, dw, ds)
 }

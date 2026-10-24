@@ -15,7 +15,8 @@ pub fn validate(c: &Config) -> Result<()> {
         "guarded autotune is supported only for the unfused local Vulkan byte-LM"
     );
     ensure!(
-        c.scan_backend.is_fused() && c.hola_backend.is_fused()
+        c.scan_backend.is_fused()
+            && c.hola_backend.is_fused()
             && c.arms.iter().all(|arm| arm.mixer == "kronlstm"),
         "autotune requires fused KronLSTM scan and HOLA; tensor_solver, GDN2, and tensor HOLA are not certified"
     );

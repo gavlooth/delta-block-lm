@@ -7,8 +7,8 @@ mod diagnostics;
 mod epilogues;
 mod gemm;
 mod gemm_batched;
-mod hola_tune;
 mod gemm_guard;
+mod hola_tune;
 mod io_benchmark;
 mod kron_benchmark;
 mod lm_retrieval;
@@ -219,7 +219,11 @@ fn execute() -> Result<()> {
     ensure!(
         !matches!(
             command.as_str(),
-            "gemm-micro" | "gemm-step" | "update-loss-benchmark" | "update-loss-reference" | "gdn-directional-diagnostic"
+            "gemm-micro"
+                | "gemm-step"
+                | "update-loss-benchmark"
+                | "update-loss-reference"
+                | "gdn-directional-diagnostic"
         ) || (arm_name.is_none()
             && (resume.is_none() || command == "update-loss-reference")
             && seed == c.seed),
@@ -347,12 +351,18 @@ fn execute() -> Result<()> {
         "gdn-reference" => {
             let selected = reference_scan_backend.unwrap_or(c.scan_backend);
             let report = delta_mixers::checks::gdn_numerical_checks_selected(
-                &device, selected, reference_tokens, reference_objective,
+                &device,
+                selected,
+                reference_tokens,
+                reference_objective,
             );
             json!({"schema":1,"command":command,"passed":report.is_ok(),"device":runtime::identity(&device),"config":c,"scan_backend":selected,"tokens":reference_tokens,"objective":reference_objective,"numerical_report":report.as_ref().ok(),"error":report.as_ref().err()})
         }
         "gdn-benchmark" => kron_benchmark::gdn_run(
-            &c, &device, benchmark_warmups.unwrap_or(2), benchmark_trials.unwrap_or(5),
+            &c,
+            &device,
+            benchmark_warmups.unwrap_or(2),
+            benchmark_trials.unwrap_or(5),
         )?,
         "gdn-directional-diagnostic" => kron_benchmark::directional_diagnostic(&c, &device)?,
         "hola-reference" => {
