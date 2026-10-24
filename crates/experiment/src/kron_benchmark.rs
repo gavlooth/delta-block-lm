@@ -384,6 +384,7 @@ fn prepare_model_case_kind(
     cpu_config.head_backend = crate::config::HeadBackend::Native;
     cpu_config.loss_backend = crate::config::LossBackend::Tensor;
     cpu_config.update_backend = crate::config::UpdateBackend::Tensor;
+    cpu_config.epilogue_backend = crate::config::EpilogueBackend::Native;
     let reference = cpu_reference(&cpu_config, &arm, &rows)?;
     let train_device = device.clone().autodiff();
     // Fork detaches the CPU graph: no model/input transfers occur in the GPU step.
@@ -423,6 +424,7 @@ fn prepare_model_case_kind(
         model.set_head_backend(c.head_backend);
         model.set_loss_backend(c.loss_backend);
         model.set_update_backend(c.update_backend);
+        model.set_epilogue_backend(c.epilogue_backend);
         let initial_error = compare_parameters(
             "identical CPU initialization",
             &parameters(&model, None)?,
@@ -465,7 +467,7 @@ fn prepare_model_case_kind(
             "projection_backend":c.projection_backend,"normalization_backend":c.normalization_backend,
             "convolution_backend":c.convolution_backend,
             "head_backend":c.head_backend,
-            "update_backend":c.update_backend,"loss_backend":c.loss_backend,
+            "update_backend":c.update_backend,"loss_backend":c.loss_backend,"epilogue_backend":c.epilogue_backend,
             "reference":"CPU TensorSolver/Tensor/Separate/Tensor normalization",
             "initial_parameters_max_abs":initial_error,"logits_max_abs":output_error,
             "all_parameter_gradients_max_abs":gradient_error,"AdamW_parameters_max_abs":update_error,

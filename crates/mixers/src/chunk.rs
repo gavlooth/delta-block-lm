@@ -188,8 +188,14 @@ pub fn scan(
                 key_overlap(k.clone())
                     * v.clone().matmul(v.clone().swap_dims(2, 3))
                     * erase.clone(),
+                // Keep the row dot product's VJP rank-2: the GPU rank-4 reduction
+                // loses the initial-state adjoint after the erase/solve chain.
+                // Same contraction and tolerances; see docs/optimization/tensor-solver.md.
                 write
-                    - ((k.clone() * prefix.clone()).matmul(state.clone()) * v.clone()).sum_dim(3)
+                    - ((k.clone() * prefix.clone()).matmul(state.clone()) * v.clone())
+                        .reshape([batch * heads * size, values])
+                        .sum_dim(1)
+                        .reshape([batch, heads, size, 1])
                         * erase,
             ),
         };
@@ -233,3 +239,7 @@ pub fn scan(
         scores: Tensor::cat(scores, 1),
     }
 }
+
+#[cfg(test)]
+#[path = "chunk_tests.rs"]
+mod tests;
