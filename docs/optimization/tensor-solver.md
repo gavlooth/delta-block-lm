@@ -16,6 +16,12 @@ zero/signed corrections, padding and resets. Key field 1 element 32
 `0.002235880982479412`. Its absolute error is `0.00015438434143956372`.
 CPU and the custom fused scan passing do not certify the GPU tensor solver.
 
+The accepted source correction is `e1cb69ce`: an equivalent rowwise dot GEMM
+for the KronLSTM initial-state bilinear term. Its independent CPU/GPU regression
+and historical/default Vulkan reference checks pass in the final integration
+verification recorded below. The earlier rank-2 reduction attempt is retained
+as a failed intermediate correction, not an accepted alternative.
+
 ## Algebraic localization
 
 For a valid token, let `bar = diag(alpha) S_previous`,
@@ -244,6 +250,55 @@ a GDN-2-specific formula or a new tolerance issue. The rowwise dot-GEMM
 successor changes only the same KronLSTM RHS contraction. Its production
 acceptance must be recorded separately; the successful T7 tests do not excuse
 the failed independent regression.
+
+## Rowwise dot-GEMM acceptance
+
+Frozen solver source: `e1cb69ce` (child of the incomplete rank-2 correction).
+The final verification exercised the combined integration source
+`53a684349a1a4cb3be5bda1f7ab2dcdf338529b9`, which includes that solver change.
+Evidence is recorded in a child revision, without rewriting either tested
+source snapshot.
+
+Logs: `artifacts/integration/final/`. Tested experiment binary SHA-256:
+`d94d0896930d2022b5db42ed0b9efd24b16094312fcee8c5d3e2c7e304856e10`.
+The before-regression failure remains in
+`artifacts/kron-validation/solver-fix-verification-2/before-vulkan-regression.stdout`.
+
+| Check | Result | Recorded seconds |
+| --- | --- | ---: |
+| Unified executable build | PASS | 5 |
+| CPU workspace tests | PASS: 33 + 7 + 13 tests | 8 |
+| Independent Vulkan key/initial/reset/pad regression | PASS: 1 test | 3 |
+| Historical T7 output/state/score objectives | all PASS | 7 |
+| Default TensorSolver Kron reference | PASS: 13 cases | 4 |
+
+The CPU workspace run includes
+`tensor_solver_initial_key_reset_padding_cpu`. The explicitly run GPU test
+is `tensor_solver_initial_key_reset_padding_vulkan`; its same independent
+fixture fails before both corrections, fails after the rank-2 attempt, and
+passes after the rowwise dot GEMM. Neither the fixture nor its tolerances were
+weakened. The GPU test covers both solver callers and chunk sizes 1/2/5/16.
+
+Historical objective JSON reports are preserved separately under
+`artifacts/kron-validation/solver-final-1792870523144/`:
+
+| T7 objective | Input VJP max abs | Initial-state VJP max abs | Continuation VJP max abs |
+| --- | ---: | ---: | ---: |
+| output_only | 6.85548e-8 | 1.64059e-8 | 8.07143e-8 |
+| final_state_only | 2.93909e-9 | 0 | 3.46227e-9 |
+| score_only | 6.78971e-9 | 3.53416e-10 | 8.96639e-9 |
+
+The default reference additionally covers T1/T7/T35 and all four objectives,
+plus strided T35 combined inputs and continuation gradients. Every case
+reports `scan_backend: tensor_solver`; the largest reported input-gradient
+absolute error is 1.43901e-7. The device reports Intel Arc MTL Vulkan with
+fusion and autotune disabled.
+
+This accepts the corrected solver behavior within the exercised contracts,
+not a measured performance improvement or a general repair to Burn's
+underlying reduction implementation. Unrelated integration checks are outside
+this solver acceptance; the integration log also contains an IO-benchmark
+failure, so the entire integration transaction must not be called all-pass.
 
 ## Independent regression behavior
 
