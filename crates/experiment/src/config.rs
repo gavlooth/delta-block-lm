@@ -68,6 +68,7 @@ impl Arm {
             || c.convolution_backend == delta_mixers::ConvolutionBackend::FusedGpu
             || !c.update_backend.is_tensor()
             || !c.loss_backend.is_tensor()
+            || !c.epilogue_backend.is_native()
     }
 }
 
@@ -80,6 +81,20 @@ pub enum HeadBackend {
     Heuristic,
 }
 impl HeadBackend {
+    pub fn is_native(&self) -> bool {
+        *self == Self::Native
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpilogueBackend {
+    #[default]
+    Native,
+    AnalyticBackward,
+    FusedPointwise,
+}
+impl EpilogueBackend {
     pub fn is_native(&self) -> bool {
         *self == Self::Native
     }
@@ -161,6 +176,8 @@ pub struct Config {
     pub convolution_backend: delta_mixers::ConvolutionBackend,
     #[serde(skip_serializing_if = "HeadBackend::is_native")]
     pub head_backend: HeadBackend,
+    #[serde(skip_serializing_if = "EpilogueBackend::is_native")]
+    pub epilogue_backend: EpilogueBackend,
     #[serde(skip_serializing_if = "UpdateBackend::is_tensor")]
     pub update_backend: UpdateBackend,
     #[serde(skip_serializing_if = "LossBackend::is_tensor")]
@@ -220,6 +237,7 @@ impl Default for Config {
             normalization_backend: NormalizationBackend::Tensor,
             convolution_backend: delta_mixers::ConvolutionBackend::Tensor,
             head_backend: HeadBackend::Native,
+            epilogue_backend: EpilogueBackend::Native,
             update_backend: UpdateBackend::Tensor,
             loss_backend: LossBackend::Tensor,
             context: 128,
@@ -323,6 +341,7 @@ impl Config {
             (!self.scan_backend.is_fused()
                 && !self.hola_backend.is_fused()
                 && self.normalization_backend.is_tensor()
+                && self.epilogue_backend.is_native()
                 && self.convolution_backend != delta_mixers::ConvolutionBackend::FusedGpu)
                 || matches!(self.backend.as_str(), "vulkan" | "cuda"),
             "fused_gpu requires an explicit GPU backend; no CPU fallback"

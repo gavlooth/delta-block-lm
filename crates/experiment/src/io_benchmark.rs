@@ -98,6 +98,7 @@ fn shape(c: &Config, arm: &Arm, corpus: &Corpus, device: &Device, directory: &Pa
     let mut checkpoint_bytes = 0;
     let mut first_checkpoint = Value::Null;
     let mut cold_io = Value::Null;
+    let measured_rows = data::examples(c, Some(corpus), c.seed, c.batch_size, c.batch_size, "train")?;
     // One cold observation, excluded warmups, then measured trials. Alternate design order.
     for iteration in 0..1 + warmups + trials {
         deadline(c, start)?;
@@ -169,7 +170,7 @@ fn shape(c: &Config, arm: &Arm, corpus: &Corpus, device: &Device, directory: &Pa
         comparisons.push(json!({"iteration":iteration,"phase":if iteration==0 {"cold"} else if measured {"measured"} else {"warmup"},"batch_values_exact":true,"parameters_and_ids_exact":true,"optimizer_moments_ids_counters_exact":true,"restored_next_step_exact":true}));
         runtime::write_json(&directory.join("partial.json"), &json!({"completed":false,"samples":summarize(&samples),"comparisons":comparisons,"first_checkpoint":first_checkpoint}))?;
     }
-    Ok(json!({"completed":true,"config":c,"arm":arm,"batch_size":c.batch_size,"context":c.context,"fixture_sha256":data::fixture_hash(&rows),"parameters":base.num_params(),"cold_optimizer_step_ms":cold_step_ms,"cold_io":cold_io,"first_checkpoint":first_checkpoint,"timings":summarize(&samples),"checks":comparisons,
+    Ok(json!({"completed":true,"config":c,"arm":arm,"batch_size":c.batch_size,"context":c.context,"initial_fixture_sha256":data::fixture_hash(&rows),"fixture_sha256":data::fixture_hash(&measured_rows),"parameters":base.num_params(),"cold_optimizer_step_ms":cold_step_ms,"cold_io":cold_io,"first_checkpoint":first_checkpoint,"timings":summarize(&samples),"checks":comparisons,
         "work":{"packed_host_payload_bytes":c.tokens_per_step()*16,"resident_batch_logical_bytes":c.tokens_per_step()*20,"checkpoint_bytes":checkpoint_bytes,"sampled_peak_pool_reserved_bytes":peak_reserved,"pool_measurement":"sampled pool reservation, not physical/live peak; includes correctness fixtures","exact_capacity_host_vectors":4,"batch_tensor_creations":5,"full_step_designs":["legacy_flat_map_collect","exact_capacity_owned_upload","same_step_resident_batch"],"checkpoint_designs":["original_atomic_save_and_guarded_validated_restore","same_step_resident_model_optimizer_continuation"],"resident_checkpoint_note":"resident continuation is full_optimizer_step_resident; original model and optimizer state prepared outside its clock. It has no durability and is only an IO-overhead bound, never a replacement save/load policy"}}))
 }
 

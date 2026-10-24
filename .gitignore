@@ -1,5 +1,5 @@
 /.agents
 /target/
-/data/
-/artifacts/
+/data
+/artifacts
 /.cache/

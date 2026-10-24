@@ -8,7 +8,7 @@ use burn::{
     nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig},
     optim::GradientsParams,
     prelude::*,
-    tensor::activation::{log_softmax, silu},
+    tensor::activation::log_softmax,
 };
 use delta_mixers::{
     Mixer,
@@ -33,6 +33,8 @@ pub struct LanguageModel {
     pub(super) normalization_backend: delta_mixers::NormalizationBackend,
     #[module(skip)]
     pub(super) head_backend: HeadBackend,
+    #[module(skip)]
+    pub(super) epilogue_backend: crate::config::EpilogueBackend,
     #[module(skip)]
     pub(super) loss_backend: LossBackend,
     #[module(skip)]
@@ -74,6 +76,7 @@ impl LanguageModel {
             head: linear(c.d_model, c.vocab()),
             normalization_backend: c.normalization_backend,
             head_backend: c.head_backend,
+            epilogue_backend: c.epilogue_backend,
             loss_backend: c.loss_backend,
             update_backend: c.update_backend,
         })
@@ -113,6 +116,9 @@ impl LanguageModel {
     pub fn set_update_backend(&mut self, backend: UpdateBackend) {
         self.update_backend = backend;
     }
+    pub fn set_epilogue_backend(&mut self, backend: crate::config::EpilogueBackend) {
+        self.epilogue_backend = backend;
+    }
     pub fn loss(&self, logits: Tensor<3>, batch: &Batch) -> Tensor<1> {
         loss_selected(logits, batch, self.loss_backend)
     }
@@ -142,7 +148,7 @@ impl LanguageModel {
                     .rms(&block.ff_norm, hidden.clone())
             });
             let update = profile.section("MLP: up", || block.up.forward(normalized));
-            let update = profile.section("MLP: SiLU", || silu(update));
+            let update = profile.section("MLP: SiLU", || self.epilogue_backend.silu(update));
             let update = profile.section("MLP: down", || block.down.forward(update));
             hidden = profile.section("Residual adds", || hidden + update);
         }

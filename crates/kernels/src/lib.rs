@@ -64,3 +64,9 @@ pub use cross_entropy_ops::cross_entropy_rows;
 mod soft_ops;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 pub use soft_ops::soft_order_keys;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod epilogue;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod epilogue_ops;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+pub use epilogue_ops::{silu_analytic, silu_vjp};

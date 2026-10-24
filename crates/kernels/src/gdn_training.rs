@@ -323,7 +323,7 @@ pub(crate) fn run_backward(
     erase: CubeTensor, write: CubeTensor, upstream: CubeTensor, checkpoint: CubeTensor,
     auxiliary: CubeTensor, valid: CubeTensor, reset: CubeTensor, chunk: usize,
 ) -> (CubeTensor, CubeTensor, CubeTensor, CubeTensor, CubeTensor, CubeTensor, CubeTensor) {
-    let [batch, time, heads, _] = q.shape().dims::<4>();
+    let [batch, _, heads, _] = q.shape().dims::<4>();
     for tensor in [&q, &k, &v, &alpha, &erase, &write, &upstream, &checkpoint, &auxiliary, &valid, &reset] {
         assert_u32_tensor(tensor);
     }

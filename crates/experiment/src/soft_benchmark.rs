@@ -247,9 +247,18 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
             a.remask(&[0, 1, 3]);
             b.remask(&[0, 1, 3]);
             state_equal(&a, &b)?;
-            ensure!(values(b.visibility.clone()) == vec![1.0, 0.0, (step + 1) as f32 / 4.0, 0.0], "independent visibility schedule");
-            ensure!(ids_host(b.provisional.clone()) == vec![-1, -1, 1, -1], "independent immutable/unavailable/signed-zero proposals");
-            ensure!(ids_host(b.retained.clone()) == vec![-1, -1, 1, -1], "independent retained proposals");
+            ensure!(
+                values(b.visibility.clone()) == vec![1.0, 0.0, (step + 1) as f32 / 4.0, 0.0],
+                "independent visibility schedule"
+            );
+            ensure!(
+                ids_host(b.provisional.clone()) == vec![-1, -1, 1, -1],
+                "independent immutable/unavailable/signed-zero proposals"
+            );
+            ensure!(
+                ids_host(b.retained.clone()) == vec![-1, -1, 1, -1],
+                "independent retained proposals"
+            );
         }
         let ga = a.candidates.weights.clone().square().sum().backward();
         let gb = b.candidates.weights.clone().square().sum().backward();

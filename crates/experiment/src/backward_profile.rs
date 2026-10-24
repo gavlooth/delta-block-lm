@@ -9,7 +9,7 @@ use crate::{
 use anyhow::{Result, ensure};
 use burn::{
     prelude::*,
-    tensor::{Distribution, activation::silu},
+    tensor::Distribution,
 };
 use delta_mixers::{
     attribution::{Component, Fixture},
@@ -198,7 +198,7 @@ pub fn run(
     warmups: usize,
     trials: usize,
 ) -> Result<Value> {
-    use delta_mixers::{CachePolicy, HolaBackend, MixerKind, ProjectionBackend};
+    use delta_mixers::{CachePolicy, MixerKind, ProjectionBackend};
     ensure!(
         matches!(c.backend.as_str(), "vulkan" | "cuda") && !c.fusion,
         "backward attribution requires the non-fusion GPU backend"
@@ -208,13 +208,12 @@ pub fn run(
         mixer_config.kind == MixerKind::KronLstm
             && mixer_config.cache_policy != CachePolicy::None
             && c.scan_backend.is_fused()
-            && c.hola_backend == HolaBackend::FusedGpu
+            && c.hola_backend.is_fused()
             && matches!(
                 c.projection_backend,
                 ProjectionBackend::Merged | ProjectionBackend::MergedHeuristicOutput
-            )
-            && c.normalization_backend.is_tensor(),
-        "backward attribution requires KronLSTM + HOLA, fused scan/read, merged projections and tensor normalization"
+            ),
+        "backward attribution requires KronLSTM + HOLA, fused scan/read and merged projections"
     );
     validate_shape(c)?;
     ensure!(c.task == "lm", "backward attribution requires the byte LM");
@@ -361,7 +360,7 @@ pub fn run(
                     if mlp {
                         block
                             .down
-                            .forward(silu(block.up.forward(hidden[i].clone())))
+                            .forward(base.epilogue_backend.silu(block.up.forward(hidden[i].clone())))
                             .flatten(0, 2)
                     } else {
                         base.normalization_backend
