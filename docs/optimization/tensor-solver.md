@@ -76,22 +76,37 @@ It reconstructs the saved fixture without changing production recurrence code:
   production implementation or a proposed workaround.
 - Independent f64 `grad(write)` is the RHS adjoint. Thus the expected direct RHS
   key contribution is `-beta * grad(write) * prefix * (S_initial v)`.
-- A separate variant retains gradients of masked key, prefix, key-prefix,
-  state projection, bilinear reduction, erase product, RHS and correction.
-  A discrepancy between normal and retained variants identifies an ownership
-  or graph-consumption interaction, rather than a recurrence formula change.
+- The attempted non-leaf gradient-retention variant was invalid: Burn rejects
+  `require_grad()` on a non-leaf. It panicked after the branch probes, and is
+  not counted as a successful check.
+
+The parent observed the production focused key gradient
+`0.0020814966410398483`. Its forward finite differences were
+`0.002217008899805466` at epsilon 0.001 and `0.0022392289984488624`
+at epsilon 0.003, consistent with the correct forward dependency rather than
+the missing backward contribution. The copied full graph had 368 failing key
+elements (maximum absolute error about 7.466e-4). All-except-RHS passed every
+key (maximum 2.94e-8); RHS-only returned exactly zero at the focused key versus
+expected `0.00015438433429990284`, with 371 failing key elements.
+
+The corrected suffix-cut discriminator is frozen at `f19cf74b`. It uses
+`detach().require_grad()` to replace exactly one intermediate with a leaf,
+then measures its suffix VJP. The cuts are masked key, key-prefix, state
+projection, bilinear reduction, erase product, and RHS. Expected adjoints
+come from the independent f64 RHS adjoint, initial state and value vectors.
+It skips the previously exercised full-graph and finite-difference stages.
 
 The bounded commands, run serially by the parent under the existing GPU then
 build locks, are:
 
 ```sh
 timeout 180s cargo build --workspace --features delta-experiment/vulkan --example tensor_solver_diagnostic
-timeout 120s target/debug/examples/tensor_solver_diagnostic vulkan chain
+timeout 120s target/debug/examples/tensor_solver_diagnostic vulkan cut
 ```
 
-The executable also accepts `cpu chain` for a matched backend control.
-The `chain` argument skips the already-passing broad primitive probes.
-At this source checkpoint there is no claimed fix and no production change.
+The executable also accepts `cpu cut` for a matched backend control.
+The `cut` argument skips both broad primitive and earlier chain probes.
+At this source checkpoint there is no claimed fix and no production math change.
 
 ## Independent regression behavior
 

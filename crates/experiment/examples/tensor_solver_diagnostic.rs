@@ -376,6 +376,34 @@ fn exact_chain(device: &Device, cuts_only: bool) {
     }
 }
 
+fn reduction_probe(device: &Device, time: usize, width: usize, strided_v: bool, strided_seed: bool, form: &str) -> bool {
+    let x_data=data(B*H*time*width,0);
+    let v_data=data(B*H*time*width,1);
+    let seed=data(B*H*time,2);
+    let mut y=vec![0.;B*H*time];
+    let mut dx=vec![0.;x_data.len()];
+    let mut dv=vec![0.;v_data.len()];
+    for i in 0..x_data.len() {
+        y[i/width]+=f64::from(x_data[i])*f64::from(v_data[i]);
+        dx[i]=f64::from(seed[i/width])*f64::from(v_data[i]);
+        dv[i]=f64::from(seed[i/width])*f64::from(x_data[i]);
+    }
+    let x=upload4(x_data,[B,H,time,width],false,device).require_grad();
+    let v=upload4(v_data,[B,H,time,width],strided_v,device).require_grad();
+    let out=match form {
+        "sum" => (x.clone()*v.clone()).sum_dim(3),
+        "flat_sum" => (x.clone()*v.clone()).reshape([B*H*time,width]).sum_dim(1).reshape([B,H,time,1]),
+        "dot_matmul" => x.clone().unsqueeze_dim::<5>(3).matmul(v.clone().unsqueeze_dim::<5>(4)).reshape([B,H,time,1]),
+        _ => unreachable!(),
+    };
+    let grads=(out.clone()*upload4(seed,[B,H,time,1],strided_seed,device)).sum().backward();
+    let name=format!("reduce_{form}_t{time}_v{width}_stridedv{strided_v}_stridedseed{strided_seed}");
+    let mut ok=report(&format!("{name}/forward"),values(out),&y);
+    ok &= report(&format!("{name}/projection_vjp"),values(x.grad(&grads).unwrap()),&dx);
+    ok &= report(&format!("{name}/value_vjp"),values(v.grad(&grads).unwrap()),&dv);
+    ok
+}
+
 fn main() {
     assert!(!cfg!(feature="fusion"),"diagnostic must match the non-fusion failing runtime");
     let backend = std::env::args().nth(1).expect("cpu|vulkan");
@@ -397,6 +425,19 @@ fn main() {
     println!("{}",json!({"device":format!("{device:?}"),"identity":format!("{:?}",device.identity()),"absolute_tolerance":ATOL,"relative_tolerance":RTOL}));
     if let Some(mode @ ("chain" | "cut")) = std::env::args().nth(2).as_deref() {
         exact_chain(&device, mode=="cut");
+        return;
+    }
+    if std::env::args().nth(2).as_deref()==Some("reduction") {
+        let mut ok=true;
+        for time in [7,16] {for width in [32,64] {for strided_v in [false,true] {for strided_seed in [false,true] {
+            ok &= reduction_probe(&device,time,width,strided_v,strided_seed,"sum");
+            if time==7 && width==64 {
+                for form in ["flat_sum","dot_matmul"] {
+                    ok &= reduction_probe(&device,time,width,strided_v,strided_seed,form);
+                }
+            }
+        }}}}
+        println!("{}",json!({"all_probes_passed":ok,"scope":"standalone multiply/reduce VJP and equivalent contractions"}));
         return;
     }
     let mut ok = true;
