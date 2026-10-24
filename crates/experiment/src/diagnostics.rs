@@ -108,7 +108,7 @@ struct Forward {
 fn forward(model: &LanguageModel, batch: &Batch, device: &Device) -> Result<Forward> {
     let logits = model.forward(batch);
     let shape = logits.dims().to_vec();
-    let nll = model::scalar(model::loss(logits.clone(), batch))?;
+    let nll = model::scalar(model.loss(logits.clone(), batch))?;
     runtime::sync(device)?;
     let values = logits
         .into_data()
@@ -292,7 +292,7 @@ pub fn checkpoint_check(
         let original = phase(c, arm, &model, rows, device, &arm_dir.join("source"))?;
         // One isolated real update reproduces optimizer-produced tensor layout, not a training outcome.
         let batch = Batch::new(rows, &device.clone().autodiff());
-        let objective = model::loss(model.forward(&batch), &batch);
+        let objective = model.loss(model.forward(&batch), &batch);
         let gradient = model::checked_gradients(&model, objective)?;
         model = optimizer.step(c.learning_rate, model, gradient);
         runtime::sync(device)?;
@@ -327,9 +327,9 @@ pub fn checkpoint_check(
             device,
         )?;
         let reference_gradient =
-            model::checked_gradients(&model, model::loss(model.forward(&batch), &batch))?;
+            model::checked_gradients(&model, model.loss(model.forward(&batch), &batch))?;
         let restored_gradient =
-            model::checked_gradients(&restored, model::loss(restored.forward(&batch), &batch))?;
+            model::checked_gradients(&restored, restored.loss(restored.forward(&batch), &batch))?;
         model = optimizer.step(c.learning_rate, model, reference_gradient);
         restored = loaded_optimizer.step(c.learning_rate, restored, restored_gradient);
         runtime::sync(device)?;

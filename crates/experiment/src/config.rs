@@ -64,6 +64,8 @@ impl Arm {
             || (self.cache != "none" && c.hola_backend.is_fused())
             || !c.normalization_backend.is_tensor()
             || c.convolution_backend == delta_mixers::ConvolutionBackend::FusedGpu
+            || !c.update_backend.is_tensor()
+            || !c.loss_backend.is_tensor()
     }
 }
 
@@ -78,6 +80,32 @@ pub enum HeadBackend {
 impl HeadBackend {
     pub fn is_native(&self) -> bool {
         *self == Self::Native
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateBackend {
+    #[default]
+    Tensor,
+    FusedGpu,
+}
+impl UpdateBackend {
+    pub fn is_tensor(&self) -> bool {
+        *self == Self::Tensor
+    }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LossBackend {
+    #[default]
+    Tensor,
+    Fused64,
+    Fused256,
+}
+impl LossBackend {
+    pub fn is_tensor(&self) -> bool {
+        *self == Self::Tensor
     }
 }
 
@@ -117,6 +145,10 @@ pub struct Config {
     pub convolution_backend: delta_mixers::ConvolutionBackend,
     #[serde(skip_serializing_if = "HeadBackend::is_native")]
     pub head_backend: HeadBackend,
+    #[serde(skip_serializing_if = "UpdateBackend::is_tensor")]
+    pub update_backend: UpdateBackend,
+    #[serde(skip_serializing_if = "LossBackend::is_tensor")]
+    pub loss_backend: LossBackend,
     pub context: usize,
     pub batch_size: usize,
     pub learning_rate: f64,
@@ -170,6 +202,8 @@ impl Default for Config {
             normalization_backend: NormalizationBackend::Tensor,
             convolution_backend: delta_mixers::ConvolutionBackend::Tensor,
             head_backend: HeadBackend::Native,
+            update_backend: UpdateBackend::Tensor,
+            loss_backend: LossBackend::Tensor,
             context: 128,
             batch_size: 1,
             learning_rate: 0.001,
@@ -215,6 +249,11 @@ impl Config {
         ensure!(
             !self.autotune || matches!(self.backend.as_str(), "vulkan" | "cuda"),
             "autotune requires an explicit GPU backend"
+        );
+        ensure!(
+            (self.update_backend.is_tensor() && self.loss_backend.is_tensor())
+                || (matches!(self.backend.as_str(), "vulkan" | "cuda") && !self.fusion),
+            "fused update/loss require an explicit non-fusion GPU backend"
         );
         ensure!(
             self.head_backend.is_native() || self.task == "lm",
@@ -414,6 +453,18 @@ mod tests {
                 changed.pilot_fingerprint().unwrap()
             );
         }
+        let mut changed = Config::default();
+        changed.update_backend = UpdateBackend::FusedGpu;
+        assert_ne!(
+            Config::default().pilot_fingerprint().unwrap(),
+            changed.pilot_fingerprint().unwrap()
+        );
+        let mut changed = Config::default();
+        changed.loss_backend = LossBackend::Fused256;
+        assert_ne!(
+            Config::default().pilot_fingerprint().unwrap(),
+            changed.pilot_fingerprint().unwrap()
+        );
     }
     #[test]
     fn legacy_selector_defaults_without_changing_serialized_identity() {
@@ -427,6 +478,8 @@ mod tests {
         assert!(legacy.get("normalization_backend").is_none());
         assert!(legacy.get("convolution_backend").is_none());
         assert!(legacy.get("head_backend").is_none());
+        assert!(legacy.get("update_backend").is_none());
+        assert!(legacy.get("loss_backend").is_none());
         let decoded: Config = serde_json::from_value(legacy.clone()).unwrap();
         assert_eq!(decoded.scan_backend, ScanBackend::TensorSolver);
         assert_eq!(decoded.hola_backend, HolaBackend::Tensor);
@@ -439,6 +492,8 @@ mod tests {
             delta_mixers::ConvolutionBackend::Tensor
         );
         assert_eq!(decoded.head_backend, HeadBackend::Native);
+        assert_eq!(decoded.update_backend, UpdateBackend::Tensor);
+        assert_eq!(decoded.loss_backend, LossBackend::Tensor);
         assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
     }
     #[test]
@@ -514,6 +569,27 @@ mod tests {
             HolaBackend::FusedGpuPairsNorms,
         ] {
             config.hola_backend = backend;
+            assert!(config.validate().is_err());
+        }
+    }
+    #[test]
+    fn update_and_loss_selectors_are_explicit_gpu_only() {
+        for (update_backend, loss_backend) in [
+            (UpdateBackend::FusedGpu, LossBackend::Tensor),
+            (UpdateBackend::Tensor, LossBackend::Fused64),
+            (UpdateBackend::Tensor, LossBackend::Fused256),
+        ] {
+            let mut config = Config {
+                update_backend,
+                loss_backend,
+                ..Config::default()
+            };
+            assert!(config.validate().is_err());
+            config.backend = "vulkan".into();
+            config.validate().unwrap();
+            let baseline = Config::default().pilot_fingerprint().unwrap();
+            assert_ne!(baseline, config.pilot_fingerprint().unwrap());
+            config.fusion = true;
             assert!(config.validate().is_err());
         }
     }
