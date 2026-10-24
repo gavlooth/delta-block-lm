@@ -33,7 +33,7 @@ fn execute() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     ensure!(
         args.len() >= 2,
-        "usage: delta-experiment <reference|convolution-reference|normalization-reference|kron-reference|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|kron-model-benchmark|hola-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
+        "usage: delta-experiment <reference|convolution-reference|normalization-reference|kron-reference|gdn-reference|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|gdn-benchmark|kron-model-benchmark|hola-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256|fused_gdn2 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
     );
     let command = &args[0];
     let c = Config::load(Path::new(&args[1]))?;
@@ -139,11 +139,11 @@ fn execute() -> Result<()> {
         "--legacy-stress-report is only valid for kron-model-benchmark"
     );
     ensure!(
-        command == "kron-reference"
+        matches!(command.as_str(), "kron-reference" | "gdn-reference")
             || (reference_scan_backend.is_none()
                 && reference_tokens.is_none()
                 && reference_objective.is_none()),
-        "--scan-backend, --tokens and --objective are only valid for kron-reference"
+        "--scan-backend, --tokens and --objective are only valid for recurrence references"
     );
     ensure!(
         command == "hola-reference" || reference_hola_backend.is_none(),
@@ -158,6 +158,7 @@ fn execute() -> Result<()> {
             command.as_str(),
             "kron-benchmark"
                 | "kron-model-benchmark"
+                | "gdn-benchmark"
                 | "profile"
                 | "backward-profile"
                 | "projection-benchmark"
@@ -178,6 +179,7 @@ fn execute() -> Result<()> {
             command.as_str(),
             "kron-benchmark"
                 | "kron-model-benchmark"
+                | "gdn-benchmark"
                 | "hola-benchmark"
                 | "profile"
                 | "backward-profile"
@@ -197,7 +199,7 @@ fn execute() -> Result<()> {
     ensure!(
         !matches!(
             command.as_str(),
-            "kron-benchmark" | "kron-model-benchmark" | "hola-benchmark"
+            "kron-benchmark" | "kron-model-benchmark" | "hola-benchmark" | "gdn-benchmark"
         ) || (arm_name.is_none() && resume.is_none() && seed == c.seed),
         "benchmarks use configured/fixed paired fixtures, not --arm/--seed/--resume"
     );
@@ -256,6 +258,16 @@ fn execute() -> Result<()> {
             );
             json!({"schema":1,"command":"kron-reference","passed":report.is_ok(),"device":runtime::identity(&device),"config":c,"scan_backend":selected,"tokens":reference_tokens,"objective":reference_objective,"numerical_report":report.as_ref().ok(),"error":report.as_ref().err()})
         }
+        "gdn-reference" => {
+            let selected = reference_scan_backend.unwrap_or(c.scan_backend);
+            let report = delta_mixers::checks::gdn_numerical_checks_selected(
+                &device, selected, reference_tokens, reference_objective,
+            );
+            json!({"schema":1,"command":command,"passed":report.is_ok(),"device":runtime::identity(&device),"config":c,"scan_backend":selected,"tokens":reference_tokens,"objective":reference_objective,"numerical_report":report.as_ref().ok(),"error":report.as_ref().err()})
+        }
+        "gdn-benchmark" => kron_benchmark::gdn_run(
+            &c, &device, benchmark_warmups.unwrap_or(2), benchmark_trials.unwrap_or(5),
+        )?,
         "hola-reference" => {
             let report = if let Some(selected) = reference_hola_backend {
                 delta_mixers::checks::hola_numerical_checks_selected(&device, selected)
@@ -455,6 +467,7 @@ fn execute() -> Result<()> {
                 | "gemm-micro"
                 | "gemm-step"
                 | "update-loss-benchmark"
+                | "gdn-benchmark"
         ) || result["completed"] == true,
         "profile/benchmark failed or hit its deadline; separate partial report retained"
     );
@@ -464,6 +477,7 @@ fn execute() -> Result<()> {
             "checkpoint-check"
                 | "certify"
                 | "kron-reference"
+                | "gdn-reference"
                 | "hola-reference"
                 | "kron-model-check"
                 | "normalization-reference"

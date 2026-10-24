@@ -74,14 +74,24 @@ returned tensors retain derivatives, including the initial state and score
 objectives. At a zero physical edit both paths choose the norm's zero
 subgradient without changing nonzero scores or cache ordering.
 
+GDN-2 training can explicitly select `ScanBackend::FusedGdn2` (`fused_gdn2`).
+It requires a CubeCL GPU, f32, key32/value64 and chunk size 1..=16, and retains
+the same output, state, score and seven-input first-derivative contract.
+The historical omitted selector remains `TensorSolver`; all existing Kron
+selectors remain Kron-only. The older output-only GDN-2 chunk-WY operator has
+no initial-state or differentiable score interface and is not substituted into
+training. The stateful path instead uses an analytic VJP with bounded checkpoint
+replay, including reset/padding boundaries and zero physical edit subgradients.
+
 HOLA independently selects `HolaBackend::Tensor` (the historical default) or
 `HolaBackend::FusedGpu`. The latter requires a GPU, key32/value64, capacity
 1..=64 and chunk length 1..=16. It retains exact causal membership, original
 KV entries, earlier-position tie breaking, recency selection and gradients
 through cache reads/normalization/gate/sink. These execution selectors change
-no trainable parameter shapes or identities. The separate GDN-2 custom kernel
-remains independently checked; GDN-2 recurrent model execution uses the tensor
-solver. Implemented fused paths are not by themselves a measured speedup.
+no trainable parameter shapes or identities. The separate output-only GDN-2
+custom kernel remains independently checked. Implemented fused paths are not
+by themselves a measured speedup; see `docs/optimization/gdn.md` for the
+stateful GDN-2 design, strict checks and bounded measurement commands.
 
 `projection_backend` is independent of the recurrence/HOLA selectors:
 `separate` (the omitted historical default) executes the original seven input

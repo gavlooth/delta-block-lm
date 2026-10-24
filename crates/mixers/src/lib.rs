@@ -1,6 +1,6 @@
 //! Trainable causal GDN-2 and KronLSTM with optional HOLA exact memory.
 //! See `README.md` for recurrence equations, reference provenance and check commands.
-//! Training explicitly selects the tensor solver or the opt-in fused Kron GPU scan.
+//! Training explicitly selects the tensor solver or an opt-in fused GPU scan.
 //! The default remains the differentiable tensor solver until paired measurements.
 use burn::module::{Module, Param};
 use burn::nn::{Linear, LinearConfig, RmsNorm, RmsNormConfig};
@@ -43,10 +43,18 @@ pub enum ScanBackend {
     FusedGpu,
     FusedParallel128,
     FusedParallel256,
+    FusedGdn2,
 }
 impl ScanBackend {
     pub fn is_tensor_solver(&self) -> bool {
         *self == Self::TensorSolver
+    }
+    pub fn supports(&self, kind: MixerKind) -> bool {
+        match self {
+            Self::TensorSolver => true,
+            Self::FusedGdn2 => kind == MixerKind::Gdn2,
+            _ => kind == MixerKind::KronLstm,
+        }
     }
     pub fn is_fused(&self) -> bool {
         !self.is_tensor_solver()
@@ -64,6 +72,7 @@ impl ScanBackend {
             Self::FusedGpu => "fused_kron_gpu",
             Self::FusedParallel128 => "fused_kron_parallel128_gpu",
             Self::FusedParallel256 => "fused_kron_parallel256_gpu",
+            Self::FusedGdn2 => "fused_gdn2_gpu",
         }
     }
 }
@@ -158,15 +167,14 @@ impl MixerConfig {
         );
         assert!(self.cache_policy == CachePolicy::None || self.cache_capacity > 0);
         if self.scan_backend.is_fused() {
-            assert_eq!(
-                self.kind,
-                MixerKind::KronLstm,
-                "fused GPU scan requires KronLSTM"
+            assert!(
+                self.scan_backend.supports(self.kind),
+                "fused scan selector does not support this mixer kind"
             );
             assert_eq!(
                 (self.key_dim, self.value_dim),
                 (32, 64),
-                "fused Kron scan requires key32/value64"
+                "fused scan requires key32/value64"
             );
             chunk::assert_fused_device(device);
         }
@@ -338,15 +346,14 @@ impl Mixer {
     /// Changes execution only; trainable tensors and their identities remain unchanged.
     pub fn set_scan_backend(&mut self, backend: ScanBackend) {
         if backend.is_fused() {
-            assert_eq!(
-                self.kind,
-                MixerKind::KronLstm,
-                "fused GPU scan requires KronLSTM"
+            assert!(
+                backend.supports(self.kind),
+                "fused scan selector does not support this mixer kind"
             );
             assert_eq!(
                 (self.key_dim, self.value_dim),
                 (32, 64),
-                "fused Kron scan requires key32/value64"
+                "fused scan requires key32/value64"
             );
             chunk::assert_fused_device(&self.q.weight.val().device());
         }
