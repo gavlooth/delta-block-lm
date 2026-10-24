@@ -8,6 +8,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use burn::{module::Module, optim::ModuleOptimizer, prelude::*};
+use burn_pack::Reader;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path, time::{Instant, SystemTime, UNIX_EPOCH}};
 
@@ -68,6 +69,59 @@ fn record(samples: &mut BTreeMap<String, Vec<f64>>, name: &str, ms: f64, measure
     if measured { samples.entry(name.into()).or_default().push(ms); }
 }
 
+// Independently recomputed GPU reductions need the same numerical contract as profile.rs.
+// Never use this for save/load of the same tensors: those checks remain byte-exact.
+fn recomputed_records(reference: Reader, actual: Reader) -> Result<Value> {
+    ensure!(reference.metadata() == actual.metadata(), "recomputed record metadata changed");
+    ensure!(serde_json::to_value(reference.scalars())? == serde_json::to_value(actual.scalars())?,
+        "recomputed record scalar counters changed");
+    let mut expected = BTreeMap::new();
+    for tensor in reference.into_tensors()? {
+        let (name, dtype, shape, id, bytes) = tensor.into_parts()?;
+        ensure!(expected.insert(name, (dtype, shape, id, bytes)).is_none(), "duplicate reference tensor");
+    }
+    let count = expected.len();
+    let mut passed = true;
+    let mut maximum = 0.0f64;
+    let mut differing = Vec::new();
+    for tensor in actual.into_tensors()? {
+        let (name, dtype, shape, id, bytes) = tensor.into_parts()?;
+        let (ref_dtype, ref_shape, ref_id, ref_bytes) = expected.remove(&name)
+            .with_context(|| format!("unexpected recomputed tensor {name}"))?;
+        ensure!(dtype == ref_dtype && shape == ref_shape && id == ref_id,
+            "recomputed tensor {name}: dtype/shape/parameter ID changed");
+        let bitwise_equal = bytes[..] == ref_bytes[..];
+        let reference_hash = data::hash(&ref_bytes);
+        let actual_hash = data::hash(&bytes);
+        let mut tensor_maximum = 0.0f64;
+        let mut tensor_passed = bitwise_equal;
+        if dtype == burn::tensor::DType::F32 {
+            let reference = TensorData::from_bytes(ref_bytes, ref_shape, ref_dtype)
+                .try_to_vec::<f32>().map_err(|e| anyhow::anyhow!("reference {name}: {e:?}"))?;
+            let actual = TensorData::from_bytes(bytes, shape, dtype)
+                .try_to_vec::<f32>().map_err(|e| anyhow::anyhow!("actual {name}: {e:?}"))?;
+            ensure!(reference.len() == actual.len(), "recomputed tensor {name}: element count changed");
+            tensor_passed = true;
+            for (&reference, &actual) in reference.iter().zip(&actual) {
+                let error = (actual as f64 - reference as f64).abs();
+                tensor_passed &= reference.is_finite() && actual.is_finite()
+                    && error <= 2e-5 + 3e-4 * (reference as f64).abs();
+                tensor_maximum = tensor_maximum.max(error);
+            }
+        }
+        passed &= tensor_passed;
+        maximum = maximum.max(tensor_maximum);
+        if !bitwise_equal {
+            differing.push(json!({"tensor":name,"reference_sha256":reference_hash,
+                "actual_sha256":actual_hash,"max_abs_diff":tensor_maximum,"passed":tensor_passed}));
+        }
+    }
+    ensure!(expected.is_empty(), "missing recomputed tensors: {:?}", expected.keys().collect::<Vec<_>>());
+    Ok(json!({"passed":passed,"atol":2e-5,"rtol":3e-4,"max_abs_diff":maximum,
+        "tensor_count":count,"bitwise_equal":differing.is_empty(),"bitwise_differing_tensors":differing,
+        "dtype_shape_ids_metadata_counters_exact":true,"non_f32_tensors_byte_exact":true}))
+}
+
 fn shape(c: &Config, arm: &Arm, corpus: &Corpus, device: &Device, directory: &Path, warmups: usize, trials: usize, start: Instant) -> Result<Value> {
     std::fs::create_dir_all(directory)?;
     let train_device = device.clone().autodiff();
@@ -118,7 +172,8 @@ fn shape(c: &Config, arm: &Arm, corpus: &Corpus, device: &Device, directory: &Pa
         let next_resident = Batch::new(&generated, &train_device);
         let order = if iteration % 2 == 0 { ["legacy", "exact_capacity", "resident"] } else { ["resident", "exact_capacity", "legacy"] };
         let reference_path = directory.join(format!("continuation-reference-{iteration}.burnpack"));
-        let mut expected_optimizer = None;
+        let mut expected_optimizer: Option<burn::tensor::Bytes> = None;
+        let mut mode_comparisons = Vec::new();
         for mode in order {
             deadline(c, start)?;
             let model = base.clone();
@@ -149,23 +204,28 @@ fn shape(c: &Config, arm: &Arm, corpus: &Corpus, device: &Device, directory: &Pa
                 "iteration {iteration}, {mode}: retained optimizer mutated after step");
             record(&mut samples, &format!("full_optimizer_step_{mode}"), ms, measured);
             if let Some(bytes) = runtime::sampled_reserved(device) { peak_reserved = Some(peak_reserved.unwrap_or(0).max(bytes)); }
-            // Exact logical parameters including IDs, and all optimizer tensors/scalars/metadata.
-            // Every iteration is a same-state, same-next-row comparison, not diverging trajectories.
-            let signature = checkpoint::optimizer_signature(c, optim.into_bytes()?)?;
+            // Metadata/IDs/counters stay exact; only independently recomputed float values use
+            // profile.rs's numerical tolerance. Serialization of a fixed tensor remains exact.
+            let optimizer_bytes = optim.into_bytes()?;
             if let Some(expected) = &expected_optimizer {
-                if let Err(error) = checkpoint::validate_model(&updated, &reference_path) {
+                let parameters = recomputed_records(Reader::from_file(&reference_path)?,
+                    Reader::from_bytes(updated.clone().into_record().into_bytes()?)?)?;
+                let optimizer_state = recomputed_records(Reader::from_bytes(expected.clone())?,
+                    Reader::from_bytes(optimizer_bytes)?)?;
+                let comparison = json!({"mode":mode,"parameters":parameters,"optimizer":optimizer_state});
+                runtime::write_json(&directory.join(format!("comparison-{mode}-{iteration}.json")), &comparison)?;
+                if parameters["passed"] != true || optimizer_state["passed"] != true {
                     let actual_path = directory.join(format!("continuation-{mode}-{iteration}.burnpack"));
                     updated.clone().save_file(&actual_path)?;
-                    runtime::write_json(&directory.join("continuation-mismatch.json"),
-                        &json!({"iteration":iteration,"mode":mode,"phase":"input-design comparison before checkpoint save/load","reference":reference_path,"actual":actual_path,"reference_optimizer":expected,"actual_optimizer":signature}))?;
-                    return Err(error).with_context(|| format!("iteration {iteration}, {mode}: input-design next-step mismatch before checkpoint transaction; actual record retained"));
+                    anyhow::bail!("iteration {iteration}, {mode}: recomputed next step exceeds numerical tolerance; comparison and actual record retained");
                 }
-                ensure!(&signature == expected, "iteration {iteration}, {mode}: input design changed next-step optimizer state");
+                mode_comparisons.push(comparison);
             } else {
                 updated.clone().save_file(&reference_path)?;
                 checkpoint::validate_model(&updated, &reference_path)
                     .with_context(|| format!("iteration {iteration}, {mode}: continuation reference serialization self-check"))?;
-                expected_optimizer = Some(signature);
+                mode_comparisons.push(json!({"mode":mode,"reference":true,"serialization_self_check_exact":true}));
+                expected_optimizer = Some(optimizer_bytes);
             }
         }
         deadline(c, start)?;
@@ -188,9 +248,15 @@ fn shape(c: &Config, arm: &Arm, corpus: &Corpus, device: &Device, directory: &Pa
         let restored_signature = checkpoint::optimizer_signature(c, restored_optimizer.into_bytes()?)?;
         ensure!(before_signature == restored_signature, "checkpoint optimizer IDs/moments/counters changed");
         let (continued, continuation_ms) = timed(device, || step(c, loaded, &mut restored_optimizer, &next_resident))?;
-        checkpoint::validate_model(&continued, &reference_path)
-            .context("restored checkpoint next-step continuation")?;
-        ensure!(Some(checkpoint::optimizer_signature(c, restored_optimizer.into_bytes()?)?) == expected_optimizer, "checkpoint next-step optimizer continuation differs");
+        let continued_parameters = recomputed_records(Reader::from_file(&reference_path)?,
+            Reader::from_bytes(continued.clone().into_record().into_bytes()?)?)?;
+        let continued_optimizer = recomputed_records(
+            Reader::from_bytes(expected_optimizer.as_ref().context("continuation reference")?.clone())?,
+            Reader::from_bytes(restored_optimizer.into_bytes()?)?)?;
+        let continuation = json!({"parameters":continued_parameters,"optimizer":continued_optimizer});
+        runtime::write_json(&directory.join(format!("restored-continuation-{iteration}.json")), &continuation)?;
+        ensure!(continued_parameters["passed"] == true && continued_optimizer["passed"] == true,
+            "restored checkpoint recomputed next step exceeds numerical tolerance");
         for (name, ms) in [("checkpoint_atomic_save", save_ms), ("checkpoint_state_validation", state_ms), ("checkpoint_target_initialization", initialize_ms), ("checkpoint_guarded_model_load_including_validation", load_ms), ("checkpoint_model_validation_standalone", validate_ms), ("checkpoint_optimizer_load_including_validation", optimizer_ms), ("checkpoint_restored_continuation", continuation_ms)] {
             record(&mut samples, name, ms, measured);
         }
@@ -198,7 +264,7 @@ fn shape(c: &Config, arm: &Arm, corpus: &Corpus, device: &Device, directory: &Pa
         if iteration == 0 {
             first_checkpoint = json!({"path":saved,"state":loaded_state,"model_sha256":checkpoint::file_sha256(&saved.join("model.burnpack"))?,"optimizer_sha256":checkpoint::file_sha256(&saved.join("optimizer.burnpack"))?,"save_ms":save_ms,"model_load_including_validation_ms":load_ms,"optimizer_load_including_validation_ms":optimizer_ms,"optimizer_canonical":before_signature});
         }
-        comparisons.push(json!({"iteration":iteration,"phase":if iteration==0 {"cold"} else if measured {"measured"} else {"warmup"},"batch_values_exact":true,"parameters_and_ids_exact":true,"optimizer_moments_ids_counters_exact":true,"restored_next_step_exact":true}));
+        comparisons.push(json!({"iteration":iteration,"phase":if iteration==0 {"cold"} else if measured {"measured"} else {"warmup"},"batch_values_exact":true,"checkpoint_parameters_ids_moments_counters_exact":true,"input_design_recomputed_steps":mode_comparisons,"restored_recomputed_next_step":continuation}));
         runtime::write_json(&directory.join("partial.json"), &json!({"completed":false,"samples":summarize(&samples),"comparisons":comparisons,"first_checkpoint":first_checkpoint}))?;
     }
     Ok(json!({"completed":true,"config":c,"arm":arm,"batch_size":c.batch_size,"context":c.context,"fixture_sha256":data::fixture_hash(&rows),"parameters":base.num_params(),"cold_optimizer_step_ms":cold_step_ms,"cold_io":cold_io,"first_checkpoint":first_checkpoint,"timings":summarize(&samples),"checks":comparisons,
@@ -235,4 +301,32 @@ pub fn run(c: &Config, arm: &Arm, device: &Device, warmups: usize, trials: usize
         "decision":"measurements are observations, not automatic adoption. Exact-capacity packing removes avoidable vector growth without changing data/order/config. No async prefetch or checkpoint safety bypass. Resident fixtures bound removable IO only; training still generates the next deterministic rows each step."});
     runtime::write_json(&directory.join("result.json"), &result)?;
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn float_record(value: f32, id: u64, step: u64) -> Reader {
+        let (bytes, shape, dtype) = TensorData::new(vec![value], [1]).into_parts();
+        let bytes = burn_pack::Writer::new(vec![
+            burn_pack::Tensor::new("weight".into(), dtype, shape, Some(id), bytes),
+        ])
+        .with_scalar("step", burn_pack::Scalar::UInt(step))
+        .into_bytes().unwrap();
+        Reader::from_bytes(bytes).unwrap()
+    }
+
+    #[test]
+    fn recomputed_equivalence_tolerates_roundoff_not_identity_or_state_changes() {
+        let report = recomputed_records(float_record(1.0, 7, 2), float_record(1.0001, 7, 2)).unwrap();
+        assert_eq!(report["passed"], true);
+        assert_eq!(report["bitwise_equal"], false);
+        assert_eq!(report["bitwise_differing_tensors"][0]["tensor"], "weight");
+        assert!(report["max_abs_diff"].as_f64().unwrap() > 0.0);
+        assert_eq!(recomputed_records(float_record(1.0, 7, 2), float_record(1.01, 7, 2)).unwrap()["passed"], false);
+        assert!(recomputed_records(float_record(1.0, 7, 2), float_record(1.0, 8, 2)).is_err());
+        assert!(recomputed_records(float_record(1.0, 7, 2), float_record(1.0, 7, 3)).is_err());
+        assert_eq!(recomputed_records(float_record(f32::NAN, 7, 2), float_record(f32::NAN, 7, 2)).unwrap()["passed"], false);
+    }
 }
