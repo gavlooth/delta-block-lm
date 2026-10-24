@@ -139,8 +139,11 @@ pub fn micro(c: &Config, device: &Device, warmups: usize, trials: usize) -> Resu
                         start.elapsed().as_secs_f64() < c.max_seconds.min(290.),
                         "gemm-micro deadline; partial report retained"
                     );
-                    let heuristic = name == "vocabulary_head"
-                        && c.head_backend == crate::config::HeadBackend::Heuristic;
+                    let heuristic = (name == "vocabulary_head"
+                        && c.head_backend == crate::config::HeadBackend::Heuristic)
+                        || (name == "mixer_output"
+                            && c.projection_backend
+                                == delta_mixers::ProjectionBackend::MergedHeuristicOutput);
                     let mut case = benchmark(
                         device, name, batch, phase, m, n, k, at, bt, heuristic, warmups, trials,
                     )?;

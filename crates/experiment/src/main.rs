@@ -6,6 +6,7 @@ mod data;
 mod diagnostics;
 mod gemm;
 mod gemm_batched;
+mod gemm_guard;
 mod kron_benchmark;
 mod lm_retrieval;
 mod model;
@@ -183,11 +184,57 @@ fn execute() -> Result<()> {
         checkpoint_manifest.is_none() || command == "certify",
         "--checkpoints is only valid for certify"
     );
+    ensure!(
+        !c.autotune
+            || !matches!(
+                command.as_str(),
+                "soft"
+                    | "projection-benchmark"
+                    | "normalization-benchmark"
+                    | "kron-benchmark"
+                    | "kron-model-benchmark"
+            ),
+        "autotuned training certifies the configured fused LM only; this command changes GEMM execution/geometry internally"
+    );
     let backend = diagnostic_backend.unwrap_or(&c.backend);
     let mut runtime_config = c.clone();
     runtime_config.backend = backend.to_owned();
     let device = runtime::device(&runtime_config)?;
-    let result = match command.as_str() {
+    let mut gemm_preflight = Vec::new();
+    if c.autotune
+        && backend == "vulkan"
+        && matches!(
+            command.as_str(),
+            "train"
+                | "smoke"
+                | "compare"
+                | "decision"
+                | "benchmark"
+                | "profile"
+                | "backward-profile"
+                | "gemm-step"
+                | "checkpoint-check"
+                | "certify"
+        )
+    {
+        let contexts = if matches!(command.as_str(), "profile" | "backward-profile") {
+            profile_contexts.clone().unwrap_or_else(|| {
+                if command == "backward-profile" {
+                    vec![128, 512]
+                } else {
+                    vec![c.context]
+                }
+            })
+        } else {
+            vec![c.context]
+        };
+        for context in contexts {
+            let mut checked = c.clone();
+            checked.context = context;
+            gemm_preflight.push(gemm_guard::ensure(&checked, &device)?);
+        }
+    }
+    let mut result = match command.as_str() {
         "reference" => {
             let report = delta_mixers::numerical_checks(&device.clone().autodiff())
                 .map_err(anyhow::Error::msg)?;
@@ -329,6 +376,9 @@ fn execute() -> Result<()> {
         }
         _ => anyhow::bail!("unknown command {command}"),
     };
+    if !gemm_preflight.is_empty() {
+        result["gemm_preflight"] = json!(gemm_preflight);
+    }
     if !matches!(
         command.as_str(),
         "kron-benchmark"

@@ -2244,6 +2244,7 @@ dependencies = [
  "burn",
  "burn-pack",
  "cubecl",
+ "cubecl-environment",
  "delta-kernels",
  "delta-mixers",
  "serde",
