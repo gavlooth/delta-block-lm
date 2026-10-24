@@ -1,0 +1,18 @@
+[package]
+name = "dre-lngram"
+description = "Latent n-gram lookup memory (Lngram, single table)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+cuda = ["burn/cuda", "dre-core/cuda"]
+
+[dependencies]
+burn.workspace = true
+dre-core.workspace = true
+
+[dev-dependencies]
+burn = { workspace = true, features = ["ndarray"] }
