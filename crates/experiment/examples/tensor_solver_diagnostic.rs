@@ -173,6 +173,185 @@ fn overlap(device: &Device, shared: bool) -> bool {
     ok
 }
 
+struct ExactFixture {
+    fields: Vec<Vec<f32>>,
+    initial: Vec<f32>,
+    upstream: Vec<f32>,
+    valid: Vec<bool>,
+    reset: Vec<bool>,
+    expected_key: Vec<f64>,
+    expected_rhs_key: Vec<f64>,
+}
+fn exact_fixture() -> ExactFixture {
+    use delta_mixers::{MixerKind, reference::{self, Token}};
+    let widths = [K,K,64,K,1,1];
+    let mut fields: Vec<Vec<f32>> = widths.iter().enumerate().map(|(field,&width)| {
+        (0..B*T*H*width).map(|i| {
+            let signal = ((i*13+field*19+1) as f64 * 0.037).sin() as f32;
+            if field == 3 {0.91+0.03*signal} else if field >= 4 {0.45+0.1*signal} else {0.1*signal}
+        }).collect()
+    }).collect();
+    let valid: Vec<bool> = (0..B*T).map(|i| i%T < T-(i/T+1)).collect();
+    let mut reset: Vec<bool> = (0..B*T).map(|i| i%T==0 || i%T==5).collect();
+    reset[0] = false;
+    for row in 0..B { for p in 0..T { for h in 0..H {
+        let scalar = (row*T+p)*H+h;
+        for field in [1,2] {
+            let width = widths[field];
+            let norm = fields[field][scalar*width..(scalar+1)*width].iter().map(|x|x*x).sum::<f32>().sqrt();
+            for x in &mut fields[field][scalar*width..(scalar+1)*width] {*x/=norm;}
+        }
+        if p==1 {fields[4][scalar]=0.;fields[5][scalar]=0.;}
+        else if p==3 {fields[5][scalar]=-0.2;}
+        else if p==4 || p==6 {
+            let field = if p==4 {1} else {2};
+            let width = widths[field];
+            fields[field][scalar*width..(scalar+1)*width].fill(0.);
+        }
+        if p==2 {fields[3][scalar*K]=0.;}
+    }}}
+    let initial: Vec<f32> = (0..B*H*K*64).map(|i|0.03*((i*11+7) as f32*0.017).sin()).collect();
+    let upstream: Vec<f32> = (0..B*T*H*64).map(|i|((i*7+3) as f64*0.051).cos() as f32).collect();
+    let mut expected_key = vec![0.;B*T*H*K];
+    let mut expected_rhs_key = vec![0.;B*T*H*K];
+    for b in 0..B {for h in 0..H {
+        let tokens: Vec<Token> = (0..T).map(|t| {
+            let x: Vec<Vec<f64>> = fields.iter().zip(widths).map(|(f,w)| {
+                let start = ((b*T+t)*H+h)*w;
+                f[start..start+w].iter().map(|&x|f64::from(x)).collect()
+            }).collect();
+            Token {q:x[0].clone(),k:x[1].clone(),v:x[2].clone(),alpha:x[3].clone(),erase:x[4].clone(),write:x[5].clone()}
+        }).collect();
+        let state: Vec<f64> = initial[(b*H+h)*K*64..(b*H+h+1)*K*64].iter().map(|&x|f64::from(x)).collect();
+        let u: Vec<Vec<f64>> = (0..T).map(|t| {
+            let first = ((b*T+t)*H+h)*64;
+            upstream[first..first+64].iter().map(|&x|f64::from(x)).collect()
+        }).collect();
+        let back = reference::backward(MixerKind::KronLstm,&tokens,&valid[b*T..(b+1)*T],&reset[b*T..(b+1)*T],
+            &u,&vec![0.;K*64],Some(&state),&[0.;T]);
+        let mut prefix = [1.;K];
+        for t in 0..T {
+            for k in 0..K {
+                if valid[b*T+t] {prefix[k] *= if reset[b*T+t] {0.} else {tokens[t].alpha[k]};}
+                let i = ((b*T+t)*H+h)*K+k;
+                expected_key[i] = back.tokens[t].k[k];
+                if valid[b*T+t] {
+                    expected_rhs_key[i] = -tokens[t].erase[0]*back.tokens[t].write[0]*prefix[k]*
+                        (0..64).map(|v|state[k*64+v]*tokens[t].v[v]).sum::<f64>();
+                }
+            }
+        }
+    }}
+    ExactFixture {fields,initial,upstream,valid,reset,expected_key,expected_rhs_key}
+}
+fn fixture_inputs(f: &ExactFixture, device: &Device) -> (Vec<Tensor<4>>,Tensor<4>,Tensor<2>,Tensor<2>) {
+    let x = f.fields.iter().zip([K,K,64,K,1,1]).map(|(data,width)|
+        tensor(data.clone(),[B,T,H,width],device).require_grad()).collect();
+    (x,tensor(f.initial.clone(),[B,H,K,64],device).require_grad(),
+        tensor(f.valid.iter().map(|&v|if v {1.} else {0.}).collect(),[B,T],device),
+        tensor(f.reset.iter().map(|&v|if v {1.} else {0.}).collect(),[B,T],device))
+}
+fn fixture_scan(x: &[Tensor<4>], initial: Tensor<4>, valid: Tensor<2>, reset: Tensor<2>) -> delta_mixers::chunk::ScanOutput {
+    delta_mixers::chunk::scan(delta_mixers::MixerKind::KronLstm,delta_mixers::chunk::ScanInput {
+        q:x[0].clone(),k:x[1].clone(),v:x[2].clone(),alpha:x[3].clone(),erase:x[4].clone(),write:x[5].clone()
+    },valid,reset,16,Some(initial))
+}
+fn exact_chain(device: &Device) {
+    let f = exact_fixture();
+    let focus = K;
+    println!("{}",json!({"probe":"independent_f64_decomposition","key_index":focus,
+        "full_key_vjp":f.expected_key[focus],"rhs_key_vjp":f.expected_rhs_key[focus],
+        "other_key_vjp":f.expected_key[focus]-f.expected_rhs_key[focus]}));
+    // This uses the actual production graph; unlike the saved acceptance, it records the
+    // focused gradient and forward finite difference instead of stopping at the first mismatch.
+    let (x,initial,valid,reset) = fixture_inputs(&f,device);
+    let out = fixture_scan(&x,initial,valid,reset);
+    let _ = (values(out.output.clone()),values(out.final_state),values(out.scores));
+    let grads = (out.output*tensor(f.upstream.clone(),[B,T,H,64],device)).sum().backward();
+    let actual = values(x[1].grad(&grads).unwrap());
+    println!("{}",json!({"probe":"production_graph_focused_key_vjp","actual":actual[focus],"expected":f.expected_key[focus]}));
+    report("production_graph/all_key_vjp",actual,&f.expected_key);
+    for epsilon in [0.001f32,0.003] {
+        let mut objectives = Vec::new();
+        let mut changed = Vec::new();
+        for sign in [-1.,1.] {
+            let (mut x,initial,valid,reset) = fixture_inputs(&f,device);
+            let mut keys = f.fields[1].clone();
+            keys[focus] += sign*epsilon;
+            changed.push(f64::from(keys[focus]));
+            x[1] = tensor(keys,[B,T,H,K],device);
+            let output = values(fixture_scan(&x,initial,valid,reset).output);
+            objectives.push(output.iter().zip(&f.upstream).map(|(&y,&u)|f64::from(y)*f64::from(u)).sum::<f64>());
+        }
+        println!("{}",json!({"probe":"production_graph_forward_finite_difference","epsilon":epsilon,
+            "finite_difference":(objectives[1]-objectives[0])/(changed[1]-changed[0]),"expected":f.expected_key[focus]}));
+    }
+    for mode in ["full","rhs_only","without_rhs","retain_intermediates"] {
+        let (x,initial,valid,reset) = fixture_inputs(&f,device);
+        let mut retained = Vec::<(&str,Tensor<4>)>::new();
+        let mut keep = |name,t:Tensor<4>| {
+            if mode=="retain_intermediates" {let t=t.require_grad();retained.push((name,t.clone()));t} else {t}
+        };
+        let active = valid.reshape([B,1,T,1]);
+        let q=x[0].clone().swap_dims(1,2)*active.clone();
+        let k=keep("masked_key",x[1].clone().swap_dims(1,2)*active.clone());
+        let v=x[2].clone().swap_dims(1,2)*active.clone();
+        let erase=x[4].clone().swap_dims(1,2)*active.clone();
+        let write=x[5].clone().swap_dims(1,2)*active.clone();
+        let alpha=x[3].clone().swap_dims(1,2)*(1.0f32-reset.reshape([B,1,T,1]))*active.clone()+(1.0f32-active);
+        let prefix=keep("prefix",alpha.clone().cumprod(2));
+        let mut product=Tensor::ones([B,H,T,K],device);
+        let mut rows=Vec::new();
+        for r in 0..T {
+            product=(product*alpha.clone().slice([0..B,0..H,r..r+1,0..K]))
+                .slice_assign([0..B,0..H,r..r+1,0..K],Tensor::ones([B,H,1,K],device));
+            rows.push(product.clone().unsqueeze_dim::<5>(2));
+        }
+        let decay=Tensor::cat(rows,2);
+        let rhs_k=if mode=="without_rhs" {k.clone().detach()} else {k.clone()};
+        let other_k=if mode=="rhs_only" {k.clone().detach()} else {k.clone()};
+        let factors=decay.clone()*other_k.clone().unsqueeze_dim::<5>(2);
+        let overlap=|left:Tensor<4>| (left.unsqueeze_dim::<5>(3)*factors.clone()).sum_dim(4).reshape([B,H,T,T]);
+        let lower=overlap(other_k.clone())*v.clone().matmul(v.clone().swap_dims(2,3))*erase.clone();
+        let kprefix=keep("key_prefix",rhs_k*prefix.clone());
+        let projection=keep("state_projection",kprefix.matmul(initial.clone()));
+        let inner=keep("inner", (projection*v.clone()).sum_dim(3));
+        let erased=keep("erased", inner*erase);
+        let rhs=keep("rhs",write-erased);
+        let mut power=lower.tril(-1).neg();
+        let mut inverse=Tensor::<2>::eye(T,device).reshape([1,1,T,T]);
+        let mut covered=1;
+        while covered<T {
+            inverse=inverse.clone()+power.clone().matmul(inverse);
+            covered*=2;
+            if covered<T {power=power.clone().matmul(power);}
+        }
+        let correction=keep("correction",inverse.matmul(rhs));
+        let edits=correction*v;
+        let out=(q.clone()*prefix.clone()).matmul(initial.clone())+overlap(q).tril(0).matmul(edits.clone());
+        let squared=other_k.clone().square().sum_dim(3)*edits.clone().square().sum_dim(3);
+        let zero=squared.clone().equal_elem(0.);
+        let scores=squared.mask_fill(zero.clone(),1.).sqrt().mask_fill(zero,0.);
+        let tail=decay.slice([0..B,0..H,T-1..T,0..T,0..K]).reshape([B,H,T,K]);
+        let last=prefix.slice([0..B,0..H,T-1..T,0..K]).reshape([B,H,K,1]);
+        let final_state=last*initial+(tail*other_k).swap_dims(2,3).matmul(edits);
+        let _ = (values(out.clone()),values(final_state),values(scores));
+        let grads=(out.swap_dims(1,2)*tensor(f.upstream.clone(),[B,T,H,64],device)).sum().backward();
+        let actual=values(x[1].grad(&grads).unwrap());
+        let expected:Vec<f64>=f.expected_key.iter().zip(&f.expected_rhs_key).map(|(&all,&rhs)|
+            if mode=="rhs_only" {rhs} else if mode=="without_rhs" {all-rhs} else {all}).collect();
+        println!("{}",json!({"probe":format!("graph_{mode}/focused_key_vjp"),"actual":actual[focus],"expected":expected[focus]}));
+        report(&format!("graph_{mode}/all_key_vjp"),actual,&expected);
+        for (name,t) in retained {
+            let shape=t.dims();
+            let g=t.grad(&grads).map(values).unwrap_or_default();
+            let offset=if shape[1]==H {T*shape[3]} else {focus};
+            println!("{}",json!({"probe":format!("retained/{name}"),"shape":shape,
+                "b0_t0_h1_vjp":g.get(offset..offset+shape[3]),"vjp_max_abs":g.iter().map(|x|x.abs()).fold(0.,f32::max)}));
+        }
+    }
+}
+
 fn main() {
     assert!(!cfg!(feature="fusion"),"diagnostic must match the non-fusion failing runtime");
     let backend = std::env::args().nth(1).expect("cpu|vulkan");
@@ -192,6 +371,10 @@ fn main() {
         _ => panic!("backend unavailable"),
     }.autodiff();
     println!("{}",json!({"device":format!("{device:?}"),"identity":format!("{:?}",device.identity()),"absolute_tolerance":ATOL,"relative_tolerance":RTOL}));
+    if std::env::args().nth(2).as_deref()==Some("chain") {
+        exact_chain(&device);
+        return;
+    }
     let mut ok = true;
     for strided in [false,true] {
         for (m,k,n,broadcast) in [(T,K,64,false),(T,64,T,false),(T,T,T,false),(T,T,T,true),(T,T,1,false)] {
