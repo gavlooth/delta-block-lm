@@ -65,7 +65,7 @@ pub fn run(
             let rows = data::examples(&config, corpus.as_ref(), c.seed, 0, c.batch_size, "train")?;
             let batch = Batch::new(&rows, &td);
             let logits = base.forward(&batch);
-            let gradients = model::checked_gradients(&base, model::loss(logits.clone(), &batch))?;
+            let gradients = model::checked_gradients(&base, base.loss(logits.clone(), &batch))?;
             let reference_logits = crate::kron_benchmark::values(logits);
             let reference_gradients = crate::kron_benchmark::parameters(&base, Some(&gradients))?;
             let updated = train::optimizer(&config).step(c.learning_rate, base.clone(), gradients);
@@ -78,7 +78,7 @@ pub fn run(
                 candidate.set_scan_backend(mode);
                 let logits = candidate.forward(&batch);
                 let gradients =
-                    model::checked_gradients(&candidate, model::loss(logits.clone(), &batch))?;
+                    model::checked_gradients(&candidate, candidate.loss(logits.clone(), &batch))?;
                 let le = crate::kron_benchmark::equivalent(
                     "paired logits",
                     &crate::kron_benchmark::values(logits),
