@@ -1,11 +1,12 @@
 // Bounded, serial GPU evaluation across compile-time Burn autotune feature choices.
 import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
-const [mode, offArg, onArg, configArg, rootArg, batchArg = "8", pairsArg = "11", headArg = "native"] = Bun.argv.slice(2);
+const [mode, offArg, onArg, configArg, rootArg, batchArg = "8", pairsArg = "11", headArg = "native", projectionArg = "merged"] = Bun.argv.slice(2);
 if (!rootArg || !["prepare", "micro-off", "micro-on", "pair"].includes(mode)) {
-  throw new Error("usage: bun scripts/benchmark-gemm.ts prepare|micro-off|micro-on|pair OFF_BINARY ON_BINARY CONFIG ROOT [batch=8 pairs=11 head=native|padded320|heuristic]");
+  throw new Error("usage: bun scripts/benchmark-gemm.ts prepare|micro-off|micro-on|pair OFF_BINARY ON_BINARY CONFIG ROOT [batch=8 pairs=11 head=native|padded320|heuristic projection=merged|merged_heuristic_output]");
 }
 if (!["native","padded320","heuristic"].includes(headArg)) throw new Error("unknown candidate head backend");
+if (!["merged","merged_heuristic_output"].includes(projectionArg)) throw new Error("unknown candidate projection backend");
 const root = resolve(rootArg), off = resolve(offArg), on = resolve(onArg);
 await mkdir(root, { recursive: true });
 const base = await Bun.file(configArg).json();
@@ -18,6 +19,7 @@ for (const batch of [1, 8, 16]) {
     else delete config.autotune;
     if (tuned && headArg !== "native") config.head_backend = headArg;
     else delete config.head_backend;
+    config.projection_backend = tuned ? projectionArg : "merged";
     await Bun.write(`${dir}/config.json`, JSON.stringify(config, null, 2) + "\n");
   }
 }

@@ -298,6 +298,8 @@ this build.
 - `crates/kernels/src/kron_parallel.rs` SHA256:
   `7c6ea24cd0757ac92fd1b98cfe1b968a4929500457425269a3c6550ea71a5301`
 - jj change: `qzystkmyyskmtmxzozrmyuntpynrzvtu`.
+- Frozen source commit: `c72c28191a52b5b7dd249ad4b5fbea9e3ca4c546`.
+- Remaining validation-only evidence change: `wkwonztqtylswzxkstxvstplmkwuoxyt`.
 
 Final commands use the workspace-private **relative** `.cache/cubecl`
 directory. Config copies are retained under `artifacts/scan/final/`;
@@ -340,4 +342,77 @@ earlier individual passing matrices above remain provisional evidence.
 This item does not certify larger K/V widths, contexts beyond512, other
 devices/dtypes, higher-order derivatives or later-plan components. Those
 scaling items remain pending; batch8 evidence is not width/context proof.
+
+### Final private-cache results
+
+Both batches completed all three selectors, both contexts, two warmups and
+11 paired trials per selector/context. These are the decisive isolated
+confirmation measurements, not the provisional tables above.
+
+| Batch | Context |64 step ms |128 step ms |256 step ms | Paired reduction128 (95% interval) | Paired reduction256 (95% interval) |
+|---:|---:|---:|---:|---:|---|---|
+| 8 |512 |1469.864 |1253.448 |1218.261 |14.92% [13.76,15.22] |**17.10% [16.52,18.17]** |
+| 8 |128 |344.218 |293.129 |282.697 |14.64% [14.09,15.84] |**17.90% [14.38,19.70]** |
+| 1 |512 |542.326 |321.814 |274.617 |40.31% [39.64,41.39] |**49.48% [47.45,50.00]** |
+| 1 |128 |179.683 |120.583 |107.848 |32.72% [32.05,33.79] |**41.03% [37.24,41.74]** |
+
+Each candidate wins all11 paired trials at every shape. The intended-batch
+256-lane improvement remains beyond noise, with **no numerical/model work
+removed and no launch reduction**. At B8/context512 the median full-step
+throughput rises approximately2787→3362tokens/s (1.21x). The128-lane
+specialization is correct and useful for reproducibility but not adopted
+over the consistently faster256-lane path.
+
+| Batch | Context |64 isolated F / F+B ms |128 isolated F / F+B ms |256 isolated F / F+B ms | Kernels/step (all paths) |
+|---:|---:|---:|---:|---:|---:|
+|8 |512 |17.950 /86.280 |8.555 /34.840 |6.269 /25.787 |5833 |
+|8 |128 |5.204 /22.621 |3.019 /9.952 |2.171 /7.698 |5833 |
+|1 |512 |18.266 /83.646 |8.456 /30.372 |5.937 /19.326 |5780 |
+|1 |128 |5.588 /22.519 |2.926 /8.609 |2.159 /6.336 |5780 |
+
+Final sampled pool reservations are778733888/778717952bytes at B8 and
+198329664/198321792bytes at B1 (contexts512/128). The earlier memory/work
+limitations and unchanged logical buffer counts still apply.
+
+Final independent f64 gates all pass at unchanged2e-5/3e-4 tolerances:
+
+- `final/parallel128-b1/kron-reference.json`:13 edge/strided/continuation
+  cases, maximum input-gradient error7.334e-8.
+- `final/parallel256-b1/kron-reference.json`:13 edge/strided/continuation
+  cases, maximum input-gradient error9.154e-8.
+- `final/parallel256-t128/kron-reference.json` and
+  `final/parallel256-t512/kron-reference.json`:all four objectives at each
+  context, including every output, state, physical score and all seven
+  input/state gradients; maximum input-gradient error7.733e-8.
+
+All paths above are relative to `artifacts/scan/`. The final paired
+real-corpus preflights also pass logits/every parameter gradient/AdamW
+updates before throughput at B1/B8 and both contexts; the observed errors
+are unchanged from the provisional preflights. The earlier independent
+CPU-model and historical-checkpoint gates passed; the parent explicitly
+owns their single combined integration rerun and the workspace tests.
+
+Final reports:
+
+- B8: `artifacts/scan/final/historical-b8/scan-benchmark-2821741-1792867936305942024/report.json`
+- B1: `artifacts/scan/final/historical-b1/scan-benchmark-2817454-1792867902717342986/report.json`
+- Statistics, source/binary proof reference and queue records:
+  `artifacts/scan/final/paired-summary.json`.
+
+Queue wait is not compute time:
+
+| Command | Execution seconds | Approximate queue seconds | Total wrapper seconds |
+|---|---:|---:|---:|
+|B8 paired |80.41 |492.18 |572.59 |
+|B1 paired |32.52 |458.59 |491.11 |
+|128-lane default f64 |0.95 |572.60 |573.55 |
+|256-lane default f64 |1.06 |491.12 |492.18 |
+|256-lane T512 f64 |4.72 |565.79 |570.51 |
+|256-lane T128 f64 |1.43 |570.52 |571.95 |
+
+**Final decision: adopt the explicit `fused_parallel256` selector.** The
+fixed-build/private-cache confirmation independently supports the decision
+at the realistic B8 workload. Keep omitted=`tensor_solver` and explicit
+`fused_gpu` historical arithmetic/fingerprints unchanged; no automatic
+selector switching or fallback is introduced.
 

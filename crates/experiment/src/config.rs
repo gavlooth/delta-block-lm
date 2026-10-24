@@ -287,6 +287,14 @@ impl Config {
             "heuristic head requires a GPU backend"
         );
         ensure!(
+            self.projection_backend != ProjectionBackend::MergedHeuristicOutput
+                || matches!(self.backend.as_str(), "vulkan" | "cuda"),
+            "heuristic output projection requires a GPU backend"
+        );
+        if self.autotune {
+            crate::gemm_guard::validate(self)?;
+        }
+        ensure!(
             self.context >= 8 && self.batch_size > 0 && self.layers > 0 && self.d_model > 0,
             "invalid model shape"
         );
@@ -537,6 +545,11 @@ mod tests {
         config.autotune = true;
         assert!(config.validate().is_err());
         config.backend = "vulkan".into();
+        config.task = "lm".into();
+        config.scan_backend = ScanBackend::FusedGpu;
+        config.hola_backend = HolaBackend::FusedGpu;
+        config.projection_backend = ProjectionBackend::Merged;
+        config.arms[0].mixer = "kronlstm".into();
         config.validate().unwrap();
         let encoded = serde_json::to_value(&config).unwrap();
         assert_eq!(encoded["autotune"], true);
