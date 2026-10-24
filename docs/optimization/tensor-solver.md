@@ -140,18 +140,20 @@ The final context bisection at source `91c8ce19` established:
 - Runtime checkpointing is **Disabled**. A static `BalancedCheckpointing`
   type name in one panic trace was not evidence of runtime recomputation.
 
-The proven library defect boundary is the rank-4 reduction's backward in the
+The proven library defect boundary is the reduction's backward in the
 erase/broadcast/triangular-solve graph. A layout/stride interaction in its
-incoming `[B,H,T,1]` adjoint is the remaining low-level explanation to investigate;
-the specific faulty CubeCL instruction has **not** been established.
+incoming singleton-width adjoint is the remaining low-level explanation to
+investigate; the specific faulty CubeCL instruction has **not** been established.
 
-The production correction flattens only the rowwise bilinear product before
-reducing values:
+The first correction (`c0a0dd9f`) flattened the product before reducing values.
+It fixed the historical T7 acceptance but failed the independent chunk-size-1
+regression, so it is not accepted as the complete correction (evidence below).
+The successor uses the independently checked equivalent rowwise dot GEMM:
 
 ```rust
-(projected_initial * v)
-    .reshape([batch * heads * size, values])
-    .sum_dim(1)
+projected_initial
+    .unsqueeze_dim::<5>(3)
+    .matmul(v.unsqueeze_dim::<5>(4))
     .reshape([batch, heads, size, 1])
 ```
 
@@ -162,9 +164,9 @@ or dispatch to the custom fused scan. GDN-2 has no corresponding scalar
 initial-state dot-product reduction and remains unchanged. The unrelated
 key-overlap and norm reductions remain unchanged.
 
-The rank-2 formulation keeps the same multiplication and reduction element
-counts; reshape may materialize a noncontiguous input when necessary.
-No performance improvement or memory-saving claim is made. No dependencies,
+The dot GEMM removes this reduction backward from the RHS without detaching
+any operand. Its tiny-matrix dispatch cost has not been benchmarked; no
+performance improvement or memory-saving claim is made. No dependencies,
 checkpoint parameters, public APIs, or numerical tolerances change.
 
 ## Upstream-report text
@@ -196,12 +198,52 @@ loss = (output * independent_output_seed).sum()
 broadcast over 64 values. **Actual:** Zero product-leaf gradient, while a leaf
 substituted immediately after `sum_dim(3)` has the correct nonzero adjoint.
 Detaching erase or inverse restores it; removing value sharing does not.
-Replacing only the reduction by the equivalent rank-2 formulation restores
-the full recurrence's key VJP. Standalone multiply/reduce examples pass, so a
-report must retain the consumer graph rather than claim a generic sum bug.
+Replacing only the reduction by either equivalent contraction restores the
+historical T7 key VJP. However, rank-2 reduction still loses the initial erase
+contribution at chunk size 1 in a second independent fixture. Standalone
+multiply/reduce examples pass, so a report must retain the consumer graph
+rather than claim a generic sum bug.
 
 Submission destination: https://github.com/tracel-ai/burn/issues .
 No upstream issue has been filed or assigned a number in this investigation.
+
+## First correction verification: incomplete
+
+The combined integration tree included frozen correction `c0a0dd9f`. A matched
+before run reverted only its RHS reduction while keeping the rest of that tree
+identical. Retained logs:
+
+`artifacts/kron-validation/solver-fix-verification-2/`
+
+| Check | Result | Recorded seconds |
+| --- | --- | ---: |
+| Before: independent Vulkan regression | FAIL | 8 |
+| Rank-2 correction: independent CPU regression | PASS | 1 |
+| Rank-2 correction: independent Vulkan regression | FAIL | 2 |
+| Rank-2 correction: workspace CPU tests | PASS | 3 |
+| Unified executable build | PASS | 5 |
+| Historical T7 output/state/score objectives | all PASS | 7 |
+| Default TensorSolver Kron reference | PASS | 5 |
+
+The GPU regression fails identically before and after:
+`key VJP[3]: -0.0014381682 != -0.0013434548440675893`.
+The fixed test iteration order identifies the first case as
+KronLSTM/B2/T5/H2/K3/V4/chunk1/output-only, before any GDN-2 case.
+Assertions in the successor now include the caller, dimensions and chunk size.
+
+Scalar decomposition of this independent fixture gives:
+
+| Key-gradient term | Value |
+| --- | ---: |
+| Direct edit | -0.001438168312022801 |
+| Initial-state erase | 0.0000947134679552117 |
+| Sum | -0.0013434548440675893 |
+
+The missing term is again exactly the initial-state erase contribution, not
+a GDN-2-specific formula or a new tolerance issue. The rowwise dot-GEMM
+successor changes only the same KronLSTM RHS contraction. Its production
+acceptance must be recorded separately; the successful T7 tests do not excuse
+the failed independent regression.
 
 ## Independent regression behavior
 
@@ -222,7 +264,8 @@ timeout 180s cargo test --workspace --features delta-experiment/vulkan tensor_so
 timeout 180s cargo test --workspace --features delta-experiment/vulkan tensor_solver_initial_key_reset_padding_vulkan -- --ignored --test-threads=1
 ```
 
-These tests have not been executed at the correction's source freeze.
+The first-correction outcomes are recorded above. The successor's checks use
+the identical fixture and tolerances.
 The GPU command must use the repository's GPU/build lock ordering.
 Existing strict Kron acceptance, including all input fields, initial state,
 continuation, and strided inputs, remains unchanged.

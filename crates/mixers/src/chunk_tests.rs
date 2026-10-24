@@ -82,6 +82,7 @@ fn initial_key_reset_padding(device: Device) {
         assert!(expected_initial[..h*k*v].iter().any(|x| x.abs() > 1e-4));
         assert!(expected_initial[h*k*v..].iter().all(|&x| x == 0.));
         for chunk in [1, 2, 5, 16] {
+            let case = format!("{kind:?}/B{b}/T{t}/H{h}/K{k}/V{v}/chunk{chunk}/output_only");
             let x: Vec<Tensor<4>> = data.iter().zip(widths).map(|(data, width)| {
                 Tensor::from_data(TensorData::new(data.clone(), [b,t,h,width]), &device).require_grad()
             }).collect();
@@ -91,10 +92,10 @@ fn initial_key_reset_padding(device: Device) {
             let output = scan(kind, ScanInput {q:x[0].clone(),k:x[1].clone(),v:x[2].clone(),
                 alpha:x[3].clone(),erase:x[4].clone(),write:x[5].clone()},
                 metadata(&valid), metadata(&reset), chunk, Some(initial.clone()));
-            assert_close("output", &values(output.output.clone()), &expected_output);
+            assert_close(&format!("{case}/output"), &values(output.output.clone()), &expected_output);
             let grads = (output.output * Tensor::from_data(TensorData::new(upstream.clone(), [b,t,h,v]), &device)).sum().backward();
-            assert_close("key VJP", &values(x[1].grad(&grads).unwrap()), &expected_key);
-            assert_close("initial-state VJP", &values(initial.grad(&grads).unwrap()), &expected_initial);
+            assert_close(&format!("{case}/key VJP"), &values(x[1].grad(&grads).unwrap()), &expected_key);
+            assert_close(&format!("{case}/initial-state VJP"), &values(initial.grad(&grads).unwrap()), &expected_initial);
         }
     }
 }

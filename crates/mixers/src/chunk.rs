@@ -188,13 +188,14 @@ pub fn scan(
                 key_overlap(k.clone())
                     * v.clone().matmul(v.clone().swap_dims(2, 3))
                     * erase.clone(),
-                // Keep the row dot product's VJP rank-2: the GPU rank-4 reduction
-                // loses the initial-state adjoint after the erase/solve chain.
-                // Same contraction and tolerances; see docs/optimization/tensor-solver.md.
+                // A rowwise dot GEMM preserves the initial-state VJP. A multiply/sum
+                // reduction loses it on GPU in the erase/solve graph, even at rank 2
+                // for size=1; see docs/optimization/tensor-solver.md.
                 write
-                    - ((k.clone() * prefix.clone()).matmul(state.clone()) * v.clone())
-                        .reshape([batch * heads * size, values])
-                        .sum_dim(1)
+                    - (k.clone() * prefix.clone())
+                        .matmul(state.clone())
+                        .unsqueeze_dim::<5>(3)
+                        .matmul(v.clone().unsqueeze_dim::<5>(4))
                         .reshape([batch, heads, size, 1])
                         * erase,
             ),
