@@ -104,8 +104,11 @@ historical `separate`. No parameter name, shape or ID changes in any mode.
 Burn's private matmul tuner exposes no global candidate exclusion. Therefore,
 before any autotuned training/step profiling, a fail-closed preflight probes all
 five active linear families with the actual configured batch/context/width:
-real rank-3 forwards plus input and parameter VJPs, against independent scalar
-f64 dots at the existing `2e-5 + 3e-4*abs(reference)` tolerance. A failed probe
+real rank-3 forwards plus input and parameter VJPs on deterministic representative
+tensors. It checks four sampled entries of **each** F/dX/dW result against scalar
+f64 dots at the existing `2e-5 + 3e-4*abs(reference)` tolerance; this is not a
+whole-output f64 proof. The separate shape sweep and all-output/all-parameter
+CPU model gates remain acceptance requirements. A failed sampled probe
 refuses training before any real optimizer step and retains `gemm-preflight.json`.
 This is not a whitelist of known batch sizes: new shapes are probed too.
 Certificates under `CACHE_DIR/gemm-verdicts/` are bound to exact shapes and

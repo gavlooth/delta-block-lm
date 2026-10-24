@@ -71,9 +71,16 @@ fn packed(x: Tensor<2>) -> Tensor<2> {
     // Flattening a true transpose requires a contiguous copy; the following reshape is metadata.
     x.reshape([m * n]).reshape([m, n])
 }
-fn multiply(a: Tensor<2>, b: Tensor<2>, heuristic: bool) -> Tensor<2> {
+fn multiply(a: Tensor<2>, b: Tensor<2>, heuristic: bool, gemm_batches: usize) -> Tensor<2> {
     if heuristic {
         crate::model::heuristic_matmul(a, b)
+    } else if gemm_batches > 0 {
+        let [rows, k] = a.dims();
+        let n = b.dims()[1];
+        // Burn keeps row-tile-aligned contexts batched; only dW flattens by default.
+        a.reshape([gemm_batches, rows / gemm_batches, k])
+            .matmul(b.reshape([1, k, n]))
+            .reshape([rows, n])
     } else {
         a.matmul(b)
     }
@@ -84,6 +91,7 @@ fn sample(
     b: &Tensor<2>,
     pack: bool,
     heuristic: bool,
+    gemm_batches: usize,
 ) -> Result<f64> {
     runtime::sync(device)?;
     let start = Instant::now();
@@ -92,7 +100,7 @@ fn sample(
     } else {
         (a.clone(), b.clone())
     };
-    let out = multiply(a, b, heuristic);
+    let out = multiply(a, b, heuristic, gemm_batches);
     runtime::sync(device)?;
     let ms = start.elapsed().as_secs_f64() * 1000.;
     std::hint::black_box(out);
@@ -144,8 +152,25 @@ pub fn micro(c: &Config, device: &Device, warmups: usize, trials: usize) -> Resu
                         || (name == "mixer_output"
                             && c.projection_backend
                                 == delta_mixers::ProjectionBackend::MergedHeuristicOutput);
+                    let gemm_batches = if !heuristic && phase != "weight_vjp" {
+                        batch
+                    } else {
+                        0
+                    };
                     let mut case = benchmark(
-                        device, name, batch, phase, m, n, k, at, bt, heuristic, warmups, trials,
+                        device,
+                        name,
+                        batch,
+                        phase,
+                        m,
+                        n,
+                        k,
+                        at,
+                        bt,
+                        heuristic,
+                        gemm_batches,
+                        warmups,
+                        trials,
                     )?;
                     case["context"] = json!(c.context);
                     report["cases"].as_array_mut().unwrap().push(case);
@@ -159,7 +184,7 @@ pub fn micro(c: &Config, device: &Device, warmups: usize, trials: usize) -> Resu
                 "gemm-micro deadline; partial report retained"
             );
             report["cases"].as_array_mut().unwrap().push(benchmark(
-                device, "square", 0, "forward", size, size, size, false, false, false, warmups,
+                device, "square", 0, "forward", size, size, size, false, false, false, 0, warmups,
                 trials,
             )?);
             runtime::write_json(&path, &report)?;
@@ -213,6 +238,7 @@ fn benchmark(
     at: bool,
     bt: bool,
     heuristic: bool,
+    gemm_batches: usize,
     warmups: usize,
     trials: usize,
 ) -> Result<Value> {
@@ -230,14 +256,14 @@ fn benchmark(
     let a = if at { a.swap_dims(0, 1) } else { a };
     let b = if bt { b.swap_dims(0, 1) } else { b };
     runtime::sync(device)?;
-    let first_use = sample(device, &a, &b, false, heuristic)?;
-    let first_pack = sample(device, &a, &b, true, heuristic)?;
+    let first_use = sample(device, &a, &b, false, heuristic, gemm_batches)?;
+    let first_pack = sample(device, &a, &b, true, heuristic, gemm_batches)?;
     let mut original = Vec::with_capacity(trials);
     let mut pack = Vec::with_capacity(trials);
     for i in 0..warmups + trials {
         let mut times = [0.; 2];
         for mode in if i % 2 == 0 { [0, 1] } else { [1, 0] } {
-            times[mode] = sample(device, &a, &b, mode == 1, heuristic)?;
+            times[mode] = sample(device, &a, &b, mode == 1, heuristic, gemm_batches)?;
         }
         if i >= warmups {
             original.push(times[0]);
@@ -245,15 +271,15 @@ fn benchmark(
         }
     }
     let kernels = dispatches(device, || {
-        std::hint::black_box(multiply(a.clone(), b.clone(), heuristic));
+        std::hint::black_box(multiply(a.clone(), b.clone(), heuristic, gemm_batches));
     })?;
     let av = a.clone().into_data().try_to_vec::<f32>().unwrap();
     let bv = b.clone().into_data().try_to_vec::<f32>().unwrap();
-    let cv = multiply(a.clone(), b.clone(), heuristic)
+    let cv = multiply(a.clone(), b.clone(), heuristic, gemm_batches)
         .into_data()
         .try_to_vec::<f32>()
         .unwrap();
-    let cp = multiply(packed(a), packed(b), heuristic)
+    let cp = multiply(packed(a), packed(b), heuristic, gemm_batches)
         .into_data()
         .try_to_vec::<f32>()
         .unwrap();
@@ -275,7 +301,9 @@ fn benchmark(
     }
     let flops = 2. * m as f64 * n as f64 * k as f64;
     Ok(
-        json!({"name":name,"batch":batch,"phase":phase,"m":m,"n":n,"k":k,
+        json!({"name":name,"batch":batch,"phase":phase,"m":if gemm_batches>0 {m/gemm_batches}else{m},"effective_rows":m,
+        "gemm_batches":gemm_batches.max(1),"rank":if gemm_batches>0 {3}else{2},"rhs_batch_broadcast":gemm_batches>0,
+        "n":n,"k":k,
         "lhs_transposed":at,"rhs_transposed":bt,"flops":flops,"first_use_ms":first_use,"first_pack_use_ms":first_pack,
         "forced_heuristic":heuristic,
         "original_samples_ms":original,"original_median_ms":median(&original),"original_gflops":flops/median(&original)/1e6,
@@ -328,5 +356,15 @@ mod tests {
         let device = Device::ndarray();
         let x = Tensor::<2>::from_data([[1., 2., 3.], [4., 5., 6.]], &device).swap_dims(0, 1);
         assert_eq!(x.clone().into_data(), packed(x).into_data());
+    }
+    #[test]
+    fn native_forward_retains_batched_linear_geometry() {
+        let device = Device::ndarray();
+        let input = Tensor::<2>::from_data([[1., 2.], [3., 4.], [5., 6.], [7., 8.]], &device);
+        let identity = Tensor::<2>::from_data([[1., 0.], [0., 1.]], &device);
+        assert_eq!(
+            input.clone().into_data(),
+            multiply(input, identity, false, 2).into_data()
+        );
     }
 }
