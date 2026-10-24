@@ -57,10 +57,15 @@ pub enum HolaBackend {
     #[default]
     Tensor,
     FusedGpu,
+    FusedGpuPairs,
+    FusedGpuPairsNorms,
 }
 impl HolaBackend {
     pub fn is_tensor(&self) -> bool {
         *self == Self::Tensor
+    }
+    pub fn is_fused(&self) -> bool {
+        !self.is_tensor()
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,7 +151,7 @@ impl MixerConfig {
             );
             chunk::assert_fused_device(device);
         }
-        if self.hola_backend == HolaBackend::FusedGpu {
+        if self.hola_backend.is_fused() {
             chunk::assert_fused_device(device);
             if self.cache_policy != CachePolicy::None {
                 assert_eq!(
@@ -317,7 +322,7 @@ impl Mixer {
         self.scan_backend = backend;
     }
     pub fn set_hola_backend(&mut self, backend: HolaBackend) {
-        if backend == HolaBackend::FusedGpu {
+        if backend.is_fused() {
             assert_eq!(
                 (self.key_dim, self.value_dim),
                 (32, 64),
@@ -460,8 +465,18 @@ impl Mixer {
         if let Some(cache) = &self.cache {
             let (cache_q, cache_k) = profile.section("HOLA RMSNorms", || {
                 (
-                    self.normalization_backend.rms(&cache.q_norm, raw_q),
-                    self.normalization_backend.rms(&cache.k_norm, raw_k),
+                    hola::normalize(
+                        self.hola_backend,
+                        self.normalization_backend,
+                        &cache.q_norm,
+                        raw_q,
+                    ),
+                    hola::normalize(
+                        self.hola_backend,
+                        self.normalization_backend,
+                        &cache.k_norm,
+                        raw_k,
+                    ),
                 )
             });
             let exact = profile.section("HOLA read", || {

@@ -16,7 +16,7 @@ use burn_cubecl::CubeBackend;
 
 #[backend_extension(Cube, Autodiff, Fusion: cfg(feature = "fusion"))]
 pub trait HolaOps: Backend {
-    #[fusion(meta = |q: &TensorSpec, _k, v: &TensorSpec, _scores, _valid, _documents, _sink, capacity: &usize, chunk: &usize, _recency| {
+    #[fusion(meta = |q: &TensorSpec, _k, v: &TensorSpec, _scores, _valid, _documents, _sink, capacity: &usize, chunk: &usize, _recency, _pairs| {
         let [batch, time, heads, _] = q.shape.dims::<4>();
         (
             v.clone(),
@@ -36,6 +36,7 @@ pub trait HolaOps: Backend {
         capacity: usize,
         chunk: usize,
         recency: bool,
+        pairs: bool,
     ) -> (
         FloatTensor<Self>,
         FloatTensor<Self>,
@@ -43,7 +44,7 @@ pub trait HolaOps: Backend {
         FloatTensor<Self>,
     );
 
-    #[fusion(meta = |q: &TensorSpec, k: &TensorSpec, v: &TensorSpec, _valid, _documents, sink: &TensorSpec, _schedule, _expiry, _output, _stats, _upstream, _capacity, _chunk| {
+    #[fusion(meta = |q: &TensorSpec, k: &TensorSpec, v: &TensorSpec, _valid, _documents, sink: &TensorSpec, _schedule, _expiry, _output, _stats, _upstream, _capacity, _chunk, _pairs| {
         (q.clone(), k.clone(), v.clone(), sink.clone())
     })]
     fn hola_backward(
@@ -60,6 +61,7 @@ pub trait HolaOps: Backend {
         upstream: FloatTensor<Self>,
         capacity: usize,
         chunk: usize,
+        pairs: bool,
     ) -> (
         FloatTensor<Self>,
         FloatTensor<Self>,
@@ -80,6 +82,7 @@ impl HolaOps for CubeBackend {
         capacity: usize,
         chunk: usize,
         recency: bool,
+        pairs: bool,
     ) -> (
         FloatTensor<Self>,
         FloatTensor<Self>,
@@ -87,7 +90,7 @@ impl HolaOps for CubeBackend {
         FloatTensor<Self>,
     ) {
         crate::hola::run_read(
-            q, k, v, scores, valid, documents, sink, capacity, chunk, recency,
+            q, k, v, scores, valid, documents, sink, capacity, chunk, recency, pairs,
         )
     }
 
@@ -105,6 +108,7 @@ impl HolaOps for CubeBackend {
         upstream: FloatTensor<Self>,
         capacity: usize,
         chunk: usize,
+        pairs: bool,
     ) -> (
         FloatTensor<Self>,
         FloatTensor<Self>,
@@ -113,7 +117,7 @@ impl HolaOps for CubeBackend {
     ) {
         crate::hola::run_backward(
             q, k, v, valid, documents, sink, schedule, expiry, output, stats, upstream, capacity,
-            chunk,
+            chunk, pairs,
         )
     }
 }
@@ -130,6 +134,7 @@ impl<B: Backend + HolaOps, C: CheckpointStrategy> HolaOps for Autodiff<B, C> {
         capacity: usize,
         chunk: usize,
         recency: bool,
+        pairs: bool,
     ) -> (
         FloatTensor<Self>,
         FloatTensor<Self>,
@@ -150,8 +155,7 @@ impl<B: Backend + HolaOps, C: CheckpointStrategy> HolaOps for Autodiff<B, C> {
                 FloatTensor<B>,
                 FloatTensor<B>,
                 FloatTensor<B>,
-                usize,
-                usize,
+                (usize, usize, bool),
             );
             fn backward(
                 self,
@@ -171,12 +175,11 @@ impl<B: Backend + HolaOps, C: CheckpointStrategy> HolaOps for Autodiff<B, C> {
                     expiry,
                     output,
                     stats,
-                    capacity,
-                    chunk,
+                    (capacity, chunk, pairs),
                 ) = ops.state;
                 let (dq, dk, dv, ds) = B::hola_backward(
                     q, k, v, valid, documents, sink, schedule, expiry, output, stats, upstream,
-                    capacity, chunk,
+                    capacity, chunk, pairs,
                 );
                 let [nq, nk, nv, ns] = ops.parents;
                 if let Some(node) = nq {
@@ -214,6 +217,7 @@ impl<B: Backend + HolaOps, C: CheckpointStrategy> HolaOps for Autodiff<B, C> {
             capacity,
             chunk,
             recency,
+            pairs,
         );
         // Metadata and selection scores intentionally create no autodiff edges.
         let schedule_ad = <Autodiff<B, C> as AutodiffBackend>::from_inner(schedule.clone());
@@ -236,8 +240,7 @@ impl<B: Backend + HolaOps, C: CheckpointStrategy> HolaOps for Autodiff<B, C> {
                     expiry,
                     output.clone(),
                     stats,
-                    capacity,
-                    chunk,
+                    (capacity, chunk, pairs),
                 ),
                 output,
             ),
@@ -260,6 +263,7 @@ impl<B: Backend + HolaOps, C: CheckpointStrategy> HolaOps for Autodiff<B, C> {
         upstream: FloatTensor<Self>,
         capacity: usize,
         chunk: usize,
+        pairs: bool,
     ) -> (
         FloatTensor<Self>,
         FloatTensor<Self>,
@@ -280,6 +284,7 @@ impl<B: Backend + HolaOps, C: CheckpointStrategy> HolaOps for Autodiff<B, C> {
             upstream.into_primitive(),
             capacity,
             chunk,
+            pairs,
         );
         (
             <Autodiff<B, C> as AutodiffBackend>::from_inner(dq),
@@ -307,6 +312,8 @@ pub struct HolaReadOutput {
 /// uses the last physical slot's document even when that slot is padding.
 /// Supports first-order Q/K/V/sink derivatives, f32 key32/value64, capacity 1..64,
 /// chunk 1..16, and CubeCL GPU execution only. No higher-order VJP or CPU fallback.
+/// `pairs` explicitly selects sparse query-edge reuse during backward; false
+/// preserves the historical recomputing key VJP. The forward is identical.
 pub fn hola_read(
     q: Tensor<4>,
     k: Tensor<4>,
@@ -319,6 +326,7 @@ pub fn hola_read(
     chunk_size: usize,
     recency: bool,
     return_final_positions: bool,
+    pairs: bool,
 ) -> HolaReadOutput {
     assert!((1..=16).contains(&chunk_size), "HOLA chunk must be 1..=16");
     let [batch, time, heads, _] = q.dims();
@@ -334,6 +342,7 @@ pub fn hola_read(
         capacity,
         chunk_size,
         recency,
+        pairs,
     );
     HolaReadOutput {
         output: Tensor::from_dispatch(output),

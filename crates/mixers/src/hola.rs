@@ -5,6 +5,20 @@ use crate::{CachePolicy, HolaBackend};
 use burn::prelude::*;
 use burn::tensor::activation::softmax;
 
+/// The norms candidate changes only the two cache-read norms, not other blocks.
+pub(crate) fn normalize(
+    backend: HolaBackend,
+    normalization: crate::NormalizationBackend,
+    norm: &burn::nn::RmsNorm,
+    input: Tensor<4>,
+) -> Tensor<4> {
+    if backend == HolaBackend::FusedGpuPairsNorms {
+        crate::NormalizationBackend::FusedNorms.rms(norm, input)
+    } else {
+        normalization.rms(norm, input)
+    }
+}
+
 pub(crate) struct CacheRead {
     pub output: Tensor<4>,
     pub final_positions: Tensor<3>,
@@ -30,7 +44,7 @@ pub(crate) fn read_selected(
         HolaBackend::Tensor => read(
             q, k, v, scores, valid, documents, capacity, chunk, policy, sink,
         ),
-        HolaBackend::FusedGpu => {
+        HolaBackend::FusedGpu | HolaBackend::FusedGpuPairs | HolaBackend::FusedGpuPairsNorms => {
             assert!(
                 policy != CachePolicy::None,
                 "HOLA requires an active cache policy"
@@ -50,6 +64,7 @@ pub(crate) fn read_selected(
                     chunk,
                     policy == CachePolicy::Recency,
                     false,
+                    backend != HolaBackend::FusedGpu,
                 )
                 .output
             }
@@ -79,7 +94,7 @@ pub(crate) fn read_detailed_selected(
         HolaBackend::Tensor => read_detailed(
             q, k, v, scores, valid, documents, capacity, chunk, policy, sink,
         ),
-        HolaBackend::FusedGpu => {
+        HolaBackend::FusedGpu | HolaBackend::FusedGpuPairs | HolaBackend::FusedGpuPairsNorms => {
             assert!(
                 policy != CachePolicy::None,
                 "HOLA requires an active cache policy"
@@ -107,6 +122,7 @@ pub(crate) fn read_detailed_selected(
                     chunk,
                     policy == CachePolicy::Recency,
                     true,
+                    backend != HolaBackend::FusedGpu,
                 );
                 CacheRead {
                     output: result.output,

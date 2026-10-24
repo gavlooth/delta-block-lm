@@ -393,12 +393,14 @@ pub fn run(
 enum ExecutionChoice {
     Projection(delta_mixers::ProjectionBackend),
     Normalization(delta_mixers::NormalizationBackend),
+    Hola(delta_mixers::HolaBackend),
 }
 impl ExecutionChoice {
     fn apply(self, model: &mut LanguageModel) {
         match self {
             Self::Projection(mode) => model.set_projection_backend(mode),
             Self::Normalization(mode) => model.set_normalization_backend(mode),
+            Self::Hola(mode) => model.set_hola_backend(mode),
         }
     }
 }
@@ -412,7 +414,7 @@ pub fn projection_run(
     warmups: usize,
     trials: usize,
 ) -> Result<Value> {
-    comparison_run(c, arm, device, contexts, warmups, trials, false)
+    comparison_run(c, arm, device, contexts, warmups, trials, false, false)
 }
 
 pub fn normalization_run(
@@ -423,7 +425,18 @@ pub fn normalization_run(
     warmups: usize,
     trials: usize,
 ) -> Result<Value> {
-    comparison_run(c, arm, device, contexts, warmups, trials, true)
+    comparison_run(c, arm, device, contexts, warmups, trials, true, false)
+}
+
+pub fn hola_run(
+    c: &Config,
+    arm: &Arm,
+    device: &Device,
+    contexts: &[usize],
+    warmups: usize,
+    trials: usize,
+) -> Result<Value> {
+    comparison_run(c, arm, device, contexts, warmups, trials, false, true)
 }
 
 fn comparison_run(
@@ -434,28 +447,41 @@ fn comparison_run(
     warmups: usize,
     trials: usize,
     normalization: bool,
+    hola: bool,
 ) -> Result<Value> {
     use delta_mixers::{NormalizationBackend, ProjectionBackend};
     ensure!(
-        !normalization || matches!(c.backend.as_str(), "vulkan" | "cuda"),
-        "normalization comparison requires a GPU; no CPU fallback"
+        !(normalization || hola) || matches!(c.backend.as_str(), "vulkan" | "cuda"),
+        "custom operator comparison requires a GPU; no CPU fallback"
     );
-    let command = if normalization {
+    ensure!(
+        !hola || (!c.fusion && !c.autotune),
+        "HOLA comparison requires non-fusion execution without matmul autotune"
+    );
+    let command = if hola {
+        "hola-tune"
+    } else if normalization {
         "normalization-benchmark"
     } else {
         "projection-benchmark"
     };
-    let backend_key = if normalization {
+    let backend_key = if hola {
+        "hola_backend"
+    } else if normalization {
         "normalization_backend"
     } else {
         "projection_backend"
     };
-    let forward_key = if normalization {
+    let forward_key = if hola {
+        "hola_forward_samples_ms"
+    } else if normalization {
         "normalization_forward_samples_ms"
     } else {
         "projection_forward_samples_ms"
     };
-    let forward_median_key = if normalization {
+    let forward_median_key = if hola {
+        "hola_forward_median_ms"
+    } else if normalization {
         "normalization_forward_median_ms"
     } else {
         "projection_forward_median_ms"
@@ -473,7 +499,14 @@ fn comparison_run(
         .artifact_dir
         .join(format!("{command}-{}-{nonce}", std::process::id()));
     let report_path = directory.join("report.json");
-    let modes = if normalization {
+    let modes = if hola {
+        [
+            delta_mixers::HolaBackend::FusedGpu,
+            delta_mixers::HolaBackend::FusedGpuPairs,
+            delta_mixers::HolaBackend::FusedGpuPairsNorms,
+        ]
+        .map(ExecutionChoice::Hola)
+    } else if normalization {
         [
             NormalizationBackend::Tensor,
             NormalizationBackend::FusedNorms,
@@ -495,7 +528,11 @@ fn comparison_run(
         "memory_limitation":"sampled pool reserved bytes include all six scratch trajectories and allocator reuse; not physical peak or live temporary bytes"});
     runtime::write_json(&report_path, &report)?;
     let outcome = (|| -> Result<()> {
-        if normalization {
+        if hola {
+            report["independent_hola_reference"] = serde_json::to_value(
+                delta_mixers::checks::hola_numerical_checks(device).map_err(anyhow::Error::msg)?,
+            )?;
+        } else if normalization {
             report["independent_normalization_reference"] = serde_json::to_value(
                 delta_mixers::normalization::numerical_checks(device)
                     .map_err(anyhow::Error::msg)?,
@@ -510,13 +547,17 @@ fn comparison_run(
         for &context in contexts {
             let mut config = c.clone();
             config.context = context;
-            if normalization {
+            if hola {
+                config.hola_backend = delta_mixers::HolaBackend::FusedGpu;
+            } else if normalization {
                 config.normalization_backend = NormalizationBackend::Tensor;
             } else {
                 config.projection_backend = ProjectionBackend::Separate;
             }
             config.validate()?;
-            let isolated = if normalization {
+            let isolated = if hola {
+                Value::Null
+            } else if normalization {
                 serde_json::to_value(
                     delta_mixers::normalization::benchmark(
                         device,
@@ -650,7 +691,9 @@ fn comparison_run(
                             .totals
                             .iter()
                             .filter(|(name, _)| {
-                                if normalization {
+                                if hola {
+                                    name.starts_with("HOLA")
+                                } else if normalization {
                                     name.contains("RMSNorm")
                                         || name.starts_with("L2 ")
                                         || **name == "Residual adds"
@@ -679,7 +722,7 @@ fn comparison_run(
             report["cases"].as_array_mut().unwrap().push(json!({"context":context,
                 "fixture_sha256":data::fixture_hash(&rows),"parameters":base.num_params(),
                 "equivalence":checks,"trial_orders":orders,
-                (if normalization { "isolated_normalization" } else { "isolated_input_projections" }):isolated,
+                (if hola { "isolated_hola" } else if normalization { "isolated_normalization" } else { "isolated_input_projections" }):isolated,
                 "results":results}));
             runtime::write_json(&report_path, &report)?;
         }

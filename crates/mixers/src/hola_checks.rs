@@ -205,6 +205,35 @@ impl Fixture {
             ),
         }
     }
+
+    fn upload_strided(&self, device: &Device) -> Inputs {
+        let mut x = self.upload(device);
+        let strided = |data: &Vec<f32>, width| {
+            let mut backing = vec![0.; self.b * self.h * self.t * width];
+            for b in 0..self.b {
+                for t in 0..self.t {
+                    for h in 0..self.h {
+                        for i in 0..width {
+                            backing[((b * self.h + h) * self.t + t) * width + i] =
+                                data[((b * self.t + t) * self.h + h) * width + i];
+                        }
+                    }
+                }
+            }
+            Tensor::<4>::from_data(
+                TensorData::new(backing, [self.b, self.h, self.t, width]),
+                device,
+            )
+            .swap_dims(1, 2)
+            .require_grad()
+        };
+        x.q = strided(&self.q, 32);
+        x.k = strided(&self.k, 32);
+        x.v = strided(&self.v, 64);
+        x.scores = strided(&self.scores, 1);
+        x.upstream = strided(&self.upstream, 64);
+        x
+    }
 }
 
 struct Inputs {
@@ -432,7 +461,7 @@ fn check(
     ))
 }
 
-fn cancellation_check(device: &Device) -> Result<HolaCheck, String> {
+fn cancellation_check(device: &Device, backend: HolaBackend) -> Result<HolaCheck, String> {
     let mut f = Fixture::new(1, 1, 1, 1, CachePolicy::Surprise, false);
     f.name = "cancellation_vjp_matches_actual_forward_probability";
     f.q.fill(0.);
@@ -447,7 +476,7 @@ fn cancellation_check(device: &Device) -> Result<HolaCheck, String> {
         f.upstream[h * 64] = 1.;
     }
     let x = f.upload(device);
-    let observed = values(x.forward(&f, HolaBackend::FusedGpu));
+    let observed = values(x.forward(&f, backend));
     let mut expected = Oracle {
         output: observed.iter().map(|&x| f64::from(x)).collect(),
         positions: vec![0.; f.h],
@@ -471,7 +500,7 @@ fn cancellation_check(device: &Device) -> Result<HolaCheck, String> {
             expected.dk[h * 32 + i] = derivative * f64::from(f.q[h * 32 + i]) / 32.0f64.sqrt();
         }
     }
-    let mut report = check(&f, &x, &expected, HolaBackend::FusedGpu)?;
+    let mut report = check(&f, &x, &expected, backend)?;
     // This regression checks consistency with the actual f32 forward, not a
     // claimed f64 cancellation result; the regular fixtures use the f64 oracle.
     report.oracle = "analytic_vjp_of_observed_f32_forward_probability";
@@ -489,7 +518,12 @@ pub fn hola_numerical_checks(device: &Device) -> Result<Vec<HolaCheck>, String> 
                 device.clone().inner().as_dispatch(),
                 burn::backend::DispatchDevice::Cube(_)
             ) {
-                vec![HolaBackend::Tensor, HolaBackend::FusedGpu]
+                vec![
+                    HolaBackend::Tensor,
+                    HolaBackend::FusedGpu,
+                    HolaBackend::FusedGpuPairs,
+                    HolaBackend::FusedGpuPairsNorms,
+                ]
             } else {
                 vec![HolaBackend::Tensor]
             }
@@ -508,7 +542,7 @@ pub fn hola_numerical_checks_selected(
     backend: HolaBackend,
 ) -> Result<Vec<HolaCheck>, String> {
     let device = device.clone().autodiff();
-    if backend == HolaBackend::FusedGpu {
+    if backend.is_fused() {
         #[cfg(any(feature = "vulkan", feature = "cuda"))]
         if !matches!(
             device.clone().inner().as_dispatch(),
@@ -540,8 +574,26 @@ fn fixture_checks(device: &Device, backends: &[HolaBackend]) -> Result<Vec<HolaC
     for &backend in backends {
         reports.push(check(&f, &x, &expected, backend)?);
     }
-    if backends.contains(&HolaBackend::FusedGpu) {
-        reports.push(cancellation_check(device)?);
+    let mut f = Fixture::new(2, 35, 16, 16, CachePolicy::Surprise, true);
+    f.name = "strided_q_k_v_scores_upstream";
+    let x = f.upload_strided(device);
+    let expected = oracle(&f);
+    for &backend in backends {
+        reports.push(check(&f, &x, &expected, backend)?);
+    }
+    f.name = "zero_inputs_and_adjoints";
+    f.q.fill(0.);
+    f.k.fill(0.);
+    f.v.fill(0.);
+    f.upstream.fill(0.);
+    f.sink.fill(0.);
+    let x = f.upload_strided(device);
+    let expected = oracle(&f);
+    for &backend in backends {
+        reports.push(check(&f, &x, &expected, backend)?);
+    }
+    for &backend in backends.iter().filter(|backend| backend.is_fused()) {
+        reports.push(cancellation_check(device, backend)?);
     }
     Ok(reports)
 }

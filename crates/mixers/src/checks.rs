@@ -665,13 +665,12 @@ fn layer_check(
         normalization_backend: crate::NormalizationBackend::Tensor,
         d_model: 8,
         heads: 1,
-        key_dim: if scan_backend == ScanBackend::FusedGpu || hola_backend == HolaBackend::FusedGpu {
+        key_dim: if scan_backend == ScanBackend::FusedGpu || hola_backend.is_fused() {
             32
         } else {
             4
         },
-        value_dim: if scan_backend == ScanBackend::FusedGpu || hola_backend == HolaBackend::FusedGpu
-        {
+        value_dim: if scan_backend == ScanBackend::FusedGpu || hola_backend.is_fused() {
             64
         } else {
             6

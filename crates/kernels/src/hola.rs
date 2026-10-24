@@ -314,9 +314,11 @@ fn query_backward_kernel(
     upstream: &View<f32>,
     dq: &mut View<f32>,
     auxiliary: &mut View<f32>,
+    pairs: &mut View<f32>,
     #[comptime] capacity: usize,
     #[comptime] chunk: usize,
     #[comptime] lanes: usize,
+    #[comptime] save_pairs: bool,
 ) {
     let lane = UNIT_POS as usize;
     let token = CUBE_POS as usize;
@@ -366,9 +368,10 @@ fn query_backward_kernel(
         );
         positions[lane] = p;
         let mut derivative = 0.0f32;
+        let mut probability = 0.0f32;
         if active && p >= 0.0f32 {
             let s = p as usize;
-            let probability = f32::exp(logit(q, k, b, t, s, h) - maximum) * inverse;
+            probability = f32::exp(logit(q, k, b, t, s, h) - maximum) * inverse;
             let mut dot = 0.0f32;
             let mut j = 0usize;
             while j < V {
@@ -378,6 +381,11 @@ fn query_backward_kernel(
             derivative = probability * (dot - delta) * SCALE;
         }
         derivatives[lane] = derivative;
+        if save_pairs {
+            let pair = (token * (capacity + chunk) + lane) * 2;
+            pairs[pair] = probability;
+            pairs[pair + 1] = derivative;
+        }
     }
     sync_cube();
     if lane < K {
@@ -456,6 +464,82 @@ fn key_value_backward_kernel(
                 sync_cube();
             }
             t += 1;
+        }
+    }
+    if lane < K {
+        dk[token * K + lane] = key_gradient;
+    }
+    dv[token * V + lane] = value_gradient;
+}
+
+/// Reuse the query VJP's sparse edge scalars. The selection schedule is inverted
+/// once per chunk, not once per query or channel. No probability recomputation,
+/// per-query workgroup barriers, atomic accumulation or dense T-by-T tensor.
+#[cube(launch)]
+fn key_value_pairs_backward_kernel(
+    q: &View<f32>,
+    valid: &View<f32>,
+    documents: &View<f32>,
+    schedule: &View<f32>,
+    expiry: &View<f32>,
+    pairs: &View<f32>,
+    upstream: &View<f32>,
+    dk: &mut View<f32>,
+    dv: &mut View<f32>,
+    #[comptime] capacity: usize,
+    #[comptime] chunk: usize,
+) {
+    let lane = UNIT_POS as usize;
+    let token = CUBE_POS as usize;
+    let heads = q.shape(2);
+    let time = q.shape(1);
+    let h = token % heads;
+    let s = token / heads % time;
+    let b = token / (heads * time);
+    if b >= q.shape(0) {
+        terminate!();
+    }
+    let mut key_gradient = 0.0f32;
+    let mut value_gradient = 0.0f32;
+    let mut slot_shared = Shared::<[usize]>::new_slice(1usize);
+    if metadata(valid, b, s) >= 0.5f32 {
+        let end = expiry[token] as usize;
+        let document = metadata(documents, b, s);
+        let chunks = (time + chunk - 1) / chunk;
+        let mut first = s / chunk * chunk;
+        while first < end {
+            if lane == 0 {
+                let mut slot = capacity + s % chunk;
+                if first > s {
+                    slot = 0usize;
+                    while slot < capacity {
+                        let position = schedule
+                            [((b * heads + h) * (chunks + 1) + first / chunk) * capacity + slot];
+                        if position == s as f32 {
+                            break;
+                        }
+                        slot += 1;
+                    }
+                }
+                slot_shared[0] = slot;
+            }
+            sync_cube();
+            let slot = slot_shared[0];
+            let mut t = usize::max(first, s);
+            let last = usize::min(first + chunk, end);
+            while t < last {
+                if metadata(valid, b, t) >= 0.5f32 && metadata(documents, b, t) == document {
+                    let query_token = (b * time + t) * heads + h;
+                    let edge = (query_token * (capacity + chunk) + slot) * 2;
+                    if lane < K {
+                        key_gradient += pairs[edge + 1] * q[ix(q, b, t, h, lane)];
+                    }
+                    value_gradient += pairs[edge] * upstream[ix(upstream, b, t, h, lane)];
+                }
+                t += 1;
+            }
+            sync_cube();
+            first += chunk;
         }
     }
     if lane < K {
@@ -567,6 +651,7 @@ pub(crate) fn run_read(
     capacity: usize,
     chunk: usize,
     recency: bool,
+    _pairs: bool,
 ) -> (CubeTensor, CubeTensor, CubeTensor, CubeTensor) {
     let [batch, time, heads, keys] = q.shape().dims::<4>();
     assert!(
@@ -647,6 +732,7 @@ pub(crate) fn run_backward(
     upstream: CubeTensor,
     capacity: usize,
     chunk: usize,
+    save_pairs: bool,
 ) -> (CubeTensor, CubeTensor, CubeTensor, CubeTensor) {
     let [batch, time, heads, _] = q.shape().dims::<4>();
     for tensor in [
@@ -659,6 +745,11 @@ pub(crate) fn run_backward(
     let dv = empty(&q, v.shape());
     let ds = empty(&q, [heads]);
     let auxiliary = empty(&q, [batch, time, heads, 2]);
+    let pairs = if save_pairs {
+        empty(&q, [batch, time, heads, (capacity + chunk) * 2])
+    } else {
+        auxiliary.clone()
+    };
     let lanes = (capacity + chunk).next_power_of_two().max(V);
     query_backward_kernel::launch(
         &q.client,
@@ -670,32 +761,53 @@ pub(crate) fn run_backward(
         valid.clone().into_tensor_arg(),
         documents.clone().into_tensor_arg(),
         sink.into_tensor_arg(),
-        schedule.into_tensor_arg(),
+        schedule.clone().into_tensor_arg(),
         output.into_tensor_arg(),
         stats.clone().into_tensor_arg(),
         upstream.clone().into_tensor_arg(),
         dq.clone().into_tensor_arg(),
         auxiliary.clone().into_tensor_arg(),
+        pairs.clone().into_tensor_arg(),
         capacity,
         chunk,
         lanes,
+        save_pairs,
     );
-    key_value_backward_kernel::launch(
-        &q.client,
-        count(&q, batch * time * heads),
-        CubeDim::new_1d(V as u32),
-        q.clone().into_tensor_arg(),
-        k.into_tensor_arg(),
-        v.into_tensor_arg(),
-        valid.into_tensor_arg(),
-        documents.into_tensor_arg(),
-        expiry.into_tensor_arg(),
-        stats.into_tensor_arg(),
-        auxiliary.clone().into_tensor_arg(),
-        upstream.into_tensor_arg(),
-        dk.clone().into_tensor_arg(),
-        dv.clone().into_tensor_arg(),
-    );
+    if save_pairs {
+        key_value_pairs_backward_kernel::launch(
+            &q.client,
+            count(&q, batch * time * heads),
+            CubeDim::new_1d(V as u32),
+            q.clone().into_tensor_arg(),
+            valid.into_tensor_arg(),
+            documents.into_tensor_arg(),
+            schedule.into_tensor_arg(),
+            expiry.into_tensor_arg(),
+            pairs.into_tensor_arg(),
+            upstream.into_tensor_arg(),
+            dk.clone().into_tensor_arg(),
+            dv.clone().into_tensor_arg(),
+            capacity,
+            chunk,
+        );
+    } else {
+        key_value_backward_kernel::launch(
+            &q.client,
+            count(&q, batch * time * heads),
+            CubeDim::new_1d(V as u32),
+            q.clone().into_tensor_arg(),
+            k.into_tensor_arg(),
+            v.into_tensor_arg(),
+            valid.into_tensor_arg(),
+            documents.into_tensor_arg(),
+            expiry.into_tensor_arg(),
+            stats.into_tensor_arg(),
+            auxiliary.clone().into_tensor_arg(),
+            upstream.into_tensor_arg(),
+            dk.clone().into_tensor_arg(),
+            dv.clone().into_tensor_arg(),
+        );
+    }
     sink_backward_kernel::launch(
         &q.client,
         count(&q, heads),
