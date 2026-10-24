@@ -181,6 +181,7 @@ struct ExactFixture {
     reset: Vec<bool>,
     expected_key: Vec<f64>,
     expected_rhs_key: Vec<f64>,
+    expected_write: Vec<f64>,
 }
 fn exact_fixture() -> ExactFixture {
     use delta_mixers::{MixerKind, reference::{self, Token}};
@@ -214,6 +215,7 @@ fn exact_fixture() -> ExactFixture {
     let upstream: Vec<f32> = (0..B*T*H*64).map(|i|((i*7+3) as f64*0.051).cos() as f32).collect();
     let mut expected_key = vec![0.;B*T*H*K];
     let mut expected_rhs_key = vec![0.;B*T*H*K];
+    let mut expected_write = vec![0.;B*T*H];
     for b in 0..B {for h in 0..H {
         let tokens: Vec<Token> = (0..T).map(|t| {
             let x: Vec<Vec<f64>> = fields.iter().zip(widths).map(|(f,w)| {
@@ -231,6 +233,7 @@ fn exact_fixture() -> ExactFixture {
             &u,&vec![0.;K*64],Some(&state),&[0.;T]);
         let mut prefix = [1.;K];
         for t in 0..T {
+            expected_write[(b*T+t)*H+h] = back.tokens[t].write[0];
             for k in 0..K {
                 if valid[b*T+t] {prefix[k] *= if reset[b*T+t] {0.} else {tokens[t].alpha[k]};}
                 let i = ((b*T+t)*H+h)*K+k;
@@ -242,7 +245,7 @@ fn exact_fixture() -> ExactFixture {
             }
         }
     }}
-    ExactFixture {fields,initial,upstream,valid,reset,expected_key,expected_rhs_key}
+    ExactFixture {fields,initial,upstream,valid,reset,expected_key,expected_rhs_key,expected_write}
 }
 fn fixture_inputs(f: &ExactFixture, device: &Device) -> (Vec<Tensor<4>>,Tensor<4>,Tensor<2>,Tensor<2>) {
     let x = f.fields.iter().zip([K,K,64,K,1,1]).map(|(data,width)|
@@ -256,12 +259,13 @@ fn fixture_scan(x: &[Tensor<4>], initial: Tensor<4>, valid: Tensor<2>, reset: Te
         q:x[0].clone(),k:x[1].clone(),v:x[2].clone(),alpha:x[3].clone(),erase:x[4].clone(),write:x[5].clone()
     },valid,reset,16,Some(initial))
 }
-fn exact_chain(device: &Device) {
+fn exact_chain(device: &Device, cuts_only: bool) {
     let f = exact_fixture();
     let focus = K;
     println!("{}",json!({"probe":"independent_f64_decomposition","key_index":focus,
         "full_key_vjp":f.expected_key[focus],"rhs_key_vjp":f.expected_rhs_key[focus],
         "other_key_vjp":f.expected_key[focus]-f.expected_rhs_key[focus]}));
+    if !cuts_only {
     // This uses the actual production graph; unlike the saved acceptance, it records the
     // focused gradient and forward finite difference instead of stopping at the first mismatch.
     let (x,initial,valid,reset) = fixture_inputs(&f,device);
@@ -286,11 +290,15 @@ fn exact_chain(device: &Device) {
         println!("{}",json!({"probe":"production_graph_forward_finite_difference","epsilon":epsilon,
             "finite_difference":(objectives[1]-objectives[0])/(changed[1]-changed[0]),"expected":f.expected_key[focus]}));
     }
-    for mode in ["full","rhs_only","without_rhs","retain_intermediates"] {
+    }
+    let modes: &[&str] = if cuts_only {
+        &["masked_key","key_prefix","state_projection","inner","erased","rhs"]
+    } else { &["full","rhs_only","without_rhs"] };
+    for &mode in modes {
         let (x,initial,valid,reset) = fixture_inputs(&f,device);
         let mut retained = Vec::<(&str,Tensor<4>)>::new();
         let mut keep = |name,t:Tensor<4>| {
-            if mode=="retain_intermediates" {let t=t.require_grad();retained.push((name,t.clone()));t} else {t}
+            if cuts_only && mode==name {let t=t.detach().require_grad();retained.push((name,t.clone()));t} else {t}
         };
         let active = valid.reshape([B,1,T,1]);
         let q=x[0].clone().swap_dims(1,2)*active.clone();
@@ -309,7 +317,7 @@ fn exact_chain(device: &Device) {
         }
         let decay=Tensor::cat(rows,2);
         let rhs_k=if mode=="without_rhs" {k.clone().detach()} else {k.clone()};
-        let other_k=if mode=="rhs_only" {k.clone().detach()} else {k.clone()};
+        let other_k=if mode=="rhs_only" || cuts_only {k.clone().detach()} else {k.clone()};
         let factors=decay.clone()*other_k.clone().unsqueeze_dim::<5>(2);
         let overlap=|left:Tensor<4>| (left.unsqueeze_dim::<5>(3)*factors.clone()).sum_dim(4).reshape([B,H,T,T]);
         let lower=overlap(other_k.clone())*v.clone().matmul(v.clone().swap_dims(2,3))*erase.clone();
@@ -337,17 +345,33 @@ fn exact_chain(device: &Device) {
         let final_state=last*initial+(tail*other_k).swap_dims(2,3).matmul(edits);
         let _ = (values(out.clone()),values(final_state),values(scores));
         let grads=(out.swap_dims(1,2)*tensor(f.upstream.clone(),[B,T,H,64],device)).sum().backward();
+        if !cuts_only {
         let actual=values(x[1].grad(&grads).unwrap());
         let expected:Vec<f64>=f.expected_key.iter().zip(&f.expected_rhs_key).map(|(&all,&rhs)|
             if mode=="rhs_only" {rhs} else if mode=="without_rhs" {all-rhs} else {all}).collect();
         println!("{}",json!({"probe":format!("graph_{mode}/focused_key_vjp"),"actual":actual[focus],"expected":expected[focus]}));
         report(&format!("graph_{mode}/all_key_vjp"),actual,&expected);
+        }
         for (name,t) in retained {
             let shape=t.dims();
             let g=t.grad(&grads).map(values).unwrap_or_default();
-            let offset=if shape[1]==H {T*shape[3]} else {focus};
-            println!("{}",json!({"probe":format!("retained/{name}"),"shape":shape,
-                "b0_t0_h1_vjp":g.get(offset..offset+shape[3]),"vjp_max_abs":g.iter().map(|x|x.abs()).fold(0.,f32::max)}));
+            let offset=T*shape[3];
+            let seed = f.expected_write[1];
+            let beta = f64::from(f.fields[4][1]);
+            let expected:Vec<f64> = match name {
+                "masked_key" => f.expected_rhs_key[K..2*K].to_vec(),
+                "key_prefix" => (0..K).map(|k| -beta*seed*(0..64).map(|v|
+                    f64::from(f.initial[(K+k)*64+v])*f64::from(f.fields[2][64+v])).sum::<f64>()).collect(),
+                "state_projection" => (0..64).map(|v| -beta*seed*f64::from(f.fields[2][64+v])).collect(),
+                "inner" => vec![-beta*seed],
+                "erased" => vec![-seed],
+                "rhs" => vec![seed],
+                _ => unreachable!(),
+            };
+            println!("{}",json!({"probe":format!("cut/{name}"),"shape":shape,
+                "b0_t0_h1_vjp":g.get(offset..offset+shape[3]),"expected_b0_t0_h1":expected,
+                "vjp_max_abs":g.iter().map(|x|x.abs()).fold(0.,f32::max)}));
+            report(&format!("cut/{name}/focused_row"),g[offset..offset+shape[3]].to_vec(),&expected);
         }
     }
 }
@@ -371,8 +395,8 @@ fn main() {
         _ => panic!("backend unavailable"),
     }.autodiff();
     println!("{}",json!({"device":format!("{device:?}"),"identity":format!("{:?}",device.identity()),"absolute_tolerance":ATOL,"relative_tolerance":RTOL}));
-    if std::env::args().nth(2).as_deref()==Some("chain") {
-        exact_chain(&device);
+    if let Some(mode @ ("chain" | "cut")) = std::env::args().nth(2).as_deref() {
+        exact_chain(&device, mode=="cut");
         return;
     }
     let mut ok = true;

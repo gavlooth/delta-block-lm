@@ -210,3 +210,7 @@ pub fn scan(
         scores: Tensor::cat(scores, 1),
     }
 }
+
+#[cfg(test)]
+#[path = "chunk_tests.rs"]
+mod tests;
