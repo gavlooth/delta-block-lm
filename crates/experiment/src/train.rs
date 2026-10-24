@@ -23,7 +23,15 @@ pub(crate) fn optimizer_config(c: &Config) -> AdamWConfig {
         .with_grad_clipping(Some(GradientClippingConfig::Norm(c.gradient_clip)))
 }
 pub(crate) fn optimizer(c: &Config) -> ModuleOptimizer {
-    optimizer_config(c).init()
+    if c.update_backend.is_tensor() {
+        optimizer_config(c).init()
+    } else {
+        crate::update::FusedAdamW {
+            decay: c.weight_decay,
+            clip: c.gradient_clip,
+        }
+        .into()
+    }
 }
 pub(crate) fn loaded_corpus(c: &Config) -> Result<Option<Corpus>> {
     if c.task == "lm" {
@@ -72,7 +80,7 @@ pub fn evaluate(
     for rows in examples.chunks(c.batch_size) {
         let batch = Batch::new(rows, &device);
         let logits = model.forward(&batch);
-        let loss = model::scalar(model::loss(logits.clone(), &batch))?;
+        let loss = model::scalar(model.loss(logits.clone(), &batch))?;
         let predictions = logits
             .argmax(2)
             .reshape([rows.len() * c.context])
@@ -270,7 +278,7 @@ pub fn run(
         let batch = Batch::new(&rows, &train_device);
         let logits = model.forward(&batch);
         peak(&mut peak_reserved, device);
-        let loss = model::loss(logits, &batch);
+        let loss = model.loss(logits, &batch);
         let value = model::scalar(loss.clone())?;
         let grads = model::checked_gradients(&model, loss)?;
         peak(&mut peak_reserved, device);
@@ -395,7 +403,7 @@ pub fn pilot(c: &Config, device: &Device) -> Result<Value> {
             &train_device,
         );
         let first = Instant::now();
-        let loss = model::loss(model.forward(&batch), &batch);
+        let loss = model.loss(model.forward(&batch), &batch);
         let grads = model::checked_gradients(&model, loss)?;
         model = optim.step(c.learning_rate, model, grads);
         runtime::sync(device)?;
@@ -414,7 +422,7 @@ pub fn pilot(c: &Config, device: &Device) -> Result<Value> {
                 "train",
             )?;
             let batch = Batch::new(&rows, &train_device);
-            let loss = model::loss(model.forward(&batch), &batch);
+            let loss = model.loss(model.forward(&batch), &batch);
             let grads = model::checked_gradients(&model, loss)?;
             model = optim.step(c.learning_rate, model, grads);
             runtime::sync(device)?;
@@ -867,7 +875,7 @@ mod summary_tests {
         let mut optim = optimizer(&c);
         let batch = Batch::new(&[data::recall(&c, 1, 0, false)], &device);
         let gradient =
-            model::checked_gradients(&model, model::loss(model.forward(&batch), &batch)).unwrap();
+            model::checked_gradients(&model, model.loss(model.forward(&batch), &batch)).unwrap();
         model = optim.step(c.learning_rate, model, gradient);
         let original_model = model.clone();
         let state = State {
@@ -895,7 +903,7 @@ mod summary_tests {
         let optim_hash = checkpoint::file_sha256(&path.join("optimizer.burnpack")).unwrap();
         checkpoint(&c, &path, &model, &optim, &state).unwrap();
         let gradient =
-            model::checked_gradients(&model, model::loss(model.forward(&batch), &batch)).unwrap();
+            model::checked_gradients(&model, model.loss(model.forward(&batch), &batch)).unwrap();
         model = optim.step(c.learning_rate, model, gradient);
         assert!(
             checkpoint(&c, &path, &model, &optim, &state).is_err(),

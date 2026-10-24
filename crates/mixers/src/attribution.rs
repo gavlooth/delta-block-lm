@@ -198,7 +198,8 @@ impl Fixture {
                     self.mixed.clone(),
                     self.projected[6].clone().reshape([b, t, h, v]),
                 );
-                mixer.project_output(mixed.reshape([b, t, h * v]))
+                mixer
+                    .project_output(mixed.reshape([b, t, h * v]))
                     .flatten(0, 2)
             }
             Component::Masks => {

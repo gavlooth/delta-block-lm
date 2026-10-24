@@ -1,5 +1,5 @@
 use crate::{
-    config::{Arm, Config, HeadBackend},
+    config::{Arm, Config, HeadBackend, LossBackend, UpdateBackend},
     data::Batch,
 };
 use anyhow::{Result, ensure};
@@ -33,6 +33,10 @@ pub struct LanguageModel {
     pub(super) normalization_backend: delta_mixers::NormalizationBackend,
     #[module(skip)]
     pub(super) head_backend: HeadBackend,
+    #[module(skip)]
+    pub(super) loss_backend: LossBackend,
+    #[module(skip)]
+    pub(super) update_backend: UpdateBackend,
 }
 impl LanguageModel {
     pub fn new(c: &Config, arm: &Arm, device: &Device) -> Result<Self> {
@@ -70,6 +74,8 @@ impl LanguageModel {
             head: linear(c.d_model, c.vocab()),
             normalization_backend: c.normalization_backend,
             head_backend: c.head_backend,
+            loss_backend: c.loss_backend,
+            update_backend: c.update_backend,
         })
     }
     pub fn set_scan_backend(&mut self, backend: delta_mixers::ScanBackend) {
@@ -95,6 +101,15 @@ impl LanguageModel {
     }
     pub fn set_head_backend(&mut self, backend: HeadBackend) {
         self.head_backend = backend;
+    }
+    pub fn set_loss_backend(&mut self, backend: LossBackend) {
+        self.loss_backend = backend;
+    }
+    pub fn set_update_backend(&mut self, backend: UpdateBackend) {
+        self.update_backend = backend;
+    }
+    pub fn loss(&self, logits: Tensor<3>, batch: &Batch) -> Tensor<1> {
+        loss_selected(logits, batch, self.loss_backend)
     }
     pub(super) fn head_forward(&self, hidden: Tensor<3>) -> Tensor<3> {
         match self.head_backend {
@@ -162,12 +177,33 @@ pub(super) fn heuristic_matmul(a: Tensor<2>, b: Tensor<2>) -> Tensor<2> {
         panic!("heuristic matmul requires a GPU feature")
     }
 }
-pub fn loss(logits: Tensor<3>, batch: &Batch) -> Tensor<1> {
+pub fn loss_selected(logits: Tensor<3>, batch: &Batch, backend: LossBackend) -> Tensor<1> {
     let [b, t, v] = logits.dims();
-    let chosen = log_softmax(logits.reshape([b * t, v]), 1)
-        .gather(1, batch.target.clone().reshape([b * t, 1]))
-        .reshape([b, t]);
-    (chosen.neg() * batch.weight.clone()).sum() / batch.weight.clone().sum()
+    let chosen = if backend.is_tensor() {
+        log_softmax(logits.reshape([b * t, v]), 1)
+            .gather(1, batch.target.clone().reshape([b * t, 1]))
+            .reshape([b, t])
+            .neg()
+    } else {
+        #[cfg(any(feature = "vulkan", feature = "cuda"))]
+        {
+            delta_kernels::cross_entropy_rows(
+                logits.reshape([b * t, v]),
+                batch.target.clone().reshape([b * t]).float(),
+                if backend == LossBackend::Fused64 {
+                    64
+                } else {
+                    256
+                },
+            )
+            .reshape([b, t])
+        }
+        #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
+        {
+            panic!("fused cross entropy requires a GPU feature")
+        }
+    };
+    (chosen * batch.weight.clone()).sum() / batch.weight.clone().sum()
 }
 pub fn scalar(tensor: Tensor<1>) -> Result<f64> {
     let data = tensor
@@ -187,29 +223,43 @@ pub fn checked_gradients_profiled<P: Sections>(
     loss: Tensor<1>,
     profile: &mut P,
 ) -> Result<GradientsParams> {
+    let grads = profile.section("Backward (total only)", || {
+        GradientsParams::from_grads(loss.backward(), model)
+    });
+    check_parameter_gradients(model, &grads, profile)?;
+    Ok(grads)
+}
+pub(super) fn check_parameter_gradients<P: Sections>(
+    model: &LanguageModel,
+    grads: &GradientsParams,
+    profile: &mut P,
+) -> Result<()> {
     struct Check<'a> {
         grads: &'a GradientsParams,
         missing: usize,
         norms: Vec<Tensor<1>>,
+        backend: UpdateBackend,
     }
     impl ModuleVisitor for Check<'_> {
         fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
             if let Some(g) = self.grads.get::<D>(param.id) {
                 // A squared sum catches NaN and overflow; reduce once on device per parameter.
-                self.norms.push(g.square().sum());
+                self.norms.push(if self.backend.is_tensor() {
+                    g.square().sum()
+                } else {
+                    crate::update::square_sum(g)
+                });
             } else {
                 self.missing += 1;
             }
         }
     }
-    let grads = profile.section("Backward (total only)", || {
-        GradientsParams::from_grads(loss.backward(), model)
-    });
     let total = profile.section("Gradient checks: reductions", || -> Result<Tensor<1>> {
         let mut check = Check {
-            grads: &grads,
+            grads,
             missing: 0,
             norms: Vec::new(),
+            backend: model.update_backend,
         };
         model.visit(&mut check);
         ensure!(
@@ -223,7 +273,7 @@ pub fn checked_gradients_profiled<P: Sections>(
         .section("Host/device: gradient norm readback", || scalar(total))
         .is_ok();
     ensure!(finite, "nonfinite parameter gradients");
-    Ok(grads)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -288,7 +338,7 @@ mod tests {
         let mut before = Parameters(Vec::new());
         model.blocks[0].mixer.visit(&mut before);
         let mut optim = crate::train::optimizer(&c);
-        let objective = loss(model.forward(&batch), &batch);
+        let objective = model.loss(model.forward(&batch), &batch);
         let grads = checked_gradients(&model, objective).unwrap();
         model = optim.step(0.001, model, grads);
         let mut after = Parameters(Vec::new());
@@ -317,9 +367,9 @@ mod tests {
         .unwrap();
         let mut restored_optim =
             crate::checkpoint::load_optimizer(&c, path.join("optimizer.burnpack")).unwrap();
-        let grads = checked_gradients(&model, loss(model.forward(&batch), &batch)).unwrap();
+        let grads = checked_gradients(&model, model.loss(model.forward(&batch), &batch)).unwrap();
         let restored_grads =
-            checked_gradients(&restored, loss(restored.forward(&batch), &batch)).unwrap();
+            checked_gradients(&restored, restored.loss(restored.forward(&batch), &batch)).unwrap();
         let model = optim.step(0.001, model, grads);
         let restored = restored_optim.step(0.001, restored, restored_grads);
         let difference = (model.forward(&batch) - restored.forward(&batch))
