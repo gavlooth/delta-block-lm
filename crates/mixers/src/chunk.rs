@@ -37,6 +37,29 @@ pub fn scan_selected(
 ) -> ScanOutput {
     match backend {
         ScanBackend::TensorSolver => scan(kind, input, valid, reset, chunk_size, initial),
+        ScanBackend::FusedGdn2 => {
+            assert_eq!(kind, MixerKind::Gdn2, "fused_gdn2 requires GDN-2");
+            assert_fused_device(&input.q.device());
+            #[cfg(any(feature = "vulkan", feature = "cuda"))]
+            {
+                let [batch, _, heads, keys] = input.q.dims();
+                let values = input.v.dims()[3];
+                let initial = initial.unwrap_or_else(|| {
+                    Tensor::zeros([batch, heads, keys, values], &input.q.device())
+                });
+                let result = delta_kernels::gdn_training_scan(
+                    input.q, input.k, input.v, input.alpha, input.erase, input.write,
+                    valid, reset, initial, chunk_size,
+                );
+                ScanOutput {
+                    output: result.output,
+                    final_state: result.final_state,
+                    scores: result.scores,
+                }
+            }
+            #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
+            unreachable!("fused GDN-2 scan requires the vulkan or cuda feature")
+        }
         ScanBackend::FusedGpu | ScanBackend::FusedParallel128 | ScanBackend::FusedParallel256 => {
             assert_eq!(
                 kind,

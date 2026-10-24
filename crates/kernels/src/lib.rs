@@ -7,6 +7,12 @@ mod ops;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 pub use ops::gdn2_scan;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod gdn_training;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod gdn_training_ops;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+pub use gdn_training_ops::{GdnTrainingOutput, gdn_training_scan};
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
 mod kron;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 mod kron_ops;

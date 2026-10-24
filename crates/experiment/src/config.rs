@@ -27,8 +27,8 @@ impl Arm {
             value => anyhow::bail!("unknown cache {value}"),
         };
         ensure!(
-            !c.scan_backend.is_fused() || kind == MixerKind::KronLstm,
-            "fused_gpu is KronLSTM-only; use tensor_solver for GDN-2"
+            c.scan_backend.supports(kind),
+            "scan selector does not support mixer kind: use fused_gdn2 for GDN-2, existing fused selectors for KronLSTM"
         );
         Ok(MixerConfig {
             d_model: c.d_model,
@@ -57,6 +57,8 @@ impl Arm {
             (ScanBackend::FusedParallel256, false) => "fused_kron_parallel256_gpu",
             (ScanBackend::FusedParallel128, true) => "fused_kron_parallel128_and_hola_gpu",
             (ScanBackend::FusedParallel256, true) => "fused_kron_parallel256_and_hola_gpu",
+            (ScanBackend::FusedGdn2, false) => "fused_gdn2_gpu",
+            (ScanBackend::FusedGdn2, true) => "fused_gdn2_and_hola_gpu",
         }
     }
     pub fn uses_custom_gpu(&self, c: &Config) -> bool {

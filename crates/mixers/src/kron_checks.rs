@@ -9,6 +9,7 @@ use serde::Serialize;
 
 #[derive(Debug, Serialize)]
 pub struct KronCheck {
+    pub mixer: MixerKind,
     pub scan_backend: ScanBackend,
     pub tokens: usize,
     pub objective: &'static str,
@@ -67,7 +68,7 @@ pub fn kron_numerical_checks_selected(
             if objective.is_some_and(|selected| selected != mode) {
                 continue;
             }
-            reports.push(check(&device, backend, time, mode, false).map_err(|error| {
+            reports.push(check(&device, backend, MixerKind::KronLstm, time, mode, false).map_err(|error| {
                 let objective = match mode {
                     0 => "output+final_state+score",
                     1 => "output_only",
@@ -79,7 +80,37 @@ pub fn kron_numerical_checks_selected(
         }
     }
     if tokens.is_none() && objective.is_none() {
-        reports.push(check(&device, backend, 35, 0, true)?);
+        reports.push(check(&device, backend, MixerKind::KronLstm, 35, 0, true)?);
+    }
+    Ok(reports)
+}
+
+/// Independent GDN-2 output/state/score/initial VJPs at the original tolerances.
+pub fn gdn_numerical_checks_selected(
+    device: &Device,
+    backend: ScanBackend,
+    tokens: Option<usize>,
+    objective: Option<usize>,
+) -> Result<Vec<KronCheck>, String> {
+    if !backend.supports(MixerKind::Gdn2) {
+        return Err("GDN-2 requires tensor_solver or fused_gdn2".into());
+    }
+    if tokens.is_some_and(|n| !(1..=512).contains(&n))
+        || objective.is_some_and(|mode| mode > 3) {
+        return Err("GDN-2 reference expects tokens 1..=512 and objective 0..=3".into());
+    }
+    let device = device.clone().autodiff();
+    if backend.is_fused() { chunk::assert_fused_device(&device); }
+    let mut reports = Vec::new();
+    for time in tokens.map_or_else(|| vec![1, 7, 35], |n| vec![n]) {
+        for mode in 0..4 {
+            if objective.is_some_and(|selected| selected != mode) { continue; }
+            reports.push(check(&device, backend, MixerKind::Gdn2, time, mode, false)
+                .map_err(|error| format!("GDN-2 {backend:?} T{time} objective={mode}: {error}"))?);
+        }
+    }
+    if tokens.is_none() && objective.is_none() {
+        reports.push(check(&device, backend, MixerKind::Gdn2, 35, 0, true)?);
     }
     Ok(reports)
 }
@@ -87,11 +118,12 @@ pub fn kron_numerical_checks_selected(
 fn check(
     device: &Device,
     backend: ScanBackend,
+    kind: MixerKind,
     time: usize,
     mode: usize,
     strided: bool,
 ) -> Result<KronCheck, String> {
-    let mut f = Fixture::new(MixerKind::KronLstm, time);
+    let mut f = Fixture::new(kind, time);
     // Both non-reset initial-state dependence and reset-discarded initial state are exercised.
     f.reset[0] = false;
     if time == 1 {
@@ -120,10 +152,13 @@ fn check(
                 }
                 let scalar = (row * time + p) * f.h + h;
                 if p == 1 {
-                    f.data[4][scalar] = 0.;
-                    f.data[5][scalar] = 0.; // exactly zero correction with nonzero norms
+                    for field in [4, 5] {
+                        let width = f.widths[field];
+                        f.data[field][scalar * width..(scalar + 1) * width].fill(0.);
+                    } // exactly zero edit with nonzero key/value norms
                 } else if p == 3 {
-                    f.data[5][scalar] = -0.2; // signed correction; score must use its absolute value
+                    let width = f.widths[5];
+                    f.data[5][scalar * width..(scalar + 1) * width].fill(-0.2);
                 } else if p == 4 || p == 6 {
                     let field = if p == 4 { 1 } else { 2 };
                     let width = f.widths[field];
@@ -185,7 +220,7 @@ fn check(
             let valid = &f.valid[row * time..(row + 1) * time];
             let reset = &f.reset[row * time..(row + 1) * time];
             let forward =
-                reference::scan(MixerKind::KronLstm, &tokens, valid, reset, Some(&initial));
+                reference::scan(kind, &tokens, valid, reset, Some(&initial));
             let upstream = (0..time)
                 .map(|p| {
                     let first = ((row * time + p) * f.h + head) * f.v;
@@ -209,7 +244,7 @@ fn check(
                 })
                 .collect::<Vec<_>>();
             let backward = reference::backward(
-                MixerKind::KronLstm,
+                kind,
                 &tokens,
                 valid,
                 reset,
@@ -275,7 +310,7 @@ fn check(
     };
     let out = chunk::scan_selected(
         backend,
-        MixerKind::KronLstm,
+        kind,
         scan_input(&x),
         valid.clone(),
         reset.clone(),
@@ -381,7 +416,7 @@ fn check(
         let (a, av, ar) = section(0, split);
         let a = chunk::scan_selected(
             backend,
-            MixerKind::KronLstm,
+            kind,
             a,
             av,
             ar,
@@ -391,7 +426,7 @@ fn check(
         let (b, bv, br) = section(split, time);
         let b = chunk::scan_selected(
             backend,
-            MixerKind::KronLstm,
+            kind,
             b,
             bv,
             br,
@@ -479,6 +514,7 @@ fn check(
         (0., 0.)
     };
     Ok(KronCheck {
+        mixer: kind,
         scan_backend: backend,
         tokens: time,
         strided_inputs: strided,

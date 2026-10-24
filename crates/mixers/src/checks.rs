@@ -9,7 +9,7 @@ use serde::Serialize;
 use std::time::Instant;
 #[path = "kron_checks.rs"]
 mod kron;
-pub use kron::{KronCheck, kron_numerical_checks, kron_numerical_checks_selected};
+pub use kron::{KronCheck, gdn_numerical_checks_selected, kron_numerical_checks, kron_numerical_checks_selected};
 #[path = "hola_checks.rs"]
 mod hola;
 pub use hola::{
@@ -27,6 +27,7 @@ pub struct NumericalReport {
     pub layer: Vec<LayerCheck>,
     pub fused_kron: Vec<KronCheck>,
     pub fused_hola: Vec<HolaCheck>,
+    pub fused_gdn: Vec<KronCheck>,
 }
 #[derive(Debug, Serialize)]
 pub struct RecurrenceCheck {
@@ -472,12 +473,23 @@ pub fn numerical_checks(device: &Device) -> Result<NumericalReport, String> {
         }
     }
     let fused_kron = kron_numerical_checks(&device)?;
+    let mut fused_gdn = gdn_numerical_checks_selected(
+        &device, ScanBackend::TensorSolver, None, None,
+    )?;
     let mut fused_hola = Vec::new();
     #[cfg(any(feature = "vulkan", feature = "cuda"))]
     if matches!(
         device.clone().inner().as_dispatch(),
         burn::backend::DispatchDevice::Cube(_)
     ) {
+        fused_gdn.extend(gdn_numerical_checks_selected(
+            &device, ScanBackend::FusedGdn2, None, None,
+        )?);
+        for policy in [CachePolicy::None, CachePolicy::Surprise, CachePolicy::Recency] {
+            layer.push(layer_check(
+                &device, MixerKind::Gdn2, policy, ScanBackend::FusedGdn2, HolaBackend::Tensor,
+            )?);
+        }
         for policy in [
             CachePolicy::None,
             CachePolicy::Surprise,
@@ -522,6 +534,7 @@ pub fn numerical_checks(device: &Device) -> Result<NumericalReport, String> {
         layer,
         fused_kron,
         fused_hola,
+        fused_gdn,
     })
 }
 

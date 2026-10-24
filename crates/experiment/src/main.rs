@@ -143,7 +143,7 @@ fn execute() -> Result<()> {
         "--legacy-stress-report is only valid for kron-model-benchmark"
     );
     ensure!(
-        command == "kron-reference"
+        matches!(command.as_str(), "kron-reference" | "gdn-reference")
             || (reference_scan_backend.is_none()
                 && reference_tokens.is_none()
                 && reference_objective.is_none()),
@@ -162,6 +162,7 @@ fn execute() -> Result<()> {
             command.as_str(),
             "kron-benchmark"
                 | "kron-model-benchmark"
+                | "gdn-benchmark"
                 | "profile"
                 | "backward-profile"
                 | "projection-benchmark"
@@ -184,6 +185,7 @@ fn execute() -> Result<()> {
             command.as_str(),
             "kron-benchmark"
                 | "kron-model-benchmark"
+                | "gdn-benchmark"
                 | "hola-benchmark"
                 | "profile"
                 | "backward-profile"
@@ -205,7 +207,7 @@ fn execute() -> Result<()> {
     ensure!(
         !matches!(
             command.as_str(),
-            "kron-benchmark" | "kron-model-benchmark" | "hola-benchmark"
+            "kron-benchmark" | "kron-model-benchmark" | "hola-benchmark" | "gdn-benchmark"
         ) || (arm_name.is_none() && resume.is_none() && seed == c.seed),
         "benchmarks use configured/fixed paired fixtures, not --arm/--seed/--resume"
     );
@@ -255,6 +257,7 @@ fn execute() -> Result<()> {
                     | "io-benchmark"
                     | "kron-benchmark"
                     | "kron-model-benchmark"
+                    | "gdn-benchmark"
             ),
         "autotuned training certifies the configured fused LM only; this command changes GEMM execution/geometry internally"
     );
@@ -329,6 +332,16 @@ fn execute() -> Result<()> {
             );
             json!({"schema":1,"command":"kron-reference","passed":report.is_ok(),"device":runtime::identity(&device),"config":c,"scan_backend":selected,"tokens":reference_tokens,"objective":reference_objective,"numerical_report":report.as_ref().ok(),"error":report.as_ref().err()})
         }
+        "gdn-reference" => {
+            let selected = reference_scan_backend.unwrap_or(c.scan_backend);
+            let report = delta_mixers::checks::gdn_numerical_checks_selected(
+                &device, selected, reference_tokens, reference_objective,
+            );
+            json!({"schema":1,"command":command,"passed":report.is_ok(),"device":runtime::identity(&device),"config":c,"scan_backend":selected,"tokens":reference_tokens,"objective":reference_objective,"numerical_report":report.as_ref().ok(),"error":report.as_ref().err()})
+        }
+        "gdn-benchmark" => kron_benchmark::gdn_run(
+            &c, &device, benchmark_warmups.unwrap_or(2), benchmark_trials.unwrap_or(5),
+        )?,
         "hola-reference" => {
             let report = if let Some(selected) = reference_hola_backend {
                 delta_mixers::checks::hola_numerical_checks_selected(&device, selected)
@@ -538,6 +551,7 @@ fn execute() -> Result<()> {
                 | "soft-benchmark"
                 | "soft-step"
                 | "io-benchmark"
+                | "gdn-benchmark"
         ) || result["completed"] == true,
         "profile/benchmark failed or hit its deadline; separate partial report retained"
     );
@@ -547,6 +561,7 @@ fn execute() -> Result<()> {
             "checkpoint-check"
                 | "certify"
                 | "kron-reference"
+                | "gdn-reference"
                 | "hola-reference"
                 | "kron-model-check"
                 | "normalization-reference"
