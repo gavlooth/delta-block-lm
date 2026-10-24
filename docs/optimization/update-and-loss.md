@@ -1,5 +1,11 @@
 # AdamW/checks/clipping and cross-entropy evaluation
 
+## Decision
+
+**Adopt `update_backend: "fused_gpu"` explicitly for the realistic B8/context512 pilot; keep `loss_backend: "tensor"` (or omit it).** The final isolated B8/context512 session saves31.005ms per paired complete step (1.739%;95% paired-median bootstrap interval22.088–49.058ms), while complete resident checks+clipping+AdamW falls35.122→13.685ms. Both fused loss designs pass correctness but fail the beyond-noise integrated-speed gate; the combined update+loss gain does not establish an independent loss benefit.
+
+Historical/default selectors, fingerprints, parameter layout and native optimizer-state layout remain unchanged. The suggested component budget before scaling is **15ms for complete checks/clipping/update at B8/context512 and the current2,379,568 parameters**, rather than assuming dispatch reduction equals model speedup. The short-context B8 timing anomaly below does not satisfy that budget and is not generalized into a stable speedup claim. Larger K/V widths, contexts beyond512 and other devices/dtypes are not certified by this evaluation.
+
 ## Scope and baseline
 
 Intel Arc MTL integrated GPU (`spirv_32902_32085`), Vulkan, f32, Burn 0.22 / CubeCL 0.11; no Burn fusion or matmul autotune. The controlled model is `configs/lm512-projections.json`: four layers, width 256, H4/K32/V64, chunk/cache 16, fused KronLSTM/HOLA, merged projections, tensor normalization, native 257-column vocabulary head, seed 1 and pinned byte-LM corpus. Batch 8 is the adoption workload; batch 1 and contexts 128/512 are reported separately. Recommended and historical config files are unchanged.
@@ -29,7 +35,7 @@ Both candidates eliminate the vocabulary-sized log-softmax and its generic backw
 
 All production, evaluation, diagnostics, profiling and model-check callsites select loss through the model. The CPU model oracle explicitly keeps tensor update/loss, rather than accidentally certifying a GPU candidate against itself. No new optimizer-state layout or historical config migration is needed.
 
-## Numerical and checkpoint evidence
+## Provisional numerical and checkpoint evidence
 
 Unchanged tolerance throughout: `2e-5 + 3e-4*abs(reference)`, with the original independent CPU directional gate's `3e-3 + .03*abs(reference)`.
 
@@ -41,6 +47,8 @@ Unchanged tolerance throughout: `2e-5 + 3e-4*abs(reference)`, with the original 
 - Benchmark state roundtrips save native-layout fused optimizer moments and load/validate them through both implementations.
 
 Evidence root: `artifacts/update-and-loss/`. Scalar/reference and continuation report: `baseline-b1/update-loss-reference.json`. Configured model gate: `both/kron-model-check-2657068-1792866488775894497/report.json`. CPU test output is the recorded `cargo test --workspace` run; no tolerances or old failures were changed.
+
+Review identified a valid native-checkpoint consumer case omitted by the pilot checkpoint: `max_moment_2: Some(...)` can remain in an ordinary AdamW state after disabling AMSGrad. The initial fused wrapper incorrectly asserted that it was absent, although the native loader accepts it and native ordinary AdamW preserves it. Frozen source commit `b379379d1180d9f1bc8bc038034668ad3b0a4983` removes that assertion and retains the optional tensor unchanged; the ordinary update still uses current second moment, not the stored maximum. The regression creates an AMSGrad producer checkpoint, loads it through ordinary native and fused consumers, compares three continuation updates, checks exact maximum-tensor signatures after every step, and validates another save/load roundtrip.
 
 ## Initial batch-8/context-512 experiment
 
@@ -77,6 +85,8 @@ Unchanged parameter payload **9,518,272bytes**, AdamW moments **19,036,544bytes*
 
 The unavoidable head logits and logits VJP remain full vocabulary-sized tensors. Loss work is O(batch*context*vocabulary), not quadratic in context; shared reductions use256bytes or1024bytes per workgroup. The first five-trajectory session sampled825,641,280bytes of shared pool reservation, including all trajectories/retained optimizer states and allocator reuse. That is neither a candidate-specific live-byte count nor a physical GPU peak. Logical sizes are retained in `logical-memory.json`.
 
+Those logical tensor sizes are **not net retained-memory savings**. The custom VJP retains logits where the native log-softmax VJP can retain log-probabilities instead; avoiding a4,210,688byte B8/C512 log-softmax result does not prove that much lower live or peak memory. The final reported pool reservation likewise includes all five scratch trajectories and both isolated-update states.
+
 ## Reproduction
 
 From the `optim` workspace, build only with `../build.sh optim`. Binaries are `/tmp/delta-bins/optim/delta-experiment`, never `target/debug`. The saved `artifacts/update-and-loss/*.json` inputs copy the recommended config, disable budget output, choose a fresh artifact directory, and vary only batch/context or the explicit component selectors. All commands executing GPU work are wrapped in `flock /tmp/delta-block-lm-gpu.lock`; each actual GPU run has a deadline of at most300s.
@@ -95,3 +105,127 @@ bun scripts/summarize-update-loss.ts artifacts/update-and-loss/summary.json REPO
 ```
 
 `update-loss-reference` can omit `--resume` to run just independent numerical/safety checks; supplying a historical directory explicitly adds its validated three-step continuation. The benchmark saves incremental reports before/toward its cooperative deadline and observes launches only in separate warm steps. `scripts/summarize-update-loss.ts` uses10000 deterministic bootstrap resamples (seed0x5eed) of within-trial differences; intervals are exploratory percentile intervals, not multiple-comparison-adjusted acceptance probabilities.
+
+## Frozen source and isolated build
+
+The production source is frozen in commit `b379379d1180d9f1bc8bc038034668ad3b0a4983` (change `mrqwrnsotxvylvyxmuuxzlrwsmxwxunz`). Remaining documentation is in evidence child `lrkouyttxtnnyuxrxtnuzvwonsqzwyyz`, so evidence snapshots do not rewrite the production commit.
+
+- SHA256 of canonical `source_files` JSON (54 sorted inputs): `a9beab9a86581f7cc9c9f984d19b452dfe98a6eaeb9eb56b495be20cda50de5c`.
+- Fixed build-helper SHA256: `987e44a9fd1711ab16924014d73b2629627e7f9e19cbe3fca4610b480aa381e3`.
+- Private executable SHA256: `a54651d55a3242a43879c2a4e53398c70ca248ae1bd5d6e2164ce738f3a228a3`.
+- Proof files: `artifacts/update-and-loss/source-manifest-b379379d.json` and `candidate-b379379d.json`. The manifest includes every Rust source in all three local crates, all Cargo manifests/lockfile and `.cargo/config.toml`; the source checksum was unchanged after the build.
+- The fixed helper cleaned only local packages, then built default-CPU+Vulkan without fusion/autotune. Reported lock wait245s; Cargo build3.98s; outer transaction248.76s. The wait is not compilation or GPU execution time. `.cache` and `.cache/cubecl` were observed to be directories, not symlinks.
+
+Final hardware commands use `/usr/bin/time` outside and inside the GPU lock: `outer_wall_seconds` includes queueing; `locked_execution_seconds` excludes queueing but includes process/device setup, compilation if needed, warmups, checks and report I/O. Warm complete-step samples remain independently synchronized and exclude those startup/report costs. Each locked binary invocation is limited by `timeout 290s`.
+
+## Final isolated correctness
+
+The frozen-source/private-binary invocation passed with `passed:true`, no error, the private relative shader cache and unchanged tolerances. Report: `artifacts/update-and-loss/isolated-reference/update-loss-reference.json`.
+
+| Check | Cases/steps | Largest absolute difference |
+|---|---:|---:|
+| Scalar-f64 weighted loss | 32 | 4.035e-7 |
+| Scalar-f64 row cross-entropy | 32 | 1.253e-6 |
+| Every logits VJP | 32 | 2.375e-8 |
+| Every floating loss-weight VJP | 32 | 9.362e-7 |
+| AdamW parameter/moment oracle and native comparison | 16 × 5 updates | parameter error1.306e-7 |
+| Historical checkpoint-13, every parameter gradient | 3 real updates | 4.285e-8 |
+| Historical checkpoint-13, every updated parameter | 3 real updates | 9.537e-7 |
+| Native AMSGrad producer→ordinary native/fused checkpoint consumers | 3 real updates + roundtrip | parameter error1.491e-8 |
+
+The optional maximum tensor is **exactly** preserved after every consumer update and after saving/reloading the continued fused optimizer; this is a typed tensor-signature equality check, not a tolerance-based omission. Its complete native/fused checkpoint fixture is retained under `isolated-reference/optional-maximum-2903896-1792868585398371159/`. Both missing-gradient paths and NaN/±infinity/squared-overflow rejection pass. Zero/clipped gradients, transposed storage and loss padding weights remain part of the independent oracle.
+
+Locked execution was9.25s; outer wall160.56s, hence approximately151.31s of lock queueing/process overhead outside the lock. No fresh duplicate full model/reference matrix is claimed here: the preceding passing matrices remain separately labelled provisional; the coordinator requested one final isolated correctness gate and owns the combined post-integration model/checkpoint gates.
+
+## Decisive B8/context512 paired confirmation
+
+Frozen source/private binary above, private shader cache, GPU/build transaction isolation, two warmups and **15 rotating/reversed paired trials** in one session. No build or another participating GPU run overlaps these samples. Complete steps retain loss and gradient readbacks, all missing/nonfinite checks, the original per-parameter clipping semantics, AdamW and actual batch uploads.
+
+| Update / loss | Median complete step ms | Median paired saved ms | Median paired saved % | 95% paired-median bootstrap interval, ms | Kernels/step |
+|---|---:|---:|---:|---:|---:|
+| tensor / tensor | 1786.758 | 0 | 0 | — | 5833 |
+| fused / tensor | 1760.759 | 31.005 | 1.739 | [22.088,49.058] | 3922 |
+| tensor / fused64 | 1790.214 | 5.278 | 0.296 | [-14.771,31.623] | 5815 |
+| tensor / fused256 | 1790.506 | -2.516 | -0.141 | [-26.652,13.285] | 5815 |
+| fused / fused256 | 1756.682 | 35.893 | 1.927 | [19.568,41.362] | 3904 |
+
+The update-only saving is positive in12/15 trials; baseline samples span1685.928–1936.835ms, so absolute throughput still drifts. The paired interval excludes zero despite that drift. Use the update-only arm for attribution: the combined arm's positive interval can be explained by the accepted update and does not rescue either loss-only interval.
+
+| Resident actual-shape component | Tensor | Fused64 | Fused256 |
+|---|---:|---:|---:|
+| Final norm + native vocabulary head + loss, forward ms | 8.314 | 7.886 | 7.535 |
+| Same component, forward+backward ms | 19.564 | 19.759 | 19.596 |
+
+Resident full-parameter safety checks+clipping+AdamW: **35.122ms tensor /13.685ms fused**. This separate component result is not substituted for the measured31.005ms paired whole-step saving. Final shared pool reservation was825,509,952bytes, with the multi-trajectory/live-vs-reserved limitations described above. Both optimizer state cross-load validators pass.
+
+Raw samples/histograms: `final-b8-c512/update-loss-2907981-1792868606011947909/report.json`; reproducible paired summary: `final-b8-summary.json`. Locked execution164.63s; outer166.81s; approximate queueing/outer process overhead2.18s. The run used `final-b8-c512.json`, `--warmups 2 --trials 15`, with the290s timeout inside the GPU lock.
+
+## Required batch/context comparisons
+
+All four runs use the same frozen source/private binary and two warmups. B8/context512 has15 trials; the other shapes have9. Column order below is the five independent, equal-start trajectories used within every rotating/reversed trial. These are complete forward+backward+checks+clipping+AdamW steps, not isolated kernels.
+
+| Batch / context | Tensor update/loss ms | Fused update / tensor loss ms | Tensor update / fused64 loss ms | Tensor update / fused256 loss ms | Fused update / fused256 loss ms |
+|---|---:|---:|---:|---:|---:|
+| 1 / 128 | 185.563 | 170.411 | 190.088 | 192.138 | 166.696 |
+| 1 / 512 | 555.236 | 551.728 | 557.646 | 572.233 | 547.707 |
+| 8 / 128 | 414.309 | 357.085 | 381.264 | 524.910 | 363.451 |
+| 8 / 512 | 1786.758 | 1760.759 | 1790.214 | 1790.506 | 1756.682 |
+
+Each cell in the next table is **median paired saved ms [95% paired bootstrap interval]**, always relative to that trial's tensor/tensor step. Positive is faster; intervals crossing zero are not speedup evidence.
+
+| Batch / context | Fused update | Fused64 loss only | Fused256 loss only | Fused update + fused256 loss |
+|---|---|---|---|---|
+| 1 / 128 | 16.061 [15.030,24.431] | -1.435 [-9.213,2.600] | -3.185 [-10.063,9.460] | 18.997 [15.717,23.881] |
+| 1 / 512 | 7.398 [-11.921,17.424] | -17.443 [-24.575,3.100] | -11.274 [-37.023,1.449] | 16.027 [-17.245,31.542] |
+| 8 / 128 | 57.224 [23.856,346.328] | -3.000 [-84.616,49.250] | 1.323 [-25.020,79.562] | 57.568 [27.280,252.725] |
+| 8 / 512 | 31.005 [22.088,49.058] | 5.278 [-14.771,31.623] | -2.516 [-26.652,13.285] | 35.893 [19.568,41.362] |
+
+Update-only paired median percentages are8.837% /1.332% /13.812% /1.739% in table order. **B1/context512 does not establish a beyond-noise integrated gain** in its9-trial session; it is not presented as a confirmed4–5% speedup from the isolated component. The adoption decision uses the explicitly requested realistic B8/context512 result.
+
+Issued kernels/step in column order:
+
+- B1, both contexts: **5780 /3869 /5762 /5762 /3851**.
+- B8, both contexts: **5833 /3922 /5815 /5815 /3904**.
+
+| Batch / context | Complete resident checks+clipping+AdamW tensor / fused ms | Final norm/head/loss F / FB ms, tensor | F / FB ms, fused64 | F / FB ms, fused256 | Sampled pool reservation bytes |
+|---|---:|---:|---:|---:|---:|
+| 1 / 128 | 35.797 /12.802 | 1.663 /2.817 | 1.306 /2.172 | 1.398 /2.243 | 228083456 |
+| 1 / 512 | 38.138 /12.439 | 2.610 /4.747 | 2.394 /4.613 | 2.642 /4.994 | 252855104 |
+| 8 / 128 | 205.881 /122.627 | 12.199 /28.024 | 7.764 /28.068 | 7.304 /19.779 | 340929856 |
+| 8 / 512 | 35.122 /13.685 | 8.314 /19.564 | 7.886 /19.759 | 7.535 /19.596 | 825509952 |
+
+**Short-context B8 anomaly, retained rather than hidden:** its baseline full steps range365.495–1034.618ms. Resident update samples range138.396–684.114ms for tensor and35.888–209.700ms for fused, despite the same parameter count and fixed resident gradients within that component loop. The cause is not attributed: no additional hardware experiment was run at the coordinator's request. These highly variable samples do not establish a stable13.8% short-context gain, a constant update cost at every shape, or satisfaction of the15ms B8/context512 component budget at context128. B1/context128 is separately stable enough for a positive paired interval; neither result substitutes for the decisive realistic long-context batch.
+
+All four optimizer-state cross-load checks pass. Pool reservations include all scratch trajectories, isolated states and allocator reuse, not candidate-specific physical peaks. No loss-only interval excludes zero at any required shape; the smaller loss-only isolated F/FB values at some shapes do not justify adopting a loss selector.
+
+Raw reports (all under `artifacts/update-and-loss/`):
+
+- `final-b1-c128/update-loss-3004074-1792869212665013350/report.json`
+- `final-b1-c512/update-loss-2968348-1792869019098050732/report.json`
+- `final-b8-c128/update-loss-2978366-1792869078503342937/report.json`
+- `final-b8-c512/update-loss-2907981-1792868606011947909/report.json`
+
+`final-summary.json` contains every mode's medians, paired intervals, launch counts and component samples' medians. `shape-diagnostics.json` retains the anomalous ranges. `isolated-command-outcomes.json` binds every final command to the frozen source/binary hashes and separates queueing from locked execution:
+
+| Command | Locked execution s | Outer wall s | Approximate queue/outer overhead s |
+|---|---:|---:|---:|
+| Independent reference + both checkpoint continuation regressions | 9.25 | 160.56 | 151.31 |
+| B8 / 512,15 trials | 164.63 | 166.81 | 2.18 |
+| B1 / 512,9 trials | 35.92 | 412.36 | 376.44 |
+| B8 / 128,9 trials | 46.55 | 70.05 | 23.50 |
+| B1 / 128,9 trials | 13.06 | 100.64 | 87.58 |
+
+### Exact final bounded commands
+
+Run from the named workspace. The two timing wrappers distinguish queueing from locked execution; each `timeout` is inside the resource lock. The four step sessions use the same already-copied binary, not a rebuild between arms.
+
+```sh
+../build.sh optim
+/usr/bin/time -f 'outer_wall_seconds=%e' flock /tmp/delta-block-lm-gpu.lock /usr/bin/time -f 'locked_execution_seconds=%e' timeout 290s /tmp/delta-bins/optim/delta-experiment update-loss-reference artifacts/update-and-loss/isolated-reference.json --resume artifacts/lm512-vulkan/kronlstm-hola-seed1/checkpoint-13
+/usr/bin/time -f 'outer_wall_seconds=%e' flock /tmp/delta-block-lm-gpu.lock /usr/bin/time -f 'locked_execution_seconds=%e' timeout 290s /tmp/delta-bins/optim/delta-experiment update-loss-benchmark artifacts/update-and-loss/final-b8-c512.json --warmups 2 --trials 15
+/usr/bin/time -f 'B1C512_outer_wall_seconds=%e' flock /tmp/delta-block-lm-gpu.lock /usr/bin/time -f 'B1C512_locked_execution_seconds=%e' timeout 290s /tmp/delta-bins/optim/delta-experiment update-loss-benchmark artifacts/update-and-loss/final-b1-c512.json --warmups 2 --trials 9
+/usr/bin/time -f 'B8C128_outer_wall_seconds=%e' flock /tmp/delta-block-lm-gpu.lock /usr/bin/time -f 'B8C128_locked_execution_seconds=%e' timeout 290s /tmp/delta-bins/optim/delta-experiment update-loss-benchmark artifacts/update-and-loss/final-b8-c128.json --warmups 2 --trials 9
+/usr/bin/time -f 'B1C128_outer_wall_seconds=%e' flock /tmp/delta-block-lm-gpu.lock /usr/bin/time -f 'B1C128_locked_execution_seconds=%e' timeout 290s /tmp/delta-bins/optim/delta-experiment update-loss-benchmark artifacts/update-and-loss/final-b1-c128.json --warmups 2 --trials 9
+bun scripts/summarize-update-loss.ts artifacts/update-and-loss/final-summary.json artifacts/update-and-loss/final-b8-c512/update-loss-benchmark.json artifacts/update-and-loss/final-b1-c512/update-loss-benchmark.json artifacts/update-and-loss/final-b8-c128/update-loss-benchmark.json artifacts/update-and-loss/final-b1-c128/update-loss-benchmark.json
+```
+

@@ -89,6 +89,17 @@ cache/environment; decisions are also logged to
 `ARTIFACT_DIR/autotune-decisions.jsonl` when enabled. Tuning changes all Burn
 autotuned operations, not only GEMMs. Use fresh run directories/budgets.
 
+The accepted matrix-efficiency option is `configs/lm512-gemm-guarded.json`
+with `--features vulkan,autotune`, `head_backend: "heuristic"` and
+`projection_backend: "merged_heuristic_output"`, plus the mandatory startup
+probe below. On the isolated D256/L4/context512 model, eleven interleaved pairs
+reduce B8 step1619.76→1188.30ms and B1 560.21→510.47ms beyond paired noise.
+This does **not** adopt bare autotune or change historical defaults; legacy
+solver/HOLA tensor paths remain unsupported. See
+`docs/optimization/gemm-efficiency.md` for every shape, source/binary proof,
+startup costs and exact commands. Larger K/V/context configurations still need
+their own numerical/performance acceptance.
+
 Autotuned model execution is restricted to the local non-fusion byte-LM,
 `scan_backend: "fused_gpu"`, `hola_backend: "fused_gpu"`, merged inputs and
 tensor normalization/gating. Unsupported combinations fail before device creation.

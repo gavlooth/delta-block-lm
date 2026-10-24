@@ -2,12 +2,13 @@
 
 ## Status and decision
 
-Implemented, not measured or numerically certified in this workspace. No builds,
-tests, formatters, or GPU jobs were run during implementation. The integration
-owner must run the acceptance queue below before using the candidate in training.
-No speedup or adoption claim is made. `TensorSolver` remains the omitted default;
-historical config/checkpoint fingerprints and existing Kron selector meanings are
-unchanged. `scan_backend: "fused_gdn2"` is explicit and GDN-2-only.
+Implemented. The f64 reference gate and isolated recurrence timings are measured and
+recorded under "Measured results" below. Full-model paired throughput for the
+candidate has not been measured, and one full-model directional check (B8/T128 with
+HOLA on) stopped at its finite-difference gate; see that section. `TensorSolver`
+remains the omitted default; historical config/checkpoint fingerprints and existing
+Kron selector meanings are unchanged. `scan_backend: "fused_gdn2"` is explicit and
+GDN-2-only.
 
 Three designs were considered:
 
@@ -107,7 +108,7 @@ calls are separate from warm samples. Shape-first calls happen after numerical
 gating and are not claimed to be cold compiler measurements. Per-case seed,
 config, parameter/fixture hashes, tolerances and samples are retained in JSON.
 
-## Integration-owner queue (not executed here)
+## Integration-owner queue (reference commands)
 
 Use the owner's single consistent CPU/Vulkan/fusion feature build, once after all
 source branches land. Formatting and compilation belong to that integration pass.
@@ -142,4 +143,29 @@ is a retained failure, not a reason to relax tolerances or accept partial timing
 
 After acceptance, compare warm isolated and B8 model medians, dispatch and memory
 observations against the retained baseline. Keep the tensor default unless the
-measured integrated gain justifies maintenance and shared-memory cost.
+measured integrated gain justifies maintenance and shared-memory cost. Isolated
+results are below; the full-model paired throughput for `fused_gdn2` has not been
+measured yet, so the default is unchanged.
+
+## Measured results
+
+### Correctness
+
+- The f64 gate (`gdn-reference --scan-backend fused_gdn2`) passed on Vulkan.
+- Full-model B8/T128 with HOLA off passed the CPU oracle.
+- Full-model B8/T128 with HOLA on **stopped at the CPU (tensor reference) full-parameter directional finite-difference check**: analytic 0.0105004, numerical 0.0139475, absolute error 3.447e-3 against a limit of 3.315e-3. The gate and tolerance are unchanged, so this case is recorded as a failure of that check, not a pass.
+
+Diagnostic `gdn-directional-diagnostic` (`artifacts/integration/directional-diagnostic.stdout`): with HOLA on, every tested epsilon (5e-4, 1e-3, 2e-3, 4e-3) changes cache membership in 7–24 chunks (63–597 changed set slots) for GDN B8, and the errors are 1.62e-2, 3.35e-3, 3.45e-3 and 8.8e-4 respectively. Kron B8 passes at all epsilons despite similar membership changes; Kron B1 fails at epsilon 4e-3.
+
+Interpretation: the finite difference spans a discontinuous hard top-k cache selection, so the numerical directional derivative is not a reliable reference when the selected set changes. This points to differencing across a selection discontinuity, not a gradient defect in the fused operator (the f64 gate and the HOLA-off case pass). It is an interpretation of the diagnostic, not a separate proof. The gate and tolerance were not changed; the policy decision on how to treat HOLA-on full-model directional checks is pending.
+
+### Isolated recurrence timing
+
+Median milliseconds, forward (F) and forward+backward (F+B), from `artifacts/gdn/benchmark-1792870192457-3146723/gdn-benchmark-3146728-1792870192622379980/report.json`:
+
+| Shape | `tensor_solver` F | `tensor_solver` F+B | `fused_gdn2` F | `fused_gdn2` F+B |
+| --- | ---: | ---: | ---: | ---: |
+| B1/T128 | 19.859 | 48.599 | 5.905 | 23.309 |
+| B8/T128 | 21.680 | 53.421 | 6.060 | 25.290 |
+
+The isolated fused recurrence is about 3.4–3.6× faster forward and about 2.1× faster forward+backward. This is the recurrence alone. Full-model paired throughput (and memory) for `fused_gdn2` has not been measured, so there is no adoption decision: `TensorSolver` remains the default and `fused_gdn2` stays an explicit opt-in.

@@ -3,11 +3,11 @@
 ## Scope and status
 
 This change provides three executable designs and paired attribution for the active
-Step1–6 model. No benchmark, build, formatting, or numerical gate was run by the
-implementation worker. All timings below must come from the parent's frozen-source
-run; no gain is asserted. The assignment's B8/T512 MLP forward/backward attribution
-of **358.64 ms** is context supplied to this work, not a measurement reproduced here.
-It includes GEMMs and must not be presented as removable activation overhead.
+Step1–6 model. Measured results on the optimized base are in "Measured results"
+below: `analytic_backward` is adopted in the optimized config and `fused_pointwise` is
+not. The assignment's B8/T512 MLP forward/backward attribution of **358.64 ms** is
+context supplied to this work, not a measurement reproduced here. It includes GEMMs
+and must not be presented as removable activation overhead.
 
 The model remains `RMSNorm -> up linear -> SiLU -> down linear -> residual add`.
 Both linears retain their original parameter tensors and parameter IDs. The new
@@ -130,13 +130,25 @@ attributing a whole-MLP change to pointwise arithmetic.
 
 ## Decision rule and evidence history
 
-Keep `native` by default. An opt-in custom path earns recommendation only after
-all independent and fullmodel gates pass, ordinary-step paired savings are
-repeatable at the requested shapes, and its memory/dispatch evidence justifies
-the extra kernels. If gains are noise or regressions, recommend the library path
-and publish the measured removable-cost estimate, not a hypothetical rejection.
+Keep `native` unless an opt-in custom path passes all independent and fullmodel gates, shows repeatable ordinary-step paired savings at the requested shapes, and its memory/dispatch evidence justifies the extra kernels. If gains are noise or regressions, recommend the library path.
 
-Freeze the implementation in a described source change, create a child change,
-and place subsequent measurement evidence in that child (or a separately named
-artifact). Do not rewrite the described source to attach results. There are no
-measurement results in this source document.
+The implementation was frozen in a described source change and measurement evidence was recorded separately, without rewriting the described source.
+
+## Measured results
+
+Measured on top of the optimized base (`artifacts/integration/optimized-b8.json`), B8/T512, 2 warmups, 11 paired trials. Report: `artifacts/integration/batch2/epilogue-over-optimized.stdout`.
+
+| Epilogue backend | Median step (ms) | Kernels | Paired saving vs native (ms) | Interval (ms) | Trials faster |
+| --- | ---: | ---: | ---: | --- | --- |
+| `native` | 876.891 | 3678 | — | — | — |
+| `analytic_backward` | 863.295 | 3630 | 22.227 | [9.559, 27.882] | 10/11 |
+| `fused_pointwise` | 865.424 | 3606 | 11.102 | [2.644, 20.904] | 9/11 |
+
+Independent f64 `epilogue-reference` checks passed on Vulkan (`artifacts/integration/final/epilogue-reference.stdout`). Residual adds are unchanged. The configured full-model CPU oracle with `analytic_backward` (`kron-model-check` on the recommended config) passed 4/4 cases.
+
+### Decision
+
+- `epilogue_backend: analytic_backward` is adopted in `configs/lm512-optimized.json`. It has the larger paired saving (about 2.5% of the step) and its interval excludes zero.
+- `fused_pointwise` is not adopted: its gain is smaller (about 1.3%) with a wider relative interval, despite the lowest kernel count.
+- `native` remains the default for configs that do not select a backend, so historical fingerprints are unchanged.
+- These numbers are for the optimized base only; results on other bases, or with graph fusion toggled differently, must be measured separately.

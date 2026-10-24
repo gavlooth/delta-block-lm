@@ -1350,6 +1350,33 @@ complete feedback round), fused-pointwise SiLU (smaller gain than the
 analytic VJP alone), and unguarded matmul autotune (wrong vocabulary-head
 weight VJPs, see Matrix-multiply efficiency).
 
+### Re-profile after the round
+
+`backward-profile` at B8/context512 on the adopted configurations, two
+warmups and five trials (backward coverage 101.8% / 102.1%). Component rows
+are four-layer forward+backward medians, as percentages of each ordinary
+step:
+
+| Component | `lm512-optimized`, ms | % | `lm512-optimized-autotune`, ms | % |
+|---|---:|---:|---:|---:|
+| Ordinary complete step | 855.0 | 100 | 512.9 | 100 |
+| Merged input projections | 199.4 | 23.3 | 104.6 | 20.4 |
+| Fused KronLSTM scan | 103.2 | 12.1 | 101.9 | 19.9 |
+| MLP (up, SiLU, down) | 335.4 | 39.2 | 93.5 | 18.2 |
+| HOLA RMSNorms and fused read | 59.9 | 7.0 | 57.9 | 11.3 |
+| Mixer output RMSNorm, gate and projection | 62.8 | 7.3 | 54.4 | 10.6 |
+| L2 norms and gate activations | 52.0 | 6.1 | 47.5 | 9.3 |
+| Short causal convolutions | 22.2 | 2.6 | 21.0 | 4.1 |
+| Final norm, vocabulary head and loss | 16.9 | 2.0 | 18.2 | 3.5 |
+| Block RMSNorms and residuals | 16.4 | 1.9 | 16.6 | 3.2 |
+| Gradient checks and AdamW | 15.9 | 1.9 | 12.6 | 2.5 |
+
+Throughput: 4,791 and 7,985 tokens/s, against 2,538 tokens/s for the
+previous recommended B8 profile in Batch scaling. With guarded autotune the
+step is no longer dominated by one component: projections, scan and MLP are
+each about a fifth, so the next round should look at the merged input
+projection backward (dX/dW) and the scan before anything smaller.
+
 ### Component decisions
 
 | Component | Adopted selector | Evidence (each measured alone) | Document |
@@ -1369,7 +1396,11 @@ weight VJPs, see Matrix-multiply efficiency).
 All with unchanged tolerances (2e-5 + 3e-4·|reference|; CPU directional
 check 3e-3 + 0.03·|reference|):
 
-- CPU workspace tests: 33 experiment + 7 kernel + 13 mixer pass.
+- CPU workspace tests: 35 experiment + 7 kernel + 13 mixer pass (one
+  ignored Vulkan regression, run separately and passing).
+- Guarded-autotune recommended config: `kron-model-check` with the
+  `vulkan,autotune` binary passes all four cases (max logits 4.35e-6,
+  gradient 3.20e-6, AdamW 1.40e-5).
 - Independent float64 references pass for scan256, HOLA pairs, convolution
   (72 cases), normalization (116), update/loss, SiLU and fused GDN-2.
 - `kron-model-check --model-scope configured` on the recommended config

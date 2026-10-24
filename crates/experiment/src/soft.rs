@@ -59,10 +59,13 @@ impl Candidates {
                 const TILE: usize = 256;
                 let tiles = vocab.div_ceil(TILE);
                 let local_k = k.min(TILE);
-                let padded =
+                let padded = if vocab % TILE == 0 {
+                    keys.reshape([rows * tiles, TILE])
+                } else {
                     Tensor::<2, Int>::full([rows, tiles * TILE], i32::MIN, &probabilities.device())
                         .slice_assign([0..rows, 0..vocab], keys)
-                        .reshape([rows * tiles, TILE]);
+                        .reshape([rows * tiles, TILE])
+                };
                 let local_ids = top_ids(padded.clone(), local_k);
                 let local_keys = padded
                     .gather(1, local_ids.clone())

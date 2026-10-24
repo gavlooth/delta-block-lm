@@ -2,14 +2,14 @@
 
 ## Status and scope
 
-Implementation is ready for integration-owner verification; **completed performance measurements are pending**. The integration owner exercised two revisions and found GPU recomputation nondeterminism, documented below. No build, test, formatter, CPU benchmark, or GPU benchmark was run by this slice's author. There is no measured speedup, checkpoint throughput claim, or adoption claim for asynchronous prefetch. Steps 1–6 only.
+The implementation was verified by the integration owner, and the measurements are recorded under "Measured results" below. The integration owner exercised two revisions early on and found GPU recomputation nondeterminism, documented below; the final run passed all checks. Steps 1–6 only.
 
 `io-benchmark` uses the configured first arm, model width/depth/selectors, optimizer, real corpus and seed. It evaluates B1/B8 × contexts 128/512. It rejects non-LM configurations, an overriding arm/seed/resume, more than three warmups, or trials outside 1–8. The default is one warmup and three measured trials, plus one separately recorded first observation. The wall-clock admission deadline is `min(max_seconds, 900)` seconds; an external timeout must bound a single blocking operation. Warmups and first observations are not counted as measured trials.
 
 ### Designs
 
 1. **Saved baseline:** the previous `Batch::new` implementation is preserved verbatim in behavior as `io_benchmark::legacy_batch` (flat-map/collect input, target and weight; host reset vector; device ones for validity). It is diagnostic-only, not a second training selector.
-2. **Exact-capacity owned packing:** `data::HostBatch` allocates the three flattened vectors with the known B×T capacity and copies each row once. `Batch::new` delegates to this packing/upload split. This removes avoidable geometric vector growth, not the necessary owned upload payload. It does not claim a measured latency improvement. All training/evaluation callers automatically retain the same data ordering, reset/valid masks and tensor types. No config/checkpoint fingerprint field or historical selector was added or changed.
+2. **Exact-capacity owned packing:** `data::HostBatch` allocates the three flattened vectors with the known B×T capacity and copies each row once. `Batch::new` delegates to this packing/upload split. This removes avoidable geometric vector growth, not the necessary owned upload payload. Measured: about 0.3 ms less pack+upload per batch at B8/T512, with no step-level difference outside noise (see "Measured results"). All training/evaluation callers automatically retain the same data ordering, reset/valid masks and tensor types. No config/checkpoint fingerprint field or historical selector was added or changed.
 3. **Same-step resident fixture:** prebuilt next-row tensors and identical pre-update model/optimizer state are prepared outside the full optimizer-step clock. This bounds removable input overhead without asynchronous queues. It is not advertised as a valid way to train repeatedly on stale rows.
 
 Checkpoint comparison is the **original atomic save plus guarded, validated file restore** versus **resident same-state continuation**. The latter has no durability and is an overhead bound, not a candidate replacement for checkpointing. No validation, checksum, synchronization, optimizer-state check, config/data check, collision check, or atomic rename is removed. `train::checkpoint` and its unchanged `State` layout are exposed crate-locally so the harness exercises the real transaction instead of imitating it. `checkpoint.rs` remains unchanged.
@@ -38,7 +38,7 @@ Every uploaded batch is checked elementwise against independent row/index expect
 
 The whole checkpoint `state.json` must equal the expected configured run identity and counters. `latest.json` must point at the completed directory with the same step/tokens. Existing training collision and resume checks are untouched. All scratch checkpoints and reports live in a fresh `artifact_dir/io/PID-TIMESTAMP/` subtree, never in original arm run directories. Source checkpoint and continuation-reference files remain available as evidence; their aggregate disk use scales with model size and trial count.
 
-## Integration queue (not executed here)
+## Integration queue (reference commands; the measured run used `artifacts/integration/io-optimized.json`)
 
 Keep the integration owner's established feature combination; the examples below use the existing default CPU plus Vulkan features, with fusion/autotune off as in `lm512.json`. Do not run this concurrently with another GPU command.
 
@@ -86,7 +86,32 @@ Each shape report contains:
 
 Pool reservation is not physical/live peak memory and includes correctness fixtures. Logical payload counts do not claim allocator capacity, backend-dependent integer storage, actual PCIe traffic, GPU dispatch count, or process RSS; these are not instrumented. Source and optimizer fixture snapshots add retained memory outside the step clock. Do not sum isolated section medians into a claimed measured full-step cost.
 
-Before scaling, use the B8 integrated samples to set an IO budget: compare the paired old/new total steps and resident overhead bound, report medians and raw spread, and decide whether row-generation/upload or validated checkpoint cadence is material relative to actual full-step time. Keep exact-capacity packing's allocation rationale distinct from any measured speed claim. Consider prefetch only if measurements show sufficient headroom to justify queue ownership, lifetime, deterministic ordering and failure-propagation complexity. Keep checkpoint validation and atomic completion regardless of their cost. **No numeric component budget or winning measured design is asserted until the queued evidence exists.**
+Before scaling, the B8 samples set the IO budget: compare the paired old/new total steps and the resident overhead bound, report medians and raw spread, and decide whether row generation/upload or validated checkpoint cadence is material relative to the full step. Keep exact-capacity packing's allocation rationale distinct from its measured speed. Consider prefetch only if measurements show enough headroom to justify queue ownership, lifetime, deterministic ordering and failure-propagation complexity. Keep checkpoint validation and atomic completion regardless of their cost. The measured numbers and the resulting decisions follow.
+
+## Measured results
+
+Run by the integration owner on the heuristic build (binary hashes in `artifacts/integration/final2/binaries.sha256`; stdout in `artifacts/integration/final2/io-benchmark.stdout`). Config `artifacts/integration/io-optimized.json`: `lm512-projections` projections, scan `fused_parallel256`, HOLA `fused_gpu_pairs`, conv `fused_gpu`, norm `fused_norms_gates`, batch size overridden per shape, 1 warmup, 3 measured trials. All exact batch and checkpoint checks passed; recomputed steps used the tolerance described above.
+
+Median milliseconds:
+
+| Shape | Corpus rows | Legacy pack+upload | Exact-capacity pack+upload | Full step, legacy | Full step, exact-capacity | Full step, resident | Atomic save | Guarded model load (with validation) | Optimizer load (with validation) | Restored continuation step |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| B1/T128 | 0.22 | 0.78 | 0.72 | 157.25 | 159.36 | 131.56 | 263.65 | 167.64 | 173.37 | 250.37 |
+| B1/T512 | 0.07 | 0.98 | 0.68 | 356.93 | 323.48 | 297.50 | 278.55 | 171.13 | 184.05 | 404.75 |
+| B8/T128 | 0.06 | 0.92 | 0.69 | 256.82 | 237.66 | 302.69 | 279.40 | 152.81 | 171.27 | 362.25 |
+| B8/T512 | 0.11 | 1.18 | 0.90 | 959.63 | 939.59 | 1035.50 | 266.70 | 178.24 | 186.84 | 1067.70 |
+
+The checkpoint (model, optimizer and state) is 28.61 MB. Initial corpus load and validation took 3.30 ms.
+
+With only three trials, full-step spreads are about ±100 ms. Differences between the three input designs at the step level (including the resident fixture, which is not consistently fastest) are within that noise and must not be read as speedups. The isolated pack+upload medians are the more reliable signal.
+
+### Decisions
+
+- **Input pipeline:** packing plus upload is about 1 ms against a roughly 940 ms B8/T512 step, under 0.2%. No asynchronous prefetch is added; the ordering, lifetime and failure-propagation cost is not justified.
+- **Exact-capacity packing:** kept. It saves about 0.28 ms per step at B8/T512 (1.18 ms to 0.90 ms), small but free of added complexity.
+- **Checkpointing:** no code change. Atomic save costs about 265–280 ms at every shape. At `checkpoint_every` 4 and an optimized step of about 506 ms, a save adds roughly 13% per step on average. For long runs, raise the checkpoint interval rather than introducing an asynchronous writer; validation and atomic rename stay as they are.
+- **Limits:** page cache was uncontrolled, so loads are warm-file times; the sample count is small; the step-level comparison cannot rank the input designs.
+
 
 ## Integration failure attribution and fixture follow-up
 
@@ -163,10 +188,15 @@ outside measured regions.
 The follow-up includes a CPU record-comparator regression covering
 roundoff, out-of-tolerance values, changed IDs/counters and nonfinite
 values. This tests the harness's comparison contract, not a conjectured
-checkpoint product bug. The author has not built or run this follow-up.
+checkpoint product bug. The final integration run exercised it together with the full benchmark (see Resolution below).
 
 Integration-owner comparator check (retain the established feature set):
 
 ```sh
 timeout 300s cargo test -p delta-experiment --features vulkan recomputed_equivalence_tolerates_roundoff_not_identity_or_state_changes
 ```
+
+### Resolution
+
+After the harness change, the integration run completed and passed every check. Recomputed steps are compared at `2e-5 + 3e-4 * abs(reference)`; checkpoint save and restore stays byte-exact. The earlier failures are therefore explained as run-to-run GPU nondeterminism in independently recomputed steps (the swapped `head.weight` hashes above), not a checkpoint defect. The kernel-level cause of that nondeterminism was not investigated. Measured results are in "Measured results" above.
+
