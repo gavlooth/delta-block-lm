@@ -1074,3 +1074,161 @@ pub fn gdn_run(c: &Config, device: &Device, warmups: usize, trials: usize) -> Re
     runtime::write_json(&report_path, &result)?;
     Ok(result)
 }
+
+#[derive(Default)]
+struct MembershipTrace {
+    layer: Option<usize>,
+    entries: Vec<MembershipEntry>,
+}
+struct MembershipEntry {
+    layer: Option<usize>,
+    chunk_start: usize,
+    used: bool,
+    shape: [usize; 3],
+    ordered: Vec<i32>,
+    members: Vec<i32>,
+}
+impl delta_mixers::profile::Sections for MembershipTrace {
+    const CAPTURE_CACHE_MEMBERSHIP: bool = true;
+    fn block(&mut self, index: Option<usize>) { self.layer = index; }
+    fn section<T>(&mut self, _name: &'static str, run: impl FnOnce() -> T) -> T { run() }
+    fn cache_membership(&mut self, chunk_start: usize, used: bool, positions: &Tensor<3>) {
+        let shape = positions.dims();
+        let ordered = values(positions.clone()).into_iter().map(|x| x as i32).collect::<Vec<_>>();
+        let mut members = ordered.clone();
+        // Sorting separately within each batch/head distinguishes rank reorder
+        // from a change in the set that the following chunk actually reads.
+        for row in members.chunks_exact_mut(shape[2]) { row.sort_unstable(); }
+        self.entries.push(MembershipEntry {
+            layer: self.layer, chunk_start, used, shape, ordered, members,
+        });
+    }
+}
+impl MembershipTrace {
+    fn report(&self) -> Result<Value> {
+        Ok(json!(self.entries.iter().map(|entry| -> Result<Value> {
+            Ok(json!({
+                "layer":entry.layer,"chunk_start":entry.chunk_start,
+                "used_by_later_chunk":entry.used,"shape":entry.shape,
+                "ordered_positions_sha256":data::hash(&serde_json::to_vec(&entry.ordered)?),
+                "membership_set_sha256":data::hash(&serde_json::to_vec(&entry.members)?)
+            }))
+        }).collect::<Result<Vec<_>>>()?))
+    }
+    fn changes_from(&self, base: &Self) -> Result<Value> {
+        ensure!(self.entries.len() == base.entries.len(), "membership trace length changed");
+        let mut changes = Vec::new();
+        for (entry, previous) in self.entries.iter().zip(&base.entries) {
+            ensure!(entry.layer == previous.layer && entry.chunk_start == previous.chunk_start
+                && entry.shape == previous.shape, "membership trace layout changed");
+            if entry.ordered != previous.ordered {
+                changes.push(json!({
+                    "layer":entry.layer,"chunk_start":entry.chunk_start,
+                    "used_by_later_chunk":entry.used,
+                    "set_changed":entry.members != previous.members,
+                    "changed_ordered_slots":entry.ordered.iter().zip(&previous.ordered).filter(|(a,b)| a != b).count(),
+                    "changed_set_slots":entry.members.iter().zip(&previous.members).filter(|(a,b)| a != b).count()
+                }));
+            }
+        }
+        Ok(json!(changes))
+    }
+}
+
+/// Investigation only: never substitutes a passing epsilon for the existing gate.
+/// Reports actual tensor-HOLA cache selection, not an inferred top-k reconstruction.
+pub fn directional_diagnostic(c: &Config, device: &Device) -> Result<Value> {
+    ensure!(c.backend == "cpu", "directional diagnostic is CPU-only");
+    let started = Instant::now();
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let path = c.artifact_dir.join(format!("directional-diagnostic-{nonce}.json"));
+    std::fs::create_dir_all(&c.artifact_dir)?;
+    let mut config = c.clone();
+    config.scan_backend = ScanBackend::TensorSolver;
+    config.hola_backend = HolaBackend::Tensor;
+    config.projection_backend = delta_mixers::ProjectionBackend::Separate;
+    config.normalization_backend = delta_mixers::NormalizationBackend::Tensor;
+    config.convolution_backend = delta_mixers::ConvolutionBackend::Tensor;
+    config.head_backend = crate::config::HeadBackend::Native;
+    config.loss_backend = crate::config::LossBackend::Tensor;
+    config.update_backend = crate::config::UpdateBackend::Tensor;
+    let mut report = json!({
+        "command":"gdn-directional-diagnostic","completed":false,"acceptance_changed":false,
+        "original_epsilon":0.002,"absolute_tolerance":0.003,"relative_tolerance":0.03,
+        "source_config":c,"cpu_oracle_config":config,"device":runtime::identity(device),
+        "report_path":path,"cases":[],
+        "scope":"Fixed epsilon sweep only; neither selects an epsilon nor accepts a failed gate. All original parameters and hard surprise cache decisions remain active."
+    });
+    runtime::write_json(&path, &report)?;
+    let td = device.clone().autodiff();
+    for (kind, batch_size) in [(MixerKind::Gdn2, 8usize), (MixerKind::KronLstm, 1), (MixerKind::KronLstm, 8)] {
+        deadline(started, c)?;
+        config.batch_size = batch_size;
+        let arm = Arm {
+            name: format!("{kind:?}-hola"),
+            mixer: if kind == MixerKind::Gdn2 { "gdn2" } else { "kronlstm" }.into(),
+            cache: "surprise".into(),
+        };
+        td.seed(c.seed);
+        let base = LanguageModel::new(&config, &arm, &td)?;
+        let rows = (0..batch_size).map(|row| Example {
+            input: (0..c.context).map(|t| ((t * 17 + row * 11 + c.seed as usize) % config.vocab()) as i32).collect(),
+            target: (0..c.context).map(|t| (((t + 1) * 17 + row * 11 + c.seed as usize) % config.vocab()) as i32).collect(),
+            weight: vec![1.; c.context], groups: vec![None; c.context],
+        }).collect::<Vec<_>>();
+        let batch = Batch::new(&rows, &td);
+        let ordinary_loss = base.loss(base.forward(&batch), &batch);
+        let ordinary_loss_value = model::scalar(ordinary_loss.clone())?;
+        let grads = model::checked_gradients(&base, ordinary_loss)?;
+        let snapshot = parameters(&base, Some(&grads))?;
+        let analytic = snapshot.iter().enumerate().flat_map(|(p, (_, values))| {
+            values.iter().enumerate().map(move |(i, &g)| {
+                f64::from(g) * f64::from(parameter_direction(p, i))
+            })
+        }).sum::<f64>();
+        let tolerance = 3e-3 + 0.03 * analytic.abs();
+        let mut base_trace = MembershipTrace::default();
+        let inference = base.valid();
+        let base_logits = inference.forward_profiled(&batch, &mut base_trace);
+        let traced_loss = model::scalar(inference.loss(base_logits, &batch))?;
+        let index = report["cases"].as_array().unwrap().len();
+        report["cases"].as_array_mut().unwrap().push(json!({
+            "mixer":kind,"batch":batch_size,"context":c.context,"cache":"surprise",
+            "initial_parameters_sha256":data::hash(&serde_json::to_vec(&parameters(&base, None)?)?),
+            "fixture_sha256":data::fixture_hash(&rows),"all_parameter_tensors_perturbed":snapshot.len(),
+            "analytic":analytic,"tolerance":tolerance,
+            "ordinary_base_loss":ordinary_loss_value,"traced_base_loss":traced_loss,
+            "base_memberships":base_trace.report()?,"samples":[]
+        }));
+        runtime::write_json(&path, &report)?;
+        for epsilon in [5e-4, 1e-3, 2e-3, 4e-3] {
+            deadline(started, c)?;
+            let mut plus_trace = MembershipTrace::default();
+            let plus = base.valid().map(&mut PerturbParameters { scale: epsilon, index: 0 });
+            let logits = plus.forward_profiled(&batch, &mut plus_trace);
+            let plus_loss = model::scalar(plus.loss(logits, &batch))?;
+            drop(plus);
+            let mut minus_trace = MembershipTrace::default();
+            let minus = base.valid().map(&mut PerturbParameters { scale: -epsilon, index: 0 });
+            let logits = minus.forward_profiled(&batch, &mut minus_trace);
+            let minus_loss = model::scalar(minus.loss(logits, &batch))?;
+            let numerical = (plus_loss - minus_loss) / (2. * epsilon);
+            let error = (analytic - numerical).abs();
+            report["cases"][index]["samples"].as_array_mut().unwrap().push(json!({
+                "epsilon":epsilon,"per_element_direction_magnitude":0.01,
+                "plus_loss":plus_loss,"minus_loss":minus_loss,
+                "numerical":numerical,"absolute_error":error,
+                "within_original_tolerance":analytic.is_finite() && numerical.is_finite() && error <= tolerance,
+                "plus_memberships":plus_trace.report()?,"minus_memberships":minus_trace.report()?,
+                "plus_vs_base":plus_trace.changes_from(&base_trace)?,
+                "minus_vs_base":minus_trace.changes_from(&base_trace)?,
+                "plus_vs_minus":plus_trace.changes_from(&minus_trace)?
+            }));
+            runtime::write_json(&path, &report)?;
+        }
+    }
+    report["completed"] = json!(true);
+    report["elapsed_seconds"] = json!(started.elapsed().as_secs_f64());
+    runtime::write_json(&path, &report)?;
+    Ok(report)
+}

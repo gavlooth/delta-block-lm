@@ -169,6 +169,23 @@ pub(crate) fn read_detailed(
     policy: CachePolicy,
     sink: Tensor<1>,
 ) -> CacheRead {
+    read_impl::<false>(q, k, v, scores, valid, documents, capacity, chunk, policy, sink).0
+}
+
+/// Exact production tensor selection, with optional per-chunk position snapshots.
+pub(crate) fn read_with_membership(
+    q: Tensor<4>, k: Tensor<4>, v: Tensor<4>, scores: Tensor<4>,
+    valid: Tensor<2>, documents: Tensor<2>, capacity: usize, chunk: usize,
+    policy: CachePolicy, sink: Tensor<1>,
+) -> (CacheRead, Vec<(usize, Tensor<3>)>) {
+    read_impl::<true>(q, k, v, scores, valid, documents, capacity, chunk, policy, sink)
+}
+
+fn read_impl<const TRACE: bool>(
+    q: Tensor<4>, k: Tensor<4>, v: Tensor<4>, scores: Tensor<4>,
+    valid: Tensor<2>, documents: Tensor<2>, capacity: usize, chunk: usize,
+    policy: CachePolicy, sink: Tensor<1>,
+) -> (CacheRead, Vec<(usize, Tensor<3>)>) {
     assert!(capacity > 0 && chunk > 0 && policy != CachePolicy::None);
     let [b, t, h, dk] = q.dims();
     let dv = v.dims()[3];
@@ -180,6 +197,7 @@ pub(crate) fn read_detailed(
     let mut cd = Tensor::full([b, h, capacity], -1.0, &device);
     let mut output = Vec::with_capacity(t.div_ceil(chunk));
     let mut work = 0;
+    let mut memberships = Vec::new();
     for first in (0..t).step_by(chunk) {
         let n = chunk.min(t - first);
         let total = capacity + n;
@@ -282,10 +300,11 @@ pub(crate) fn read_detailed(
         cd = docs.gather(2, index.clone());
         ck = keys.gather(2, index.clone().unsqueeze_dim::<4>(3).repeat_dim(3, dk));
         cv = values.gather(2, index.unsqueeze_dim::<4>(3).repeat_dim(3, dv));
+        if TRACE { memberships.push((first, cp.clone())); }
     }
-    CacheRead {
+    (CacheRead {
         output: Tensor::cat(output, 1),
         final_positions: cp,
         attention_pairs: work,
-    }
+    }, memberships)
 }
