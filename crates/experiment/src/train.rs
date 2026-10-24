@@ -141,18 +141,18 @@ pub fn evaluate(
     )
 }
 #[derive(Deserialize, Serialize)]
-struct State {
-    schema: u32,
-    config_sha256: String,
-    data: Value,
-    arm: String,
-    seed: u64,
-    step: usize,
-    tokens: usize,
-    training_seconds: f64,
-    initial_evaluation: Value,
+pub(crate) struct State {
+    pub(crate) schema: u32,
+    pub(crate) config_sha256: String,
+    pub(crate) data: Value,
+    pub(crate) arm: String,
+    pub(crate) seed: u64,
+    pub(crate) step: usize,
+    pub(crate) tokens: usize,
+    pub(crate) training_seconds: f64,
+    pub(crate) initial_evaluation: Value,
 }
-fn checkpoint(
+pub(crate) fn checkpoint(
     c: &Config,
     path: &Path,
     model: &LanguageModel,

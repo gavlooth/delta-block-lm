@@ -56,34 +56,42 @@ pub struct Batch {
 }
 impl Batch {
     pub fn new(examples: &[Example], device: &Device) -> Self {
+        HostBatch::new(examples).upload(device)
+    }
+}
+
+/// Owned upload payloads: exact capacities avoid geometric growth while flattening rows.
+/// Upload consumes these buffers; retaining a second host copy would not be buffer reuse.
+pub(crate) struct HostBatch {
+    shape: [usize; 2],
+    input: Vec<i32>,
+    target: Vec<i32>,
+    weight: Vec<f32>,
+    reset: Vec<f32>,
+}
+impl HostBatch {
+    pub(crate) fn new(examples: &[Example]) -> Self {
         let b = examples.len();
         let t = examples[0].input.len();
-        let ints = |f: fn(&Example) -> &Vec<i32>| {
-            Tensor::from_data(
-                TensorData::new(
-                    examples
-                        .iter()
-                        .flat_map(|e| f(e).iter().copied())
-                        .collect::<Vec<_>>(),
-                    [b, t],
-                ),
-                device,
-            )
-        };
-        let weight = examples
-            .iter()
-            .flat_map(|e| e.weight.iter().copied())
-            .collect::<Vec<_>>();
-        let mut reset = vec![0.0f32; b * t];
-        for row in 0..b {
+        let mut input = Vec::with_capacity(b * t);
+        let mut target = Vec::with_capacity(b * t);
+        let mut weight = Vec::with_capacity(b * t);
+        let mut reset = vec![0.0; b * t];
+        for (row, example) in examples.iter().enumerate() {
+            input.extend_from_slice(&example.input);
+            target.extend_from_slice(&example.target);
+            weight.extend_from_slice(&example.weight);
             reset[row * t] = 1.0;
         }
-        Self {
-            input: ints(|e| &e.input),
-            target: ints(|e| &e.target),
-            weight: Tensor::from_data(TensorData::new(weight, [b, t]), device),
-            valid: Tensor::ones([b, t], device),
-            reset: Tensor::from_data(TensorData::new(reset, [b, t]), device),
+        Self { shape: [b, t], input, target, weight, reset }
+    }
+    pub(crate) fn upload(self, device: &Device) -> Batch {
+        Batch {
+            input: Tensor::from_data(TensorData::new(self.input, self.shape), device),
+            target: Tensor::from_data(TensorData::new(self.target, self.shape), device),
+            weight: Tensor::from_data(TensorData::new(self.weight, self.shape), device),
+            valid: Tensor::ones(self.shape, device),
+            reset: Tensor::from_data(TensorData::new(self.reset, self.shape), device),
         }
     }
 }
@@ -281,6 +289,26 @@ pub fn fixture_hash(examples: &[Example]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn host_batch_preserves_row_order_sparse_weights_and_resets() {
+        let rows = vec![
+            Example { input: vec![256, 7, 8], target: vec![7, 8, 9], weight: vec![0.0, 0.5, 1.0], groups: vec![None; 3] },
+            Example { input: vec![256, 3, 4], target: vec![3, 4, 5], weight: vec![1.0, 0.0, 0.25], groups: vec![None; 3] },
+        ];
+        let host = HostBatch::new(&rows);
+        assert_eq!(host.shape, [2, 3]);
+        assert_eq!(host.input, [256, 7, 8, 256, 3, 4]);
+        assert_eq!(host.target, [7, 8, 9, 3, 4, 5]);
+        assert_eq!(host.weight, [0.0, 0.5, 1.0, 1.0, 0.0, 0.25]);
+        assert_eq!(host.reset, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        let batch = host.upload(&Device::ndarray());
+        assert_eq!(batch.input.dims(), [2, 3]);
+        assert_eq!(batch.input.into_data().try_to_vec_as::<i32>().unwrap(), [256, 7, 8, 256, 3, 4]);
+        assert_eq!(batch.target.into_data().try_to_vec_as::<i32>().unwrap(), [7, 8, 9, 3, 4, 5]);
+        assert_eq!(batch.weight.into_data().try_to_vec::<f32>().unwrap(), [0.0, 0.5, 1.0, 1.0, 0.0, 0.25]);
+        assert_eq!(batch.valid.into_data().try_to_vec::<f32>().unwrap(), [1.0; 6]);
+        assert_eq!(batch.reset.into_data().try_to_vec::<f32>().unwrap(), [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+    }
     #[test]
     fn recall_is_fixed_disjoint_and_causal() {
         let c = Config::default();
