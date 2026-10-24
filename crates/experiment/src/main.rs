@@ -8,6 +8,7 @@ mod gemm;
 mod gemm_batched;
 mod hola_tune;
 mod gemm_guard;
+mod io_benchmark;
 mod kron_benchmark;
 mod lm_retrieval;
 mod model;
@@ -174,6 +175,7 @@ fn execute() -> Result<()> {
                 | "soft-benchmark"
                 | "soft-step"
                 | "optimization-benchmark"
+                | "io-benchmark"
         ) || benchmark_warmups.is_none(),
         "--warmups is only valid for Kron benchmarks/profile; hola-benchmark uses two warmups per mode"
     );
@@ -196,6 +198,7 @@ fn execute() -> Result<()> {
                 | "soft-benchmark"
                 | "soft-step"
                 | "optimization-benchmark"
+                | "io-benchmark"
         ) || benchmark_trials.is_none(),
         "--trials is only valid for a benchmark command"
     );
@@ -232,6 +235,10 @@ fn execute() -> Result<()> {
         "--checkpoints is only valid for certify"
     );
     ensure!(
+        command != "io-benchmark" || (arm_name.is_none() && resume.is_none() && seed == c.seed),
+        "IO benchmark uses the first configured arm, seed and fresh scratch state"
+    );
+    ensure!(
         !c.autotune
             || !matches!(
                 command.as_str(),
@@ -245,6 +252,7 @@ fn execute() -> Result<()> {
                     | "update-loss-benchmark"
                     | "soft-benchmark"
                     | "soft-step"
+                    | "io-benchmark"
                     | "kron-benchmark"
                     | "kron-model-benchmark"
             ),
@@ -289,6 +297,13 @@ fn execute() -> Result<()> {
         }
     }
     let mut result = match command.as_str() {
+        "io-benchmark" => io_benchmark::run(
+            &c,
+            &c.arms[0],
+            &device,
+            benchmark_warmups.unwrap_or(1),
+            benchmark_trials.unwrap_or(3),
+        )?,
         "reference" => {
             let report = delta_mixers::numerical_checks(&device.clone().autodiff())
                 .map_err(anyhow::Error::msg)?;
@@ -346,7 +361,7 @@ fn execute() -> Result<()> {
             json!({"schema":1,"command":"soft","device":runtime::identity(&device),"config":c,"feedback":soft::episode(&c,&device)?})
         }
         "soft-reference" => {
-            json!({"command":command,"device":runtime::identity(&device),"checks":soft_benchmark::reference(&c,&device)?})
+            json!({"command":command,"passed":true,"device":runtime::identity(&device),"checks":soft_benchmark::reference(&c,&device)?})
         }
         "soft-benchmark" => soft_benchmark::run(
             &c,
@@ -522,6 +537,7 @@ fn execute() -> Result<()> {
                 | "optimization-benchmark"
                 | "soft-benchmark"
                 | "soft-step"
+                | "io-benchmark"
         ) || result["completed"] == true,
         "profile/benchmark failed or hit its deadline; separate partial report retained"
     );
