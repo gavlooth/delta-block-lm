@@ -219,7 +219,7 @@ fn instrumentation_check(
 }
 
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
-fn dispatches(
+pub(super) fn dispatches(
     runner: &mut Runner,
     c: &Config,
     corpus: Option<&Corpus>,
@@ -247,7 +247,7 @@ fn dispatches(
     )
 }
 #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
-fn dispatches(
+pub(super) fn dispatches(
     _runner: &mut Runner,
     _c: &Config,
     _corpus: Option<&Corpus>,

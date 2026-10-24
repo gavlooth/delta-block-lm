@@ -198,7 +198,7 @@ pub fn run(
     warmups: usize,
     trials: usize,
 ) -> Result<Value> {
-    use delta_mixers::{CachePolicy, HolaBackend, MixerKind, ProjectionBackend, ScanBackend};
+    use delta_mixers::{CachePolicy, HolaBackend, MixerKind, ProjectionBackend};
     ensure!(
         matches!(c.backend.as_str(), "vulkan" | "cuda") && !c.fusion,
         "backward attribution requires the non-fusion GPU backend"
@@ -207,7 +207,7 @@ pub fn run(
     ensure!(
         mixer_config.kind == MixerKind::KronLstm
             && mixer_config.cache_policy != CachePolicy::None
-            && c.scan_backend == ScanBackend::FusedGpu
+            && c.scan_backend.is_fused()
             && c.hola_backend == HolaBackend::FusedGpu
             && matches!(
                 c.projection_backend,
@@ -244,7 +244,7 @@ pub fn run(
         "full_step":"ordinary actual byte-LM step includes every model part, loss/backward, finite-gradient safety checks, clipping and AdamW, data preparation/upload and scalar readbacks. Separate alternating scratch trajectory times only backward/check/update boundaries. No model parts are stubbed or removed.",
         "optimizer_row":"checks+AdamW are a non-autodiff component timed after real full-model gradients; fwd=fwd+bwd=complete guarded update, backward=0; warmed moments/clipping/readback included, gradient generation excluded",
         "excluded":"initialization, corpus loading, cold JIT/first use, warmups, transfers for isolated fixtures, checkpoint/report IO. Ordinary step still includes production transfers.",
-        "workgroup_count":"scan geometry is source-derived, not a hardware occupancy counter: batch*heads 64-lane workgroups in EACH forward and backward scan kernel; no partition over time/key/value. Launch observer independently counts issued kernels.",
+        "workgroup_count":"scan geometry is source-derived, not a hardware occupancy counter: batch*heads workgroups in EACH forward and backward scan kernel; 64*partitions lanes, with explicit selector partitioning keys across 1/2/4 lane groups; time remains sequential. Launch observer independently counts issued kernels.",
         "cases":[]});
     runtime::write_json(&path, &report)?;
     let outcome = (|| -> Result<()> {
@@ -427,7 +427,7 @@ pub fn run(
                     result["batch"] = json!(batch_size);
                     result["heads"] = json!(heads);
                     result["workgroups_per_scan_kernel"] = json!(batch_size * heads);
-                    result["lanes_per_workgroup"] = json!(64);
+                    result["lanes_per_workgroup"] = json!(64 * c.scan_backend.partitions());
                     result["tokens_heads_per_second"] = json!(
                         1000. * (batch_size * heads * context) as f64
                             / result["forward_backward_median_ms"].as_f64().unwrap()

@@ -16,7 +16,7 @@ use burn_cubecl::CubeBackend;
 
 #[backend_extension(Cube, Autodiff, Fusion: cfg(feature = "fusion"))]
 pub trait KronOps: Backend {
-    #[fusion(meta = |q: &TensorSpec, _k, _v, _alpha, _erase, _write, _valid, _reset, initial: &TensorSpec, chunk: &usize| {
+    #[fusion(meta = |q: &TensorSpec, _k, _v, _alpha, _erase, _write, _valid, _reset, initial: &TensorSpec, chunk: &usize, _partitions| {
         let [batch, time, heads, _] = q.shape.dims::<4>();
         (
             TensorSpec::new([batch * time * heads * 65 + initial.shape.num_elements()].into(), q.dtype),
@@ -35,9 +35,10 @@ pub trait KronOps: Backend {
         reset: FloatTensor<Self>,
         initial: FloatTensor<Self>,
         chunk: usize,
+        partitions: usize,
     ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>);
 
-    #[fusion(meta = |q: &TensorSpec, k: &TensorSpec, v: &TensorSpec, alpha: &TensorSpec, erase: &TensorSpec, _upstream, _checkpoint, _auxiliary, _valid, _reset, _chunk| {
+    #[fusion(meta = |q: &TensorSpec, k: &TensorSpec, v: &TensorSpec, alpha: &TensorSpec, erase: &TensorSpec, _upstream, _checkpoint, _auxiliary, _valid, _reset, _chunk, _partitions| {
         let [batch, _, heads, _] = q.shape.dims::<4>();
         (
             q.clone(), k.clone(), v.clone(), alpha.clone(), erase.clone(), erase.clone(),
@@ -56,6 +57,7 @@ pub trait KronOps: Backend {
         valid: FloatTensor<Self>,
         reset: FloatTensor<Self>,
         chunk: usize,
+        partitions: usize,
     ) -> (
         FloatTensor<Self>,
         FloatTensor<Self>,
@@ -79,8 +81,11 @@ impl KronOps for CubeBackend {
         reset: FloatTensor<Self>,
         initial: FloatTensor<Self>,
         chunk: usize,
+        partitions: usize,
     ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
-        crate::kron::run_scan(q, k, v, alpha, erase, write, valid, reset, initial, chunk)
+        crate::kron::run_scan(
+            q, k, v, alpha, erase, write, valid, reset, initial, chunk, partitions,
+        )
     }
 
     fn kron_backward(
@@ -95,6 +100,7 @@ impl KronOps for CubeBackend {
         valid: FloatTensor<Self>,
         reset: FloatTensor<Self>,
         chunk: usize,
+        partitions: usize,
     ) -> (
         FloatTensor<Self>,
         FloatTensor<Self>,
@@ -105,7 +111,7 @@ impl KronOps for CubeBackend {
         FloatTensor<Self>,
     ) {
         crate::kron::run_backward(
-            q, k, v, alpha, erase, upstream, checkpoint, auxiliary, valid, reset, chunk,
+            q, k, v, alpha, erase, upstream, checkpoint, auxiliary, valid, reset, chunk, partitions,
         )
     }
 }
@@ -122,6 +128,7 @@ impl<B: Backend + KronOps, C: CheckpointStrategy> KronOps for Autodiff<B, C> {
         reset: FloatTensor<Self>,
         initial: FloatTensor<Self>,
         chunk: usize,
+        partitions: usize,
     ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
         #[derive(Debug)]
         struct ScanBackward;
@@ -137,6 +144,7 @@ impl<B: Backend + KronOps, C: CheckpointStrategy> KronOps for Autodiff<B, C> {
                 FloatTensor<B>,
                 FloatTensor<B>,
                 usize,
+                usize,
             );
             fn backward(
                 self,
@@ -145,9 +153,11 @@ impl<B: Backend + KronOps, C: CheckpointStrategy> KronOps for Autodiff<B, C> {
                 _checkpointer: &mut Checkpointer,
             ) {
                 let upstream = grads.consume::<B>(&ops.node);
-                let (q, k, v, alpha, erase, checkpoint, auxiliary, valid, reset, chunk) = ops.state;
+                let (q, k, v, alpha, erase, checkpoint, auxiliary, valid, reset, chunk, partitions) =
+                    ops.state;
                 let (dq, dk, dv, da, de, dw, ds) = B::kron_backward(
                     q, k, v, alpha, erase, upstream, checkpoint, auxiliary, valid, reset, chunk,
+                    partitions,
                 );
                 let [nq, nk, nv, na, ne, nw, ns] = ops.parents;
                 if let Some(node) = nq {
@@ -204,13 +214,14 @@ impl<B: Backend + KronOps, C: CheckpointStrategy> KronOps for Autodiff<B, C> {
             reset.clone(),
             initial,
             chunk,
+            partitions,
         );
         let checkpoint_ad = <Autodiff<B, C> as AutodiffBackend>::from_inner(checkpoint.clone());
         let auxiliary_ad = <Autodiff<B, C> as AutodiffBackend>::from_inner(auxiliary.clone());
         let packed = match ScanBackward.prepare::<C>(guards).compute_bound().stateful() {
             OpsKind::Tracked(prep) => prep.finish(
                 (
-                    q, k, v, alpha, erase, checkpoint, auxiliary, valid, reset, chunk,
+                    q, k, v, alpha, erase, checkpoint, auxiliary, valid, reset, chunk, partitions,
                 ),
                 packed,
             ),
@@ -231,6 +242,7 @@ impl<B: Backend + KronOps, C: CheckpointStrategy> KronOps for Autodiff<B, C> {
         valid: FloatTensor<Self>,
         reset: FloatTensor<Self>,
         chunk: usize,
+        partitions: usize,
     ) -> (
         FloatTensor<Self>,
         FloatTensor<Self>,
@@ -252,6 +264,7 @@ impl<B: Backend + KronOps, C: CheckpointStrategy> KronOps for Autodiff<B, C> {
             valid.into_primitive(),
             reset.into_primitive(),
             chunk,
+            partitions,
         );
         (
             <Autodiff<B, C> as AutodiffBackend>::from_inner(dq),
@@ -295,6 +308,26 @@ pub fn kron_scan(
     initial: Tensor<4>,
     chunk_size: usize,
 ) -> KronScanOutput {
+    kron_scan_partitioned(
+        q, k, v, alpha, erase, write, valid, reset, initial, chunk_size, 1,
+    )
+}
+
+/// Explicit cooperative state partitioning. `partitions=1` retains the original
+/// 64-lane kernel; 2 and 4 use 128 and 256 lanes without changing state storage.
+pub fn kron_scan_partitioned(
+    q: Tensor<4>,
+    k: Tensor<4>,
+    v: Tensor<4>,
+    alpha: Tensor<4>,
+    erase: Tensor<4>,
+    write: Tensor<4>,
+    valid: Tensor<2>,
+    reset: Tensor<2>,
+    initial: Tensor<4>,
+    chunk_size: usize,
+    partitions: usize,
+) -> KronScanOutput {
     let [batch, time, heads, keys] = q.dims();
     let values = v.dims()[3];
     let output_len = batch * time * heads * values;
@@ -313,6 +346,7 @@ pub fn kron_scan(
         reset.into_dispatch(),
         initial.into_dispatch(),
         chunk_size,
+        partitions,
     );
     let packed = Tensor::<1>::from_dispatch(packed);
     KronScanOutput {
