@@ -109,6 +109,20 @@ impl LossBackend {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SoftSelectionBackend {
+    #[default]
+    Cpu,
+    Gpu,
+    GpuTiled,
+}
+impl SoftSelectionBackend {
+    pub fn is_cpu(&self) -> bool {
+        *self == Self::Cpu
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -167,6 +181,8 @@ pub struct Config {
     pub comparison_seconds: f64,
     pub max_seconds: f64,
     pub soft_candidate_width: usize,
+    #[serde(skip_serializing_if = "SoftSelectionBackend::is_cpu")]
+    pub soft_selection_backend: SoftSelectionBackend,
     pub soft_steps: usize,
     pub soft_eta: f64,
     pub soft_temperature: f64,
@@ -222,6 +238,7 @@ impl Default for Config {
             comparison_seconds: 60.0,
             max_seconds: 90.0,
             soft_candidate_width: 4,
+            soft_selection_backend: SoftSelectionBackend::Cpu,
             soft_steps: 4,
             soft_eta: 0.5,
             soft_temperature: 1.0,
@@ -254,6 +271,11 @@ impl Config {
             (self.update_backend.is_tensor() && self.loss_backend.is_tensor())
                 || (matches!(self.backend.as_str(), "vulkan" | "cuda") && !self.fusion),
             "fused update/loss require an explicit non-fusion GPU backend"
+        );
+        ensure!(
+            self.soft_selection_backend.is_cpu()
+                || matches!(self.backend.as_str(), "vulkan" | "cuda"),
+            "GPU soft selection requires an explicit GPU backend"
         );
         ensure!(
             self.head_backend.is_native() || self.task == "lm",
@@ -480,6 +502,7 @@ mod tests {
         assert!(legacy.get("head_backend").is_none());
         assert!(legacy.get("update_backend").is_none());
         assert!(legacy.get("loss_backend").is_none());
+        assert!(legacy.get("soft_selection_backend").is_none());
         let decoded: Config = serde_json::from_value(legacy.clone()).unwrap();
         assert_eq!(decoded.scan_backend, ScanBackend::TensorSolver);
         assert_eq!(decoded.hola_backend, HolaBackend::Tensor);
@@ -494,6 +517,7 @@ mod tests {
         assert_eq!(decoded.head_backend, HeadBackend::Native);
         assert_eq!(decoded.update_backend, UpdateBackend::Tensor);
         assert_eq!(decoded.loss_backend, LossBackend::Tensor);
+        assert_eq!(decoded.soft_selection_backend, SoftSelectionBackend::Cpu);
         assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
     }
     #[test]
@@ -591,6 +615,26 @@ mod tests {
             assert_ne!(baseline, config.pilot_fingerprint().unwrap());
             config.fusion = true;
             assert!(config.validate().is_err());
+        }
+    }
+    #[test]
+    fn soft_selection_is_explicit_and_gpu_only() {
+        let mut config = Config::default();
+        let baseline = config.pilot_fingerprint().unwrap();
+        for backend in [SoftSelectionBackend::Gpu, SoftSelectionBackend::GpuTiled] {
+            config.soft_selection_backend = backend;
+            config.backend = "cpu".into();
+            assert!(config.validate().is_err());
+            config.backend = "vulkan".into();
+            config.validate().unwrap();
+            assert_ne!(baseline, config.pilot_fingerprint().unwrap());
+            let encoded = serde_json::to_value(&config).unwrap();
+            assert_eq!(
+                serde_json::from_value::<Config>(encoded)
+                    .unwrap()
+                    .soft_selection_backend,
+                backend
+            );
         }
     }
 }
