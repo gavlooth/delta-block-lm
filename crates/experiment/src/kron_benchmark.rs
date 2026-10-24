@@ -24,10 +24,10 @@ use std::{
 
 const ATOL: f64 = 2e-5;
 const RTOL: f64 = 3e-4;
-fn values<const D: usize>(x: Tensor<D>) -> Vec<f32> {
+pub(super) fn values<const D: usize>(x: Tensor<D>) -> Vec<f32> {
     x.into_data().try_to_vec::<f32>().expect("f32 benchmark")
 }
-fn equivalent(name: &str, a: &[f32], b: &[f32]) -> Result<f64> {
+pub(super) fn equivalent(name: &str, a: &[f32], b: &[f32]) -> Result<f64> {
     ensure!(a.len() == b.len(), "{name}: length mismatch");
     let mut maximum = 0.0f64;
     for (i, (&a, &b)) in a.iter().zip(b).enumerate() {
@@ -58,7 +58,7 @@ fn deadline(start: Instant, c: &Config) -> Result<()> {
     );
     Ok(())
 }
-struct Raw {
+pub(super) struct Raw {
     x: Vec<Tensor<4>>,
     valid: Tensor<2>,
     reset: Tensor<2>,
@@ -66,7 +66,7 @@ struct Raw {
     upstream: Tensor<4>,
 }
 impl Raw {
-    fn new(device: &Device, batch: usize, time: usize, seed: u64) -> Self {
+    pub(super) fn new(device: &Device, batch: usize, time: usize, seed: u64) -> Self {
         let heads = 4;
         let widths = [32, 32, 64, 32, 1, 1];
         let mut rng = data::Rng(seed);
@@ -152,7 +152,12 @@ impl Raw {
         (output, grads)
     }
 }
-fn raw_timed(raw: &Raw, backend: ScanBackend, backward: bool, device: &Device) -> Result<f64> {
+pub(super) fn raw_timed(
+    raw: &Raw,
+    backend: ScanBackend,
+    backward: bool,
+    device: &Device,
+) -> Result<f64> {
     runtime::sync(device)?;
     let clock = Instant::now();
     let result = raw.run(backend, backward);
@@ -182,7 +187,7 @@ impl ModuleVisitor for Parameters<'_> {
         self.tensors.push((tensor.dims().to_vec(), values(tensor)));
     }
 }
-fn parameters(
+pub(super) fn parameters(
     model: &LanguageModel,
     grads: Option<&GradientsParams>,
 ) -> Result<Vec<(Vec<usize>, Vec<f32>)>> {
@@ -199,7 +204,7 @@ fn parameters(
     );
     Ok(visitor.tensors)
 }
-fn compare_parameters(
+pub(super) fn compare_parameters(
     name: &str,
     a: &[(Vec<usize>, Vec<f32>)],
     b: &[(Vec<usize>, Vec<f32>)],

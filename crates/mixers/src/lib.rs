@@ -39,15 +39,29 @@ pub enum ScanBackend {
     #[default]
     TensorSolver,
     FusedGpu,
+    FusedParallel128,
+    FusedParallel256,
 }
 impl ScanBackend {
     pub fn is_tensor_solver(&self) -> bool {
         *self == Self::TensorSolver
     }
+    pub fn is_fused(&self) -> bool {
+        !self.is_tensor_solver()
+    }
+    pub fn partitions(&self) -> usize {
+        match self {
+            Self::FusedParallel128 => 2,
+            Self::FusedParallel256 => 4,
+            _ => 1,
+        }
+    }
     pub fn training_algorithm(&self) -> &'static str {
         match self {
             Self::TensorSolver => "differentiable_chunk_tensor_solver",
             Self::FusedGpu => "fused_kron_gpu",
+            Self::FusedParallel128 => "fused_kron_parallel128_gpu",
+            Self::FusedParallel256 => "fused_kron_parallel256_gpu",
         }
     }
 }
@@ -133,7 +147,7 @@ impl MixerConfig {
             "computational chunk_size must be 1..=16"
         );
         assert!(self.cache_policy == CachePolicy::None || self.cache_capacity > 0);
-        if self.scan_backend == ScanBackend::FusedGpu {
+        if self.scan_backend.is_fused() {
             assert_eq!(
                 self.kind,
                 MixerKind::KronLstm,
@@ -301,7 +315,7 @@ impl Mixer {
     }
     /// Changes execution only; trainable tensors and their identities remain unchanged.
     pub fn set_scan_backend(&mut self, backend: ScanBackend) {
-        if backend == ScanBackend::FusedGpu {
+        if backend.is_fused() {
             assert_eq!(
                 self.kind,
                 MixerKind::KronLstm,

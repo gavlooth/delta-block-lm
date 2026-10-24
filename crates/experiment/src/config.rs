@@ -27,7 +27,7 @@ impl Arm {
             value => anyhow::bail!("unknown cache {value}"),
         };
         ensure!(
-            c.scan_backend != ScanBackend::FusedGpu || kind == MixerKind::KronLstm,
+            !c.scan_backend.is_fused() || kind == MixerKind::KronLstm,
             "fused_gpu is KronLSTM-only; use tensor_solver for GDN-2"
         );
         Ok(MixerConfig {
@@ -47,15 +47,19 @@ impl Arm {
     }
     pub fn training_algorithm(&self, c: &Config) -> &'static str {
         let fused_hola = self.cache != "none" && c.hola_backend == HolaBackend::FusedGpu;
-        match (c.scan_backend == ScanBackend::FusedGpu, fused_hola) {
-            (false, false) => "differentiable_chunk_tensor_solver",
-            (true, false) => "fused_kron_gpu",
-            (false, true) => "tensor_solver_fused_hola_gpu",
-            (true, true) => "fused_kron_and_hola_gpu",
+        match (c.scan_backend, fused_hola) {
+            (ScanBackend::TensorSolver, false) => "differentiable_chunk_tensor_solver",
+            (ScanBackend::FusedGpu, false) => "fused_kron_gpu",
+            (ScanBackend::TensorSolver, true) => "tensor_solver_fused_hola_gpu",
+            (ScanBackend::FusedGpu, true) => "fused_kron_and_hola_gpu",
+            (ScanBackend::FusedParallel128, false) => "fused_kron_parallel128_gpu",
+            (ScanBackend::FusedParallel256, false) => "fused_kron_parallel256_gpu",
+            (ScanBackend::FusedParallel128, true) => "fused_kron_parallel128_and_hola_gpu",
+            (ScanBackend::FusedParallel256, true) => "fused_kron_parallel256_and_hola_gpu",
         }
     }
     pub fn uses_custom_gpu(&self, c: &Config) -> bool {
-        c.scan_backend == ScanBackend::FusedGpu
+        c.scan_backend.is_fused()
             || (self.cache != "none" && c.hola_backend == HolaBackend::FusedGpu)
             || !c.normalization_backend.is_tensor()
     }
@@ -240,7 +244,7 @@ impl Config {
             "invalid deadlines"
         );
         ensure!(
-            (self.scan_backend != ScanBackend::FusedGpu
+            (!self.scan_backend.is_fused()
                 && self.hola_backend != HolaBackend::FusedGpu
                 && self.normalization_backend.is_tensor())
                 || matches!(self.backend.as_str(), "vulkan" | "cuda"),
@@ -436,6 +440,35 @@ mod tests {
             config.pilot_fingerprint().unwrap(),
             padded.pilot_fingerprint().unwrap()
         );
+    }
+    #[test]
+    fn parallel_scan_selectors_are_explicit_distinct_and_gpu_only() {
+        let baseline = Config::default().pilot_fingerprint().unwrap();
+        let mut fingerprints = Vec::new();
+        for backend in [
+            ScanBackend::FusedGpu,
+            ScanBackend::FusedParallel128,
+            ScanBackend::FusedParallel256,
+        ] {
+            let mut config = Config::default();
+            config.scan_backend = backend;
+            assert!(config.validate().is_err());
+            config.backend = "vulkan".into();
+            assert!(config.arms[0].mixer_config(&config).is_err());
+            config.arms[0].mixer = "kronlstm".into();
+            config.arms[0].mixer_config(&config).unwrap();
+            let encoded = serde_json::to_value(&config).unwrap();
+            assert_eq!(
+                serde_json::from_value::<Config>(encoded)
+                    .unwrap()
+                    .scan_backend,
+                backend
+            );
+            let identity = config.pilot_fingerprint().unwrap();
+            assert_ne!(identity, baseline);
+            assert!(!fingerprints.contains(&identity));
+            fingerprints.push(identity);
+        }
     }
     #[test]
     fn fused_selectors_reject_cpu_and_gdn_scan_without_fallback() {

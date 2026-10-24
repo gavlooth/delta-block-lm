@@ -11,7 +11,7 @@ const K: usize = 32;
 const V: usize = 64;
 
 #[cube]
-fn ix(x: &View<f32>, b: usize, t: usize, h: usize, i: usize) -> usize {
+pub(super) fn ix(x: &View<f32>, b: usize, t: usize, h: usize, i: usize) -> usize {
     b * x.stride(0) + t * x.stride(1) + h * x.stride(2) + i * x.stride(3)
 }
 
@@ -388,7 +388,12 @@ pub(crate) fn run_scan(
     reset: CubeTensor,
     initial: CubeTensor,
     chunk: usize,
+    partitions: usize,
 ) -> (CubeTensor, CubeTensor, CubeTensor) {
+    assert!(
+        matches!(partitions, 1 | 2 | 4),
+        "Kron partitions must be 1, 2 or 4"
+    );
     let [batch, time, heads, keys] = q.shape().dims::<4>();
     assert!(
         batch > 0 && time > 0 && heads > 0,
@@ -428,24 +433,46 @@ pub(crate) fn run_scan(
     let packed = empty(&q, [packed_len]);
     let checkpoint = empty(&q, [batch, heads, time.div_ceil(chunk), K, V]);
     let auxiliary = empty(&q, [batch, time, heads, 4]);
-    forward_kernel::launch(
-        &q.client,
-        count(&q, batch * heads),
-        CubeDim::new_1d(V as u32),
-        q.clone().into_tensor_arg(),
-        k.into_tensor_arg(),
-        v.into_tensor_arg(),
-        alpha.into_tensor_arg(),
-        erase.into_tensor_arg(),
-        write.into_tensor_arg(),
-        valid.into_tensor_arg(),
-        reset.into_tensor_arg(),
-        initial.into_tensor_arg(),
-        packed.clone().into_tensor_arg(),
-        checkpoint.clone().into_tensor_arg(),
-        auxiliary.clone().into_tensor_arg(),
-        chunk,
-    );
+    if partitions == 1 {
+        forward_kernel::launch(
+            &q.client,
+            count(&q, batch * heads),
+            CubeDim::new_1d(V as u32),
+            q.clone().into_tensor_arg(),
+            k.into_tensor_arg(),
+            v.into_tensor_arg(),
+            alpha.into_tensor_arg(),
+            erase.into_tensor_arg(),
+            write.into_tensor_arg(),
+            valid.into_tensor_arg(),
+            reset.into_tensor_arg(),
+            initial.into_tensor_arg(),
+            packed.clone().into_tensor_arg(),
+            checkpoint.clone().into_tensor_arg(),
+            auxiliary.clone().into_tensor_arg(),
+            chunk,
+        );
+    } else {
+        crate::kron_parallel::forward_kernel::launch(
+            &q.client,
+            count(&q, batch * heads),
+            CubeDim::new_1d((V * partitions) as u32),
+            q.clone().into_tensor_arg(),
+            k.into_tensor_arg(),
+            v.into_tensor_arg(),
+            alpha.into_tensor_arg(),
+            erase.into_tensor_arg(),
+            write.into_tensor_arg(),
+            valid.into_tensor_arg(),
+            reset.into_tensor_arg(),
+            initial.into_tensor_arg(),
+            packed.clone().into_tensor_arg(),
+            checkpoint.clone().into_tensor_arg(),
+            auxiliary.clone().into_tensor_arg(),
+            chunk,
+            partitions,
+        );
+    }
     (packed, checkpoint, auxiliary)
 }
 
@@ -461,6 +488,7 @@ pub(crate) fn run_backward(
     valid: CubeTensor,
     reset: CubeTensor,
     chunk: usize,
+    partitions: usize,
 ) -> (
     CubeTensor,
     CubeTensor,
@@ -470,6 +498,10 @@ pub(crate) fn run_backward(
     CubeTensor,
     CubeTensor,
 ) {
+    assert!(
+        matches!(partitions, 1 | 2 | 4),
+        "Kron partitions must be 1, 2 or 4"
+    );
     let [batch, time, heads, _] = q.shape().dims::<4>();
     for tensor in [
         &q,
@@ -493,30 +525,58 @@ pub(crate) fn run_backward(
     let de = empty(&q, erase.shape());
     let dw = empty(&q, [batch, time, heads, 1]);
     let ds = empty(&q, [batch, heads, K, V]);
-    backward_kernel::launch(
-        &q.client,
-        count(&q, batch * heads),
-        CubeDim::new_1d(V as u32),
-        q.clone().into_tensor_arg(),
-        k.into_tensor_arg(),
-        v.into_tensor_arg(),
-        alpha.into_tensor_arg(),
-        erase.into_tensor_arg(),
-        valid.into_tensor_arg(),
-        reset.into_tensor_arg(),
-        checkpoint.into_tensor_arg(),
-        auxiliary.into_tensor_arg(),
-        upstream.into_tensor_arg(),
-        replay.into_tensor_arg(),
-        dq.clone().into_tensor_arg(),
-        dk.clone().into_tensor_arg(),
-        dv.clone().into_tensor_arg(),
-        da.clone().into_tensor_arg(),
-        de.clone().into_tensor_arg(),
-        dw.clone().into_tensor_arg(),
-        ds.clone().into_tensor_arg(),
-        chunk,
-    );
+    if partitions == 1 {
+        backward_kernel::launch(
+            &q.client,
+            count(&q, batch * heads),
+            CubeDim::new_1d(V as u32),
+            q.clone().into_tensor_arg(),
+            k.into_tensor_arg(),
+            v.into_tensor_arg(),
+            alpha.into_tensor_arg(),
+            erase.into_tensor_arg(),
+            valid.into_tensor_arg(),
+            reset.into_tensor_arg(),
+            checkpoint.into_tensor_arg(),
+            auxiliary.into_tensor_arg(),
+            upstream.into_tensor_arg(),
+            replay.into_tensor_arg(),
+            dq.clone().into_tensor_arg(),
+            dk.clone().into_tensor_arg(),
+            dv.clone().into_tensor_arg(),
+            da.clone().into_tensor_arg(),
+            de.clone().into_tensor_arg(),
+            dw.clone().into_tensor_arg(),
+            ds.clone().into_tensor_arg(),
+            chunk,
+        );
+    } else {
+        crate::kron_parallel::backward_kernel::launch(
+            &q.client,
+            count(&q, batch * heads),
+            CubeDim::new_1d((V * partitions) as u32),
+            q.clone().into_tensor_arg(),
+            k.into_tensor_arg(),
+            v.into_tensor_arg(),
+            alpha.into_tensor_arg(),
+            erase.into_tensor_arg(),
+            valid.into_tensor_arg(),
+            reset.into_tensor_arg(),
+            checkpoint.into_tensor_arg(),
+            auxiliary.into_tensor_arg(),
+            upstream.into_tensor_arg(),
+            replay.into_tensor_arg(),
+            dq.clone().into_tensor_arg(),
+            dk.clone().into_tensor_arg(),
+            dv.clone().into_tensor_arg(),
+            da.clone().into_tensor_arg(),
+            de.clone().into_tensor_arg(),
+            dw.clone().into_tensor_arg(),
+            ds.clone().into_tensor_arg(),
+            chunk,
+            partitions,
+        );
+    }
     (dq, dk, dv, da, de, dw, ds)
 }
 
