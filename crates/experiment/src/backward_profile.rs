@@ -2,7 +2,7 @@
 use crate::{
     config::{Arm, Config},
     data::{self, Batch},
-    model::{self, LanguageModel},
+    model::LanguageModel,
     profile::{Runner, median},
     runtime, train,
 };
@@ -379,7 +379,7 @@ pub fn run(
                 components.push(result);
             }
             let mut final_row = benchmark(&device, &bound, 1, warmups, trials, |_| {
-                model::loss(
+                base.loss(
                     base.head_forward(
                         base.normalization_backend
                             .rms(&base.norm, hidden[0].clone()),
