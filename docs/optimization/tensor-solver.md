@@ -36,8 +36,8 @@ A scalar reconstruction of the exact fixture at the failed coordinate separates:
 | Sum | 0.002235880982140489 |
 
 The saved GPU value matches the direct term alone; the residual matches the
-missing erase term. This is localization evidence, not yet a proven library
-root cause. In the triangular formulation the corresponding branch is
+missing erase term. By itself this localized the failure but did not establish
+the library cause. In the triangular formulation the corresponding branch is
 `((k * prefix).matmul(initial) * v).sum_dim(3) * erase` in the RHS.
 An incorrect alpha **backward** alone cannot explain a key derivative error:
 alpha and key are independent inputs. Incorrect alpha/prefix **forward** values
@@ -46,8 +46,7 @@ or mutation of saved forward values could affect it.
 ## Primitive exclusion evidence
 
 Frozen temporary diagnostic source: `b36e2026`.
-The parent ran the unified non-fusion build and Vulkan primitive harness;
-the agent did not run GPU, tests, builds, linters, or formatters.
+The unified non-fusion build and Vulkan primitive harness ran serially.
 Reported compile time was 3.02 s and full transaction time 5.16 s.
 All probes passed the unchanged tolerances:
 
@@ -80,7 +79,7 @@ It reconstructs the saved fixture without changing production recurrence code:
   `require_grad()` on a non-leaf. It panicked after the branch probes, and is
   not counted as a successful check.
 
-The parent observed the production focused key gradient
+The exact-chain run observed the production focused key gradient
 `0.0020814966410398483`. Its forward finite differences were
 `0.002217008899805466` at epsilon 0.001 and `0.0022392289984488624`
 at epsilon 0.003, consistent with the correct forward dependency rather than
@@ -96,8 +95,8 @@ projection, bilinear reduction, erase product, and RHS. Expected adjoints
 come from the independent f64 RHS adjoint, initial state and value vectors.
 It skips the previously exercised full-graph and finite-difference stages.
 
-The bounded commands, run serially by the parent under the existing GPU then
-build locks, are:
+Historical reproduction commands at source `f19cf74b`, run serially under the
+existing GPU then build locks, were:
 
 ```sh
 timeout 180s cargo build --workspace --features delta-experiment/vulkan --example tensor_solver_diagnostic
@@ -106,7 +105,103 @@ timeout 120s target/debug/examples/tensor_solver_diagnostic vulkan cut
 
 The executable also accepts `cpu cut` for a matched backend control.
 The `cut` argument skips both broad primitive and earlier chain probes.
-At this source checkpoint there is no claimed fix and no production math change.
+That checkpoint had no production math change. The temporary example has now
+been removed; it remains available in the frozen diagnostic revisions, not
+as a permanent extra executable.
+
+## Proven failing boundary and correction
+
+The cut run returned correct RHS, erased-product, and scalar-inner leaf VJPs.
+The scalar-inner focused VJP was `0.04179788753` against f64
+`0.04179788472`. Cutting at the state projection returned zero for all 64
+focused channels, and consequently the key-prefix and masked-key cuts were
+also zero.
+
+The standalone reduction matrix at source `661e4e86` then passed all 72
+forward/operand-VJP comparisons: T7/16, V32/64, contiguous and swapped value
+inputs and scalar seeds; the T7/V64 cases also covered rank-2 reduction and
+rowwise dot-matmul equivalents. Therefore this is **not** a general claim that
+GPU multiplication or `sum_dim(3)` is incorrect in isolation.
+
+The final context bisection at source `91c8ce19` established:
+
+- A leaf substituted for the **product** `state_projection * v` also receives
+  zero VJP through the original rank-4 `sum_dim(3)` in the recurrence graph.
+  This excludes the multiplication's saved value, key GEMM, and alpha
+  derivative as the point where this contribution disappears.
+- Detaching only the erase coefficient or only the downstream inverse restores
+  the projection VJP (maximum absolute error approximately 6.9e-10).
+- Detaching write or the edit-value consumer, using a distinct/constant/fresh
+  value for the inner product, and omitting unused final-state/score branches
+  do not restore it.
+- Both complete copied graphs with an equivalent rank-2 reduction or rowwise
+  dot matmul pass **every** key VJP. Focused value:
+  `0.0022358810529` versus f64 `0.0022358809825`; maximum key error 2.94e-8.
+- Runtime checkpointing is **Disabled**. A static `BalancedCheckpointing`
+  type name in one panic trace was not evidence of runtime recomputation.
+
+The proven library defect boundary is the rank-4 reduction's backward in the
+erase/broadcast/triangular-solve graph. A layout/stride interaction in its
+incoming `[B,H,T,1]` adjoint is the remaining low-level explanation to investigate;
+the specific faulty CubeCL instruction has **not** been established.
+
+The production correction flattens only the rowwise bilinear product before
+reducing values:
+
+```rust
+(projected_initial * v)
+    .reshape([batch * heads * size, values])
+    .sum_dim(1)
+    .reshape([batch, heads, size, 1])
+```
+
+This computes the same row dot products, does not divide by decay, and preserves
+all input gradients and existing reset/padding behavior. It is unconditional
+for KronLSTM shapes, not a fixture-specific branch, detached-gradient workaround,
+or dispatch to the custom fused scan. GDN-2 has no corresponding scalar
+initial-state dot-product reduction and remains unchanged. The unrelated
+key-overlap and norm reductions remain unchanged.
+
+The rank-2 formulation keeps the same multiplication and reduction element
+counts; reshape may materialize a noncontiguous input when necessary.
+No performance improvement or memory-saving claim is made. No dependencies,
+checkpoint parameters, public APIs, or numerical tolerances change.
+
+## Upstream-report text
+
+**Suggested title:** CubeCL Vulkan: composed rank-4 sum_dim VJP becomes zero
+after a broadcast erase and batched triangular-solve consumer.
+
+**Environment:** Burn/burn-autodiff/burn-cubecl 0.22.0, CubeCL 0.11.0,
+cubek-reduce 0.3.0 from the lockfile; float32, Intel Arc MTL Vulkan,
+non-fusion, non-autotuned, checkpointing Disabled.
+
+**Reproduction:** Use frozen source `91c8ce19` and run the unified example build
+followed by `timeout 120s target/debug/examples/tensor_solver_diagnostic vulkan context`.
+The example is intentionally absent from the final production tree. Its exact
+fixture is independently differentiated in f64 and the `context` mode skips
+the already-run broad/finite-difference probes. The failing suffix is:
+
+```
+product_leaf: [2,4,7,64]
+inner = product_leaf.sum_dim(3)
+rhs = write - inner * erase                 // erase: [2,4,7,1], tracked
+correction = inverse.matmul(rhs)            // inverse: [2,4,7,7], tracked
+edits = correction * value
+output = initial_output + overlap.matmul(edits)
+loss = (output * independent_output_seed).sum()
+```
+
+**Expected:** Nonzero product-leaf gradient equal to the scalar inner adjoint
+broadcast over 64 values. **Actual:** Zero product-leaf gradient, while a leaf
+substituted immediately after `sum_dim(3)` has the correct nonzero adjoint.
+Detaching erase or inverse restores it; removing value sharing does not.
+Replacing only the reduction by the equivalent rank-2 formulation restores
+the full recurrence's key VJP. Standalone multiply/reduce examples pass, so a
+report must retain the consumer graph rather than claim a generic sum bug.
+
+Submission destination: https://github.com/tracel-ai/burn/issues .
+No upstream issue has been filed or assigned a number in this investigation.
 
 ## Independent regression behavior
 
@@ -119,15 +214,44 @@ VJP expectations. The fixture also asserts nonzero initial-state influence on
 the first key gradient, zero input/output effect on padding, and discarded
 initial-state gradients for a row that resets at its first active token.
 
-The parent can run the normal CPU test and the explicitly ignored GPU test
-using the same unified workspace feature set:
+Run the normal CPU test and the explicitly ignored GPU test using the same
+unified workspace feature set:
 
 ```sh
 timeout 180s cargo test --workspace --features delta-experiment/vulkan tensor_solver_initial_key_reset_padding_cpu -- --test-threads=1
 timeout 180s cargo test --workspace --features delta-experiment/vulkan tensor_solver_initial_key_reset_padding_vulkan -- --ignored --test-threads=1
 ```
 
-These tests have not been executed at this checkpoint. The GPU command must use
-the repository's GPU/build lock ordering. Existing strict Kron acceptance,
-including all input fields, initial state, continuation, and strided inputs,
-remains unchanged and is still required for acceptance of a correction.
+These tests have not been executed at the correction's source freeze.
+The GPU command must use the repository's GPU/build lock ordering.
+Existing strict Kron acceptance, including all input fields, initial state,
+continuation, and strided inputs, remains unchanged.
+
+After the unified executable build, the following bounded command reruns the
+three historical T7 objectives without overwriting any saved failure artifacts.
+Only the artifact destination differs from each historical config:
+
+```sh
+timeout 180s cargo build --workspace --features delta-experiment/vulkan
+timeout 180s bun -e '
+import { resolve } from "node:path";
+const root = resolve(`artifacts/kron-validation/solver-corrected-${Date.now()}`);
+const executable = resolve(process.env.CARGO_TARGET_DIR ?? "target", "debug/delta-experiment");
+let ok = true;
+for (const objective of ["output_only", "final_state_only", "score_only"]) {
+  const config = await Bun.file(`artifacts/kron-validation/solver-${objective}/config.json`).json();
+  config.artifact_dir = `${root}/${objective}`;
+  const file = `${config.artifact_dir}/config.json`;
+  await Bun.write(file, JSON.stringify(config, null, 2) + "\n");
+  const child = Bun.spawnSync(["timeout", "45s", executable, "kron-reference", file,
+    "--scan-backend", "tensor_solver", "--tokens", "7", "--objective", objective],
+    { stdout: "inherit", stderr: "inherit" });
+  ok = ok && child.exitCode === 0;
+}
+console.log(JSON.stringify({ artifact_dir: root, all_objectives_passed: ok }));
+process.exitCode = ok ? 0 : 1;
+'
+```
+
+These after-change results must be recorded separately from the frozen
+diagnostic evidence; the latter does not by itself certify the production edit.
