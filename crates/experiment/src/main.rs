@@ -7,6 +7,7 @@ mod diagnostics;
 mod gemm;
 mod gemm_batched;
 mod hola_tune;
+mod io_benchmark;
 mod kron_benchmark;
 mod lm_retrieval;
 mod model;
@@ -33,7 +34,7 @@ fn execute() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     ensure!(
         args.len() >= 2,
-        "usage: delta-experiment <reference|convolution-reference|normalization-reference|kron-reference|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|kron-model-benchmark|hola-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
+        "usage: delta-experiment <reference|convolution-reference|normalization-reference|kron-reference|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|kron-model-benchmark|hola-benchmark|io-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
     );
     let command = &args[0];
     let c = Config::load(Path::new(&args[1]))?;
@@ -170,6 +171,7 @@ fn execute() -> Result<()> {
                 | "update-loss-benchmark"
                 | "soft-benchmark"
                 | "soft-step"
+                | "io-benchmark"
         ) || benchmark_warmups.is_none(),
         "--warmups is only valid for Kron benchmarks/profile; hola-benchmark uses two warmups per mode"
     );
@@ -191,6 +193,7 @@ fn execute() -> Result<()> {
                 | "update-loss-benchmark"
                 | "soft-benchmark"
                 | "soft-step"
+                | "io-benchmark"
         ) || benchmark_trials.is_none(),
         "--trials is only valid for a benchmark command"
     );
@@ -204,7 +207,7 @@ fn execute() -> Result<()> {
     ensure!(
         !matches!(
             command.as_str(),
-            "gemm-micro" | "gemm-step" | "update-loss-benchmark" | "update-loss-reference"
+            "gemm-micro" | "gemm-step" | "update-loss-benchmark" | "update-loss-reference" | "io-benchmark"
         ) || (arm_name.is_none()
             && (resume.is_none() || command == "update-loss-reference")
             && seed == c.seed),
@@ -231,6 +234,11 @@ fn execute() -> Result<()> {
     runtime_config.backend = backend.to_owned();
     let device = runtime::device(&runtime_config)?;
     let result = match command.as_str() {
+        "io-benchmark" => io_benchmark::run(
+            &c, &c.arms[0], &device,
+            benchmark_warmups.unwrap_or(1),
+            benchmark_trials.unwrap_or(3),
+        )?,
         "reference" => {
             let report = delta_mixers::numerical_checks(&device.clone().autodiff())
                 .map_err(anyhow::Error::msg)?;
@@ -437,6 +445,7 @@ fn execute() -> Result<()> {
             | "scan-benchmark"
             | "convolution-benchmark"
             | "gemm-micro"
+            | "io-benchmark"
     ) {
         let output = diagnostic_output.as_deref().unwrap_or(&c.artifact_dir);
         runtime::write_json(&output.join(format!("{command}.json")), &result)?;
@@ -455,6 +464,7 @@ fn execute() -> Result<()> {
                 | "gemm-micro"
                 | "gemm-step"
                 | "update-loss-benchmark"
+                | "io-benchmark"
         ) || result["completed"] == true,
         "profile/benchmark failed or hit its deadline; separate partial report retained"
     );
