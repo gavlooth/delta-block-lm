@@ -117,25 +117,7 @@ impl LanguageModel {
         loss_selected(logits, batch, self.loss_backend)
     }
     pub(super) fn head_forward(&self, hidden: Tensor<3>) -> Tensor<3> {
-        match self.head_backend {
-            HeadBackend::Native => self.head.forward(hidden),
-            HeadBackend::Padded320 => {
-                let [b, t, _] = hidden.dims();
-                let weight = self.head.weight.val();
-                let [width, vocab] = weight.dims();
-                assert_eq!(vocab, 257);
-                // The 63 added columns are constants, never parameters or optimizer state.
-                let padding = Tensor::<2>::zeros([width, 320 - vocab], &hidden.device());
-                let padded = Tensor::cat(vec![weight, padding], 1);
-                burn::tensor::module::linear(hidden, padded, None).slice([0..b, 0..t, 0..vocab])
-            }
-            HeadBackend::Heuristic => {
-                let [b, t, width] = hidden.dims();
-                let weight = self.head.weight.val();
-                let vocab = weight.dims()[1];
-                heuristic_matmul(hidden.reshape([b * t, width]), weight).reshape([b, t, vocab])
-            }
-        }
+        project_head(hidden, self.head.weight.val(), self.head_backend)
     }
     pub fn forward(&self, batch: &Batch) -> Tensor<3> {
         self.forward_profiled(batch, &mut Unprofiled)
@@ -180,6 +162,30 @@ pub(super) fn heuristic_matmul(a: Tensor<2>, b: Tensor<2>) -> Tensor<2> {
     {
         let _ = (a, b);
         panic!("heuristic matmul requires a GPU feature")
+    }
+}
+
+pub(super) fn project_head(
+    hidden: Tensor<3>,
+    weight: Tensor<2>,
+    backend: HeadBackend,
+) -> Tensor<3> {
+    match backend {
+        HeadBackend::Native => burn::tensor::module::linear(hidden, weight, None),
+        HeadBackend::Padded320 => {
+            let [b, t, _] = hidden.dims();
+            let [width, vocab] = weight.dims();
+            assert_eq!(vocab, 257);
+            // Padding is constant, absent from both stored parameters and the loss.
+            let padding = Tensor::<2>::zeros([width, 320 - vocab], &hidden.device());
+            burn::tensor::module::linear(hidden, Tensor::cat(vec![weight, padding], 1), None)
+                .slice([0..b, 0..t, 0..vocab])
+        }
+        HeadBackend::Heuristic => {
+            let [b, t, width] = hidden.dims();
+            let output = weight.dims()[1];
+            heuristic_matmul(hidden.reshape([b * t, width]), weight).reshape([b, t, output])
+        }
     }
 }
 pub fn loss_selected(logits: Tensor<3>, batch: &Batch, backend: LossBackend) -> Tensor<1> {

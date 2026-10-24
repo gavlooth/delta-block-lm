@@ -7,6 +7,7 @@ mod diagnostics;
 mod gemm;
 mod gemm_batched;
 mod hola_tune;
+mod gemm_guard;
 mod kron_benchmark;
 mod lm_retrieval;
 mod model;
@@ -33,7 +34,7 @@ fn execute() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     ensure!(
         args.len() >= 2,
-        "usage: delta-experiment <reference|convolution-reference|normalization-reference|kron-reference|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|kron-model-benchmark|hola-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
+        "usage: delta-experiment <reference|convolution-reference|normalization-reference|kron-reference|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|optimization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|kron-model-benchmark|hola-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
     );
     let command = &args[0];
     let c = Config::load(Path::new(&args[1]))?;
@@ -118,8 +119,9 @@ fn execute() -> Result<()> {
                 | "hola-tune"
                 | "scan-benchmark"
                 | "convolution-benchmark"
+                | "optimization-benchmark"
         ) || profile_contexts.is_none(),
-        "--contexts is only valid for profile/backward-profile/projection-benchmark/normalization-benchmark/hola-tune/scan-benchmark/convolution-benchmark"
+        "--contexts is only valid for profile/backward-profile/projection-benchmark/normalization-benchmark/hola-tune/scan-benchmark/convolution-benchmark/optimization-benchmark"
     );
     ensure!(
         !matches!(
@@ -131,6 +133,7 @@ fn execute() -> Result<()> {
                 | "hola-tune"
                 | "scan-benchmark"
                 | "convolution-benchmark"
+                | "optimization-benchmark"
         ) || (resume.is_none() && seed == c.seed),
         "profiles use configured seed and fresh scratch state, not --seed/--resume"
     );
@@ -170,6 +173,7 @@ fn execute() -> Result<()> {
                 | "update-loss-benchmark"
                 | "soft-benchmark"
                 | "soft-step"
+                | "optimization-benchmark"
         ) || benchmark_warmups.is_none(),
         "--warmups is only valid for Kron benchmarks/profile; hola-benchmark uses two warmups per mode"
     );
@@ -191,6 +195,7 @@ fn execute() -> Result<()> {
                 | "update-loss-benchmark"
                 | "soft-benchmark"
                 | "soft-step"
+                | "optimization-benchmark"
         ) || benchmark_trials.is_none(),
         "--trials is only valid for a benchmark command"
     );
@@ -226,11 +231,64 @@ fn execute() -> Result<()> {
         checkpoint_manifest.is_none() || command == "certify",
         "--checkpoints is only valid for certify"
     );
+    ensure!(
+        !c.autotune
+            || !matches!(
+                command.as_str(),
+                "soft"
+                    | "projection-benchmark"
+                    | "normalization-benchmark"
+                    | "optimization-benchmark"
+                    | "convolution-benchmark"
+                    | "hola-tune"
+                    | "scan-benchmark"
+                    | "update-loss-benchmark"
+                    | "soft-benchmark"
+                    | "soft-step"
+                    | "kron-benchmark"
+                    | "kron-model-benchmark"
+            ),
+        "autotuned training certifies the configured fused LM only; this command changes GEMM execution/geometry internally"
+    );
     let backend = diagnostic_backend.unwrap_or(&c.backend);
     let mut runtime_config = c.clone();
     runtime_config.backend = backend.to_owned();
     let device = runtime::device(&runtime_config)?;
-    let result = match command.as_str() {
+    let mut gemm_preflight = Vec::new();
+    if c.autotune
+        && backend == "vulkan"
+        && matches!(
+            command.as_str(),
+            "train"
+                | "smoke"
+                | "compare"
+                | "decision"
+                | "benchmark"
+                | "profile"
+                | "backward-profile"
+                | "gemm-step"
+                | "checkpoint-check"
+                | "certify"
+        )
+    {
+        let contexts = if matches!(command.as_str(), "profile" | "backward-profile") {
+            profile_contexts.clone().unwrap_or_else(|| {
+                if command == "backward-profile" {
+                    vec![128, 512]
+                } else {
+                    vec![c.context]
+                }
+            })
+        } else {
+            vec![c.context]
+        };
+        for context in contexts {
+            let mut checked = c.clone();
+            checked.context = context;
+            gemm_preflight.push(gemm_guard::ensure(&checked, &device)?);
+        }
+    }
+    let mut result = match command.as_str() {
         "reference" => {
             let report = delta_mixers::numerical_checks(&device.clone().autodiff())
                 .map_err(anyhow::Error::msg)?;
@@ -322,7 +380,8 @@ fn execute() -> Result<()> {
         | "normalization-benchmark"
         | "hola-tune"
         | "scan-benchmark"
-        | "convolution-benchmark" => {
+        | "convolution-benchmark"
+        | "optimization-benchmark" => {
             let arm = if let Some(name) = arm_name {
                 c.arms
                     .iter()
@@ -339,6 +398,7 @@ fn execute() -> Result<()> {
                 "hola-tune" => profile::hola_run,
                 "scan-benchmark" => scan_benchmark::run,
                 "convolution-benchmark" => profile::convolution_run,
+                "optimization-benchmark" => profile::optimization_run,
                 _ => unreachable!(),
             };
             let configured_context = [c.context];
@@ -423,6 +483,9 @@ fn execute() -> Result<()> {
         }
         _ => anyhow::bail!("unknown command {command}"),
     };
+    if !gemm_preflight.is_empty() {
+        result["gemm_preflight"] = json!(gemm_preflight);
+    }
     if !matches!(
         command.as_str(),
         "kron-benchmark"
@@ -436,6 +499,7 @@ fn execute() -> Result<()> {
             | "hola-tune"
             | "scan-benchmark"
             | "convolution-benchmark"
+            | "optimization-benchmark"
             | "gemm-micro"
     ) {
         let output = diagnostic_output.as_deref().unwrap_or(&c.artifact_dir);
@@ -455,6 +519,9 @@ fn execute() -> Result<()> {
                 | "gemm-micro"
                 | "gemm-step"
                 | "update-loss-benchmark"
+                | "optimization-benchmark"
+                | "soft-benchmark"
+                | "soft-step"
         ) || result["completed"] == true,
         "profile/benchmark failed or hit its deadline; separate partial report retained"
     );
@@ -470,6 +537,7 @@ fn execute() -> Result<()> {
                 | "convolution-reference"
                 | "gemm-micro"
                 | "update-loss-reference"
+                | "soft-reference"
         ) || result["passed"] == true,
         "numerical/checkpoint diagnostic/certification failed; separate report retained"
     );
