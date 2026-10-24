@@ -15,6 +15,8 @@ mod runtime;
 mod scan_benchmark;
 mod soft;
 mod train;
+mod update;
+mod update_loss;
 use anyhow::{Context, Result, ensure};
 use config::Config;
 use serde_json::json;
@@ -164,6 +166,7 @@ fn execute() -> Result<()> {
                 | "convolution-benchmark"
                 | "gemm-micro"
                 | "gemm-step"
+                | "update-loss-benchmark"
         ) || benchmark_warmups.is_none(),
         "--warmups is only valid for Kron benchmarks/profile; hola-benchmark uses two warmups per mode"
     );
@@ -182,6 +185,7 @@ fn execute() -> Result<()> {
                 | "convolution-benchmark"
                 | "gemm-micro"
                 | "gemm-step"
+                | "update-loss-benchmark"
         ) || benchmark_trials.is_none(),
         "--trials is only valid for a benchmark command"
     );
@@ -193,9 +197,13 @@ fn execute() -> Result<()> {
         "benchmarks use configured/fixed paired fixtures, not --arm/--seed/--resume"
     );
     ensure!(
-        !matches!(command.as_str(), "gemm-micro" | "gemm-step")
-            || (arm_name.is_none() && resume.is_none() && seed == c.seed),
-        "GEMM benchmarks use configured seed, first arm and fresh scratch state"
+        !matches!(
+            command.as_str(),
+            "gemm-micro" | "gemm-step" | "update-loss-benchmark" | "update-loss-reference"
+        ) || (arm_name.is_none()
+            && (resume.is_none() || command == "update-loss-reference")
+            && seed == c.seed),
+        "benchmarks/references use configured seed and first arm; only update-loss-reference accepts an optional historical checkpoint"
     );
     ensure!(
         model_scope.is_none() || command == "kron-model-check",
@@ -257,6 +265,16 @@ fn execute() -> Result<()> {
             };
             json!({"schema":1,"command":"hola-reference","passed":report.is_ok(),"device":runtime::identity(&device),"config":c,"scope":scope,"hola_backend":reference_hola_backend,"numerical_report":report.as_ref().ok(),"error":report.as_ref().err()})
         }
+        "update-loss-reference" => {
+            let report = update_loss::reference(&c, &device, resume.as_deref());
+            json!({"schema":1,"command":command,"passed":report.is_ok(),"config":c,"device":runtime::identity(&device),"numerical_report":report.as_ref().ok(),"error":report.as_ref().err().map(|e|format!("{e:#}"))})
+        }
+        "update-loss-benchmark" => update_loss::benchmark(
+            &c,
+            &device,
+            benchmark_warmups.unwrap_or(2),
+            benchmark_trials.unwrap_or(9),
+        )?,
         "soft" => {
             json!({"schema":1,"command":"soft","device":runtime::identity(&device),"config":c,"feedback":soft::episode(&c,&device)?})
         }
@@ -406,6 +424,7 @@ fn execute() -> Result<()> {
                 | "convolution-benchmark"
                 | "gemm-micro"
                 | "gemm-step"
+                | "update-loss-benchmark"
         ) || result["completed"] == true,
         "profile/benchmark failed or hit its deadline; separate partial report retained"
     );
@@ -420,6 +439,7 @@ fn execute() -> Result<()> {
                 | "normalization-reference"
                 | "convolution-reference"
                 | "gemm-micro"
+                | "update-loss-reference"
         ) || result["passed"] == true,
         "numerical/checkpoint diagnostic/certification failed; separate report retained"
     );
