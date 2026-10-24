@@ -14,6 +14,7 @@ mod profile;
 mod runtime;
 mod scan_benchmark;
 mod soft;
+mod soft_benchmark;
 mod train;
 mod update;
 mod update_loss;
@@ -32,7 +33,7 @@ fn execute() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     ensure!(
         args.len() >= 2,
-        "usage: delta-experiment <reference|convolution-reference|normalization-reference|kron-reference|hola-reference|kron-model-check|soft|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|kron-model-benchmark|hola-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms]"
+        "usage: delta-experiment <reference|convolution-reference|normalization-reference|kron-reference|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|kron-model-benchmark|hola-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
     );
     let command = &args[0];
     let c = Config::load(Path::new(&args[1]))?;
@@ -167,6 +168,8 @@ fn execute() -> Result<()> {
                 | "gemm-micro"
                 | "gemm-step"
                 | "update-loss-benchmark"
+                | "soft-benchmark"
+                | "soft-step"
         ) || benchmark_warmups.is_none(),
         "--warmups is only valid for Kron benchmarks/profile; hola-benchmark uses two warmups per mode"
     );
@@ -186,6 +189,8 @@ fn execute() -> Result<()> {
                 | "gemm-micro"
                 | "gemm-step"
                 | "update-loss-benchmark"
+                | "soft-benchmark"
+                | "soft-step"
         ) || benchmark_trials.is_none(),
         "--trials is only valid for a benchmark command"
     );
@@ -212,6 +217,10 @@ fn execute() -> Result<()> {
     ensure!(
         diagnostic_backend.is_none() || command == "checkpoint-check",
         "--diagnostic-backend is only valid for checkpoint-check"
+    );
+    ensure!(
+        diagnostic_output.is_none() || command == "checkpoint-check",
+        "--diagnostic-output is only valid for checkpoint-check"
     );
     ensure!(
         checkpoint_manifest.is_none() || command == "certify",
@@ -278,6 +287,21 @@ fn execute() -> Result<()> {
         "soft" => {
             json!({"schema":1,"command":"soft","device":runtime::identity(&device),"config":c,"feedback":soft::episode(&c,&device)?})
         }
+        "soft-reference" => {
+            json!({"command":command,"device":runtime::identity(&device),"checks":soft_benchmark::reference(&c,&device)?})
+        }
+        "soft-benchmark" => soft_benchmark::run(
+            &c,
+            &device,
+            benchmark_warmups.unwrap_or(1),
+            benchmark_trials.unwrap_or(3),
+        )?,
+        "soft-step" => soft_benchmark::step(
+            &c,
+            &device,
+            benchmark_warmups.unwrap_or(1),
+            benchmark_trials.unwrap_or(5),
+        )?,
         "benchmark" => train::pilot(&c, &device)?,
         "hola-cost" => hola_tune::cost(&c, &c.arms[0], &device, &[512], 2, 5)?,
         "gemm-micro" => gemm::micro(

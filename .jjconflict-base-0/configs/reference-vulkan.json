@@ -1,0 +1,12 @@
+{
+  "backend":"vulkan",
+  "artifact_dir":"artifacts/reference-vulkan",
+  "d_model":32,
+  "layers":1,
+  "context":32,
+  "train_tokens":64,
+  "association_counts":[2,4],
+  "eval_examples":4,
+  "max_seconds":30,
+  "soft_candidate_width":4
+}
