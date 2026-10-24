@@ -259,7 +259,7 @@ fn fixture_scan(x: &[Tensor<4>], initial: Tensor<4>, valid: Tensor<2>, reset: Te
         q:x[0].clone(),k:x[1].clone(),v:x[2].clone(),alpha:x[3].clone(),erase:x[4].clone(),write:x[5].clone()
     },valid,reset,16,Some(initial))
 }
-fn exact_chain(device: &Device, cuts_only: bool) {
+fn exact_chain(device: &Device, cuts_only: bool, context_only: bool) {
     let f = exact_fixture();
     let focus = K;
     println!("{}",json!({"probe":"independent_f64_decomposition","key_index":focus,
@@ -291,14 +291,20 @@ fn exact_chain(device: &Device, cuts_only: bool) {
             "finite_difference":(objectives[1]-objectives[0])/(changed[1]-changed[0]),"expected":f.expected_key[focus]}));
     }
     }
-    let modes: &[&str] = if cuts_only {
+    let modes: &[&str] = if context_only {
+        &["cut_product","detach_erase","detach_write","detach_inverse","detach_edit_v","leaf_inner_v","constant_inner_v","fresh_inner_v","no_aux","flat_full","dot_full"]
+    } else if cuts_only {
         &["masked_key","key_prefix","state_projection","inner","erased","rhs"]
     } else { &["full","rhs_only","without_rhs"] };
     for &mode in modes {
+        let full_form=mode=="flat_full" || mode=="dot_full";
         let (x,initial,valid,reset) = fixture_inputs(&f,device);
         let mut retained = Vec::<(&str,Tensor<4>)>::new();
         let mut keep = |name,t:Tensor<4>| {
-            if cuts_only && mode==name {let t=t.detach().require_grad();retained.push((name,t.clone()));t} else {t}
+            if (cuts_only && !context_only && mode==name)
+                || (context_only && !full_form && name==if mode=="cut_product" {"product"} else {"state_projection"}) {
+                let t=t.detach().require_grad();retained.push((name,t.clone()));t
+            } else {t}
         };
         let active = valid.reshape([B,1,T,1]);
         let q=x[0].clone().swap_dims(1,2)*active.clone();
@@ -317,14 +323,27 @@ fn exact_chain(device: &Device, cuts_only: bool) {
         }
         let decay=Tensor::cat(rows,2);
         let rhs_k=if mode=="without_rhs" {k.clone().detach()} else {k.clone()};
-        let other_k=if mode=="rhs_only" || cuts_only {k.clone().detach()} else {k.clone()};
+        let other_k=if mode=="rhs_only" || (cuts_only && !full_form) {k.clone().detach()} else {k.clone()};
         let factors=decay.clone()*other_k.clone().unsqueeze_dim::<5>(2);
         let overlap=|left:Tensor<4>| (left.unsqueeze_dim::<5>(3)*factors.clone()).sum_dim(4).reshape([B,H,T,T]);
         let lower=overlap(other_k.clone())*v.clone().matmul(v.clone().swap_dims(2,3))*erase.clone();
         let kprefix=keep("key_prefix",rhs_k*prefix.clone());
         let projection=keep("state_projection",kprefix.matmul(initial.clone()));
-        let inner=keep("inner", (projection*v.clone()).sum_dim(3));
+        let inner_v=match mode {
+            "leaf_inner_v" => v.clone().detach().require_grad(),
+            "constant_inner_v" => v.clone().detach(),
+            "fresh_inner_v" => tensor(values(v.clone()),[B,H,T,64],device).require_grad(),
+            _ => v.clone(),
+        };
+        let dot=match mode {
+            "flat_full" => (projection*inner_v).reshape([B*H*T,64]).sum_dim(1).reshape([B,H,T,1]),
+            "dot_full" => projection.unsqueeze_dim::<5>(3).matmul(inner_v.unsqueeze_dim::<5>(4)).reshape([B,H,T,1]),
+            _ => keep("product",projection*inner_v).sum_dim(3),
+        };
+        let inner=keep("inner",dot);
+        let erase=if mode=="detach_erase" {erase.detach()} else {erase};
         let erased=keep("erased", inner*erase);
+        let write=if mode=="detach_write" {write.detach()} else {write};
         let rhs=keep("rhs",write-erased);
         let mut power=lower.tril(-1).neg();
         let mut inverse=Tensor::<2>::eye(T,device).reshape([1,1,T,T]);
@@ -334,18 +353,23 @@ fn exact_chain(device: &Device, cuts_only: bool) {
             covered*=2;
             if covered<T {power=power.clone().matmul(power);}
         }
+        let inverse=if mode=="detach_inverse" {inverse.detach()} else {inverse};
         let correction=keep("correction",inverse.matmul(rhs));
-        let edits=correction*v;
+        let edit_v=if mode=="detach_edit_v" {v.detach()} else {v};
+        let edits=correction*edit_v;
         let out=(q.clone()*prefix.clone()).matmul(initial.clone())+overlap(q).tril(0).matmul(edits.clone());
+        if mode!="no_aux" {
         let squared=other_k.clone().square().sum_dim(3)*edits.clone().square().sum_dim(3);
         let zero=squared.clone().equal_elem(0.);
         let scores=squared.mask_fill(zero.clone(),1.).sqrt().mask_fill(zero,0.);
         let tail=decay.slice([0..B,0..H,T-1..T,0..T,0..K]).reshape([B,H,T,K]);
         let last=prefix.slice([0..B,0..H,T-1..T,0..K]).reshape([B,H,K,1]);
         let final_state=last*initial+(tail*other_k).swap_dims(2,3).matmul(edits);
-        let _ = (values(out.clone()),values(final_state),values(scores));
+        let _ = (values(final_state),values(scores));
+        }
+        let _ = values(out.clone());
         let grads=(out.swap_dims(1,2)*tensor(f.upstream.clone(),[B,T,H,64],device)).sum().backward();
-        if !cuts_only {
+        if !cuts_only || full_form {
         let actual=values(x[1].grad(&grads).unwrap());
         let expected:Vec<f64>=f.expected_key.iter().zip(&f.expected_rhs_key).map(|(&all,&rhs)|
             if mode=="rhs_only" {rhs} else if mode=="without_rhs" {all-rhs} else {all}).collect();
@@ -363,15 +387,16 @@ fn exact_chain(device: &Device, cuts_only: bool) {
                 "key_prefix" => (0..K).map(|k| -beta*seed*(0..64).map(|v|
                     f64::from(f.initial[(K+k)*64+v])*f64::from(f.fields[2][64+v])).sum::<f64>()).collect(),
                 "state_projection" => (0..64).map(|v| -beta*seed*f64::from(f.fields[2][64+v])).collect(),
+                "product" => vec![-beta*seed;64],
                 "inner" => vec![-beta*seed],
                 "erased" => vec![-seed],
                 "rhs" => vec![seed],
                 _ => unreachable!(),
             };
-            println!("{}",json!({"probe":format!("cut/{name}"),"shape":shape,
+            println!("{}",json!({"probe":format!("cut/{mode}/{name}"),"shape":shape,
                 "b0_t0_h1_vjp":g.get(offset..offset+shape[3]),"expected_b0_t0_h1":expected,
                 "vjp_max_abs":g.iter().map(|x|x.abs()).fold(0.,f32::max)}));
-            report(&format!("cut/{name}/focused_row"),g[offset..offset+shape[3]].to_vec(),&expected);
+            report(&format!("cut/{mode}/{name}/focused_row"),g[offset..offset+shape[3]].to_vec(),&expected);
         }
     }
 }
@@ -423,8 +448,8 @@ fn main() {
         _ => panic!("backend unavailable"),
     }.autodiff();
     println!("{}",json!({"device":format!("{device:?}"),"identity":format!("{:?}",device.identity()),"absolute_tolerance":ATOL,"relative_tolerance":RTOL}));
-    if let Some(mode @ ("chain" | "cut")) = std::env::args().nth(2).as_deref() {
-        exact_chain(&device, mode=="cut");
+    if let Some(mode @ ("chain" | "cut" | "context")) = std::env::args().nth(2).as_deref() {
+        exact_chain(&device, mode!="chain", mode=="context");
         return;
     }
     if std::env::args().nth(2).as_deref()==Some("reduction") {
