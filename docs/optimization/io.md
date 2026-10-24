@@ -87,3 +87,52 @@ Each shape report contains:
 Pool reservation is not physical/live peak memory and includes correctness fixtures. Logical payload counts do not claim allocator capacity, backend-dependent integer storage, actual PCIe traffic, GPU dispatch count, or process RSS; these are not instrumented. Source and optimizer fixture snapshots add retained memory outside the step clock. Do not sum isolated section medians into a claimed measured full-step cost.
 
 Before scaling, use the B8 integrated samples to set an IO budget: compare the paired old/new total steps and resident overhead bound, report medians and raw spread, and decide whether row-generation/upload or validated checkpoint cadence is material relative to actual full-step time. Keep exact-capacity packing's allocation rationale distinct from any measured speed claim. Consider prefetch only if measurements show sufficient headroom to justify queue ownership, lifetime, deterministic ordering and failure-propagation complexity. Keep checkpoint validation and atomic completion regardless of their cost. **No numeric component budget or winning measured design is asserted until the queued evidence exists.**
+
+## Integration failure attribution and fixture follow-up
+
+The integration owner exercised the first implementation with
+`artifacts/integration/io-optimized.json` and retained stdout at
+`artifacts/integration/batch2/io-optimized.stdout`. It failed at B1/T128 with
+a `head.weight` hash difference (same parameter ID/shape/dtype). The shape
+directory contained only `continuation-reference-0.burnpack`: the failure
+was the **input-design next-step comparison, before atomic checkpoint save
+or model/optimizer restore had executed**. The generic `validate_model`
+error text called this a checkpoint-load failure, but that is not the
+operation this harness was performing. This evidence does not establish
+a checkpoint product defect.
+
+Static inspection found no off-by-one step or tied embedding/head: all
+designs start from the post-first-step `base`, use next-step row indices,
+and the model constructs separate embedding and head parameters. However,
+the original harness unnecessarily restored the optimizer from bytes for
+each nominally resident comparison, without verifying that input state.
+It also dropped locally generated batches before the timing wrapper's
+completion barrier, unlike the training loop. The follow-up uses clones
+of the actual resident optimizer and retains each timed batch through
+that barrier. These remove harness confounders; they are **not a measured
+proof of the cause of the observed hash difference**.
+
+The follow-up additionally saves and self-validates an immutable resident
+base record, checks model/optimizer equality before each design and
+retained-state equality afterward, verifies the actual timed batch, and
+self-validates the first continuation record while its source remains
+alive. All checks remain bit-exact and outside timing. Cross-design
+failure retains the actual candidate record plus
+`continuation-mismatch.json` with mode/iteration and both optimizer
+signatures. Error contexts now distinguish source serialization,
+pre-step state, retained-state mutation, input-design continuation,
+atomic save, guarded restore, and restored continuation.
+
+No product behavior or checkpoint safety code was changed by this
+follow-up, and no product regression test was added without an established
+product defect. The existing failure remains evidence, not a passing
+measurement. The integration owner should rebuild and run exactly:
+
+```sh
+timeout 960s target/debug/delta-experiment io-benchmark artifacts/integration/io-optimized.json --warmups 0 --trials 1
+```
+
+If strict comparison still fails, its phase-qualified error and retained
+records distinguish an input/model execution difference from a source
+mutation or serialization/restore defect without relaxing correctness.
+The follow-up has not been built or run by its author.
