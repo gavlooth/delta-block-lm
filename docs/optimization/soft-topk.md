@@ -70,12 +70,14 @@ No recurrent state or document reset exists in this component.
 Local Intel Arc MTL integrated GPU, Vulkan, Burn 0.22/CubeCL 0.11, f32,
 heuristic matmuls, fusion off. Shape fixtures use seed 1307 and resident
 softmax probabilities from uniform[-1,1] logits. The primary B8 rows are
-128 (=8x16), 1,024 (=8x128) and 4,096 (=8x512); B1 reports the corresponding
-16/128/512 rows. Vocabularies are 257 and 32,000; widths are 4/16/64.
+128 (=8x16) and4,096 (=8x512); B1 reports16/512 rows. Vocabularies are257
+and32,000; widths are4/16/64. The separate inactive causal controls cover
+contexts128/512 at both batches.
 
 Each shape compares all three implementations in one process, rotating
 CPU/native/tiled order within paired trials. One warmup precedes three warm
-samples. Outer device synchronization brackets each sample. Selection includes
+samples; the decisive B8/512-position/k16 confirmation uses five. Outer
+device synchronization brackets each sample. Selection includes
 validation/readback, CPU sort/transfers where applicable, gather and retained
 mass. A standalone feedback-round sample includes convex update, selection,
 retain/remask and expected embeddings. A separate selection+expectation+
@@ -98,10 +100,14 @@ soft-feedback training speedup or an implementation of deferred SBD. Warmup
 is one paired step; five warm paired steps are reported at B1/B8 and
 contexts128/512. No isolated speedup is advertised as a causal-model speedup.
 
-Every GPU child is wrapped in `flock /tmp/delta-block-lm-gpu.lock timeout
-300s ...`; the sweep releases the lock between configurations. Builds use
-`../build.sh softtopk` and its private executable
-`/tmp/delta-bins/softtopk/delta-experiment`.
+Final GPU children acquire `flock /tmp/delta-block-lm-gpu.lock` and then
+`flock /tmp/delta-block-lm-build.lock`, with the300s compute timeout **inside**
+both locks. The sweep releases locks between configurations and records
+queue wait separately from compute. Builds use the corrected
+`../build.sh softtopk` helper and its private executable
+`/tmp/delta-bins/softtopk/delta-experiment`; `.cache/cubecl` is a private
+workspace directory. Earlier shared-cache/control measurements are labeled
+provisional rather than used as final acceptance.
 
 ## Memory and work accounting
 
@@ -166,3 +172,61 @@ compare the complete four-round graphs with one backward each. The first GPU
 full-support check exposed Burn's strict frontend argtopk assertion; the
 checked backend call described above fixes it. Neither failure was hidden
 or admitted by changing numerical tolerances.
+
+## Causal full-step negative control
+
+These paired ordinary forward/backward/checked-AdamW controls completed
+before the global build/cache isolation fix and are **provisional control
+measurements, not candidate acceptance evidence**. They use the ordinary
+dev-profile experiment crate, not the optimized-host selection comparison
+below. Soft selection is inactive in every row, so observed differences are
+noise, not a software mechanism or an optimization regression.
+
+| Batch | Context | CPU selector step ms | GPU selector step ms | Median paired saving ms | GPU faster /5 |
+|---:|---:|---:|---:|---:|---:|
+| 8 | 512 | 1457.788 | 1464.098 | -2.729 | 1 |
+| 8 | 128 | 333.643 | 341.271 | -7.738 | 1 |
+| 1 | 512 | 538.149 | 538.890 | -4.464 | 2 |
+| 1 | 128 | 173.755 | 172.429 | 1.257 | 3 |
+
+Raw five paired samples and exact bounded commands:
+`artifacts/soft-topk/step-1792866602867-2669256/`.
+There are zero soft-selection dispatches in a causal LM step; total model
+dispatches were not observed in this control. Isolated selection dispatch
+counts are reported separately. Parent integration owns the final combined
+model and historical-checkpoint gates, rather than repeating the same
+unchanged causal work for every independent inactive component.
+
+## Frozen-source and build isolation
+
+Final source commit:
+`97b0ba065359d5463affbdb25f94c840e9cac8d3`
+(`wnwytkkxzqvyqxtzopvspptuskwntotz`).
+The final private executable SHA-256 is
+`d4974316921102cfc8b24266c9538de1072b28d05360831e0981cf7f855a705c`.
+`artifacts/soft-topk/build-manifest.json` records hashes of all changed
+source/runner files, Cargo inputs, exact build arguments and private cache
+identity. The corrected helper acquired GPU then build locks, cleaned only
+the three local packages, rebuilt them from this workspace and copied the
+executable. Build queue wait was152s; Cargo build time was **6.79s**, within
+the10s incremental budget. Registry dependencies were retained. Existing
+ndarray deprecation warnings remain visible.
+
+The final isolated `soft-reference` passed from that binary/private cache in
+**4.653s compute**, with **0.017s queue wait**. It includes the independent
+visibility schedule and immutable/unavailable/signed-zero proposal assertions,
+not just CPU/GPU agreement through shared bookkeeping code. Its report
+retains the same1.29745e-7 maximum scalar-f64 error and unchanged tolerances.
+
+The original dev-profile B8x16,V32k,k4 selection baseline was
+1644.768ms CPU /13.572ms native /5.806ms tiled. That provisional result is
+retained in `artifacts/soft-topk/soft-benchmark-b8-t16-k4.json`, but it is **not**
+the final speedup denominator: extrapolating its unoptimized Rust host sort
+to4096 rows would make a complete bounded sample sweep impractical.
+The final comparison builds **all three paths in the same binary** with
+`--config profile.dev.package.delta-experiment.opt-level=2`, alongside the
+repository's already optimized dependencies. No source algorithm,
+precision, workload, shader optimization flag, fusion or autotuning selector
+changes between arms. This gives the GPU a conservative, optimized CPU-sort
+baseline rather than claiming the cost of an unoptimized host comparator
+as a GPU-kernel gain. The repository's tracked build profiles remain unchanged.
