@@ -43,6 +43,7 @@ impl Arm {
             hola_backend: c.hola_backend,
             projection_backend: c.projection_backend,
             normalization_backend: c.normalization_backend,
+            convolution_backend: c.convolution_backend,
         })
     }
     pub fn training_algorithm(&self, c: &Config) -> &'static str {
@@ -58,6 +59,7 @@ impl Arm {
         c.scan_backend == ScanBackend::FusedGpu
             || (self.cache != "none" && c.hola_backend == HolaBackend::FusedGpu)
             || !c.normalization_backend.is_tensor()
+            || c.convolution_backend == delta_mixers::ConvolutionBackend::FusedGpu
     }
 }
 
@@ -107,6 +109,8 @@ pub struct Config {
     pub projection_backend: ProjectionBackend,
     #[serde(skip_serializing_if = "NormalizationBackend::is_tensor")]
     pub normalization_backend: NormalizationBackend,
+    #[serde(skip_serializing_if = "delta_mixers::ConvolutionBackend::is_tensor")]
+    pub convolution_backend: delta_mixers::ConvolutionBackend,
     #[serde(skip_serializing_if = "HeadBackend::is_native")]
     pub head_backend: HeadBackend,
     pub context: usize,
@@ -160,6 +164,7 @@ impl Default for Config {
             hola_backend: HolaBackend::Tensor,
             projection_backend: ProjectionBackend::Separate,
             normalization_backend: NormalizationBackend::Tensor,
+            convolution_backend: delta_mixers::ConvolutionBackend::Tensor,
             head_backend: HeadBackend::Native,
             context: 128,
             batch_size: 1,
@@ -242,7 +247,8 @@ impl Config {
         ensure!(
             (self.scan_backend != ScanBackend::FusedGpu
                 && self.hola_backend != HolaBackend::FusedGpu
-                && self.normalization_backend.is_tensor())
+                && self.normalization_backend.is_tensor()
+                && self.convolution_backend != delta_mixers::ConvolutionBackend::FusedGpu)
                 || matches!(self.backend.as_str(), "vulkan" | "cuda"),
             "fused_gpu requires an explicit GPU backend; no CPU fallback"
         );
@@ -386,6 +392,17 @@ mod tests {
             Config::default().pilot_fingerprint().unwrap(),
             changed.pilot_fingerprint().unwrap()
         );
+        for backend in [
+            delta_mixers::ConvolutionBackend::PaddedTensor,
+            delta_mixers::ConvolutionBackend::FusedGpu,
+        ] {
+            let mut changed = Config::default();
+            changed.convolution_backend = backend;
+            assert_ne!(
+                Config::default().pilot_fingerprint().unwrap(),
+                changed.pilot_fingerprint().unwrap()
+            );
+        }
     }
     #[test]
     fn legacy_selector_defaults_without_changing_serialized_identity() {
@@ -397,6 +414,7 @@ mod tests {
         assert!(legacy.get("autotune").is_none());
         assert!(legacy.get("projection_backend").is_none());
         assert!(legacy.get("normalization_backend").is_none());
+        assert!(legacy.get("convolution_backend").is_none());
         assert!(legacy.get("head_backend").is_none());
         let decoded: Config = serde_json::from_value(legacy.clone()).unwrap();
         assert_eq!(decoded.scan_backend, ScanBackend::TensorSolver);
@@ -405,6 +423,10 @@ mod tests {
         assert!(!decoded.autotune);
         assert_eq!(decoded.projection_backend, ProjectionBackend::Separate);
         assert_eq!(decoded.normalization_backend, NormalizationBackend::Tensor);
+        assert_eq!(
+            decoded.convolution_backend,
+            delta_mixers::ConvolutionBackend::Tensor
+        );
         assert_eq!(decoded.head_backend, HeadBackend::Native);
         assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
     }

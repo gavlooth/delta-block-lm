@@ -70,21 +70,22 @@ impl Mixer {
                 });
                 [q, k, v, decay, erase, write, gate].map(Some)
             }
-            ProjectionBackend::Merged | ProjectionBackend::MergedHeuristicOutput => profile.section("Projection: merged input", || {
-                project(
-                    input,
-                    [
-                        &self.q,
-                        &self.k,
-                        &self.v,
-                        &self.decay,
-                        &self.erase,
-                        &self.write,
-                        &self.output_gate,
-                    ],
-                )
-                .map(Some)
-            }),
+            ProjectionBackend::Merged | ProjectionBackend::MergedHeuristicOutput => profile
+                .section("Projection: merged input", || {
+                    project(
+                        input,
+                        [
+                            &self.q,
+                            &self.k,
+                            &self.v,
+                            &self.decay,
+                            &self.erase,
+                            &self.write,
+                            &self.output_gate,
+                        ],
+                    )
+                    .map(Some)
+                }),
         }
     }
 
@@ -94,14 +95,17 @@ impl Mixer {
         }
         #[cfg(any(feature = "vulkan", feature = "cuda"))]
         {
-            let [batch,tokens,width] = input.dims();
+            let [batch, tokens, width] = input.dims();
             let weight = self.output.weight.val();
             let output = weight.dims()[1];
-            delta_kernels::heuristic_matmul(input.reshape([batch*tokens,width]),weight)
-                .reshape([batch,tokens,output])
+            delta_kernels::heuristic_matmul(input.reshape([batch * tokens, width]), weight)
+                .reshape([batch, tokens, output])
         }
         #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
-        { let _ = input; panic!("heuristic output projection requires a GPU feature") }
+        {
+            let _ = input;
+            panic!("heuristic output projection requires a GPU feature")
+        }
     }
 }
 

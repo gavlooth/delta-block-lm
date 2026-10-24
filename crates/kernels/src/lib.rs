@@ -34,3 +34,9 @@ pub use decay_ops::decay;
 mod matmul_ops;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 pub use matmul_ops::heuristic_matmul;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod conv;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod conv_ops;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+pub use conv_ops::causal_conv;

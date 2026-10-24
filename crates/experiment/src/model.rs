@@ -87,6 +87,11 @@ impl LanguageModel {
             block.mixer.set_projection_backend(backend);
         }
     }
+    pub fn set_convolution_backend(&mut self, backend: delta_mixers::ConvolutionBackend) {
+        for block in &mut self.blocks {
+            block.mixer.set_convolution_backend(backend);
+        }
+    }
     pub fn set_normalization_backend(&mut self, backend: delta_mixers::NormalizationBackend) {
         self.normalization_backend = backend;
         for block in &mut self.blocks {
