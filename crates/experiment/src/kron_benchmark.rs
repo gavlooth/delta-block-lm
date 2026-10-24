@@ -344,6 +344,7 @@ fn prepare_model_case(
     config.hola_backend = HolaBackend::Tensor;
     config.projection_backend = delta_mixers::ProjectionBackend::Separate;
     config.normalization_backend = delta_mixers::NormalizationBackend::Tensor;
+    config.convolution_backend = delta_mixers::ConvolutionBackend::Tensor;
     let arm = Arm {
         name: if hola { "kron-hola" } else { "kron" }.into(),
         mixer: "kronlstm".into(),
@@ -397,6 +398,7 @@ fn prepare_model_case(
         model.set_hola_backend(hola_backend);
         model.set_projection_backend(c.projection_backend);
         model.set_normalization_backend(c.normalization_backend);
+        model.set_convolution_backend(c.convolution_backend);
         model.set_head_backend(c.head_backend);
         let initial_error = compare_parameters(
             "identical CPU initialization",
@@ -438,6 +440,7 @@ fn prepare_model_case(
         )?;
         checks.push(json!({"scan_backend":backend,"hola_backend":hola_backend,
             "projection_backend":c.projection_backend,"normalization_backend":c.normalization_backend,
+            "convolution_backend":c.convolution_backend,
             "head_backend":c.head_backend,
             "reference":"CPU TensorSolver/Tensor/Separate/Tensor normalization",
             "initial_parameters_max_abs":initial_error,"logits_max_abs":output_error,

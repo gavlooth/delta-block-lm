@@ -14,7 +14,9 @@ pub mod attribution;
 mod cache_reference;
 pub mod checks;
 pub mod chunk;
+pub mod convolution;
 pub mod gdn2_reference;
+pub use convolution::ConvolutionBackend;
 mod hola;
 pub mod normalization;
 pub mod profile;
@@ -103,6 +105,8 @@ pub struct MixerConfig {
     pub projection_backend: ProjectionBackend,
     #[serde(skip_serializing_if = "NormalizationBackend::is_tensor")]
     pub normalization_backend: NormalizationBackend,
+    #[serde(skip_serializing_if = "ConvolutionBackend::is_tensor")]
+    pub convolution_backend: ConvolutionBackend,
     pub d_model: usize,
     pub heads: usize,
     pub key_dim: usize,
@@ -129,6 +133,7 @@ impl Default for MixerConfig {
             hola_backend: HolaBackend::Tensor,
             projection_backend: ProjectionBackend::Separate,
             normalization_backend: NormalizationBackend::Tensor,
+            convolution_backend: ConvolutionBackend::Tensor,
             d_model: 128,
             heads: 4,
             key_dim: 32,
@@ -182,6 +187,9 @@ impl MixerConfig {
         if !self.normalization_backend.is_tensor() {
             chunk::assert_fused_device(device);
         }
+        if self.convolution_backend == ConvolutionBackend::FusedGpu {
+            chunk::assert_fused_device(device);
+        }
         if self.projection_backend == ProjectionBackend::MergedHeuristicOutput {
             chunk::assert_fused_device(device);
         }
@@ -223,6 +231,7 @@ impl MixerConfig {
             hola_backend: self.hola_backend,
             projection_backend: self.projection_backend,
             normalization_backend: self.normalization_backend,
+            convolution_backend: self.convolution_backend,
             heads: self.heads,
             key_dim: self.key_dim,
             value_dim: self.value_dim,
@@ -294,6 +303,8 @@ pub struct Mixer {
     #[module(skip)]
     normalization_backend: NormalizationBackend,
     #[module(skip)]
+    convolution_backend: ConvolutionBackend,
+    #[module(skip)]
     heads: usize,
     #[module(skip)]
     key_dim: usize,
@@ -312,6 +323,12 @@ struct ExactMemory {
     sink: Param<Tensor<1>>,
 }
 impl Mixer {
+    pub fn set_convolution_backend(&mut self, backend: ConvolutionBackend) {
+        if backend == ConvolutionBackend::FusedGpu {
+            chunk::assert_fused_device(&self.q.weight.val().device());
+        }
+        self.convolution_backend = backend;
+    }
     pub fn set_normalization_backend(&mut self, backend: NormalizationBackend) {
         if !backend.is_tensor() {
             chunk::assert_fused_device(&self.q.weight.val().device());
@@ -385,7 +402,10 @@ impl Mixer {
                 (reset.clone() * valid.clone()).cumsum(1),
             )
         });
-        let conv = |x, weight| causal_conv(x, weight, valid.clone(), documents.clone());
+        let conv = |x, weight| {
+            self.convolution_backend
+                .forward(x, weight, valid.clone(), documents.clone())
+        };
         let mut projected = self.project_input(input.clone(), profile);
         let raw_q = projected[0]
             .take()

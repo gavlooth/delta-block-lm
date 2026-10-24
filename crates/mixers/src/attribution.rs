@@ -1,6 +1,6 @@
 //! Resident, independent-leaf component fixtures for backward cost attribution.
 //! These call the production operators; they are never substituted into a real model step.
-use crate::{Mixer, causal_conv, chunk, hola, profile::Unprofiled};
+use crate::{Mixer, chunk, hola, profile::Unprofiled};
 use burn::{
     prelude::*,
     tensor::{
@@ -124,13 +124,15 @@ impl Fixture {
                 .into_iter()
                 .enumerate()
                 .map(|(i, weight)| {
-                    causal_conv(
-                        self.projected[i].clone(),
-                        weight.val(),
-                        self.valid.clone(),
-                        self.documents.clone(),
-                    )
-                    .sum()
+                    mixer
+                        .convolution_backend
+                        .forward(
+                            self.projected[i].clone(),
+                            weight.val(),
+                            self.valid.clone(),
+                            self.documents.clone(),
+                        )
+                        .sum()
                 })
                 .reduce(|a, b| a + b)
                 .unwrap(),
