@@ -209,7 +209,10 @@ pub fn run(
             && mixer_config.cache_policy != CachePolicy::None
             && c.scan_backend == ScanBackend::FusedGpu
             && c.hola_backend == HolaBackend::FusedGpu
-            && matches!(c.projection_backend, ProjectionBackend::Merged | ProjectionBackend::MergedHeuristicOutput)
+            && matches!(
+                c.projection_backend,
+                ProjectionBackend::Merged | ProjectionBackend::MergedHeuristicOutput
+            )
             && c.normalization_backend.is_tensor(),
         "backward attribution requires KronLSTM + HOLA, fused scan/read, merged projections and tensor normalization"
     );
