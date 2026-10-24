@@ -2,7 +2,7 @@
 
 ## Status and scope
 
-Implementation is ready for integration-owner verification; **all measurements are pending**. No build, test, formatter, CPU benchmark, or GPU benchmark was run while implementing this slice. There is no measured speedup, checkpoint throughput claim, or adoption claim for asynchronous prefetch. Steps 1–6 only.
+Implementation is ready for integration-owner verification; **completed performance measurements are pending**. The integration owner exercised two revisions and found GPU recomputation nondeterminism, documented below. No build, test, formatter, CPU benchmark, or GPU benchmark was run by this slice's author. There is no measured speedup, checkpoint throughput claim, or adoption claim for asynchronous prefetch. Steps 1–6 only.
 
 `io-benchmark` uses the configured first arm, model width/depth/selectors, optimizer, real corpus and seed. It evaluates B1/B8 × contexts 128/512. It rejects non-LM configurations, an overriding arm/seed/resume, more than three warmups, or trials outside 1–8. The default is one warmup and three measured trials, plus one separately recorded first observation. The wall-clock admission deadline is `min(max_seconds, 900)` seconds; an external timeout must bound a single blocking operation. Warmups and first observations are not counted as measured trials.
 
@@ -34,7 +34,7 @@ The command separates:
 
 The separate validation time is diagnostic attribution, **not an additive part of the already validated load time**. Timing has synchronization before and after every region. Empty-queue synchronization overhead is included even in host-only timing; very small host samples must not be overinterpreted. OS page cache is uncontrolled; warm file loads are not cold-disk measurements. The first optimizer step is the first backward/update observation, not a fully cold process measurement (initial evaluation ran first). Atomic rename is the existing completion contract; no stronger fsync/power-loss guarantee is claimed.
 
-Every uploaded batch is checked elementwise against independent row/index expectations for input, target, weight, valid and reset, including exact float bits. A CPU unit regression additionally covers distinct rows, BOS tokens, fractional/sparse weights, and row-start resets. Every full-step design starts at exactly the same model/optimizer state and uses the same next deterministic row indices. Each result must match saved logical parameter values, shapes, dtypes **and parameter IDs exactly**, plus every canonical optimizer tensor/scalar/metadata/config field. File restoration must pass these same checks before and after the next step. There is no numerical-tolerance relaxation. The initial checkpoint has real nonempty optimizer moments from a genuine model step and a real initial heldout evaluation.
+Every uploaded batch is checked elementwise against independent row/index expectations for input, target, weight, valid and reset, including exact float bits. A CPU unit regression additionally covers distinct rows, BOS tokens, fractional/sparse weights, and row-start resets. Every full-step design starts at exactly the same model/optimizer state and uses the same next deterministic row indices. **Saving/restoring the same tensors remains byte-exact**, including model parameters and optimizer moments, shapes, dtypes, IDs, counters, metadata and config. Independently recomputed optimizer steps, including the step after restoration, use the existing `profile.rs` tolerance `abs(actual-reference) <= 2e-5 + 3e-4 * abs(reference)` for each finite f32 parameter/moment element. Tensor names/shapes/dtypes/IDs, scalar counters, metadata and non-f32 payloads remain exact even across recomputation. Reports expose maximum absolute differences, every bitwise-different tensor, and both hashes. The initial checkpoint has real nonempty optimizer moments from a genuine model step and a real initial heldout evaluation.
 
 The whole checkpoint `state.json` must equal the expected configured run identity and counters. `latest.json` must point at the completed directory with the same step/tokens. Existing training collision and resume checks are untouched. All scratch checkpoints and reports live in a fresh `artifact_dir/io/PID-TIMESTAMP/` subtree, never in original arm run directories. Source checkpoint and continuation-reference files remain available as evidence; their aggregate disk use scales with model size and trial count.
 
@@ -81,7 +81,7 @@ Each shape report contains:
 - first optimizer-step and first IO observations, excluded from warm summaries;
 - `first_checkpoint`: path, complete state, model and optimizer file SHA256, canonical optimizer signature and initial save/load samples;
 - `timings.<section>.samples_ms` and `median_ms`, including all three same-step full optimizer-step designs;
-- per-iteration exact batch/parameter-ID/optimizer-state/restored-continuation checks and cold/warmup/measured phase;
+- per-iteration exact batch and checkpoint parameter/ID/optimizer-state checks, numerical recomputed-step comparisons, and cold/warmup/measured phase;
 - `work`: explicit packed host payload (16×B×T bytes), resident batch logical payload (20×B×T bytes for the f32/i32 workload), retained checkpoint file bytes, four host vectors, five tensor creations, and sampled peak pool-reserved bytes.
 
 Pool reservation is not physical/live peak memory and includes correctness fixtures. Logical payload counts do not claim allocator capacity, backend-dependent integer storage, actual PCIe traffic, GPU dispatch count, or process RSS; these are not instrumented. Source and optimizer fixture snapshots add retained memory outside the step clock. Do not sum isolated section medians into a claimed measured full-step cost.
@@ -116,10 +116,10 @@ The follow-up additionally saves and self-validates an immutable resident
 base record, checks model/optimizer equality before each design and
 retained-state equality afterward, verifies the actual timed batch, and
 self-validates the first continuation record while its source remains
-alive. All checks remain bit-exact and outside timing. Cross-design
-failure retains the actual candidate record plus
-`continuation-mismatch.json` with mode/iteration and both optimizer
-signatures. Error contexts now distinguish source serialization,
+alive. These source-state and serialization checks remain bit-exact and
+outside timing. Cross-design recomputation reports are saved separately
+as `comparison-MODE-ITERATION.json`; out-of-tolerance failure also retains
+the actual candidate record. Error contexts distinguish source serialization,
 pre-step state, retained-state mutation, input-design continuation,
 atomic save, guarded restore, and restored continuation.
 
@@ -132,7 +132,41 @@ measurement. The integration owner should rebuild and run exactly:
 timeout 960s target/debug/delta-experiment io-benchmark artifacts/integration/io-optimized.json --warmups 0 --trials 1
 ```
 
-If strict comparison still fails, its phase-qualified error and retained
-records distinguish an input/model execution difference from a source
-mutation or serialization/restore defect without relaxing correctness.
-The follow-up has not been built or run by its author.
+### Observed GPU recomputation nondeterminism
+
+The integration owner's rerun with source `ad4813a5` failed at
+`B1 T128: iteration 1, legacy: input-design next-step mismatch before
+checkpoint transaction`. The two `head.weight` hashes were exactly the
+previous run's pair, now swapped:
+
+- `a6d12a12652f11854407c4f10fbc1cdb8ec2cf539e5b4d5560db3e2f902d590b`
+- `03f554c414cadcedaeb44c1cab7d5613ce5d22c454555f970992ff7b30d74fb3`
+
+The initial-state, actual batch, retained-state and serialization checks
+had passed. Thus independently recomputing the same GPU step can produce
+two bitwise outcomes for `head.weight`; this is not evidence that saving
+and restoring unchanged tensors loses information. A vocabulary-head
+gradient reduction/matmul ordering difference is a plausible mechanism,
+**not an established kernel-level root cause**.
+
+The follow-up uses the project's existing profile numerical contract for
+recomputed f32 parameter and optimizer-moment values only. The direct
+checkpoint save/load validations are unchanged and byte-exact. Each
+recomputation report contains `atol`, `rtol`, `max_abs_diff`,
+`bitwise_equal`, and `bitwise_differing_tensors` (tensor name, both SHA256
+hashes, per-tensor maximum difference and numerical pass status). Scalar
+counters, IDs, shape/dtype, metadata and non-f32 payloads remain exact.
+Nonfinite f32 values fail even if their bytes agree. Both input-design
+comparisons and restored-next-step comparisons retain this evidence
+outside measured regions.
+
+The follow-up includes a CPU record-comparator regression covering
+roundoff, out-of-tolerance values, changed IDs/counters and nonfinite
+values. This tests the harness's comparison contract, not a conjectured
+checkpoint product bug. The author has not built or run this follow-up.
+
+Integration-owner comparator check (retain the established feature set):
+
+```sh
+timeout 300s cargo test -p delta-experiment --features vulkan recomputed_equivalence_tolerates_roundoff_not_identity_or_state_changes
+```

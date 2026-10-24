@@ -1,6 +1,6 @@
 # Steps 1–6: measured pilot results
 
-For the current optimized execution paths, measured speedups and known legacy GPU-solver limitation, see [Early GPU kernel optimization](#early-gpu-kernel-optimization). The first sections retain the original pilot measurements.
+For the current optimized execution paths, measured speedups and known legacy GPU-solver limitation, see [Early GPU kernel optimization](#early-gpu-kernel-optimization). The current recommended batch-8 configuration and its combined measurements are in [Batch-8 component optimization round](#batch-8-component-optimization-round). The first sections retain the original pilot measurements.
 
 ## Scope and stopping point
 
@@ -680,13 +680,13 @@ timeout 300s target/debug/delta-experiment reference artifacts/projection-evalua
 
 ## Normalization and gating fusion
 
-**Decision: evaluated, not adopted for the current workload.** Two custom
-CubeCL scopes pass the numerical gates and reduce dispatches, but neither has
-a repeatable beyond-noise complete-step improvement at context512. Keep
-`configs/lm512-projections.json` as the single current recommended config:
-custom Kron/HOLA, merged projections, **tensor normalization/gating**.
-That file and all older configs are intentionally unchanged; no third
-recommended config, historical checkpoint migration or Step7+ work was added.
+**Decision at B1: evaluated, not adopted.** Two custom CubeCL scopes pass the
+numerical gates and reduce dispatches, but neither had a repeatable
+beyond-noise complete-step improvement at B1/context512. **Superseded at the
+B8 training workload:** `fused_norms_gates` saves 115.26 ms per step alone
+and is part of `configs/lm512-optimized.json`; see
+[Batch-8 component optimization round](#batch-8-component-optimization-round).
+The B1 measurements below are retained unchanged.
 
 ### Explicit scopes and preserved arithmetic
 
@@ -1308,3 +1308,123 @@ timeout 300s cargo build -p delta-experiment --features vulkan
 /usr/bin/time -v -o artifacts/batch-scaling/b32/process-time.txt timeout 280s target/debug/delta-experiment backward-profile artifacts/batch-scaling/b32/config.json --contexts 512 --warmups 2 --trials 5
 timeout 300s cargo test --workspace
 ```
+
+## Batch-8 component optimization round
+
+**Decision: use `configs/lm512-optimized.json` for local Vulkan training at
+B8/context512; use `configs/lm512-optimized-autotune.json` only with a
+`vulkan,autotune` build.** Every selector is explicit; omitted selectors keep
+their historical meaning, so historical configs, fingerprints and checkpoints
+are unchanged. Intel Arc MTL/Vulkan, non-fusion Burn 0.22/CubeCL 0.11, f32,
+four layers, width 256, H4/K32/V64, chunk 16, HOLA capacity 16, seed 1,
+pinned byte-LM corpus. Per-component designs, rejected alternatives, memory
+and work accounting are in `docs/optimization/*.md`.
+
+### Complete-step results
+
+All rows are interleaved paired complete guarded steps (forward, loss
+readback, backward, gradient checks, clipping, AdamW) in one session, two
+warmups, B8/context512. Savings are medians of within-trial differences with
+20,000-resample bootstrap 95% intervals; they are not differences of
+independent medians.
+
+| Comparison | Control median, ms | Candidate median, ms | Paired saving, ms [95%] | Faster pairs |
+|---|---:|---:|---|---:|
+| Scan256 + HOLA pairs + fused convolution vs previous recommended path | 1603.758 | 972.667 | 629.232 [620.620, 658.318] | 11/11 |
+| … plus fused normalization/gating (`fused_norms_gates`) | 1603.758 | 879.039 | 732.333 [718.443, 763.398] (45.20%) | 11/11 |
+| Fused AdamW/checks on top of the above (tensor loss) | 895.674 | 871.897 | 21.081 [13.688, 39.197] | 11/11 |
+| Analytic SiLU VJP on top of the above | 876.891 | 863.295 | 22.227 [9.559, 27.882] | 10/11 |
+| Guarded matmul autotune + heuristic head/output on top of `lm512-optimized` | 851.795 | 505.618 | 355.617 [341.973, 364.235] | 11/11 |
+
+Rows 3–5 are separate sessions against the optimized base, so their savings
+are not summed into the first row's interval. Across sessions, the
+previous recommended B8 step (≈1,604 ms, 2,554 tokens/s) falls to ≈506 ms
+(≈8,100 tokens/s) with every adopted selector, about 3.2× [INFERENCE:
+cross-session ratio of medians, not a paired measurement]. Kernels per step:
+5,833 → 4,621 (scan/HOLA/convolution) → 3,677 (+normalization).
+
+Rejected after measurement: padded-tensor convolution (slower at B8),
+fused cross-entropy (`fused64`/`fused256`: intervals include zero at B8),
+tiled GPU soft top-k as the default (isolated gain does not reach the
+complete feedback round), fused-pointwise SiLU (smaller gain than the
+analytic VJP alone), and unguarded matmul autotune (wrong vocabulary-head
+weight VJPs, see Matrix-multiply efficiency).
+
+### Component decisions
+
+| Component | Adopted selector | Evidence (each measured alone) | Document |
+|---|---|---|---|
+| KronLSTM scan | `scan_backend: fused_parallel256` (4 key shards/value column) | B8/512 isolated F+B 86.28 → 25.79 ms; full step −17.10% [16.52, 18.17] alone | `scan.md` |
+| HOLA read backward | `hola_backend: fused_gpu_pairs` (reuse query-VJP edge scalars) | Key/value VJP 60.15 → 3.98 ms per layer at B8/cap16 (pre-isolation session); full step −267.54 ms with cache RMS alone | `hola.md` |
+| Short causal convolution | `convolution_backend: fused_gpu` | Four-layer F+B 77.32 → 19.16 ms | `conv-and-norms.md` |
+| Normalization/gating | `normalization_backend: fused_norms_gates` | B8 full step −115.26 ms alone; previously not adopted on B1 evidence | `conv-and-norms.md` |
+| AdamW, checks, clipping | `update_backend: fused_gpu` | Guarded update 35.12 → 13.69 ms; 5,833 → 3,922 kernels alone | `update-and-loss.md` |
+| MLP SiLU | `epilogue_backend: analytic_backward` | Residual adds stay native; no fusion across norms or matmuls | `epilogues.md` |
+| Matrix multiplies | guarded autotune, heuristic head and output projection | Rank-3 F/dX/dW preflight on every active GEMM shape before training | `gemm-efficiency.md` |
+| Soft top-k selection | `soft_selection_backend: gpu` | B8×512/k16 feedback round 8.64× (V257), 24.44× (V32k); inactive in the causal LM | `soft-topk.md` |
+| GDN-2 training | `scan_backend: fused_gdn2` (comparison arm only) | Recurrence F+B 53.42 → 25.29 ms at B8/T128; full-model comparison blocked, see below | `gdn.md` |
+
+### Correctness gates on the integrated tree
+
+All with unchanged tolerances (2e-5 + 3e-4·|reference|; CPU directional
+check 3e-3 + 0.03·|reference|):
+
+- CPU workspace tests: 33 experiment + 7 kernel + 13 mixer pass.
+- Independent float64 references pass for scan256, HOLA pairs, convolution
+  (72 cases), normalization (116), update/loss, SiLU and fused GDN-2.
+- `kron-model-check --model-scope configured` on the recommended config
+  passes all four context128/512 × HOLA off/on cases against the CPU oracle:
+  max logits 4.35e-6, max parameter gradient 3.22e-6, max AdamW 1.58e-5.
+- Historical `lm512-vulkan/kronlstm-hola-seed1/checkpoint-13` loads and
+  continues through `checkpoint-check` with its original fingerprint;
+  `update-loss-reference` continues it through the fused optimizer.
+
+### Legacy GPU tensor-solver defect: fixed
+
+The known Vulkan `TensorSolver` key-gradient mismatch
+(`artifacts/kron-validation/solver-output_only/kron-reference.json`) was the
+missing initial-state erase contribution. Diagnostics showed every small
+GEMM, decay and masking primitive correct in isolation; in the erase/solve
+chain the VJP of the rank-4 `(X·v).sum_dim(3)` row dot product reached `X`
+as exact zeros. A rank-2 flatten fixed the T7 fixture but not chunk size 1,
+so the production expression is now a row-wise dot `matmul`. The new
+regression `tensor_solver_initial_key_reset_padding_{cpu,vulkan}` fails
+before and passes after; all three historical T7 objectives and the default
+tensor-solver reference now pass. The exact CubeCL instruction at fault is
+not identified; see `tensor-solver.md` for the upstream report text.
+
+### Open findings
+
+- **CPU directional finite-difference check with HOLA.** With HOLA on, every
+  tested perturbation (ε = 5e-4…4e-3) changes cache membership in many
+  chunks, because hard surprise top-k selection is recomputed. The GDN-2 +
+  HOLA B8/T128 oracle case therefore fails at ε = 2e-3 (error 3.45e-3,
+  limit 3.32e-3) while Kron B8 passes; Kron B1 fails at ε = 4e-3. This is a
+  property of differencing across a discontinuous selection, not evidence of
+  a gradient defect; `gdn-directional-diagnostic` records the sweep and
+  membership changes. Changing the gate (for example, pinning base membership
+  during differencing) is an acceptance-policy decision and was not made.
+- **Run-to-run GPU nondeterminism.** Two identical B1 steps produced one of
+  two bitwise `head.weight` results. Recomputed steps are compared at the
+  standard tolerance; checkpoint save/restore remains byte-exact.
+- BF16 is not reported by this backend; f32 retained
+  (`precision-and-shapes.md`). Larger K/V widths and contexts beyond 512 are
+  not certified. CUDA remains unmeasured.
+
+### Reproduction
+
+```sh
+../build.sh integration                       # vulkan
+../build.sh integration --features autotune   # vulkan,autotune
+flock /tmp/delta-block-lm-gpu.lock timeout 300s target/debug/delta-experiment optimization-benchmark artifacts/integration/baseline-b8.json --contexts 512 --warmups 2 --trials 11
+flock /tmp/delta-block-lm-gpu.lock timeout 300s target/debug/delta-experiment update-loss-benchmark artifacts/integration/optimized-b8.json --warmups 2 --trials 11
+flock /tmp/delta-block-lm-gpu.lock timeout 300s target/debug/delta-experiment epilogue-benchmark artifacts/integration/optimized-b8.json --contexts 512 --warmups 2 --trials 11
+flock /tmp/delta-block-lm-gpu.lock timeout 300s bun scripts/benchmark-gemm.ts pair HEURISTIC_BINARY GUARDED_BINARY configs/lm512-optimized.json artifacts/autotune-on-optimized-b8 8 11 heuristic merged_heuristic_output
+flock /tmp/delta-block-lm-gpu.lock timeout 300s target/debug/delta-experiment kron-model-check artifacts/integration/recommended-b1.json --model-scope configured
+```
+
+Evidence: `artifacts/integration/gates/` (combined benchmark and first
+gates), `artifacts/integration/batch2/` (update and SiLU over the optimized
+base), `artifacts/integration/final/` (recommended-config gates, solver),
+`artifacts/autotune-on-optimized-b8/paired-b8.json`,
+`artifacts/kron-validation/solver-fix-verification-2/`.
