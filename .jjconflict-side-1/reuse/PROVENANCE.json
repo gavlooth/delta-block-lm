@@ -1,0 +1,14 @@
+{
+  "source_root": "/home/heefoo/Documents/code/diffusion-relation-extractor",
+  "copied_on": "2026-10-24",
+  "status": "Unmodified migration inputs; not an executable workspace",
+  "complete_crates": ["dre-core", "dre-gdn2", "dre-attention", "dre-wavelet", "dre-ohc", "dre-lngram"],
+  "partial_crate_files": ["crates/dre-relations/src/state.rs", "crates/dre-relations/src/denoiser.rs", "crates/dre-relations/src/diffusion_scheduler.rs", "crates/dre-relations/src/diffusion_scheduler_tests.rs", "crates/dre-relations/src/joint_circuit.rs", "crates/dre-relations/src/remask.rs"],
+  "file_count": 48,
+  "total_bytes": 740782,
+  "sha256_of_sorted_file_hash_lines": "8f5978cea249836c71b480120d6d31360216216d7012409d47f5bbf27a6e35e3",
+  "hash_format": "Sort copied crates/ file paths lexicographically; for each file concatenate lowercase SHA-256, two spaces, relative path, and newline; SHA-256 that UTF-8 text",
+  "verification": "All 48 destination files matched their source bytes at copy time",
+  "license": "Preserve the source manifests and inherited MIT OR Apache-2.0 license; no source license headers removed",
+  "excluded": ["training runs", "datasets", "model checkpoints", "vendored backend crates", "full relation-extraction application"]
+}
