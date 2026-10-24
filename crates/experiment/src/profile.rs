@@ -394,6 +394,7 @@ enum ExecutionChoice {
     Projection(delta_mixers::ProjectionBackend),
     Normalization(delta_mixers::NormalizationBackend),
     Hola(delta_mixers::HolaBackend),
+    Convolution(delta_mixers::ConvolutionBackend),
 }
 impl ExecutionChoice {
     fn apply(self, model: &mut LanguageModel) {
@@ -401,6 +402,7 @@ impl ExecutionChoice {
             Self::Projection(mode) => model.set_projection_backend(mode),
             Self::Normalization(mode) => model.set_normalization_backend(mode),
             Self::Hola(mode) => model.set_hola_backend(mode),
+            Self::Convolution(mode) => model.set_convolution_backend(mode),
         }
     }
 }
@@ -414,7 +416,15 @@ pub fn projection_run(
     warmups: usize,
     trials: usize,
 ) -> Result<Value> {
-    comparison_run(c, arm, device, contexts, warmups, trials, false, false)
+    comparison_run(
+        c,
+        arm,
+        device,
+        contexts,
+        warmups,
+        trials,
+        Comparison::Projection,
+    )
 }
 
 pub fn normalization_run(
@@ -425,7 +435,15 @@ pub fn normalization_run(
     warmups: usize,
     trials: usize,
 ) -> Result<Value> {
-    comparison_run(c, arm, device, contexts, warmups, trials, true, false)
+    comparison_run(
+        c,
+        arm,
+        device,
+        contexts,
+        warmups,
+        trials,
+        Comparison::Normalization,
+    )
 }
 
 pub fn hola_run(
@@ -436,7 +454,42 @@ pub fn hola_run(
     warmups: usize,
     trials: usize,
 ) -> Result<Value> {
-    comparison_run(c, arm, device, contexts, warmups, trials, false, true)
+    comparison_run(
+        c,
+        arm,
+        device,
+        contexts,
+        warmups,
+        trials,
+        Comparison::Hola,
+    )
+}
+
+pub fn convolution_run(
+    c: &Config,
+    arm: &Arm,
+    device: &Device,
+    contexts: &[usize],
+    warmups: usize,
+    trials: usize,
+) -> Result<Value> {
+    comparison_run(
+        c,
+        arm,
+        device,
+        contexts,
+        warmups,
+        trials,
+        Comparison::Convolution,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Comparison {
+    Projection,
+    Normalization,
+    Hola,
+    Convolution,
 }
 
 fn comparison_run(
@@ -446,17 +499,24 @@ fn comparison_run(
     contexts: &[usize],
     warmups: usize,
     trials: usize,
-    normalization: bool,
-    hola: bool,
+    comparison: Comparison,
 ) -> Result<Value> {
-    use delta_mixers::{NormalizationBackend, ProjectionBackend};
+    use delta_mixers::{ConvolutionBackend, NormalizationBackend, ProjectionBackend};
+    let normalization = comparison == Comparison::Normalization;
+    let convolution = comparison == Comparison::Convolution;
+    let hola = comparison == Comparison::Hola;
     ensure!(
-        !(normalization || hola) || matches!(c.backend.as_str(), "vulkan" | "cuda"),
+        !(normalization || convolution || hola) || matches!(c.backend.as_str(), "vulkan" | "cuda"),
         "custom operator comparison requires a GPU; no CPU fallback"
     );
-    ensure!(!hola || (!c.fusion && !c.autotune), "HOLA comparison requires non-fusion execution without matmul autotune");
+    ensure!(
+        !hola || (!c.fusion && !c.autotune),
+        "HOLA comparison requires non-fusion execution without matmul autotune"
+    );
     let command = if hola {
         "hola-tune"
+    } else if convolution {
+        "convolution-benchmark"
     } else if normalization {
         "normalization-benchmark"
     } else {
@@ -464,6 +524,8 @@ fn comparison_run(
     };
     let backend_key = if hola {
         "hola_backend"
+    } else if convolution {
+        "convolution_backend"
     } else if normalization {
         "normalization_backend"
     } else {
@@ -471,6 +533,8 @@ fn comparison_run(
     };
     let forward_key = if hola {
         "hola_forward_samples_ms"
+    } else if convolution {
+        "convolution_forward_samples_ms"
     } else if normalization {
         "normalization_forward_samples_ms"
     } else {
@@ -478,6 +542,8 @@ fn comparison_run(
     };
     let forward_median_key = if hola {
         "hola_forward_median_ms"
+    } else if convolution {
+        "convolution_forward_median_ms"
     } else if normalization {
         "normalization_forward_median_ms"
     } else {
@@ -503,6 +569,13 @@ fn comparison_run(
             delta_mixers::HolaBackend::FusedGpuPairsNorms,
         ]
         .map(ExecutionChoice::Hola)
+    } else if convolution {
+        [
+            ConvolutionBackend::Tensor,
+            ConvolutionBackend::PaddedTensor,
+            ConvolutionBackend::FusedGpu,
+        ]
+        .map(ExecutionChoice::Convolution)
     } else if normalization {
         [
             NormalizationBackend::Tensor,
@@ -529,6 +602,10 @@ fn comparison_run(
             report["independent_hola_reference"] = serde_json::to_value(
                 delta_mixers::checks::hola_numerical_checks(device).map_err(anyhow::Error::msg)?,
             )?;
+        } else if convolution {
+            report["independent_convolution_reference"] = serde_json::to_value(
+                delta_mixers::convolution::numerical_checks(device).map_err(anyhow::Error::msg)?,
+            )?;
         } else if normalization {
             report["independent_normalization_reference"] = serde_json::to_value(
                 delta_mixers::normalization::numerical_checks(device)
@@ -546,6 +623,8 @@ fn comparison_run(
             config.context = context;
             if hola {
                 config.hola_backend = delta_mixers::HolaBackend::FusedGpu;
+            } else if convolution {
+                config.convolution_backend = ConvolutionBackend::Tensor;
             } else if normalization {
                 config.normalization_backend = NormalizationBackend::Tensor;
             } else {
@@ -554,6 +633,17 @@ fn comparison_run(
             config.validate()?;
             let isolated = if hola {
                 Value::Null
+            } else if convolution {
+                serde_json::to_value(
+                    delta_mixers::convolution::benchmark(
+                        device,
+                        context,
+                        c.batch_size,
+                        warmups,
+                        trials,
+                    )
+                    .map_err(anyhow::Error::msg)?,
+                )?
             } else if normalization {
                 serde_json::to_value(
                     delta_mixers::normalization::benchmark(
@@ -690,6 +780,8 @@ fn comparison_run(
                             .filter(|(name, _)| {
                                 if hola {
                                     name.starts_with("HOLA")
+                                } else if convolution {
+                                    **name == "Short causal convolutions"
                                 } else if normalization {
                                     name.contains("RMSNorm")
                                         || name.starts_with("L2 ")
@@ -719,7 +811,7 @@ fn comparison_run(
             report["cases"].as_array_mut().unwrap().push(json!({"context":context,
                 "fixture_sha256":data::fixture_hash(&rows),"parameters":base.num_params(),
                 "equivalence":checks,"trial_orders":orders,
-                (if hola { "isolated_hola" } else if normalization { "isolated_normalization" } else { "isolated_input_projections" }):isolated,
+                (if hola { "isolated_hola" } else if convolution { "isolated_convolutions" } else if normalization { "isolated_normalization" } else { "isolated_input_projections" }):isolated,
                 "results":results}));
             runtime::write_json(&report_path, &report)?;
         }
