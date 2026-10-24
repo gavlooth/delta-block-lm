@@ -181,7 +181,7 @@ Complete raw reports:
 - B8/cap64: `artifacts/hola/b8-cap64/hola-tune-2658208-1792866499871959746/report.json`
 - B1/cap64: `artifacts/hola/b1-cap64/hola-tune-2678792-1792866681322867408/report.json`
 
-## Confirmation and decision
+## Provisional confirmation and decision
 
 A separate21-pair B8/context512/cap16 session, again with two warmups,
 confirms the sparse-backward gain:
@@ -198,29 +198,122 @@ The confirmation completed in209.33s internally, below its300s GPU bound.
 Initial B8/B1/cap64-B8/cap64-B1 sessions completed in164.59/79.08/181.26/79.54s
 internally; longer process wall times include GPU-lock queue wait, not compute.
 
-**Adopt the explicit `hola_backend: \"fused_gpu_pairs\"` path.** On the realistic
-B8/T512/cap16 workload it reduces complete-step median by16.89%, giving
-**1.203x throughput**, with a clearly positive paired interval in both sessions.
-At cap64 the11-pair B8 full-step median improves1947.580→1313.044ms (1.483x).
-No B1/T128 beyond-noise pair-only gain is claimed. No isolated improvement
-is substituted for these complete guarded steps.
-
-**Do not recommend the cache-only RMS override as a separate adoption.**
-It remains an explicitly named evaluated alternative for reproducibility,
-reusing an existing kernel rather than introducing another norm implementation.
-Its incremental paired median saving over pairs-only shrinks from180.575ms
-in the first B8/T512 session to13.124ms in the confirmation, with a marginal
-[0.085,42.039]ms bootstrap interval. At B1 and B8/T128 the incremental intervals
-include zero; B8/T128's median even increases slightly. This is not robust
-evidence for a general normalization recommendation, despite the combined
-variant being much faster than historical HOLA. The robust result is sparse
-read-backward reuse, not a192-launch reduction.
+The provisional decision accepted `fused_gpu_pairs` (1.203x at B8/T512/cap16)
+but held off recommending the cache-only RMS override independently. Its
+incremental paired median saving over pairs-only shrank from180.575ms in the
+first B8/T512 session to13.124ms in this confirmation, with a marginal
+[0.085,42.039]ms bootstrap interval. B1 and B8/T128 incremental intervals
+included zero. The final private-cache session below supersedes that
+conservative intended-shape decision; this earlier evidence remains visible.
 
 The measured HOLA component budget is now approximately12.4ms read FB plus
 10.0ms tensor Q/K RMS FB per layer at B8/T512/cap16 (independent resident
 synthetic-adjoint fixtures). Re-profile the actual whole model after combined
 optimizations; do not sum isolated medians into a predicted step or extrapolate
 this fixed-capacity result to larger contexts/precision/devices.
+
+## Final validation and provenance
+
+Production source is frozen in commit
+`c4219152795f83168c277b8bbce91e9db5fb7aad`
+(change `tznpnntyvswlwyqxvxokypyorxvxyvxu`); subsequent evidence-only updates
+are in child change `nuptvnzqpptvylzoxryoowmonssporkw`.
+The corrected `../build.sh hola` acquired GPU then build lock, cleaned only
+the three local packages, rebuilt all three from this workspace and copied
+the private executable. Cargo build took3.72s; queue wait358s and361.58s
+process wall are reported separately. The existing ndarray deprecation
+warnings remain visible. Build/profile/features/dependencies are unchanged.
+
+`artifacts/hola/final-provenance.json` records source-file SHA256 values,
+immutable commit, build protocol and binary SHA256
+`c1931fa864f8c140a55c07801a318c614dbef5cbdb4a615333c1ae00b8fcc14e`.
+`stat` confirms both relative `.cache` and `.cache/cubecl` are private
+directories, not the former shared symlink. No source change follows this
+build.
+
+The final private-cache `hola-reference` passes **all47 checks**:
+11 tensor and12 each historical fused / sparse pairs / pairs+norms read
+selectors. It checks the expanded strided/zero and existing padding/reset/tie/
+tail/large-value/cancellation fixtures with unchanged tolerances, including
+all Q/K/V/sink adjoints and exact membership. Evidence:
+`artifacts/hola/final-pairs/hola-reference.json`. Non-overflow maximum output
+error is3.480e-7; maximum Q/K error4.747e-5 is in the analytic cancellation
+probe and passes the original relative criterion. The large-finite-value
+fixture is checked under the same original scale-aware tolerance, not
+excluded from pass/fail. Selection-score gradients remain absent.
+
+Recorded pre-isolation supplementary gates also pass:
+
+- Historical `kron-model-check`:12 combinations; max CPU logits/parameter
+  gradient/AdamW errors5.126e-6 /2.652e-6 /8.829e-6.
+- Sparse-pairs configured `kron-model-check`:4 cases (contexts128/512, with/
+  without HOLA); maxima5.126e-6 /2.652e-6 /8.985e-6.
+- Pairs+RMS configured check:4 cases; maxima4.709e-6 /2.652e-6 /7.797e-6.
+  All include every model parameter, finite checks, one AdamW update and
+  the existing all-parameter CPU directional finite difference.
+- Independent normalization116 cases; selected fused Kron12 cases; CPU
+  reference6 recurrence/4 cache/6 full-layer cases.
+
+Those full-model reports are respectively under
+`artifacts/hola/b1/kron-model-check-2687569-1792866761049914904/`,
+`artifacts/hola/pairs/kron-model-check-2757554-1792867368642807630/`,
+and `artifacts/hola/pairs-norms/kron-model-check-2760741-1792867398027891828/`.
+No tolerance, reset, padding, cache policy, optimizer or historical fingerprint
+was relaxed. The known arbitrary-input legacy tensor-solver failure is not
+rerun, suppressed or accepted.
+
+Per parent coordination, the combined integration workspace owns the **final
+shared** full-model, workspace-test and historical
+`artifacts/lm512-vulkan/kronlstm-hola-seed1/checkpoint-13` gates; they are not
+duplicated or falsely claimed exercised by this isolated item. The new
+checkpoint-only `--diagnostic-output` option redirects report/scratch files
+without modifying the original config/hash, allowing that shared gate to
+write inside its assigned evidence namespace.
+That integration also owns widening `backward-profile`'s historically strict
+scan/read guards to `is_fused()` and propagating the combined convolution/
+normalization selectors; this isolated source deliberately leaves that
+shared profiling guard unchanged to avoid conflicting follow-on commits.
+
+## Final paired result and adoption
+
+The corrected-helper/private-cache B8 session completes both contexts with
+all preflight output/every-parameter-gradient/AdamW comparisons passing the
+original2e-5/3e-4 tolerances. Eleven paired trials follow two warmups:
+
+| Context | Historical step, ms | Pairs step, ms | Pairs + cache RMS step, ms | Pairs paired saving95% interval, ms | Combined paired saving95% interval, ms |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 1502.349 | 1274.329 | 1236.615 | [192.491,262.424] | [239.213,299.841] |
+| 128 | 376.110 | 317.481 | 312.308 | [54.738,65.152] | [50.205,74.248] |
+
+At the adoption workload B8/T512/cap16, pairs-only gives1.179x complete-step
+throughput and the combined selector gives **1.215x** (2726.4→3312.3tokens/s,
+17.69% lower step median). Median within-trial savings are232.262ms and
+267.540ms respectively. The combined selector's incremental saving over
+pairs-only is32.743ms with paired-median95% interval **[27.879,59.411]ms**.
+That positive intended-batch result, together with both earlier positive
+B8/T512 incremental intervals, supports the cache-only RMS addition at this
+specific workload. This is not a claim that every norm/gate merits fusion or
+that the prior rejected all-model/B1 normalization scope is now accepted.
+
+**Adopt `hola_backend: \"fused_gpu_pairs_norms\"` for the measured B8/T512 path.**
+The sparse-pairs-only selector is also individually accepted, isolating the
+robust backward redesign. Neither historical default nor existing `fused_gpu`
+is silently redirected. At T128 the combined variant is1.204x historical,
+but the incremental RMS interval[-14.737,7.778]ms includes zero, so no separate
+RMS-only improvement is claimed there or at B1. The provisional B1 paired
+table remains reported rather than replaced with an extrapolation from B8.
+No precision, membership, parameter identity, cache capacity or optimizer
+change is folded into either comparison.
+
+Final report:
+`artifacts/hola/final-b8/hola-tune-2882850-1792868412207054173/report.json`;
+derived paired intervals/protocol:
+`artifacts/hola/final-summary.json` (20,000resamples, median, LCG seed7713).
+Internal elapsed157.37s;165.00s process wall includes the separate queued
+numerical gate. Kernels/step remain5833/5833/5641 and sampled pool maxima
+861,580,288bytes at512 and391,799,680bytes at128, shared across scratch
+trajectories with the limitations above. The numerical gate took7.43s
+process wall. The fixed source/binary hashes above bind both final runs.
 
 ## Reproduction
 
@@ -230,6 +323,23 @@ Build from this workspace only:
 ../build.sh hola
 flock /tmp/delta-block-lm-gpu.lock timeout 300s /tmp/delta-bins/hola/delta-experiment hola-cost artifacts/hola/baseline.json
 flock /tmp/delta-block-lm-gpu.lock timeout 300s /tmp/delta-bins/hola/delta-experiment hola-reference artifacts/hola/pairs.json --hola-backend fused_gpu_pairs
+flock /tmp/delta-block-lm-gpu.lock timeout 300s /tmp/delta-bins/hola/delta-experiment hola-cost artifacts/hola/pairs.json
+flock /tmp/delta-block-lm-gpu.lock timeout 300s /tmp/delta-bins/hola/delta-experiment hola-cost artifacts/hola/pairs-norms.json
+flock /tmp/delta-block-lm-gpu.lock timeout 300s /tmp/delta-bins/hola/delta-experiment hola-tune artifacts/hola/b8.json --contexts 512,128 --warmups 2 --trials 11
+flock /tmp/delta-block-lm-gpu.lock timeout 300s /tmp/delta-bins/hola/delta-experiment hola-tune artifacts/hola/b1.json --contexts 128,512 --warmups 2 --trials 11
+flock /tmp/delta-block-lm-gpu.lock timeout 300s /tmp/delta-bins/hola/delta-experiment hola-tune artifacts/hola/b8-cap64.json --contexts 512,128 --warmups 2 --trials 11
+flock /tmp/delta-block-lm-gpu.lock timeout 300s /tmp/delta-bins/hola/delta-experiment hola-tune artifacts/hola/b1-cap64.json --contexts 128,512 --warmups 2 --trials 11
+flock /tmp/delta-block-lm-gpu.lock timeout 300s /tmp/delta-bins/hola/delta-experiment hola-tune artifacts/hola/b8.json --contexts 512 --warmups 2 --trials 21
+flock /tmp/delta-block-lm-gpu.lock timeout 300s /tmp/delta-bins/hola/delta-experiment kron-model-check artifacts/hola/b1.json
+flock /tmp/delta-block-lm-gpu.lock timeout 300s /tmp/delta-bins/hola/delta-experiment kron-model-check artifacts/hola/pairs.json --model-scope configured
+flock /tmp/delta-block-lm-gpu.lock timeout 300s /tmp/delta-bins/hola/delta-experiment kron-model-check artifacts/hola/pairs-norms.json --model-scope configured
+flock /tmp/delta-block-lm-gpu.lock timeout 300s /tmp/delta-bins/hola/delta-experiment normalization-reference artifacts/hola/pairs-norms.json
+flock /tmp/delta-block-lm-gpu.lock timeout 300s /tmp/delta-bins/hola/delta-experiment kron-reference artifacts/hola/b1.json --scan-backend fused_gpu
+/tmp/delta-bins/hola/delta-experiment reference artifacts/hola/cpu.json
+# Final corrected-helper/private-cache commands:
+../build.sh hola
+flock /tmp/delta-block-lm-gpu.lock timeout 300s /tmp/delta-bins/hola/delta-experiment hola-reference artifacts/hola/final-pairs.json
+flock /tmp/delta-block-lm-gpu.lock timeout 300s /tmp/delta-bins/hola/delta-experiment hola-tune artifacts/hola/final-b8.json --contexts 512,128 --warmups 2 --trials 11
 ```
 
 Artifact configs under `artifacts/hola/` copy the recommended config, isolate
