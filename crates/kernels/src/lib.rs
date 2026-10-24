@@ -34,3 +34,7 @@ pub use decay_ops::decay;
 mod matmul_ops;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 pub use matmul_ops::heuristic_matmul;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod soft_ops;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+pub use soft_ops::soft_order_keys;
