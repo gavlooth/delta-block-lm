@@ -388,6 +388,48 @@ pub fn run(
     Ok(report)
 }
 
+/// Execution-only bundles; projection, head, update and loss selectors stay configured.
+#[derive(Clone, Copy, serde::Serialize)]
+struct OptimizationBundle {
+    scan_backend: delta_mixers::ScanBackend,
+    hola_backend: delta_mixers::HolaBackend,
+    convolution_backend: delta_mixers::ConvolutionBackend,
+    normalization_backend: delta_mixers::NormalizationBackend,
+}
+
+impl OptimizationBundle {
+    const BASELINE: Self = Self {
+        scan_backend: delta_mixers::ScanBackend::FusedGpu,
+        hola_backend: delta_mixers::HolaBackend::FusedGpu,
+        convolution_backend: delta_mixers::ConvolutionBackend::Tensor,
+        normalization_backend: delta_mixers::NormalizationBackend::Tensor,
+    };
+
+    fn modes() -> [Self; 3] {
+        let candidate = Self {
+            scan_backend: delta_mixers::ScanBackend::FusedParallel256,
+            hola_backend: delta_mixers::HolaBackend::FusedGpuPairs,
+            convolution_backend: delta_mixers::ConvolutionBackend::FusedGpu,
+            ..Self::BASELINE
+        };
+        [
+            Self::BASELINE,
+            candidate,
+            Self {
+                normalization_backend: delta_mixers::NormalizationBackend::FusedNormsGates,
+                ..candidate
+            },
+        ]
+    }
+
+    fn apply_config(self, config: &mut Config) {
+        config.scan_backend = self.scan_backend;
+        config.hola_backend = self.hola_backend;
+        config.convolution_backend = self.convolution_backend;
+        config.normalization_backend = self.normalization_backend;
+    }
+}
+
 #[derive(Clone, Copy, serde::Serialize)]
 #[serde(untagged)]
 enum ExecutionChoice {
@@ -395,6 +437,7 @@ enum ExecutionChoice {
     Normalization(delta_mixers::NormalizationBackend),
     Hola(delta_mixers::HolaBackend),
     Convolution(delta_mixers::ConvolutionBackend),
+    Optimization(OptimizationBundle),
 }
 impl ExecutionChoice {
     fn apply(self, model: &mut LanguageModel) {
@@ -403,6 +446,12 @@ impl ExecutionChoice {
             Self::Normalization(mode) => model.set_normalization_backend(mode),
             Self::Hola(mode) => model.set_hola_backend(mode),
             Self::Convolution(mode) => model.set_convolution_backend(mode),
+            Self::Optimization(bundle) => {
+                model.set_scan_backend(bundle.scan_backend);
+                model.set_hola_backend(bundle.hola_backend);
+                model.set_convolution_backend(bundle.convolution_backend);
+                model.set_normalization_backend(bundle.normalization_backend);
+            }
         }
     }
 }
@@ -484,12 +533,37 @@ pub fn convolution_run(
     )
 }
 
+/// Compare baseline, combined kernels, and combined kernels with fused normalization.
+///
+/// Uses independent ordinary and section-barrier trajectories with model equivalence
+/// preflights. Component section sums are attribution, not isolated benchmarks;
+/// independent kernel reference gates must be run separately to bound this command.
+pub fn optimization_run(
+    c: &Config,
+    arm: &Arm,
+    device: &Device,
+    contexts: &[usize],
+    warmups: usize,
+    trials: usize,
+) -> Result<Value> {
+    comparison_run(
+        c,
+        arm,
+        device,
+        contexts,
+        warmups,
+        trials,
+        Comparison::Optimization,
+    )
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Comparison {
     Projection,
     Normalization,
     Hola,
     Convolution,
+    Optimization,
 }
 
 fn comparison_run(
@@ -505,15 +579,23 @@ fn comparison_run(
     let normalization = comparison == Comparison::Normalization;
     let convolution = comparison == Comparison::Convolution;
     let hola = comparison == Comparison::Hola;
+    let optimization = comparison == Comparison::Optimization;
     ensure!(
-        !(normalization || convolution || hola) || matches!(c.backend.as_str(), "vulkan" | "cuda"),
+        !(normalization || convolution || hola || optimization)
+            || matches!(c.backend.as_str(), "vulkan" | "cuda"),
         "custom operator comparison requires a GPU; no CPU fallback"
     );
     ensure!(
         !hola || (!c.fusion && !c.autotune),
         "HOLA comparison requires non-fusion execution without matmul autotune"
     );
-    let command = if hola {
+    ensure!(
+        !optimization || (!c.fusion && !c.autotune),
+        "optimization comparison requires non-fusion execution without matmul autotune"
+    );
+    let command = if optimization {
+        "optimization-benchmark"
+    } else if hola {
         "hola-tune"
     } else if convolution {
         "convolution-benchmark"
@@ -522,7 +604,9 @@ fn comparison_run(
     } else {
         "projection-benchmark"
     };
-    let backend_key = if hola {
+    let backend_key = if optimization {
+        "optimization_bundle"
+    } else if hola {
         "hola_backend"
     } else if convolution {
         "convolution_backend"
@@ -531,7 +615,9 @@ fn comparison_run(
     } else {
         "projection_backend"
     };
-    let forward_key = if hola {
+    let forward_key = if optimization {
+        "optimization_component_forward_section_samples_ms"
+    } else if hola {
         "hola_forward_samples_ms"
     } else if convolution {
         "convolution_forward_samples_ms"
@@ -540,7 +626,9 @@ fn comparison_run(
     } else {
         "projection_forward_samples_ms"
     };
-    let forward_median_key = if hola {
+    let forward_median_key = if optimization {
+        "optimization_component_forward_section_median_ms"
+    } else if hola {
         "hola_forward_median_ms"
     } else if convolution {
         "convolution_forward_median_ms"
@@ -562,7 +650,9 @@ fn comparison_run(
         .artifact_dir
         .join(format!("{command}-{}-{nonce}", std::process::id()));
     let report_path = directory.join("report.json");
-    let modes = if hola {
+    let modes = if optimization {
+        OptimizationBundle::modes().map(ExecutionChoice::Optimization)
+    } else if hola {
         [
             delta_mixers::HolaBackend::FusedGpu,
             delta_mixers::HolaBackend::FusedGpuPairs,
@@ -598,7 +688,15 @@ fn comparison_run(
         "memory_limitation":"sampled pool reserved bytes include all six scratch trajectories and allocator reuse; not physical peak or live temporary bytes"});
     runtime::write_json(&report_path, &report)?;
     let outcome = (|| -> Result<()> {
-        if hola {
+        if optimization {
+            report["independent_optimization_references"] = json!({
+                "status":"not_run",
+                "reason":"independent Kron, HOLA, convolution and normalization reference gates run separately; this bounded command runs full-model logits, every-parameter gradients and AdamW equivalence preflights"
+            });
+            report["optimization_component_forward_section_scope"] = json!(
+                "sum of non-overlapping recurrent scan, HOLA, short causal convolution, RMSNorm, L2/gate activation and residual-add sections; synchronized attribution, not isolated kernel or ordinary-step timing"
+            );
+        } else if hola {
             report["independent_hola_reference"] = serde_json::to_value(
                 delta_mixers::checks::hola_numerical_checks(device).map_err(anyhow::Error::msg)?,
             )?;
@@ -621,7 +719,9 @@ fn comparison_run(
         for &context in contexts {
             let mut config = c.clone();
             config.context = context;
-            if hola {
+            if optimization {
+                OptimizationBundle::BASELINE.apply_config(&mut config);
+            } else if hola {
                 config.hola_backend = delta_mixers::HolaBackend::FusedGpu;
             } else if convolution {
                 config.convolution_backend = ConvolutionBackend::Tensor;
@@ -631,7 +731,7 @@ fn comparison_run(
                 config.projection_backend = ProjectionBackend::Separate;
             }
             config.validate()?;
-            let isolated = if hola {
+            let isolated = if hola || optimization {
                 Value::Null
             } else if convolution {
                 serde_json::to_value(
@@ -778,7 +878,14 @@ fn comparison_run(
                             .totals
                             .iter()
                             .filter(|(name, _)| {
-                                if hola {
+                                if optimization {
+                                    **name == "Recurrent scan"
+                                        || name.starts_with("HOLA")
+                                        || **name == "Short causal convolutions"
+                                        || name.contains("RMSNorm")
+                                        || name.starts_with("L2 ")
+                                        || **name == "Residual adds"
+                                } else if hola {
                                     name.starts_with("HOLA")
                                 } else if convolution {
                                     **name == "Short causal convolutions"
@@ -811,7 +918,7 @@ fn comparison_run(
             report["cases"].as_array_mut().unwrap().push(json!({"context":context,
                 "fixture_sha256":data::fixture_hash(&rows),"parameters":base.num_params(),
                 "equivalence":checks,"trial_orders":orders,
-                (if hola { "isolated_hola" } else if convolution { "isolated_convolutions" } else if normalization { "isolated_normalization" } else { "isolated_input_projections" }):isolated,
+                (if optimization { "isolated_optimization" } else if hola { "isolated_hola" } else if convolution { "isolated_convolutions" } else if normalization { "isolated_normalization" } else { "isolated_input_projections" }):isolated,
                 "results":results}));
             runtime::write_json(&report_path, &report)?;
         }
@@ -829,6 +936,35 @@ fn comparison_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optimization_bundles_serialize_all_four_selectors() {
+        let modes = OptimizationBundle::modes().map(ExecutionChoice::Optimization);
+        let serialized = serde_json::to_value(modes).unwrap();
+        assert_eq!(serialized, json!([
+            {"scan_backend":"fused_gpu","hola_backend":"fused_gpu",
+             "convolution_backend":"tensor","normalization_backend":"tensor"},
+            {"scan_backend":"fused_parallel256","hola_backend":"fused_gpu_pairs",
+             "convolution_backend":"fused_gpu","normalization_backend":"tensor"},
+            {"scan_backend":"fused_parallel256","hola_backend":"fused_gpu_pairs",
+             "convolution_backend":"fused_gpu","normalization_backend":"fused_norms_gates"}
+        ]));
+    }
+
+    #[test]
+    fn optimization_baseline_resets_only_bundle_selectors() {
+        let mut expected = Config::default();
+        expected.projection_backend = delta_mixers::ProjectionBackend::Merged;
+        OptimizationBundle::BASELINE.apply_config(&mut expected);
+        let mut actual = expected.clone();
+        OptimizationBundle::modes()[2].apply_config(&mut actual);
+        OptimizationBundle::BASELINE.apply_config(&mut actual);
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+
     #[test]
     fn medians_use_summed_section_time_per_trial() {
         let mut a = Timing::default();
