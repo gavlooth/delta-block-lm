@@ -89,17 +89,51 @@ cache/environment; decisions are also logged to
 `ARTIFACT_DIR/autotune-decisions.jsonl` when enabled. Tuning changes all Burn
 autotuned operations, not only GEMMs. Use fresh run directories/budgets.
 
+Autotuned model execution is restricted to the local non-fusion byte-LM,
+`scan_backend: "fused_gpu"`, `hola_backend: "fused_gpu"`, merged inputs and
+tensor normalization/gating. Unsupported combinations fail before device creation.
+`projection_backend: "merged_heuristic_output"` retains the merged input
+contraction but explicitly pins the dependent output projection's forward and
+both VJPs to Burn's non-autotuned Cube heuristic. `head_backend: "heuristic"`
+does the same for the unchanged 257-column vocabulary parameter. The alternative
+`head_backend: "padded320"` appends constant zero weight columns, slices the real
+257 logits before the loss, and never adds trained parameters or optimizer state.
+Omitted head selection is historical `native`; omitted projection selection is
+historical `separate`. No parameter name, shape or ID changes in any mode.
+
+Burn's private matmul tuner exposes no global candidate exclusion. Therefore,
+before any autotuned training/step profiling, a fail-closed preflight probes all
+five active linear families with the actual configured batch/context/width:
+real rank-3 forwards plus input and parameter VJPs, against independent scalar
+f64 dots at the existing `2e-5 + 3e-4*abs(reference)` tolerance. A failed probe
+refuses training before any real optimizer step and retains `gemm-preflight.json`.
+This is not a whitelist of known batch sizes: new shapes are probed too.
+Certificates under `CACHE_DIR/gemm-verdicts/` are bound to exact shapes and
+execution, actual Vulkan adapter/driver information, source/dependency hashes,
+and a digest of the persistent matmul tune entries. All selections are warmed
+before that digest is read, resolving candidate-list checksums. Even a matching
+cached certificate rechecks fresh device values; only the deterministic f64
+expectations are reused. Startup/preflight cost is separate from warm step time.
+Commands that internally change training contraction families reject autotune
+rather than execute unprobed GEMMs.
+
 ### Matrix-multiply characterization
 
 `gemm-micro CONFIG --warmups 2 --trials 7` is bounded by `max_seconds` (at most
 290s) and an external process timeout. It measures all forward, input-VJP and
-weight-VJP GEMMs for the actual D256/L4/context512 byte-LM: MLP up/down,
-904-channel merged inputs, mixer output, and 257-token vocabulary head,
+weight-VJP GEMMs for the actual D256/L4/context128 or512 byte-LM: MLP up/down,
+904-channel merged inputs, mixer output, and the configured vocabulary head,
 at batches1/8/16. It retains the real transposed operand views, compares
 packing them **inside** each timed call, and reports synchronized latency,
 `2*M*N*K` GFLOP/s, launch kernel identities, logical bytes and independent
 scalar-f64 probes. First-use compile/tune costs precede warmups. Large
 1024/2048 squares provide an empirical backend ceiling, not a hardware peak.
+The same report includes126 small batched solver F/VJP probes: head batch4,
+16-token overlaps/inverses/corrections/state updates, transposes, initial
+inverse batch broadcasting and strided chunk views from a context512 parent.
+These diagnose unsupported legacy execution, not the active fused scan.
+`recommended_path_passed` and `legacy_solver_passed` are separate; aggregate
+`passed` remains false if either scope fails, with all offending values retained.
 Numerical failures retain the offending values and unchanged tolerances,
 continue characterization of the remaining shapes, then exit nonzero with
 `passed: false`; an invalid kernel's apparent GFLOP/s is not accepted throughput.
@@ -116,8 +150,20 @@ using identical seeds, batches, data indices and optimizer work. Its default
 11 pairs each measure the fourth step of a fresh trajectory after first use
 and two warmups. Raw stdout/stderr/process outcomes and paired bootstrap
 intervals are retained; build and reference checks remain separate commands.
-No GPU/build job may overlap these measurements. See “Matrix-multiply
-efficiency” in root `RESULTS.md` for the evaluated selection and exact commands.
+The optional final driver arguments select the candidate head
+(`native|padded320|heuristic`) and projection
+(`merged|merged_heuristic_output`); the control always stays historical merged
+inputs/native head with autotune off. Preflight reports/costs remain outside
+every ordinary-step clock.
+Serialize every GPU invocation with `flock /tmp/delta-block-lm-gpu.lock`; keep
+builds outside timing windows. `kron-model-check --model-scope configured`
+checks only the explicitly selected scan/HOLA pair, both contexts128/512 and
+with/without active HOLA, against the unchanged CPU logits, all parameter
+gradients, AdamW update and full-parameter directional check. Default
+`--model-scope all` retains strict acceptance of every combination and now
+records each combination separately instead of stopping at its first failure.
+Neither scope accepts the independently known primitive legacy solver defect.
+See “Matrix-multiply efficiency” in root `RESULTS.md` for selections and commands.
 
 Independent component checks avoid coupling HOLA or fused Kron acceptance to another execution path's regression:
 

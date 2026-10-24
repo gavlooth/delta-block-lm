@@ -211,7 +211,7 @@ pub fn checkpoint_check(
     arm_name: Option<&str>,
     seed: u64,
     checkpoint_override: Option<&Path>,
-    output: Option<&Path>,
+    output_root: Option<&Path>,
 ) -> Result<Value> {
     ensure!(
         checkpoint_override.is_none() || arm_name.is_some(),
@@ -237,7 +237,7 @@ pub fn checkpoint_check(
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos();
-    let directory = output
+    let directory = output_root
         .unwrap_or(&c.artifact_dir)
         .join("checkpoint-diagnostics")
         .join(format!(

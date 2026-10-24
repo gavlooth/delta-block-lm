@@ -3,6 +3,9 @@ use anyhow::Result;
 use burn::prelude::*;
 use serde_json::{Value, json};
 
+#[cfg(feature = "vulkan")]
+static ADAPTER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 pub fn device(c: &Config) -> Result<Device> {
     if matches!(c.backend.as_str(), "vulkan" | "cuda") {
         anyhow::ensure!(
@@ -49,6 +52,14 @@ pub fn device(c: &Config) -> Result<Device> {
         "vulkan" => {
             #[cfg(feature = "vulkan")]
             {
+                let gpu =
+                    cubecl::device::WgpuDevice::default().on(cubecl::device::WgpuBackend::Vulkan);
+                let setup = cubecl::wgpu::try_init_setup::<cubecl::wgpu::AutoGraphicsApi>(
+                    &gpu,
+                    Default::default(),
+                )
+                .map_err(|error| anyhow::anyhow!("initializing Vulkan: {error}"))?;
+                let _ = ADAPTER.set(format!("{:?}", setup.adapter.get_info()));
                 let device = Device::vulkan(Default::default());
                 let info = format!("{:?}", device.identity());
                 anyhow::ensure!(
@@ -78,8 +89,12 @@ pub fn device(c: &Config) -> Result<Device> {
 pub fn identity(device: &Device) -> Value {
     #[cfg(any(feature = "vulkan", feature = "cuda"))]
     {
+        #[cfg(feature = "vulkan")]
+        let adapter = ADAPTER.get().map(String::as_str);
+        #[cfg(not(feature = "vulkan"))]
+        let adapter: Option<&str> = None;
         json!({"device":format!("{device:?}"),"identity":format!("{:?}",device.identity()),
-            "autotune":cfg!(feature = "autotune"),"fusion":cfg!(feature = "fusion")})
+            "autotune":cfg!(feature = "autotune"),"fusion":cfg!(feature = "fusion"),"adapter":adapter})
     }
     #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
     {
