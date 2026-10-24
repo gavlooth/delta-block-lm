@@ -526,8 +526,9 @@ impl Mixer {
                     HolaBackend::Tensor,
                     "cache membership diagnostic requires the tensor HOLA path"
                 );
-                let (read, memberships) = profile.section("HOLA read", || {
-                    hola::read_with_membership(
+                let replay = profile.replayed_cache_selection();
+                let (read, selections) = profile.section("HOLA read", || {
+                    hola::read_with_selection(
                         cache_q,
                         cache_k,
                         raw_v,
@@ -538,10 +539,16 @@ impl Mixer {
                         self.chunk_size,
                         self.cache_policy,
                         cache.sink.val(),
+                        replay.as_deref(),
                     )
                 });
-                for (first, positions) in memberships {
-                    profile.cache_membership(first, first + self.chunk_size < t, &positions);
+                for selection in selections {
+                    profile.cache_membership(
+                        selection.chunk_start,
+                        selection.chunk_start + self.chunk_size < t,
+                        &selection.kept_slots,
+                        &selection.positions,
+                    );
                 }
                 read.output
             } else {

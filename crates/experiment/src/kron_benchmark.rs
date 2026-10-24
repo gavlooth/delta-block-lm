@@ -252,13 +252,57 @@ impl ModuleMapper for PerturbParameters {
         Param::from_tensor(current + delta)
     }
 }
-fn cpu_directional_check(
-    base: &LanguageModel,
-    batch: &Batch,
-    gradients: &ParameterSnapshot,
-) -> Result<Value> {
-    let epsilon = 2e-3;
-    let analytic = gradients
+/// Hard HOLA top-k selection is detached and piecewise constant, so the analytic gradient
+/// is the derivative with cache membership held fixed. Differencing must hold it fixed too:
+/// the unperturbed forward records every block's kept slots and both perturbed forwards
+/// reuse them. Models without a cache are unaffected.
+#[derive(Default)]
+struct FixedCacheSelection {
+    layer: Option<usize>,
+    kept: std::collections::BTreeMap<usize, Vec<Tensor<3, Int>>>,
+    replay: bool,
+}
+impl delta_mixers::profile::Sections for FixedCacheSelection {
+    const CAPTURE_CACHE_MEMBERSHIP: bool = true;
+    fn block(&mut self, index: Option<usize>) {
+        self.layer = index;
+    }
+    fn section<T>(&mut self, _name: &'static str, run: impl FnOnce() -> T) -> T {
+        run()
+    }
+    fn cache_membership(
+        &mut self,
+        _chunk_start: usize,
+        _used: bool,
+        kept_slots: &Tensor<3, Int>,
+        _positions: &Tensor<3>,
+    ) {
+        if !self.replay {
+            let layer = self.layer.expect("cache selection outside a block");
+            self.kept.entry(layer).or_default().push(kept_slots.clone());
+        }
+    }
+    fn replayed_cache_selection(&self) -> Option<Vec<Tensor<3, Int>>> {
+        if self.replay {
+            self.layer.and_then(|layer| self.kept.get(&layer).cloned())
+        } else {
+            None
+        }
+    }
+}
+impl FixedCacheSelection {
+    fn record(model: &LanguageModel, batch: &Batch) -> Self {
+        let mut selection = Self::default();
+        let _ = model.valid().forward_profiled(batch, &mut selection);
+        selection.replay = true;
+        selection
+    }
+    fn loss(&mut self, model: &LanguageModel, batch: &Batch) -> Result<f64> {
+        model::scalar(model.loss(model.forward_profiled(batch, self), batch))
+    }
+}
+fn directional_analytic(gradients: &ParameterSnapshot) -> f64 {
+    gradients
         .iter()
         .enumerate()
         .flat_map(|(p, (_, values))| {
@@ -267,18 +311,36 @@ fn cpu_directional_check(
                 .enumerate()
                 .map(move |(i, &g)| f64::from(g) * f64::from(parameter_direction(p, i)))
         })
-        .sum::<f64>();
+        .sum::<f64>()
+}
+fn fixed_selection_difference(
+    base: &LanguageModel,
+    batch: &Batch,
+    selection: &mut FixedCacheSelection,
+    epsilon: f64,
+) -> Result<(f64, f64)> {
     let plus = base.valid().map(&mut PerturbParameters {
         scale: epsilon,
         index: 0,
     });
-    let plus_loss = model::scalar(plus.loss(plus.forward(batch), batch))?;
+    let plus_loss = selection.loss(&plus, batch)?;
     drop(plus);
     let minus = base.valid().map(&mut PerturbParameters {
         scale: -epsilon,
         index: 0,
     });
-    let minus_loss = model::scalar(minus.loss(minus.forward(batch), batch))?;
+    let minus_loss = selection.loss(&minus, batch)?;
+    Ok((plus_loss, minus_loss))
+}
+fn cpu_directional_check(
+    base: &LanguageModel,
+    batch: &Batch,
+    gradients: &ParameterSnapshot,
+) -> Result<Value> {
+    let epsilon = 2e-3;
+    let analytic = directional_analytic(gradients);
+    let mut selection = FixedCacheSelection::record(base, batch);
+    let (plus_loss, minus_loss) = fixed_selection_difference(base, batch, &mut selection, epsilon)?;
     let numerical = (plus_loss - minus_loss) / (2. * epsilon);
     let error = (analytic - numerical).abs();
     let tolerance = 3e-3 + 0.03 * analytic.abs();
@@ -289,7 +351,8 @@ fn cpu_directional_check(
     Ok(
         json!({"passed":true,"all_parameter_tensors_perturbed":gradients.len(),"epsilon":epsilon,
         "analytic":analytic,"numerical":numerical,"absolute_error":error,
-        "absolute_tolerance":3e-3,"relative_tolerance":0.03}),
+        "absolute_tolerance":3e-3,"relative_tolerance":0.03,
+        "cache_selection":if selection.kept.is_empty() { "no cache" } else { "kept slots replayed from the unperturbed forward" }}),
     )
 }
 struct CpuReference {
@@ -1148,7 +1211,13 @@ impl delta_mixers::profile::Sections for MembershipTrace {
     fn section<T>(&mut self, _name: &'static str, run: impl FnOnce() -> T) -> T {
         run()
     }
-    fn cache_membership(&mut self, chunk_start: usize, used: bool, positions: &Tensor<3>) {
+    fn cache_membership(
+        &mut self,
+        chunk_start: usize,
+        used: bool,
+        _kept_slots: &Tensor<3, Int>,
+        positions: &Tensor<3>,
+    ) {
         let shape = positions.dims();
         let ordered = values(positions.clone())
             .into_iter()
@@ -1237,7 +1306,7 @@ pub fn directional_diagnostic(c: &Config, device: &Device) -> Result<Value> {
         "original_epsilon":0.002,"absolute_tolerance":0.003,"relative_tolerance":0.03,
         "source_config":c,"cpu_oracle_config":config,"device":runtime::identity(device),
         "report_path":path,"cases":[],
-        "scope":"Fixed epsilon sweep only; neither selects an epsilon nor accepts a failed gate. All original parameters and hard surprise cache decisions remain active."
+        "scope":"Fixed epsilon sweep. Each sample reports the difference with hard cache decisions recomputed (free) and with the unperturbed forward's kept slots replayed (fixed, as used by the model-check gate)."
     });
     runtime::write_json(&path, &report)?;
     let td = device.clone().autodiff();
@@ -1277,16 +1346,8 @@ pub fn directional_diagnostic(c: &Config, device: &Device) -> Result<Value> {
         let ordinary_loss_value = model::scalar(ordinary_loss.clone())?;
         let grads = model::checked_gradients(&base, ordinary_loss)?;
         let snapshot = parameters(&base, Some(&grads))?;
-        let analytic = snapshot
-            .iter()
-            .enumerate()
-            .flat_map(|(p, (_, values))| {
-                values
-                    .iter()
-                    .enumerate()
-                    .map(move |(i, &g)| f64::from(g) * f64::from(parameter_direction(p, i)))
-            })
-            .sum::<f64>();
+        let analytic = directional_analytic(&snapshot);
+        let mut fixed_selection = FixedCacheSelection::record(&base, &batch);
         let tolerance = 3e-3 + 0.03 * analytic.abs();
         let mut base_trace = MembershipTrace::default();
         let inference = base.valid();
@@ -1321,11 +1382,18 @@ pub fn directional_diagnostic(c: &Config, device: &Device) -> Result<Value> {
             let minus_loss = model::scalar(minus.loss(logits, &batch))?;
             let numerical = (plus_loss - minus_loss) / (2. * epsilon);
             let error = (analytic - numerical).abs();
+            let (fixed_plus, fixed_minus) =
+                fixed_selection_difference(&base, &batch, &mut fixed_selection, epsilon)?;
+            let fixed_numerical = (fixed_plus - fixed_minus) / (2. * epsilon);
+            let fixed_error = (analytic - fixed_numerical).abs();
             report["cases"][index]["samples"].as_array_mut().unwrap().push(json!({
                 "epsilon":epsilon,"per_element_direction_magnitude":0.01,
                 "plus_loss":plus_loss,"minus_loss":minus_loss,
                 "numerical":numerical,"absolute_error":error,
                 "within_original_tolerance":analytic.is_finite() && numerical.is_finite() && error <= tolerance,
+                "fixed_selection_plus_loss":fixed_plus,"fixed_selection_minus_loss":fixed_minus,
+                "fixed_selection_numerical":fixed_numerical,"fixed_selection_absolute_error":fixed_error,
+                "fixed_selection_within_original_tolerance":fixed_numerical.is_finite() && fixed_error <= tolerance,
                 "plus_memberships":plus_trace.report()?,"minus_memberships":minus_trace.report()?,
                 "plus_vs_base":plus_trace.changes_from(&base_trace)?,
                 "minus_vs_base":minus_trace.changes_from(&base_trace)?,

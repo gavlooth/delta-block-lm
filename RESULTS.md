@@ -1389,7 +1389,7 @@ projection backward (dX/dW) and the scan before anything smaller.
 | MLP SiLU | `epilogue_backend: analytic_backward` | Residual adds stay native; no fusion across norms or matmuls | `epilogues.md` |
 | Matrix multiplies | guarded autotune, heuristic head and output projection | Rank-3 F/dX/dW preflight on every active GEMM shape before training | `gemm-efficiency.md` |
 | Soft top-k selection | `soft_selection_backend: gpu` | B8×512/k16 feedback round 8.64× (V257), 24.44× (V32k); inactive in the causal LM | `soft-topk.md` |
-| GDN-2 training | `scan_backend: fused_gdn2` (comparison arm only) | Recurrence F+B 53.42 → 25.29 ms at B8/T128; full-model comparison blocked, see below | `gdn.md` |
+| GDN-2 training | `scan_backend: fused_gdn2` (comparison arm) | Recurrence F+B 245.35 → 93.04 ms at B8/T512; full step with HOLA 2,609.6 → 1,710.9 ms (1.53×), see below | `gdn.md` |
 
 ### Correctness gates on the integrated tree
 
@@ -1424,17 +1424,54 @@ before and passes after; all three historical T7 objectives and the default
 tensor-solver reference now pass. The exact CubeCL instruction at fault is
 not identified; see `tensor-solver.md` for the upstream report text.
 
+### CPU directional check now holds cache membership fixed
+
+HOLA's surprise top-k selection is detached and piecewise constant, so the
+analytic gradient is the derivative with cache membership held fixed. The
+old CPU directional finite-difference gate recomputed the hard selection for
+the ±ε models, and every tested ε (5e-4…4e-3) changed cache membership in
+many chunks, so the difference crossed a discontinuity: GDN-2 + HOLA B8/T128
+failed at ε = 2e-3 (error 3.45e-3, limit 3.32e-3) and Kron B1 at ε = 4e-3.
+
+The gate now records the unperturbed forward's kept cache slots for every
+block and chunk and replays them in both perturbed forwards
+(`FixedCacheSelection` in `kron_benchmark.rs`; models without a cache are
+unaffected). Epsilon 2e-3 and the tolerance 3e-3 + 0.03·|analytic| are
+unchanged. The diagnostic sweep (`gdn-directional-diagnostic`,
+`artifacts/integration/directional-diagnostic-fixed.stdout`) reports both:
+
+| Case | Free selection error, ε = 5e-4 / 1e-3 / 2e-3 / 4e-3 | Fixed selection error | Limit |
+|---|---|---|---:|
+| GDN-2 + HOLA, B8/T128 | 1.62e-2 / 3.35e-3 / 3.45e-3 / 8.8e-4 | 1.0e-5 / 1.0e-5 / 1.09e-4 / 5.0e-5 | 3.32e-3 |
+| Kron + HOLA, B1/T128 | 6.2e-4 / 6.2e-4 / 3.96e-3 / 5.57e-3 | 6.2e-4 / 9.5e-5 / 1.43e-4 / 2.4e-5 | 4.20e-3 |
+| Kron + HOLA, B8/T128 | 4.38e-3 / 2.24e-3 / 4.5e-4 / 6.9e-4 | 8.9e-5 / 3.88e-4 / 3.28e-4 / 8.9e-5 | 5.03e-3 |
+
+With membership fixed every case passes at every ε by a wide margin, which
+confirms the analytic gradients; the earlier failures came from the
+selection jumps.
+
+### GDN-2 fused training scan
+
+`bun scripts/benchmark-gdn.ts vulkan BINARY 2 5`, B8, five interleaved
+trials after two warmups, every path first checked against the CPU oracle
+(logits ≤ 4.72e-6, all parameter gradients ≤ 4.32e-7, AdamW ≤ 4.87e-6;
+directional check passes with fixed selection). Median complete step, ms:
+
+| Context | HOLA | Tensor solver | `fused_gdn2` | `fused_gdn2` + fused HOLA |
+|---:|---|---:|---:|---:|
+| 128 | off | 409.1 | 282.2 | — |
+| 128 | on | 521.4 | 402.2 | 352.5 |
+| 512 | off | 2,095.5 | 1,296.2 | — |
+| 512 | on | 2,609.6 | 1,794.6 | 1,710.9 |
+
+These are medians of five samples, not paired bootstrap intervals; every
+trial of the fused path was faster. Isolated recurrence F+B at B8/T512:
+245.35 → 93.04 ms. GDN-2 remains a comparison arm; use `fused_gdn2` with a
+GPU backend when it is trained. Report:
+`artifacts/gdn/benchmark-1792873067810-3535974/`.
+
 ### Open findings
 
-- **CPU directional finite-difference check with HOLA.** With HOLA on, every
-  tested perturbation (ε = 5e-4…4e-3) changes cache membership in many
-  chunks, because hard surprise top-k selection is recomputed. The GDN-2 +
-  HOLA B8/T128 oracle case therefore fails at ε = 2e-3 (error 3.45e-3,
-  limit 3.32e-3) while Kron B8 passes; Kron B1 fails at ε = 4e-3. This is a
-  property of differencing across a discontinuous selection, not evidence of
-  a gradient defect; `gdn-directional-diagnostic` records the sweep and
-  membership changes. Changing the gate (for example, pinning base membership
-  during differencing) is an acceptance-policy decision and was not made.
 - **Run-to-run GPU nondeterminism.** Two identical B1 steps produced one of
   two bitwise `head.weight` results. Recomputed steps are compared at the
   standard tolerance; checkpoint save/restore remains byte-exact.

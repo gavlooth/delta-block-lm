@@ -170,13 +170,22 @@ pub(crate) fn read_detailed(
     sink: Tensor<1>,
 ) -> CacheRead {
     read_impl::<false>(
-        q, k, v, scores, valid, documents, capacity, chunk, policy, sink,
+        q, k, v, scores, valid, documents, capacity, chunk, policy, sink, None,
     )
     .0
 }
 
-/// Exact production tensor selection, with optional per-chunk position snapshots.
-pub(crate) fn read_with_membership(
+/// One chunk's cache update: the slots kept (indices into cache ∪ chunk) and their positions.
+pub struct CacheSelection {
+    pub chunk_start: usize,
+    pub kept_slots: Tensor<3, Int>,
+    pub positions: Tensor<3>,
+}
+
+/// Exact production tensor selection, returning every chunk's kept slots. With `replay`,
+/// those slot indices are used instead of ranking, so cache membership stays fixed while
+/// the differentiable inputs change (finite-difference checks across a hard top-k).
+pub(crate) fn read_with_selection(
     q: Tensor<4>,
     k: Tensor<4>,
     v: Tensor<4>,
@@ -187,9 +196,10 @@ pub(crate) fn read_with_membership(
     chunk: usize,
     policy: CachePolicy,
     sink: Tensor<1>,
-) -> (CacheRead, Vec<(usize, Tensor<3>)>) {
+    replay: Option<&[Tensor<3, Int>]>,
+) -> (CacheRead, Vec<CacheSelection>) {
     read_impl::<true>(
-        q, k, v, scores, valid, documents, capacity, chunk, policy, sink,
+        q, k, v, scores, valid, documents, capacity, chunk, policy, sink, replay,
     )
 }
 
@@ -204,7 +214,8 @@ fn read_impl<const TRACE: bool>(
     chunk: usize,
     policy: CachePolicy,
     sink: Tensor<1>,
-) -> (CacheRead, Vec<(usize, Tensor<3>)>) {
+    replay: Option<&[Tensor<3, Int>]>,
+) -> (CacheRead, Vec<CacheSelection>) {
     assert!(capacity > 0 && chunk > 0 && policy != CachePolicy::None);
     let [b, t, h, dk] = q.dims();
     let dv = v.dims()[3];
@@ -216,8 +227,15 @@ fn read_impl<const TRACE: bool>(
     let mut cd = Tensor::full([b, h, capacity], -1.0, &device);
     let mut output = Vec::with_capacity(t.div_ceil(chunk));
     let mut work = 0;
-    let mut memberships = Vec::new();
-    for first in (0..t).step_by(chunk) {
+    let mut selections = Vec::new();
+    if let Some(replay) = replay {
+        assert_eq!(
+            replay.len(),
+            t.div_ceil(chunk),
+            "replayed cache selection has the wrong chunk count"
+        );
+    }
+    for (chunk_index, first) in (0..t).step_by(chunk).enumerate() {
         let n = chunk.min(t - first);
         let total = capacity + n;
         let take = |x: &Tensor<4>| {
@@ -311,7 +329,11 @@ fn read_impl<const TRACE: bool>(
             .int()
             .sum_dim(3)
             .reshape([b, h, total]);
-        let index = rank.argsort(2).slice([0..b, 0..h, 0..capacity]);
+        let index = match replay {
+            Some(replay) => replay[chunk_index].clone(),
+            None => rank.argsort(2).slice([0..b, 0..h, 0..capacity]),
+        };
+        let index_kept = index.clone();
         cs = ranked.gather(2, index.clone());
         cp = positions
             .gather(2, index.clone())
@@ -320,7 +342,11 @@ fn read_impl<const TRACE: bool>(
         ck = keys.gather(2, index.clone().unsqueeze_dim::<4>(3).repeat_dim(3, dk));
         cv = values.gather(2, index.unsqueeze_dim::<4>(3).repeat_dim(3, dv));
         if TRACE {
-            memberships.push((first, cp.clone()));
+            selections.push(CacheSelection {
+                chunk_start: first,
+                kept_slots: index_kept,
+                positions: cp.clone(),
+            });
         }
     }
     (
@@ -329,6 +355,6 @@ fn read_impl<const TRACE: bool>(
             final_positions: cp,
             attention_pairs: work,
         },
-        memberships,
+        selections,
     )
 }

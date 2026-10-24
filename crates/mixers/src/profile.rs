@@ -2,15 +2,25 @@
 //! The no-op observer is monomorphized away; production forwards do not synchronize.
 
 pub trait Sections {
-    /// CPU diagnostic only; ordinary observers compile out membership collection.
+    /// CPU diagnostic only; ordinary observers compile out cache-selection observation.
     const CAPTURE_CACHE_MEMBERSHIP: bool = false;
 
+    /// Called once per chunk with the slots kept (indices into cache ∪ chunk) and their
+    /// token positions, for the current block.
     fn cache_membership(
         &mut self,
         _chunk_start: usize,
         _used_by_later_chunk: bool,
+        _kept_slots: &burn::prelude::Tensor<3, burn::prelude::Int>,
         _positions: &burn::prelude::Tensor<3>,
     ) {
+    }
+
+    /// Kept slots to reuse for every chunk of the current block instead of ranking.
+    fn replayed_cache_selection(
+        &self,
+    ) -> Option<Vec<burn::prelude::Tensor<3, burn::prelude::Int>>> {
+        None
     }
 
     fn block(&mut self, _index: Option<usize>) {}

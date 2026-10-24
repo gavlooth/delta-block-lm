@@ -2,13 +2,13 @@
 
 ## Status and decision
 
-Implemented. The f64 reference gate and isolated recurrence timings are measured and
-recorded under "Measured results" below. Full-model paired throughput for the
-candidate has not been measured, and one full-model directional check (B8/T128 with
-HOLA on) stopped at its finite-difference gate; see that section. `TensorSolver`
-remains the omitted default; historical config/checkpoint fingerprints and existing
-Kron selector meanings are unchanged. `scan_backend: "fused_gdn2"` is explicit and
-GDN-2-only.
+Implemented and measured. The f64 reference gate, the CPU model oracle (with the
+directional check holding HOLA cache membership fixed) and B8 full-model steps pass;
+see "Measured results". At B8/T512 the complete step with HOLA falls
+2,609.6 → 1,710.9 ms (1.53×). Use `scan_backend: "fused_gdn2"` when GDN-2 is trained
+on a GPU. `TensorSolver` remains the omitted default; historical config/checkpoint
+fingerprints and existing Kron selector meanings are unchanged. The selector is
+explicit and GDN-2-only.
 
 Three designs were considered:
 
@@ -141,31 +141,53 @@ its resolved config, preserves stdout/stderr and exit codes, and uses an outer
 Do not run this concurrently with another GPU owner. A failed gate or deadline
 is a retained failure, not a reason to relax tolerances or accept partial timing.
 
-After acceptance, compare warm isolated and B8 model medians, dispatch and memory
-observations against the retained baseline. Keep the tensor default unless the
-measured integrated gain justifies maintenance and shared-memory cost. Isolated
-results are below; the full-model paired throughput for `fused_gdn2` has not been
-measured yet, so the default is unchanged.
+Final measurements are below.
 
 ## Measured results
 
 ### Correctness
 
 - The f64 gate (`gdn-reference --scan-backend fused_gdn2`) passed on Vulkan.
-- Full-model B8/T128 with HOLA off passed the CPU oracle.
-- Full-model B8/T128 with HOLA on **stopped at the CPU (tensor reference) full-parameter directional finite-difference check**: analytic 0.0105004, numerical 0.0139475, absolute error 3.447e-3 against a limit of 3.315e-3. The gate and tolerance are unchanged, so this case is recorded as a failure of that check, not a pass.
+- Full-model B8/T128 and B8/T512, HOLA off and on, pass the CPU oracle on all four
+  paths (tensor/fused scan × tensor/fused HOLA): logits ≤ 4.72e-6, all parameter
+  gradients ≤ 4.32e-7, AdamW ≤ 4.87e-6.
 
-Diagnostic `gdn-directional-diagnostic` (`artifacts/integration/directional-diagnostic.stdout`): with HOLA on, every tested epsilon (5e-4, 1e-3, 2e-3, 4e-3) changes cache membership in 7–24 chunks (63–597 changed set slots) for GDN B8, and the errors are 1.62e-2, 3.35e-3, 3.45e-3 and 8.8e-4 respectively. Kron B8 passes at all epsilons despite similar membership changes; Kron B1 fails at epsilon 4e-3.
+The first run stopped at the CPU directional finite-difference check for B8/T128 with
+HOLA on (error 3.447e-3, limit 3.315e-3). `gdn-directional-diagnostic` showed every
+tested ε (5e-4…4e-3) changing cache membership in 7–24 chunks, so the difference
+crossed the hard top-k selection. The check now replays the unperturbed forward's kept
+cache slots in both perturbed forwards; ε 2e-3 and the tolerance are unchanged. With
+membership fixed the GDN-2 errors are 1.0e-5 / 1.0e-5 / 1.09e-4 / 5.0e-5 at the four ε
+(limit 3.32e-3), and the full-model gate passes (1.09e-4 at T128, 3.16e-4 at T512).
+Reports: `artifacts/integration/directional-diagnostic.stdout` (free selection) and
+`artifacts/integration/directional-diagnostic-fixed.stdout` (both).
 
-Interpretation: the finite difference spans a discontinuous hard top-k cache selection, so the numerical directional derivative is not a reliable reference when the selected set changes. This points to differencing across a selection discontinuity, not a gradient defect in the fused operator (the f64 gate and the HOLA-off case pass). It is an interpretation of the diagnostic, not a separate proof. The gate and tolerance were not changed; the policy decision on how to treat HOLA-on full-model directional checks is pending.
+### Full-model steps
+
+B8, five interleaved trials after two warmups, median complete step in ms
+(`artifacts/gdn/benchmark-1792873067810-3535974/`):
+
+| Context | HOLA | `tensor_solver` | `fused_gdn2` | `fused_gdn2` + fused HOLA |
+| ---: | --- | ---: | ---: | ---: |
+| 128 | off | 409.1 | 282.2 | — |
+| 128 | on | 521.4 | 402.2 | 352.5 |
+| 512 | off | 2,095.5 | 1,296.2 | — |
+| 512 | on | 2,609.6 | 1,794.6 | 1,710.9 |
+
+Every fused-scan trial was faster than every tensor-solver trial in the same case.
+These are medians of five samples, not paired bootstrap intervals.
 
 ### Isolated recurrence timing
 
-Median milliseconds, forward (F) and forward+backward (F+B), from `artifacts/gdn/benchmark-1792870192457-3146723/gdn-benchmark-3146728-1792870192622379980/report.json`:
+Median milliseconds, forward (F) and forward+backward (F+B), one layer:
 
 | Shape | `tensor_solver` F | `tensor_solver` F+B | `fused_gdn2` F | `fused_gdn2` F+B |
 | --- | ---: | ---: | ---: | ---: |
-| B1/T128 | 19.859 | 48.599 | 5.905 | 23.309 |
-| B8/T128 | 21.680 | 53.421 | 6.060 | 25.290 |
+| B1/T128 | 19.59 | 55.40 | 5.76 | 24.26 |
+| B8/T128 | 19.63 | 57.17 | 6.05 | 25.43 |
+| B1/T512 | 74.82 | 261.84 | 20.12 | 87.88 |
+| B8/T512 | 69.58 | 245.35 | 19.66 | 93.04 |
 
-The isolated fused recurrence is about 3.4–3.6× faster forward and about 2.1× faster forward+backward. This is the recurrence alone. Full-model paired throughput (and memory) for `fused_gdn2` has not been measured, so there is no adoption decision: `TensorSolver` remains the default and `fused_gdn2` stays an explicit opt-in.
+From the final run (`artifacts/gdn/benchmark-1792873067810-3535974/`). The fused
+recurrence is about 3.4–3.7× faster forward and 2.3–3.0× faster forward+backward;
+the complete step gains less (1.4–1.6×) because the rest of the model is unchanged.
