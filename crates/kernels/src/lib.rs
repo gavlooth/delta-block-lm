@@ -54,3 +54,7 @@ mod cross_entropy;
 mod cross_entropy_ops;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 pub use cross_entropy_ops::cross_entropy_rows;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod soft_ops;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+pub use soft_ops::soft_order_keys;
