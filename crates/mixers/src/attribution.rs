@@ -175,12 +175,18 @@ impl Fixture {
                 let cache = mixer.cache.as_ref().expect("attribution requires HOLA");
                 hola::read_selected(
                     mixer.hola_backend,
-                    mixer
-                        .normalization_backend
-                        .rms(&cache.q_norm, self.raw[0].clone()),
-                    mixer
-                        .normalization_backend
-                        .rms(&cache.k_norm, self.raw[1].clone()),
+                    hola::normalize(
+                        mixer.hola_backend,
+                        mixer.normalization_backend,
+                        &cache.q_norm,
+                        self.raw[0].clone(),
+                    ),
+                    hola::normalize(
+                        mixer.hola_backend,
+                        mixer.normalization_backend,
+                        &cache.k_norm,
+                        self.raw[1].clone(),
+                    ),
                     self.raw[2].clone(),
                     self.scores.clone(),
                     self.valid.clone(),
@@ -198,7 +204,8 @@ impl Fixture {
                     self.mixed.clone(),
                     self.projected[6].clone().reshape([b, t, h, v]),
                 );
-                mixer.project_output(mixed.reshape([b, t, h * v]))
+                mixer
+                    .project_output(mixed.reshape([b, t, h * v]))
                     .flatten(0, 2)
             }
             Component::Masks => {

@@ -46,7 +46,7 @@ impl Arm {
         })
     }
     pub fn training_algorithm(&self, c: &Config) -> &'static str {
-        let fused_hola = self.cache != "none" && c.hola_backend == HolaBackend::FusedGpu;
+        let fused_hola = self.cache != "none" && c.hola_backend.is_fused();
         match (c.scan_backend == ScanBackend::FusedGpu, fused_hola) {
             (false, false) => "differentiable_chunk_tensor_solver",
             (true, false) => "fused_kron_gpu",
@@ -56,7 +56,7 @@ impl Arm {
     }
     pub fn uses_custom_gpu(&self, c: &Config) -> bool {
         c.scan_backend == ScanBackend::FusedGpu
-            || (self.cache != "none" && c.hola_backend == HolaBackend::FusedGpu)
+            || (self.cache != "none" && c.hola_backend.is_fused())
             || !c.normalization_backend.is_tensor()
     }
 }
@@ -241,13 +241,13 @@ impl Config {
         );
         ensure!(
             (self.scan_backend != ScanBackend::FusedGpu
-                && self.hola_backend != HolaBackend::FusedGpu
+                && !self.hola_backend.is_fused()
                 && self.normalization_backend.is_tensor())
                 || matches!(self.backend.as_str(), "vulkan" | "cuda"),
             "fused_gpu requires an explicit GPU backend; no CPU fallback"
         );
         ensure!(
-            self.hola_backend != HolaBackend::FusedGpu
+            !self.hola_backend.is_fused()
                 || !self.arms.iter().any(|arm| arm.cache != "none")
                 || (1..=64).contains(&self.cache_capacity),
             "fused HOLA capacity must be 1..=64"
@@ -362,6 +362,13 @@ mod tests {
             Config::default().pilot_fingerprint().unwrap(),
             changed.pilot_fingerprint().unwrap()
         );
+        for backend in [HolaBackend::FusedGpuPairs, HolaBackend::FusedGpuPairsNorms] {
+            changed.hola_backend = backend;
+            assert_ne!(
+                Config::default().pilot_fingerprint().unwrap(),
+                changed.pilot_fingerprint().unwrap()
+            );
+        }
         let mut changed = Config::default();
         changed.fusion = true;
         assert_ne!(
@@ -445,8 +452,14 @@ mod tests {
         config.backend = "vulkan".into();
         assert!(config.arms[0].mixer_config(&config).is_err());
         config.scan_backend = ScanBackend::TensorSolver;
-        config.hola_backend = HolaBackend::FusedGpu;
         config.backend = "cpu".into();
-        assert!(config.validate().is_err());
+        for backend in [
+            HolaBackend::FusedGpu,
+            HolaBackend::FusedGpuPairs,
+            HolaBackend::FusedGpuPairsNorms,
+        ] {
+            config.hola_backend = backend;
+            assert!(config.validate().is_err());
+        }
     }
 }

@@ -6,6 +6,7 @@ mod data;
 mod diagnostics;
 mod gemm;
 mod gemm_batched;
+mod hola_tune;
 mod kron_benchmark;
 mod lm_retrieval;
 mod model;
@@ -28,7 +29,7 @@ fn execute() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     ensure!(
         args.len() >= 2,
-        "usage: delta-experiment <reference|normalization-reference|kron-reference|hola-reference|kron-model-check|soft|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|normalization-benchmark|kron-benchmark|kron-model-benchmark|hola-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu]"
+        "usage: delta-experiment <reference|normalization-reference|kron-reference|hola-reference|kron-model-check|soft|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|normalization-benchmark|hola-cost|hola-tune|kron-benchmark|kron-model-benchmark|hola-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms]"
     );
     let command = &args[0];
     let c = Config::load(Path::new(&args[1]))?;
@@ -36,6 +37,7 @@ fn execute() -> Result<()> {
     let mut seed = c.seed;
     let mut resume: Option<PathBuf> = None;
     let mut diagnostic_backend = None;
+    let mut diagnostic_output: Option<PathBuf> = None;
     let mut checkpoint_manifest: Option<PathBuf> = None;
     let mut benchmark_warmups = None;
     let mut benchmark_trials = None;
@@ -57,6 +59,7 @@ fn execute() -> Result<()> {
             "--seed" => seed = value.parse()?,
             "--resume" => resume = Some(value.into()),
             "--diagnostic-backend" => diagnostic_backend = Some(value.as_str()),
+            "--diagnostic-output" => diagnostic_output = Some(value.into()),
             "--checkpoints" => checkpoint_manifest = Some(value.into()),
             "--warmups" => benchmark_warmups = Some(value.parse::<usize>()?),
             "--trials" => benchmark_trials = Some(value.parse::<usize>()?),
@@ -104,14 +107,22 @@ fn execute() -> Result<()> {
     ensure!(
         matches!(
             command.as_str(),
-            "profile" | "backward-profile" | "projection-benchmark" | "normalization-benchmark"
+            "profile"
+                | "backward-profile"
+                | "projection-benchmark"
+                | "normalization-benchmark"
+                | "hola-tune"
         ) || profile_contexts.is_none(),
-        "--contexts is only valid for profile/backward-profile/projection-benchmark/normalization-benchmark"
+        "--contexts is only valid for profile/backward-profile/projection-benchmark/normalization-benchmark/hola-tune"
     );
     ensure!(
         !matches!(
             command.as_str(),
-            "profile" | "backward-profile" | "projection-benchmark" | "normalization-benchmark"
+            "profile"
+                | "backward-profile"
+                | "projection-benchmark"
+                | "normalization-benchmark"
+                | "hola-tune"
         ) || (resume.is_none() && seed == c.seed),
         "profiles use configured seed and fresh scratch state, not --seed/--resume"
     );
@@ -131,6 +142,10 @@ fn execute() -> Result<()> {
         "--hola-backend is only valid for hola-reference"
     );
     ensure!(
+        command == "checkpoint-check" || diagnostic_output.is_none(),
+        "--diagnostic-output is only valid for checkpoint-check"
+    );
+    ensure!(
         matches!(
             command.as_str(),
             "kron-benchmark"
@@ -139,6 +154,7 @@ fn execute() -> Result<()> {
                 | "backward-profile"
                 | "projection-benchmark"
                 | "normalization-benchmark"
+                | "hola-tune"
                 | "gemm-micro"
                 | "gemm-step"
         ) || benchmark_warmups.is_none(),
@@ -154,6 +170,7 @@ fn execute() -> Result<()> {
                 | "backward-profile"
                 | "projection-benchmark"
                 | "normalization-benchmark"
+                | "hola-tune"
                 | "gemm-micro"
                 | "gemm-step"
         ) || benchmark_trials.is_none(),
@@ -217,6 +234,10 @@ fn execute() -> Result<()> {
             let scope = match reference_hola_backend {
                 Some(delta_mixers::HolaBackend::Tensor) => "tensor_float64_reference",
                 Some(delta_mixers::HolaBackend::FusedGpu) => "fused_float64_reference",
+                Some(
+                    delta_mixers::HolaBackend::FusedGpuPairs
+                    | delta_mixers::HolaBackend::FusedGpuPairsNorms,
+                ) => "sparse_pairs_float64_reference",
                 None if c.backend == "cpu" => "tensor_float64_reference",
                 None => "tensor_and_fused_float64_reference",
             };
@@ -226,6 +247,7 @@ fn execute() -> Result<()> {
             json!({"schema":1,"command":"soft","device":runtime::identity(&device),"config":c,"feedback":soft::episode(&c,&device)?})
         }
         "benchmark" => train::pilot(&c, &device)?,
+        "hola-cost" => hola_tune::cost(&c, &c.arms[0], &device, &[512], 2, 5)?,
         "gemm-micro" => gemm::micro(
             &c,
             &device,
@@ -238,7 +260,11 @@ fn execute() -> Result<()> {
             benchmark_warmups.unwrap_or(2),
             benchmark_trials.unwrap_or(1),
         )?,
-        "profile" | "backward-profile" | "projection-benchmark" | "normalization-benchmark" => {
+        "profile"
+        | "backward-profile"
+        | "projection-benchmark"
+        | "normalization-benchmark"
+        | "hola-tune" => {
             let arm = if let Some(name) = arm_name {
                 c.arms
                     .iter()
@@ -251,6 +277,7 @@ fn execute() -> Result<()> {
                 "profile" => profile::run,
                 "backward-profile" => backward_profile::run,
                 "projection-benchmark" => profile::projection_run,
+                "hola-tune" => profile::hola_run,
                 _ => profile::normalization_run,
             };
             let configured_context = [c.context];
@@ -311,7 +338,7 @@ fn execute() -> Result<()> {
             train::compare(&c, &device, true)?
         }
         "checkpoint-check" => {
-            diagnostics::checkpoint_check(&c, &device, backend, arm_name, seed, resume.as_deref())?
+            diagnostics::checkpoint_check(&c, &device, backend, arm_name, seed, resume.as_deref(), diagnostic_output.as_deref())?
         }
         "certify" => {
             ensure!(
@@ -339,9 +366,11 @@ fn execute() -> Result<()> {
             | "backward-profile"
             | "projection-benchmark"
             | "normalization-benchmark"
+            | "hola-tune"
             | "gemm-micro"
     ) {
-        runtime::write_json(&c.artifact_dir.join(format!("{command}.json")), &result)?;
+        let output = diagnostic_output.as_deref().unwrap_or(&c.artifact_dir);
+        runtime::write_json(&output.join(format!("{command}.json")), &result)?;
     }
     println!("{}", serde_json::to_string(&result)?);
     ensure!(
@@ -351,6 +380,7 @@ fn execute() -> Result<()> {
                 | "backward-profile"
                 | "projection-benchmark"
                 | "normalization-benchmark"
+                | "hola-tune"
                 | "gemm-micro"
                 | "gemm-step"
         ) || result["completed"] == true,
