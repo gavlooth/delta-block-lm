@@ -66,6 +66,7 @@ impl Arm {
             || c.convolution_backend == delta_mixers::ConvolutionBackend::FusedGpu
             || !c.update_backend.is_tensor()
             || !c.loss_backend.is_tensor()
+            || !c.epilogue_backend.is_native()
     }
 }
 
@@ -78,6 +79,20 @@ pub enum HeadBackend {
     Heuristic,
 }
 impl HeadBackend {
+    pub fn is_native(&self) -> bool {
+        *self == Self::Native
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpilogueBackend {
+    #[default]
+    Native,
+    AnalyticBackward,
+    FusedPointwise,
+}
+impl EpilogueBackend {
     pub fn is_native(&self) -> bool {
         *self == Self::Native
     }
@@ -159,6 +174,8 @@ pub struct Config {
     pub convolution_backend: delta_mixers::ConvolutionBackend,
     #[serde(skip_serializing_if = "HeadBackend::is_native")]
     pub head_backend: HeadBackend,
+    #[serde(skip_serializing_if = "EpilogueBackend::is_native")]
+    pub epilogue_backend: EpilogueBackend,
     #[serde(skip_serializing_if = "UpdateBackend::is_tensor")]
     pub update_backend: UpdateBackend,
     #[serde(skip_serializing_if = "LossBackend::is_tensor")]
@@ -218,6 +235,7 @@ impl Default for Config {
             normalization_backend: NormalizationBackend::Tensor,
             convolution_backend: delta_mixers::ConvolutionBackend::Tensor,
             head_backend: HeadBackend::Native,
+            epilogue_backend: EpilogueBackend::Native,
             update_backend: UpdateBackend::Tensor,
             loss_backend: LossBackend::Tensor,
             context: 128,
@@ -321,6 +339,7 @@ impl Config {
             (!self.scan_backend.is_fused()
                 && !self.hola_backend.is_fused()
                 && self.normalization_backend.is_tensor()
+                && self.epilogue_backend.is_native()
                 && self.convolution_backend != delta_mixers::ConvolutionBackend::FusedGpu)
                 || matches!(self.backend.as_str(), "vulkan" | "cuda"),
             "fused_gpu requires an explicit GPU backend; no CPU fallback"
@@ -495,6 +514,17 @@ mod tests {
             Config::default().pilot_fingerprint().unwrap(),
             changed.pilot_fingerprint().unwrap()
         );
+        for backend in [EpilogueBackend::AnalyticBackward, EpilogueBackend::FusedPointwise] {
+            let mut changed = Config::default();
+            changed.epilogue_backend = backend;
+            assert_ne!(
+                Config::default().pilot_fingerprint().unwrap(),
+                changed.pilot_fingerprint().unwrap()
+            );
+            assert!(changed.validate().is_err());
+            changed.backend = "vulkan".into();
+            changed.validate().unwrap();
+        }
     }
     #[test]
     fn legacy_selector_defaults_without_changing_serialized_identity() {
@@ -508,6 +538,7 @@ mod tests {
         assert!(legacy.get("normalization_backend").is_none());
         assert!(legacy.get("convolution_backend").is_none());
         assert!(legacy.get("head_backend").is_none());
+        assert!(legacy.get("epilogue_backend").is_none());
         assert!(legacy.get("update_backend").is_none());
         assert!(legacy.get("loss_backend").is_none());
         assert!(legacy.get("soft_selection_backend").is_none());
@@ -523,6 +554,7 @@ mod tests {
             delta_mixers::ConvolutionBackend::Tensor
         );
         assert_eq!(decoded.head_backend, HeadBackend::Native);
+        assert_eq!(decoded.epilogue_backend, EpilogueBackend::Native);
         assert_eq!(decoded.update_backend, UpdateBackend::Tensor);
         assert_eq!(decoded.loss_backend, LossBackend::Tensor);
         assert_eq!(decoded.soft_selection_backend, SoftSelectionBackend::Cpu);

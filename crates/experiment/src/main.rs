@@ -4,6 +4,7 @@ mod checkpoint;
 mod config;
 mod data;
 mod diagnostics;
+mod epilogues;
 mod gemm;
 mod gemm_batched;
 mod hola_tune;
@@ -34,7 +35,7 @@ fn execute() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     ensure!(
         args.len() >= 2,
-        "usage: delta-experiment <reference|convolution-reference|normalization-reference|kron-reference|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|optimization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|kron-model-benchmark|hola-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
+        "usage: delta-experiment <reference|convolution-reference|normalization-reference|epilogue-reference|epilogue-benchmark|kron-reference|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|optimization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|kron-model-benchmark|hola-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
     );
     let command = &args[0];
     let c = Config::load(Path::new(&args[1]))?;
@@ -116,12 +117,13 @@ fn execute() -> Result<()> {
                 | "backward-profile"
                 | "projection-benchmark"
                 | "normalization-benchmark"
+                | "epilogue-benchmark"
                 | "hola-tune"
                 | "scan-benchmark"
                 | "convolution-benchmark"
                 | "optimization-benchmark"
         ) || profile_contexts.is_none(),
-        "--contexts is only valid for profile/backward-profile/projection-benchmark/normalization-benchmark/hola-tune/scan-benchmark/convolution-benchmark/optimization-benchmark"
+        "--contexts is only valid for profile/backward-profile/projection-benchmark/normalization-benchmark/epilogue-benchmark/hola-tune/scan-benchmark/convolution-benchmark/optimization-benchmark"
     );
     ensure!(
         !matches!(
@@ -130,6 +132,7 @@ fn execute() -> Result<()> {
                 | "backward-profile"
                 | "projection-benchmark"
                 | "normalization-benchmark"
+                | "epilogue-benchmark"
                 | "hola-tune"
                 | "scan-benchmark"
                 | "convolution-benchmark"
@@ -165,6 +168,7 @@ fn execute() -> Result<()> {
                 | "backward-profile"
                 | "projection-benchmark"
                 | "normalization-benchmark"
+                | "epilogue-benchmark"
                 | "hola-tune"
                 | "scan-benchmark"
                 | "convolution-benchmark"
@@ -187,6 +191,7 @@ fn execute() -> Result<()> {
                 | "backward-profile"
                 | "projection-benchmark"
                 | "normalization-benchmark"
+                | "epilogue-benchmark"
                 | "hola-tune"
                 | "scan-benchmark"
                 | "convolution-benchmark"
@@ -238,6 +243,7 @@ fn execute() -> Result<()> {
                 "soft"
                     | "projection-benchmark"
                     | "normalization-benchmark"
+                    | "epilogue-benchmark"
                     | "optimization-benchmark"
                     | "convolution-benchmark"
                     | "hola-tune"
@@ -303,6 +309,12 @@ fn execute() -> Result<()> {
             let report = delta_mixers::normalization::numerical_checks(&device);
             json!({"schema":1,"command":command,"passed":report.is_ok(),"config":c,
                 "device":runtime::identity(&device),"numerical_report":report.as_ref().ok(),"error":report.as_ref().err()})
+        }
+        "epilogue-reference" => {
+            let report = epilogues::numerical_checks(&device);
+            json!({"schema":1,"command":command,"passed":report.is_ok(),"config":c,
+                "device":runtime::identity(&device),"numerical_report":report.as_ref().ok(),
+                "error":report.as_ref().err().map(|e| format!("{e:#}"))})
         }
         "kron-reference" => {
             let selected = reference_scan_backend.unwrap_or(c.scan_backend);
@@ -378,6 +390,7 @@ fn execute() -> Result<()> {
         | "backward-profile"
         | "projection-benchmark"
         | "normalization-benchmark"
+        | "epilogue-benchmark"
         | "hola-tune"
         | "scan-benchmark"
         | "convolution-benchmark"
@@ -395,6 +408,7 @@ fn execute() -> Result<()> {
                 "backward-profile" => backward_profile::run,
                 "projection-benchmark" => profile::projection_run,
                 "normalization-benchmark" => profile::normalization_run,
+                "epilogue-benchmark" => profile::epilogue_run,
                 "hola-tune" => profile::hola_run,
                 "scan-benchmark" => scan_benchmark::run,
                 "convolution-benchmark" => profile::convolution_run,
@@ -496,6 +510,7 @@ fn execute() -> Result<()> {
             | "backward-profile"
             | "projection-benchmark"
             | "normalization-benchmark"
+            | "epilogue-benchmark"
             | "hola-tune"
             | "scan-benchmark"
             | "convolution-benchmark"
@@ -513,6 +528,7 @@ fn execute() -> Result<()> {
                 | "backward-profile"
                 | "projection-benchmark"
                 | "normalization-benchmark"
+                | "epilogue-benchmark"
                 | "hola-tune"
                 | "scan-benchmark"
                 | "convolution-benchmark"
@@ -534,6 +550,7 @@ fn execute() -> Result<()> {
                 | "hola-reference"
                 | "kron-model-check"
                 | "normalization-reference"
+                | "epilogue-reference"
                 | "convolution-reference"
                 | "gemm-micro"
                 | "update-loss-reference"
