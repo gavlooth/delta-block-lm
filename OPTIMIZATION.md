@@ -45,11 +45,11 @@ Outside the resident step:
 - [x] Legacy GPU tensor solver key-gradient mismatch: **fixed**. The rank-4 row-dot `sum_dim(3)` VJP lost the initial-state erase adjoint on Vulkan; replaced by a row-wise dot `matmul`. New regression fails before and passes after; historical T7 fixtures pass. `tensor-solver.md`.
 - [x] CPU full-parameter directional check with HOLA: the perturbed forwards now replay the unperturbed forward's kept cache slots, so the difference matches the fixed-membership gradient; ε and tolerance unchanged. All GDN-2/Kron HOLA cases pass at every tested ε (errors ≤ 6.2e-4 vs limits ≥ 3.3e-3). `RESULTS.md`.
 
-## Not implemented yet (optimize when each is built)
+## Later steps (optimize when each is built)
 
-- [ ] oHC stream mixing (Step 7)
-- [ ] Wavelet mixer (Step 7)
-- [ ] Three Lngram components (Step 7)
+- [x] oHC stream mixing (Step 7): fused write, fused read, then gate projection fused with its RMS (`ohc_backend: fused_gate`, deterministic weight-gradient reduction); −263 ms per step over the previous fused path inside the full Step 7 model. Still the largest Step 7 cost (14 stages per step). `ohc.md`.
+- [x] Wavelet mixer (Step 7): causal fixed-filter dilated kernel (`wavelet_backend: fused_gpu`); −756 ms per step against the tensor port inside the full Step 7 model. `wavelet.md`.
+- [x] Three Lngram components (Step 7): fused symbol cache, addressing, gather and on-the-fly OneBit counterfactual (`lngram_backend: fused_gpu`); −68 ms [49, 75] against the corrected tensor port; no expanded counterfactual tensors retained. `lngram.md`.
 - [ ] SBD training and causal block replay (Step 8)
 - [ ] Learned or adaptive block boundaries (Step 12)
 - [ ] Codpula circuit inference, training and adaptive commitment (Step 9)

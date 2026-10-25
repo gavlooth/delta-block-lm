@@ -183,7 +183,9 @@ impl OhcStage {
             backend.project_gate(streams.clone(), self.gate_projection.weight.val())
         } else {
             let flat = streams.clone().cast(burn::tensor::DType::F32).reshape([
-                batch, tokens, STREAMS * width,
+                batch,
+                tokens,
+                STREAMS * width,
             ]);
             backend.gate_norm(streams.clone(), self.gate_projection.forward(flat))
         };

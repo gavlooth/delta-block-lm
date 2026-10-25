@@ -40,7 +40,7 @@
   "update_backend": "fused_gpu",
   "epilogue_backend": "analytic_backward",
   "ohc_streams": true,
-  "ohc_backend": "fused_read_write",
+  "ohc_backend": "fused_gate",
   "wavelet_layers": [
     0,
     1,

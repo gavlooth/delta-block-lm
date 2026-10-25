@@ -117,7 +117,11 @@ fn model_gate(c: &Config, device: &Device) -> Result<Value> {
     let target_device = device.clone().autodiff();
     let mut target = reference.clone().fork(&target_device);
     if gpu {
-        target.set_ohc_backend(if c.ohc_backend.is_tensor() { OhcBackend::FusedReadWrite } else { c.ohc_backend });
+        target.set_ohc_backend(if c.ohc_backend.is_tensor() {
+            OhcBackend::FusedReadWrite
+        } else {
+            c.ohc_backend
+        });
     }
     let tb = batch(&target_device, None);
     let tl = target.forward(&tb);
@@ -212,13 +216,24 @@ fn launches<T>(_: &Device, _: impl FnOnce() -> T) -> Result<Value> {
     Ok(Value::Null)
 }
 fn read_candidates(c: &Config) -> bool {
-    matches!(c.ohc_backend, OhcBackend::FusedGate | OhcBackend::TransposedGate)
+    matches!(
+        c.ohc_backend,
+        OhcBackend::FusedGate | OhcBackend::TransposedGate
+    )
 }
 fn isolated_modes(c: &Config) -> Vec<OhcBackend> {
     if read_candidates(c) {
-        vec![OhcBackend::FusedReadWrite, OhcBackend::FusedGate, OhcBackend::TransposedGate]
+        vec![
+            OhcBackend::FusedReadWrite,
+            OhcBackend::FusedGate,
+            OhcBackend::TransposedGate,
+        ]
     } else {
-        vec![OhcBackend::Tensor, OhcBackend::FusedGpu, OhcBackend::FusedReadWrite]
+        vec![
+            OhcBackend::Tensor,
+            OhcBackend::FusedGpu,
+            OhcBackend::FusedReadWrite,
+        ]
     }
 }
 fn isolated(c: &Config, device: &Device, warmups: usize, trials: usize) -> Result<Value> {
@@ -243,15 +258,31 @@ fn isolated(c: &Config, device: &Device, warmups: usize, trials: usize) -> Resul
     let modes = isolated_modes(c);
     let mut determinism = Vec::new();
     if read_candidates(c) {
-        let streams = init.forward(x.clone(), valid.clone()).detach().require_grad();
+        let streams = init
+            .forward(x.clone(), valid.clone())
+            .detach()
+            .require_grad();
         for &mode in &modes {
             let mut expected: Option<Vec<f32>> = None;
             for _ in 0..3 {
                 let y = mode.project_gate(streams.clone(), stage.gate_projection.weight.val());
                 let g = y.square().sum().backward();
-                let dw = values(stage.gate_projection.weight.val().grad(&g).ok_or_else(|| anyhow::anyhow!("missing gate projection gradient"))?);
+                let dw = values(
+                    stage
+                        .gate_projection
+                        .weight
+                        .val()
+                        .grad(&g)
+                        .ok_or_else(|| anyhow::anyhow!("missing gate projection gradient"))?,
+                );
                 if let Some(first) = &expected {
-                    ensure!(first.iter().zip(&dw).all(|(a,b)| a.to_bits()==b.to_bits()), "nondeterministic gate weight gradient for {mode:?}");
+                    ensure!(
+                        first
+                            .iter()
+                            .zip(&dw)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "nondeterministic gate weight gradient for {mode:?}"
+                    );
                 } else {
                     expected = Some(dw);
                 }
@@ -262,7 +293,7 @@ fn isolated(c: &Config, device: &Device, warmups: usize, trials: usize) -> Resul
     let mut fs = vec![Vec::new(); modes.len()];
     let mut bs = fs.clone();
     for iter in 0..warmups + trials {
-        let mut order: Vec<_> = (0..modes.len()).map(|i| (iter+i)%modes.len()).collect();
+        let mut order: Vec<_> = (0..modes.len()).map(|i| (iter + i) % modes.len()).collect();
         if iter % 2 == 1 {
             order.reverse();
         }
@@ -288,8 +319,8 @@ fn isolated(c: &Config, device: &Device, warmups: usize, trials: usize) -> Resul
         .collect::<Result<Vec<Value>>>()?;
     let mut report = json!({"scope":"stream init + one complete stage with F(u)=0.2u + learned normalized readout; resident f32 inputs; no model projections/optimizer","modes":(0..modes.len()).map(|i|json!({"ohc_backend":modes[i],"forward":summary(&fs[i]),"forward_backward":summary(&bs[i]),"dispatches":dispatches[i]})).collect::<Vec<_>>(),"paired_forward":paired(&fs[0],&fs[1]),"paired_forward_backward":paired(&bs[0],&bs[1]),"paired_baseline_to_third_forward":paired(&fs[0],&fs[2]),"paired_baseline_to_third_forward_backward":paired(&bs[0],&bs[2]),"gate_weight_gradient_determinism":determinism,"pool_reserved_bytes":runtime::sampled_reserved(&device)});
     if !read_candidates(c) {
-        report["paired_write_to_readwrite_forward"] = paired(&fs[1],&fs[2]);
-        report["paired_write_to_readwrite_forward_backward"] = paired(&bs[1],&bs[2]);
+        report["paired_write_to_readwrite_forward"] = paired(&fs[1], &fs[2]);
+        report["paired_write_to_readwrite_forward_backward"] = paired(&bs[1], &bs[2]);
     }
     Ok(report)
 }
@@ -312,16 +343,27 @@ pub fn benchmark(c: &Config, device: &Device, warmups: usize, trials: usize) -> 
     let corpus = train::loaded_corpus(c)?;
     let td = device.clone().autodiff();
     let modes = if read_candidates(c) {
-        isolated_modes(c).into_iter().map(|mode| (true,mode)).collect::<Vec<_>>()
+        isolated_modes(c)
+            .into_iter()
+            .map(|mode| (true, mode))
+            .collect::<Vec<_>>()
     } else {
-        vec![(false,OhcBackend::Tensor),(true,OhcBackend::Tensor),(true,OhcBackend::FusedGpu),(true,OhcBackend::FusedReadWrite)]
+        vec![
+            (false, OhcBackend::Tensor),
+            (true, OhcBackend::Tensor),
+            (true, OhcBackend::FusedGpu),
+            (true, OhcBackend::FusedReadWrite),
+        ]
     };
-    let configs: Vec<_> = modes.iter().map(|&(enabled,backend)| {
-        let mut config = c.clone();
-        config.ohc_streams = enabled;
-        config.ohc_backend = backend;
-        config
-    }).collect();
+    let configs: Vec<_> = modes
+        .iter()
+        .map(|&(enabled, backend)| {
+            let mut config = c.clone();
+            config.ohc_streams = enabled;
+            config.ohc_backend = backend;
+            config
+        })
+        .collect();
     let mut off_config = c.clone();
     off_config.ohc_streams = false;
     off_config.ohc_backend = OhcBackend::Tensor;
@@ -331,19 +373,26 @@ pub fn benchmark(c: &Config, device: &Device, warmups: usize, trials: usize) -> 
     let _ = snapshot(&off, None);
     let tensor = off.clone().with_ohc(c.d_model, &td);
     let overhead = tensor.num_params() - off_params;
-    let mut models = modes.iter().map(|&(enabled,backend)| {
-        let mut model = if enabled { tensor.clone() } else { off.clone() };
-        model.set_ohc_backend(backend);
-        model
-    }).collect::<Vec<_>>();
+    let mut models = modes
+        .iter()
+        .map(|&(enabled, backend)| {
+            let mut model = if enabled { tensor.clone() } else { off.clone() };
+            model.set_ohc_backend(backend);
+            model
+        })
+        .collect::<Vec<_>>();
     let params = models.iter().map(Module::num_params).collect::<Vec<_>>();
-    let mut runners = models.drain(..).zip(&configs).map(|(m,c)| Runner::new(m,c)).collect::<Vec<_>>();
+    let mut runners = models
+        .drain(..)
+        .zip(&configs)
+        .map(|(m, c)| Runner::new(m, c))
+        .collect::<Vec<_>>();
     drop(off);
     drop(tensor);
     let mut steps = vec![Vec::new(); modes.len()];
     let mut reserved = 0;
     for iter in 0..warmups + trials {
-        let mut order: Vec<_> = (0..modes.len()).map(|i| (iter+i)%modes.len()).collect();
+        let mut order: Vec<_> = (0..modes.len()).map(|i| (iter + i) % modes.len()).collect();
         if iter % 2 == 1 {
             order.reverse();
         }
@@ -372,9 +421,9 @@ pub fn benchmark(c: &Config, device: &Device, warmups: usize, trials: usize) -> 
     let comparisons = (1..modes.len()).map(|j|json!({"baseline":modes[0].1,"candidate":modes[j].1,"paired":paired(&steps[0],&steps[j])})).collect::<Vec<_>>();
     report["complete_guarded_step"] = json!({"modes":(0..modes.len()).map(|j|json!({"ohc_streams":configs[j].ohc_streams,"ohc_backend":configs[j].ohc_backend,"parameters":params[j],"step":summary(&steps[j]),"dispatches":dispatches[j]})).collect::<Vec<_>>(),"paired_comparisons":comparisons,"sampled_pool_reserved_bytes":reserved});
     if !read_candidates(c) {
-        report["complete_guarded_step"]["paired_on_vs_off_tensor"] = paired(&steps[0],&steps[1]);
-        report["complete_guarded_step"]["paired_tensor_vs_fused"] = paired(&steps[1],&steps[2]);
-        report["complete_guarded_step"]["paired_write_to_readwrite"] = paired(&steps[2],&steps[3]);
+        report["complete_guarded_step"]["paired_on_vs_off_tensor"] = paired(&steps[0], &steps[1]);
+        report["complete_guarded_step"]["paired_tensor_vs_fused"] = paired(&steps[1], &steps[2]);
+        report["complete_guarded_step"]["paired_write_to_readwrite"] = paired(&steps[2], &steps[3]);
     }
     report["memory"] = json!({"added_parameters":overhead,"added_parameter_bytes_f32":overhead*4,"table_bytes":0,"single_stream_bytes":n*d*4,"four_stream_bytes":n*4*d*4,"extra_residual_bytes":n*3*d*4,"per_stage_retained_stream_bytes":n*4*d*4,"all_stage_retained_stream_bytes":stages*n*4*d*4,"stage_count":stages,"per_stage_rotation_bytes":n*16*4,"per_stage_projected_gate_bytes":n*16*4,"fused_gate_weight_partial_bytes":n.div_ceil(128)*4*d*16*4,"fused_gate_projected_adjoint_bytes":n*16*4,"fused_write_retained_inputs_bytes":n*(4*d+16+4+d)*4,"fused_write_backward_output_bytes":n*(4*d+16+4+d)*4,"scope":"exact tensor sizes, not summed physical peak; autodiff retains additional normalized streams, gates and sublayer activations; fused write retains X,Q,gamma*b,F and recomputes reductions"});
     report["completed"] = json!(true);
@@ -565,9 +614,13 @@ pub fn attribution(c: &Config, device: &Device) -> Result<Value> {
                 .rotation
                 .rotation_selected(logits.clone(), true)
                 .reshape([b * t * 16]),
-            16 | 17 => (if part == 16 { OhcBackend::FusedGate } else { OhcBackend::TransposedGate })
-                .project_gate(streams.clone(), stage.gate_projection.weight.val())
-                .reshape([b*t*16]),
+            16 | 17 => (if part == 16 {
+                OhcBackend::FusedGate
+            } else {
+                OhcBackend::TransposedGate
+            })
+            .project_gate(streams.clone(), stage.gate_projection.weight.val())
+            .reshape([b * t * 16]),
             _ => (streams.clone() + streams.clone() * 1e-7).reshape([b * t * 4 * d]),
         }
     };

@@ -7,8 +7,10 @@ use cubecl::{frontend::Tensor as View, prelude::*};
 #[cube]
 fn x_index(x: &View<f32>, n: usize, k: usize) -> usize {
     let d = x.shape(3);
-    n / x.shape(1) * x.stride(0) + n % x.shape(1) * x.stride(1)
-        + k / d * x.stride(2) + k % d * x.stride(3)
+    n / x.shape(1) * x.stride(0)
+        + n % x.shape(1) * x.stride(1)
+        + k / d * x.stride(2)
+        + k % d * x.stride(3)
 }
 #[cube]
 fn y_index(y: &View<f32>, n: usize, j: usize) -> usize {
@@ -52,8 +54,12 @@ fn project(x: &View<f32>, w: &View<f32>, y: &mut View<f32>) {
 
 #[cube(launch)]
 fn input_vjp(
-    x: &View<f32>, w: &View<f32>, y: &View<f32>, dy: &View<f32>,
-    dx: &mut View<f32>, dp: &mut View<f32>,
+    x: &View<f32>,
+    w: &View<f32>,
+    y: &View<f32>,
+    dy: &View<f32>,
+    dx: &mut View<f32>,
+    dp: &mut View<f32>,
 ) {
     let n = CUBE_POS as usize;
     let lane = UNIT_POS as usize;
@@ -179,11 +185,22 @@ fn validate(x: &CubeTensor, w: &CubeTensor) -> (usize, usize, usize) {
 pub(crate) fn forward(x: CubeTensor, w: CubeTensor) -> CubeTensor {
     let (b, t, _) = validate(&x, &w);
     let y = empty(&x, [b, t, 16]);
-    project::launch(&x.client, count(&x, b * t), CubeDim::new_1d(256),
-        x.clone().into_tensor_arg(), w.into_tensor_arg(), y.clone().into_tensor_arg());
+    project::launch(
+        &x.client,
+        count(&x, b * t),
+        CubeDim::new_1d(256),
+        x.clone().into_tensor_arg(),
+        w.into_tensor_arg(),
+        y.clone().into_tensor_arg(),
+    );
     y
 }
-pub(crate) fn backward(x: CubeTensor, w: CubeTensor, y: CubeTensor, dy: CubeTensor) -> (CubeTensor, CubeTensor) {
+pub(crate) fn backward(
+    x: CubeTensor,
+    w: CubeTensor,
+    y: CubeTensor,
+    dy: CubeTensor,
+) -> (CubeTensor, CubeTensor) {
     let (b, t, d) = validate(&x, &w);
     assert_eq!(y.shape().dims::<3>(), [b, t, 16]);
     assert_eq!(dy.shape(), y.shape());
@@ -196,12 +213,31 @@ pub(crate) fn backward(x: CubeTensor, w: CubeTensor, y: CubeTensor, dy: CubeTens
     let dw = empty(&w, [4 * d, 16]);
     let parts = (b * t).div_ceil(128);
     let partial = empty(&x, [parts, 4 * d, 16]);
-    input_vjp::launch(&x.client, count(&x, b * t), CubeDim::new_1d(256),
-        x.clone().into_tensor_arg(), w.into_tensor_arg(), y.into_tensor_arg(), dy.into_tensor_arg(),
-        dx.clone().into_tensor_arg(), dp.clone().into_tensor_arg());
-    weight_partials::launch(&x.client, count(&x, parts * (4 * d).div_ceil(16)), CubeDim::new_1d(256),
-        x.clone().into_tensor_arg(), dp.into_tensor_arg(), partial.clone().into_tensor_arg());
-    weight_sum::launch(&x.client, count(&x, (4 * d * 16).div_ceil(256)), CubeDim::new_1d(256),
-        partial.into_tensor_arg(), dw.clone().into_tensor_arg());
+    input_vjp::launch(
+        &x.client,
+        count(&x, b * t),
+        CubeDim::new_1d(256),
+        x.clone().into_tensor_arg(),
+        w.into_tensor_arg(),
+        y.into_tensor_arg(),
+        dy.into_tensor_arg(),
+        dx.clone().into_tensor_arg(),
+        dp.clone().into_tensor_arg(),
+    );
+    weight_partials::launch(
+        &x.client,
+        count(&x, parts * (4 * d).div_ceil(16)),
+        CubeDim::new_1d(256),
+        x.clone().into_tensor_arg(),
+        dp.into_tensor_arg(),
+        partial.clone().into_tensor_arg(),
+    );
+    weight_sum::launch(
+        &x.client,
+        count(&x, (4 * d * 16).div_ceil(256)),
+        CubeDim::new_1d(256),
+        partial.into_tensor_arg(),
+        dw.clone().into_tensor_arg(),
+    );
     (dx, dw)
 }

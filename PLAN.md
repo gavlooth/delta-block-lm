@@ -1,6 +1,6 @@
 # Experimental plan
 
-Status: Steps 1–6 implemented and exercised on CPU and local Intel Vulkan; measured results and checkpoint-load correction are in [RESULTS.md](RESULTS.md). Step 7 and later are not implemented.
+Status: Steps 1–7 implemented and exercised on CPU and local Intel Vulkan; measured results and checkpoint-load correction are in [RESULTS.md](RESULTS.md). Step 8 and later are not implemented.
 
 ## 1. Goal and fixed decisions
 
@@ -161,7 +161,7 @@ R²D's convergence results do not transfer automatically to state-dependent mask
 
 ## 7. Step-by-step execution checklist
 
-Steps 1–6 are implemented and exercised as small pilots. Numerical, soft-feedback, build and checkpoint-continuation checks passed; three-seed recall and tiny-LM experiments were run and independently reevaluated from validated checkpoints. Recall remains near guessing, so its architecture-selection gate is not met and no retrieval winner is asserted. Tiny-LM learning is demonstrated at a deliberately short budget, not at production scale. Step 7 and later remain pending. See [RESULTS.md](RESULTS.md) for measurements, limits and exact evidence paths.
+Steps 1–7 are implemented and exercised as small pilots. Numerical, soft-feedback, build and checkpoint-continuation checks passed; three-seed recall and tiny-LM experiments were run and independently reevaluated from validated checkpoints. Recall remains near guessing, so its architecture-selection gate is not met and no retrieval winner is asserted. Tiny-LM learning is demonstrated at a deliberately short budget, not at production scale. Step 7 added causal oHC, wavelet and three Lngram injections with verified gradients and optimized kernels; their quality contribution is not yet measured, and the future-block visibility rules for Step 8 are defined in RESULTS.md but not exercised. Step 8 and later remain pending. See [RESULTS.md](RESULTS.md) for measurements, limits and exact evidence paths.
 
 ### Step 1 — Create the small active Burn workspace
 

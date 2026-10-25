@@ -28,7 +28,10 @@ impl OhcBackend {
         *self == Self::Tensor
     }
     pub fn fused_read(&self) -> bool {
-        matches!(self, Self::FusedReadWrite | Self::FusedGate | Self::TransposedGate)
+        matches!(
+            self,
+            Self::FusedReadWrite | Self::FusedGate | Self::TransposedGate
+        )
     }
     /// Gate projection and flattened-stream RMS; all choices preserve the same W.
     pub fn project_gate(&self, streams: Tensor<4>, weight: Tensor<2>) -> Tensor<3> {
@@ -44,7 +47,10 @@ impl OhcBackend {
                 panic!("fused oHC has no CPU fallback");
             }
         }
-        let flat = streams.clone().cast(burn::tensor::DType::F32).reshape([b * t, 4 * d]);
+        let flat = streams
+            .clone()
+            .cast(burn::tensor::DType::F32)
+            .reshape([b * t, 4 * d]);
         let projected = if *self == Self::TransposedGate {
             weight.transpose().matmul(flat.transpose()).transpose()
         } else {

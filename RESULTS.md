@@ -1,10 +1,10 @@
-# Steps 1–6: measured pilot results
+# Steps 1–7: measured pilot results
 
-For the current optimized execution paths, measured speedups and known legacy GPU-solver limitation, see [Early GPU kernel optimization](#early-gpu-kernel-optimization). The current recommended batch-8 configuration and its combined measurements are in [Batch-8 component optimization round](#batch-8-component-optimization-round). The first sections retain the original pilot measurements.
+For the current optimized execution paths, measured speedups and known legacy GPU-solver limitation, see [Early GPU kernel optimization](#early-gpu-kernel-optimization). The current recommended batch-8 configuration and its combined measurements are in [Batch-8 component optimization round](#batch-8-component-optimization-round). Step 7 (oHC, wavelet mixer, three Lngram injections) is in [Step 7: oHC, wavelet and Lngram](#step-7-ohc-wavelet-and-lngram). The first sections retain the original pilot measurements.
 
 ## Scope and stopping point
 
-Implemented and exercised the active Burn workspace, causal GDN-2 and KronLSTM, optional HOLA/recency memory, soft top-k feedback, paired associative-recall experiments, and a tiny causal language-model comparison. Stopped before Step 7: no active oHC, wavelet or Lngram integration. Their copied predecessor sources remain migration inputs only. SBD training, Codpula, CoCommit and energy-guided remasking are later work.
+Implemented and exercised the active Burn workspace, causal GDN-2 and KronLSTM, optional HOLA/recency memory, soft top-k feedback, paired associative-recall experiments, and a tiny causal language-model comparison. The Steps 1–6 sections below predate Step 7, which is reported separately at the end. SBD training, Codpula, CoCommit and energy-guided remasking are later work.
 
 All runs used the local Intel Arc Graphics (MTL) through Vulkan, with float32 execution. No Spark or predecessor production process was used or modified.
 Run artifacts report sampled backend-reserved memory and explicit recurrent/cache/convolution storage. Exact GPU peak memory is not available here; the integrated GPU shares system memory, so reserved-pool samples must not be presented as exact physical-device peaks.
@@ -1496,3 +1496,115 @@ gates), `artifacts/integration/batch2/` (update and SiLU over the optimized
 base), `artifacts/integration/final/` (recommended-config gates, solver),
 `artifacts/autotune-on-optimized-b8/paired-b8.json`,
 `artifacts/kron-validation/solver-fix-verification-2/`.
+
+## Step 7: oHC, wavelet and Lngram
+
+**Status: implemented, causal, verified and optimized; architecture quality not
+yet evaluated.** The three components were copied from the
+relation-extraction repository (`dre-ohc`, `dre-wavelet`, `dre-lngram`;
+byte-identical to `reuse/crates/`) and adapted to the causal byte-LM. Every
+field defaults to off, so historical configs, fingerprints and checkpoints
+are unchanged. The combined configuration is `configs/lm512-step7.json`
+(the batch-8 optimized model plus all three components).
+
+| Component | Configuration | Adapted for the causal LM | Adopted execution path |
+|---|---|---|---|
+| oHC | `ohc_streams: true` | Per-token four-stream SO(4) mixing; every sublayer (wavelet, Lngram, mixer, MLP) is one oHC stage, plus stream init and readout | `ohc_backend: fused_gate` |
+| Wavelet mixer | `wavelet_layers: [0,1,2]` | Centred db10 à trous filter with symmetric extension → left-only taps `t − k·2^level` inside the document (changes the filter phase relative to WNet) | `wavelet_backend: fused_gpu` |
+| Lngram | `lngram_layers: [0,1,2]`, orders `[2,3]`, 32 routes × 4 bits, memory dim 8 | Three injections as in the predecessor's three N stages; suffixes stop at the document start; three-tap smoothing → left-only | `lngram_backend: fused_gpu` |
+
+Lngram tables: 4.46 MB per injection, 13.37 MB total, in their own optimizer
+group; an AdamW step changes only indexed rows. Parameters: 2.38 M → 7.08 M
+with all three components.
+
+### Correctness
+
+Unchanged tolerance 2e-5 + 3e-4·|reference| throughout.
+
+- Independent float64 sequential references (outputs and all gradients,
+  padding, resets, short documents, zeros) pass for each component on CPU
+  and Vulkan: oHC 93 cases, wavelet 16 reports / 110,000 checks, Lngram 22
+  cases with both surrogate gradients and bitwise-deterministic table VJPs.
+  Causality perturbation differences are exactly zero for all three.
+- `kron-model-check --model-scope configured` on `lm512-step7` passes all four
+  context128/512 × HOLA cases against the CPU oracle: max logits 5.05e-6,
+  parameter gradients 2.26e-6, AdamW 2.12e-5; directional check ≤ 6.88e-5.
+- `lm512-optimized` model check and the historical
+  `lm512-vulkan/kronlstm-hola-seed1/checkpoint-13` check-and-continue still
+  pass. CPU tests: 39 experiment + 7 kernel + 16 mixer.
+- Short learning smokes (200 steps, same seed and budget) decrease loss with
+  finite gradients for each component on and off. This is a stability check,
+  not a quality result.
+- Guarded matmul autotune refuses Step 7 configs until its preflight probes
+  the new matrix multiplies.
+
+### Optimization
+
+Each component's adopted path against its copied tensor port, paired
+complete guarded steps at B8/context512, 11 trials, measured inside the full
+Step 7 configuration (the other two components enabled):
+
+| Component | Tensor port → adopted, paired saving | Faster | Main change |
+|---|---|---:|---|
+| Wavelet | 755.7 ms (MAD 122.0) | 11/11 | One fixed-filter causal dilated kernel per level with analytic input VJP; launches 6,974 → 2,210 alone |
+| Lngram | 67.7 ms [49.3, 74.5] | 10/11 | Shared route-symbol cache, fused suffix addressing + gather, OneBit counterfactual rows gathered on the fly (no expanded counterfactual tensors retained) |
+| oHC, write then read+write fusion | 463 ms, then 408 ms (MAD 83 / 62) | 9/11, 9/11 | Fused stream write; fused per-stream RMS and weighted read |
+| oHC, gate projection | 263.3 ms (13.0%, MAD 15.5) | 11/11 | Gate projection `4d → 16` fused with its RMS; deterministic tiled weight-gradient partials (no float atomics). A reshaped library GEMM saved 198.5 ms and was not selected |
+
+The first Lngram fused design was not adopted (21-pair interval
+[−9.9, 7.6] ms) after an orphaned table VJP in the tensor baseline was
+corrected; the refined design above was.
+
+### Cost of the components
+
+| Measurement | `lm512-optimized` | `lm512-step7` |
+|---|---:|---:|
+| Complete step median, ms (5 trials) | 862.2 / 868.6 | 1,774.8 |
+| Tokens/s | 4,751 | 2,308 |
+| Sampled pool reservation | 0.56 GB | 1.53 GB |
+
+The Step 7 run sits between two baseline runs in one session; these are
+medians, not a paired interval. Incremental cost of each component with the
+other two enabled (paired, before the oHC gate fusion): wavelet +507.8 ms,
+Lngram +562.7 ms [551.6, 596.5], oHC +800 ms. oHC costs most in
+combination because wavelet and Lngram add six more oHC stages (14 per
+step). Absolute medians of the same configuration varied by up to 1.5×
+between sessions on this integrated GPU, so only within-session paired
+differences are used for decisions.
+
+### Visibility rules for Step 8 (defined, not yet exercised)
+
+Step 7 is causal-only. For SBD, where noisy active-block positions read the
+clean prefix and communicate inside the active block without advancing
+persistent state:
+
+- **oHC** is per token: active-block positions run the same stages on their
+  own streams. Mask and candidate embeddings enter through the same stream
+  initialization as token embeddings; no stream state persists across
+  positions.
+- **Wavelet** taps reaching before the block read the clean prefix
+  representation; taps inside the block read the active-block
+  representation. With left-only taps, in-block communication is
+  left-to-right. Two-sided in-block taps would be a separate, measured
+  variant restricted to the block.
+- **Lngram** codes come from hidden states: suffix windows reaching before
+  the block use clean-prefix codes, and windows inside the block use
+  active-block codes. Smoothing and suffixes never read positions after `t`.
+  Table updates come only from the training loss, never from the
+  coordination passes.
+
+### Reproduction
+
+```sh
+../build.sh integration
+flock /tmp/delta-block-lm-gpu.lock timeout 240s target/debug/delta-experiment ohc-reference artifacts/integration/step7/step7-b1.json
+flock /tmp/delta-block-lm-gpu.lock timeout 200s target/debug/delta-experiment wavelet-reference artifacts/integration/step7/step7-b1.json
+flock /tmp/delta-block-lm-gpu.lock timeout 200s target/debug/delta-experiment lngram-reference artifacts/integration/step7/step7-b1.json
+flock /tmp/delta-block-lm-gpu.lock timeout 300s target/debug/delta-experiment kron-model-check artifacts/integration/step7/step7-b1.json --model-scope configured
+flock /tmp/delta-block-lm-gpu.lock timeout 600s target/debug/delta-experiment ohc-benchmark artifacts/integration/step7/paired-ohc.json --warmups 2 --trials 11
+flock /tmp/delta-block-lm-gpu.lock timeout 900s target/debug/delta-experiment wavelet-benchmark artifacts/integration/step7/paired-wavelet.json --warmups 2 --trials 11
+flock /tmp/delta-block-lm-gpu.lock timeout 900s target/debug/delta-experiment lngram-benchmark artifacts/integration/step7/paired-lngram.json --warmups 2 --trials 11
+```
+
+Details: `docs/optimization/{ohc,wavelet,lngram}.md`. Evidence:
+`artifacts/integration/step7/{gates,paired,final}/`, `artifacts/step7/`.
