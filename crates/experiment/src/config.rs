@@ -151,9 +151,37 @@ impl SoftSelectionBackend {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SbdFeedback {
+    #[default]
+    SoftFeedback,
+    HardMask,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SbdConfig {
+    pub block_lengths: Vec<usize>,
+    pub feedback: SbdFeedback,
+    pub candidate_width: usize,
+    pub commit_count: usize,
+    /// None selects fixed-count commitment; Some selects paper equation 8 (nats).
+    pub entropy_threshold: Option<f64>,
+    pub generate_tokens: usize,
+}
+impl Default for SbdConfig {
+    fn default() -> Self {
+        Self { block_lengths: vec![8], feedback: SbdFeedback::SoftFeedback,
+            candidate_width: 4, commit_count: 2, entropy_threshold: None, generate_tokens: 32 }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    /// Omitted means the historical causal architecture and serialized config.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sbd: Option<SbdConfig>,
     pub task: String,
     pub backend: String,
     /// Burn's compile-time CubeCL fusion backend; omitted means historical unfused execution.
@@ -247,6 +275,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            sbd: None,
             task: "recall".into(),
             backend: "cpu".into(),
             fusion: false,
@@ -324,6 +353,16 @@ impl Config {
         Ok(c)
     }
     pub fn validate(&self) -> Result<()> {
+        if let Some(sbd) = &self.sbd {
+            ensure!(self.task == "lm", "SBD requires byte language modeling");
+            ensure!(!self.autotune, "SBD variable-shape matmuls are not covered by the autotune preflight");
+            ensure!(!sbd.block_lengths.is_empty() && sbd.block_lengths.iter().all(|&n| n > 0),
+                "SBD block lengths must be positive");
+            ensure!(sbd.candidate_width > 0 && sbd.candidate_width <= self.vocab()
+                && sbd.commit_count > 0 && sbd.generate_tokens > 0, "invalid SBD decoding counts");
+            ensure!(sbd.entropy_threshold.is_none_or(|x| x.is_finite() && x >= 0.0),
+                "SBD entropy threshold must be finite and nonnegative");
+        }
         ensure!(
             self.ohc_backend.is_tensor()
                 || (self.ohc_streams
@@ -905,5 +944,20 @@ mod tests {
         c.validate().unwrap();
         c.fusion = true;
         assert!(c.validate().is_err());
+    }
+    #[test]
+    fn sbd_defaults_preserve_causal_serialization() {
+        let c = Config::default();
+        assert!(serde_json::to_value(&c).unwrap().get("sbd").is_none());
+        let mut enabled = Config { task: "lm".into(), sbd: Some(SbdConfig::default()), ..c.clone() };
+        enabled.validate().unwrap();
+        assert_ne!(c.pilot_fingerprint().unwrap(), enabled.pilot_fingerprint().unwrap());
+        assert_eq!(enabled.sbd.as_ref().unwrap().feedback, SbdFeedback::SoftFeedback);
+        enabled.sbd.as_mut().unwrap().block_lengths = vec![1,4,8,16];
+        enabled.sbd.as_mut().unwrap().candidate_width = 257;
+        enabled.sbd.as_mut().unwrap().commit_count = 3;
+        enabled.validate().unwrap();
+        enabled.sbd.as_mut().unwrap().block_lengths = vec![0];
+        assert!(enabled.validate().is_err());
     }
 }

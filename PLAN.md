@@ -1,6 +1,6 @@
 # Experimental plan
 
-Status: Steps 1–7 implemented and exercised on CPU and local Intel Vulkan; measured results and checkpoint-load correction are in [RESULTS.md](RESULTS.md). Step 8 and later are not implemented.
+Status: Steps 1–8 implemented and exercised on CPU and local Intel Vulkan; measured results and checkpoint-load correction are in [RESULTS.md](RESULTS.md). Step 8 has short training smoke evidence, not a quality or speedup conclusion; its independent candidate-width sweep remains unmeasured. Steps 9–12 are not implemented.
 
 ## 1. Goal and fixed decisions
 
@@ -21,7 +21,7 @@ Build a small, measurable semi-autoregressive block-denoising language model, th
 | GDN-2 | [2605.22791](https://arxiv.org/abs/2605.22791) | Channel-wise decay and separate channel-wise erase/write gates; chunkwise training |
 | KronLSTM | [2610.26834](https://arxiv.org/abs/2610.26834) | A different associative-memory update using a scalar bilinear correction; a candidate replacement, not a drop-in extra gate |
 | HOLA | [2607.02303](https://arxiv.org/abs/2607.02303) | GDN recurrent state plus a limited exact KV cache selected by committed update magnitude; sharpened cache read |
-| Wavelet mixer | [2610.04720](https://arxiv.org/abs/2610.04720) | WNet token mixing; the SBD adaptation still needs verification |
+| Wavelet mixer | [2610.04720](https://arxiv.org/abs/2610.04720) | WNet token mixing; causal and SBD visibility verified on reference fixtures |
 | oHC | [2609.02672](https://arxiv.org/abs/2609.02672) | Orthogonal mixing of residual streams |
 | Lngram | [2605.24869](https://arxiv.org/abs/2605.24869) | N-gram conditional memory in latent space |
 | SBD | [2509.04185](https://arxiv.org/abs/2509.04185) | Causal next-token prediction plus masked future-block prediction; variable training block lengths and entropy-based parallel decoding |
@@ -161,7 +161,7 @@ R²D's convergence results do not transfer automatically to state-dependent mask
 
 ## 7. Step-by-step execution checklist
 
-Steps 1–7 are implemented and exercised as small pilots. Numerical, soft-feedback, build and checkpoint-continuation checks passed; three-seed recall and tiny-LM experiments were run and independently reevaluated from validated checkpoints. Recall remains near guessing, so its architecture-selection gate is not met and no retrieval winner is asserted. Tiny-LM learning is demonstrated at a deliberately short budget, not at production scale. Step 7 added causal oHC, wavelet and three Lngram injections with verified gradients and optimized kernels; their quality contribution is not yet measured, and the future-block visibility rules for Step 8 are defined in RESULTS.md but not exercised. Step 8 and later remain pending. See [RESULTS.md](RESULTS.md) for measurements, limits and exact evidence paths.
+Steps 1–8 are implemented and exercised as small pilots. Numerical, soft-feedback, build and checkpoint-continuation checks passed; three-seed recall and tiny-LM experiments were run and independently reevaluated from validated checkpoints. Recall remains near guessing, so its architecture-selection gate is not met and no retrieval winner is asserted. Tiny-LM learning is demonstrated at a deliberately short budget, not at production scale. Step 7 added causal oHC, wavelet and three Lngram injections with verified gradients and optimized kernels; their quality contribution is still under evaluation. Step 8 implements clean causal plus masked-block training, soft feedback, frozen prefix reads and clean replay; visibility checks and fixed/variable-length training smokes pass. Candidate-width sweeps, meaningful SBD quality comparisons and full-context efficiency remain unmeasured. Steps 9–12 remain pending. See [RESULTS.md](RESULTS.md) and [docs/sbd.md](docs/sbd.md).
 
 ### Step 1 — Create the small active Burn workspace
 
@@ -246,6 +246,8 @@ Steps 1–7 are implemented and exercised as small pilots. Numerical, soft-feedb
 **Gate:** every addition has a measured cost and quality result. If an addition is harmful or ambiguous, record it and test a specific alternative; do not silently remove it from the target design.
 
 ### Step 8 — Train the SBD-style block-denoising path
+
+Implementation and reference gates complete; fixed/variable-length and hard-mask runs are context-32 training smokes only. Independent candidate-width sweep remains unmeasured. See [docs/sbd.md](docs/sbd.md).
 
 - Add the clean causal objective plus masked future-block objective, retaining the soft top-k input/update mechanism from Step 3.
 - Noisy positions read the clean state before their block and communicate within the active block; they do not advance persistent state.

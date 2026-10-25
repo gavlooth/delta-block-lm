@@ -1,4 +1,4 @@
-# Steps 1–7: measured pilot results
+# Steps 1–8: measured pilot results
 
 For the current optimized execution paths, measured speedups and known legacy GPU-solver limitation, see [Early GPU kernel optimization](#early-gpu-kernel-optimization). The current recommended batch-8 configuration and its combined measurements are in [Batch-8 component optimization round](#batch-8-component-optimization-round). Step 7 (oHC, wavelet mixer, three Lngram injections) is in [Step 7: oHC, wavelet and Lngram](#step-7-ohc-wavelet-and-lngram). The first sections retain the original pilot measurements.
 
@@ -1572,7 +1572,7 @@ step). Absolute medians of the same configuration varied by up to 1.5×
 between sessions on this integrated GPU, so only within-session paired
 differences are used for decisions.
 
-### Visibility rules for Step 8 (defined, not yet exercised)
+### Visibility rules for Step 8 (subsequently exercised; see docs/sbd.md)
 
 Step 7 is causal-only. For SBD, where noisy active-block positions read the
 clean prefix and communicate inside the active block without advancing
@@ -1608,3 +1608,13 @@ flock /tmp/delta-block-lm-gpu.lock timeout 900s target/debug/delta-experiment ln
 
 Details: `docs/optimization/{ohc,wavelet,lngram}.md`. Evidence:
 `artifacts/integration/step7/{gates,paired,final}/`, `artifacts/step7/`.
+
+## Step 8: recurrent block denoising
+
+Implemented clean causal plus masked future-block training, detached soft top-k feedback by default, hard-mask comparison, frozen clean-prefix recurrence/HOLA reads, bidirectional active-block attention, and clean replay after finalization. Existing causal configurations retain their serialization and architecture when `sbd` is absent.
+
+CPU and Vulkan reference gates passed all eight mixer × HOLA × Step-7 combinations, including future-target leakage, an inside-chunk block start, padding, the length-one causal limit, and exact replay. Detailed numerical errors, commands and artifacts are in [docs/sbd.md](docs/sbd.md).
+
+Fixed lengths 1/4/8/16, variable lengths and hard-mask feedback have end-to-end training smoke evidence at context 32, batch 1, four steps per condition. These establish execution, not useful quality or a speedup. The original variable-length evaluation covered L1 only with one example; the corrected evaluation-only report covers every configured length without retraining. Keep the original metrics as historical evidence.
+
+Full-context efficiency, independent candidate-width sweeps and meaningful quality comparisons remain unmeasured. No Step 9–12 implementation is included.

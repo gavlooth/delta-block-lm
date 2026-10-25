@@ -51,7 +51,7 @@ Outside the resident step:
 - [x] oHC stream mixing (Step 7): fused write, fused read, then gate projection fused with its RMS (`ohc_backend: fused_gate`, deterministic weight-gradient reduction); −263 ms per step over the previous fused path inside the full Step 7 model. Still the largest Step 7 cost (14 stages per step). `ohc.md`.
 - [x] Wavelet mixer (Step 7): causal fixed-filter dilated kernel (`wavelet_backend: fused_gpu`); −756 ms per step against the tensor port inside the full Step 7 model. `wavelet.md`.
 - [x] Three Lngram components (Step 7): fused symbol cache, addressing, gather and on-the-fly OneBit counterfactual (`lngram_backend: fused_gpu`); −68 ms [49, 75] against the corrected tensor port; no expanded counterfactual tensors retained. `lngram.md`.
-- [ ] SBD training and causal block replay (Step 8)
+- [ ] SBD training and causal block replay (Step 8): implemented and numerically verified; O(T) clean training preparation, frozen prefix reads and exact block attention. Inference reconstructs prefixes. Full-context efficiency and candidate-width sweeps remain unmeasured; see `docs/sbd.md`.
 - [ ] Learned or adaptive block boundaries (Step 12)
 - [ ] Codpula circuit inference, training and adaptive commitment (Step 9)
 - [ ] CoCommit coordination passes (Step 10)

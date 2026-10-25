@@ -4,6 +4,10 @@
 pub trait Sections {
     /// CPU diagnostic only; ordinary observers compile out cache-selection observation.
     const CAPTURE_CACHE_MEMBERSHIP: bool = false;
+    const CAPTURE_RECURRENT_STATE: bool = false;
+    fn recurrent_state(&mut self, _state: &burn::prelude::Tensor<4>) {}
+    const CAPTURE_CLEAN_INPUTS: bool = false;
+    fn clean_input(&mut self, _layer: usize, _kind: &'static str, _input: &burn::prelude::Tensor<3>) {}
 
     /// Called once per chunk with the slots kept (indices into cache ∪ chunk) and their
     /// token positions, for the current block.
