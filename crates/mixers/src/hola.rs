@@ -360,17 +360,17 @@ fn read_impl<const TRACE: bool>(
 }
 
 /// Read the exact cache at `start`: completed chunks' selected slots plus the
-/// unfinished clean chunk. No noisy K/V enters the cache or this read.
+/// unfinished clean chunk and, when selected, temporary active-block K/V.
 pub(crate) fn read_frozen(
     q: Tensor<4>, k: Tensor<4>, v: Tensor<4>, scores: Tensor<4>,
     valid: Tensor<2>, documents: Tensor<2>, capacity: usize, chunk: usize,
     policy: CachePolicy, sink: Tensor<1>, start: usize, backend: HolaBackend,
+    in_block_reads: crate::sbd::InBlockReads, noisy_backend: crate::sbd::NoisyReadBackend,
 ) -> Tensor<4> {
     let [b,t,h,dk] = q.dims();
     let dv = v.dims()[3];
     let n = t-start;
     let cut = start / chunk * chunk;
-    let device = q.device();
     let take = |x: &Tensor<4>, a: usize, z: usize| {
         let d = x.dims()[3];
         x.clone().slice([0..b,a..z,0..h,0..d])
@@ -398,17 +398,14 @@ pub(crate) fn read_frozen(
         docs.push(documents.clone().slice([0..b,cut..start]).unsqueeze_dim::<3>(1).expand([b,h,start-cut]));
         present.push(valid.clone().slice([0..b,cut..start]).unsqueeze_dim::<3>(1).expand([b,h,start-cut]).greater_elem(0.5));
     }
-    let keys = Tensor::cat(keys,2);
-    let values = Tensor::cat(values,2);
-    let docs = Tensor::cat(docs,2);
-    let present = Tensor::cat(present,2);
     let query_docs = documents.slice([0..b,start..t]).reshape([b,1,n,1]);
-    let visible = present.unsqueeze_dim::<4>(2)
-        .bool_and(docs.unsqueeze_dim::<4>(2).equal(query_docs));
-    let logits = (take(&q,start,t).swap_dims(1,2).matmul(keys.swap_dims(2,3)) / (dk as f64).sqrt())
-        .mask_fill(visible.bool_not(), -1.0e30);
-    let probabilities = softmax(Tensor::cat(vec![logits, sink.reshape([1,h,1,1]).expand([b,h,n,1])],3),3);
-    let active = probabilities.matmul(Tensor::cat(vec![values,Tensor::zeros([b,h,1,dv],&device)],2))
-        .swap_dims(1,2) * valid.slice([0..b,start..t]).reshape([b,n,1,1]);
+    let visible = present.into_iter().zip(docs).map(|(present,docs)| {
+        present.unsqueeze_dim::<4>(2).expand([b,h,n,docs.dims()[2]])
+            .bool_and(docs.unsqueeze_dim::<4>(2).equal(query_docs.clone()))
+    }).collect();
+    let block = (in_block_reads == crate::sbd::InBlockReads::HolaRead)
+        .then(|| (take(&k,start,t).swap_dims(1,2),take(&v,start,t).swap_dims(1,2)));
+    let active = crate::sbd::noisy_hola_read(take(&q,start,t).swap_dims(1,2),keys,values,visible,block,
+        valid.slice([0..b,start..t]),sink,noisy_backend);
     Tensor::cat(vec![clean,active],1)
 }

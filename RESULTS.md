@@ -4,7 +4,7 @@ For the current optimized execution paths, measured speedups and known legacy GP
 
 ## Scope and stopping point
 
-Implemented and exercised the active Burn workspace, causal GDN-2 and KronLSTM, optional HOLA/recency memory, soft top-k feedback, paired associative-recall experiments, and a tiny causal language-model comparison. The Steps 1–6 sections below predate Step 7, which is reported separately at the end. Step 8 is partially implemented: training and replay remain, but the added dense active-block attention has been removed and sparse/within-block attention awaits explicit user selection. Its prior measurements are historical, not evidence for the current architecture. Codpula, CoCommit and energy-guided remasking remain later work.
+Implemented and exercised the active Burn workspace, causal GDN-2 and KronLSTM, optional HOLA/recency memory, soft top-k feedback, paired associative-recall experiments, and a tiny causal language-model comparison. The Steps 1–6 sections below predate Step 7, which is reported separately at the end. Step 8 now includes user-selected in-block reads through HOLA. Its new evidence below is numerical correctness and execution-cost measurement only; earlier dense-attention measurements remain historical. Codpula, CoCommit and energy-guided remasking remain later work.
 
 All runs used the local Intel Arc Graphics (MTL) through Vulkan, with float32 execution. No Spark or predecessor production process was used or modified.
 Run artifacts report sampled backend-reserved memory and explicit recurrent/cache/convolution storage. Exact GPU peak memory is not available here; the integrated GPU shares system memory, so reserved-pool samples must not be presented as exact physical-device peaks.
@@ -1608,12 +1608,75 @@ flock /tmp/delta-block-lm-gpu.lock timeout 900s target/debug/delta-experiment ln
 Details: `docs/optimization/{ohc,wavelet,lngram}.md`. Evidence:
 `artifacts/integration/step7/{gates,paired,final}/`, `artifacts/step7/`.
 
-## Step 8: recurrent block denoising — partial implementation
+## Step 8: recurrent block denoising through HOLA
 
-Clean causal plus masked future-block training, detached soft top-k feedback by default, hard-mask support, frozen clean-prefix recurrence/HOLA reads, and clean replay after finalization remain implemented. The added dense active-block attention and its attention-only scalar oracle have been removed. Sparse/within-block attention is undecided pending explicit user selection; there is no new bidirectional active-block attention path. HOLA's pre-existing attention is unchanged. Existing causal configurations retain their serialization and architecture when `sbd` is absent.
+`sbd.in_block_reads: "hola_read"` appends temporary noisy-block K/V to the frozen clean HOLA read, using one softmax and the existing sink and sigmoid gate. It adds no parameter. Every valid block query sees every valid block key, in both directions. No noisy K/V enters cache selection or the clean path; L=1 remains bit-identical clean next-token prediction. Omitted/explicit `"none"` keeps the previous serialization and fingerprints; `hola_read` changes identity and rejects any no-HOLA layer. `configs/lm512-sbd.json` selects `hola_read`.
 
-**Historical evidence only:** the CPU and Vulkan reference gates passed all eight mixer × HOLA × Step-7 combinations before dense attention was removed, including future-target leakage, an inside-chunk block start, padding, the length-one causal limit, and exact replay. Those passes and the removed oracle's output/VJP checks do not verify the current architecture or an undecided attention operator. Detailed historical numerical errors, commands and artifacts are in [docs/sbd.md](docs/sbd.md); no new measurement is asserted here.
+### Numerical correctness
 
-The historical implementation, which included dense active-block attention with a causal length-one special case, has end-to-end training smoke evidence for fixed lengths 1/4/8/16, variable lengths and hard-mask feedback at context 32, batch 1, four steps per condition. These establish execution of that earlier implementation only, not current-architecture quality or speed. The original variable-length evaluation covered L1 only with one example; the corrected evaluation-only report covers every configured length without retraining. All original and corrected metrics remain historical evidence.
+Vulkan-enabled workspace tests passed: 46 experiment, 7 kernel and 16 mixer tests, with one explicitly GPU-only test ignored. CPU and Intel Arc Vulkan `sbd-reference` passed 12 model cases: the eight existing mixer × HOLA × Step-7 combinations with `none`, plus `hola_read` in all four combinations having HOLA. The four no-HOLA combinations reject `hola_read`. All tests use the unchanged elementwise tolerance `2e-5 + 3e-4*abs(reference)`.
 
-Step 8's attention architecture is incomplete until the user explicitly selects the sparse/within-block design. Full-context efficiency, independent candidate-width results and meaningful quality conclusions remain unestablished; no new experiments or replacement are specified. No Step 9–12 implementation is included.
+| Gate | CPU max absolute error | Vulkan max absolute error |
+| --- | ---: | ---: |
+| Independent f64 noisy-read forward | 3.57e-8 | 3.57e-8 |
+| Independent f64 full noisy-read VJP | 5.29e-8 | 1.43e-7 |
+| Oracle central finite differences | 9.42e-11 | 9.42e-11 |
+| Complete-model logits vs CPU | 0 | 2.76e-7 |
+| All-parameter gradients vs CPU | 0 | 1.40e-8 |
+| Cached vs reconstructed logits | 1.20e-7 | 0 |
+| Cached vs reconstructed gradients | 1.13e-8 | 1.40e-9 |
+
+The maximum noisy-oracle tolerance ratio was 0.00328. Coverage includes all query/cache/clean-chunk/block K/V derivatives, sink and sigmoid gate, padding, empty cache, chunk-aligned starts and a start at position 19 inside chunk 16. Future clean-token perturbations, lengths 1/4/8/16, frozen snapshots and replay passed. Changing an explicitly observed block token changed other positions' logits. Evidence: `artifacts/inblock/{cpu,lm512}/sbd-reference.json`.
+
+### Execution layout
+
+`sbd.noisy_read_backend` is `"tensor"` by default or explicitly `"fused_gpu"`. The CubeCL candidate combines noisy logits, one stable softmax and the value read, with deterministic analytic query/K/V/sink VJPs; the existing tensor graph still gathers cache entries and concatenates the temporary segments. The existing sigmoid gate remains outside the kernel. It accepts f32 K32/V64, at most 16 queries, at most 127 assembled keys and computational chunk length at most 16; unsupported execution is rejected without a CPU alternative.
+
+The fused layout is adopted in `configs/lm512-sbd.json` from the accepted B1/T512 paired evidence below. This decision concerns execution of identical math, not architecture quality. No gather/concatenation-free variant was attempted: the diagnostic times the whole noisy HOLA forward section, not the gather/concatenation share alone.
+
+### Configured-shape timeout and single-row diagnostic
+
+The B8/T512/L8 complete-step benchmark did not emit its first three-mode iteration report before the explicit 3100-second deadline (exit 124, 3100.12 seconds wall time). No paired timing, launch count or sampled-memory result is available at that shape. The responsible mode/component is not established by that timeout; it must not be interpreted as a measured HOLA cost. Evidence: `artifacts/inblock/lm512/sbd-benchmark-timeout.json`. The accepted adoption workload is B1/T512: its diagnostic step times below fit the required two warmups plus 11 pairs within 3000 seconds. B8/T512 was not retried.
+
+One warm complete step and one observed complete step per mode at **B1/T512/L8**, otherwise the canonical four-layer width-256 Step-7 configuration, completed in 267.89 seconds. Each observed step performed **128 noisy block evaluations**, including detached teacher passes, and **512 layer HOLA reads**.
+
+| B1/T512 diagnostic selection | Complete step ms | Noisy HOLA forward ms | Forward-read share | Issued kernels | Sampled pool bytes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `none`, tensor | 43,765.69 | 4,713.70 | 10.77% | 379,689 | 1,545,177,408 |
+| `hola_read`, tensor | 45,763.47 | 5,373.14 | 11.74% | 384,040 | 1,558,809,152 |
+| `hola_read`, fused | 42,599.33 | 3,909.60 | 9.18% | 368,637 | 1,558,811,008 |
+
+The forward section includes query/key norms, cache gathers, segment assembly, softmax/value read and the existing gate. Synchronization before/after each noisy HOLA read changes overlap; this is one observed step per mode, not the ordinary-step adoption comparison. The percentages exclude HOLA VJPs and are not additive GPU utilization. The high per-row/per-block evaluation and launch counts quantify work in the current SBD training path; no optimization of that loop was attempted, and the B8 timeout's cause remains unassigned. Sampled reservations include the current model/optimizer, base parameters and allocator reuse, not exact live bytes or physical-device peak. Evidence: `artifacts/inblock/b1-t512/sbd-diagnostic.json`.
+
+### Accepted B1/T512 complete-step comparison
+
+The same canonical model, seed 1, B1/T512/L8, two warmups and **11 same-session paired trials** completed in 1608.46 seconds. Mode order alternated forward/reverse, providing AB/BA order for each comparison. Examples, mask seeds and step indices matched across modes; each mode had its own identical-initialization AdamW trajectory.
+
+| B1/T512 selection | Complete-step median ms | Issued kernels in separate warm step | Sampled pool bytes |
+| --- | ---: | ---: | ---: |
+| `none`, tensor | 44,366.60 | 217,278 | 1,729,734,592 |
+| `hola_read`, tensor | 45,184.01 | 219,658 | 1,729,734,912 |
+| `hola_read`, fused | 42,034.26 | 211,234 | 1,729,735,808 |
+
+| Paired difference | Median ms | 95% paired bootstrap interval ms | Second path faster |
+| --- | ---: | ---: | ---: |
+| `none - hola_read(tensor)` | -601.87 | [-1,508.97, -328.46] | 2/11 |
+| `hola_read(tensor) - hola_read(fused)` | +2,390.35 | [+1,667.56, +3,176.01] | 10/11 |
+
+Thus adding the user-selected in-block segment costs a paired median 601.87 ms on the tensor path; this is cost accounting, not an architecture-selection test. The mathematically identical fused path saves a paired median 2390.35 ms beyond noise, so `sbd.noisy_read_backend: "fused_gpu"` is adopted. The omitted execution selector remains `tensor`.
+
+Launch accounting uses a separate warm complete step at the same step index in every mode, not the median timed step. Its mask draw evaluated 35 masked blocks twice (teacher plus differentiable pass): 70 noisy block evaluations and 280 layer reads, versus the diagnostic's 128/512. Memory samples include all three resident model/optimizer trajectories and allocator reuse; their small differences are not exact temporary allocation or physical-device peak. Absolute medians are not compared across sessions. Evidence: `artifacts/inblock/b1-t512/sbd-benchmark.json`.
+
+### Small pilot
+
+Pilot cost accounting uses the full four-layer width-256 Step-7 model with B1/T32/L8, seed 1, two warmups and 11 same-session pairs, alternating forward/reverse order. Complete SBD steps include real examples/upload, clean loss, detached teacher pass, masked loss, full backward, scalar readbacks, finite checks, clipping and AdamW; no evaluation or checkpoint is timed.
+
+| B1/T32 selection | Step median ms | Issued kernels in separate warm step | Sampled pool reservation bytes |
+| --- | ---: | ---: | ---: |
+| `none`, tensor | 727.13 | 18,311 | 415,862,976 |
+| `hola_read`, tensor | 729.92 | 18,447 | 415,863,616 |
+| `hola_read`, fused | 698.21 | 17,971 | 415,866,688 |
+
+For `none - hola_read(tensor)`, the paired median was +0.84 ms, 95% paired bootstrap interval [-30.90, +26.10] ms; `hola_read` was faster in 6/11 pairs. This cost difference is not distinguishable from noise. For `tensor - fused` with `hola_read` in both paths, the paired median saving was 32.20 ms [16.49, 47.96], faster in 11/11 pairs. Absolute medians are not compared across sessions. Pool samples include all three resident model/optimizer trajectories and allocator reuse, not exact live bytes or physical-device peak. Launch counts are issued CubeCL kernels, not submissions/workgroups. Evidence: `artifacts/inblock/pilot/sbd-benchmark.json`.
+
+Earlier training/generation numbers in [docs/sbd.md](docs/sbd.md) describe the removed separate dense-attention implementation only. No new training study, quality comparison, candidate sweep or Step-7 quality-ablation implementation was performed.

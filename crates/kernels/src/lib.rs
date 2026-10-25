@@ -100,3 +100,9 @@ mod ohc_gate;
 mod ohc_gate_ops;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 pub use ohc_gate_ops::ohc_gate_project;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod noisy_hola;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod noisy_hola_ops;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+pub use noisy_hola_ops::noisy_hola_read;

@@ -4,6 +4,66 @@ use burn::{prelude::*, tensor::activation::softmax};
 use crate::{Mixer, MixerKind, chunk, hola};
 use burn::tensor::activation::{sigmoid,silu};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InBlockReads {
+    #[default]
+    None,
+    HolaRead,
+}
+impl InBlockReads {
+    pub fn is_none(&self) -> bool { *self == Self::None }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoisyReadBackend {
+    #[default]
+    Tensor,
+    FusedGpu,
+}
+impl NoisyReadBackend {
+    pub fn is_tensor(&self) -> bool { *self == Self::Tensor }
+}
+
+/// Temporary noisy HOLA segments. Every segment participates in one softmax.
+/// Inputs use [batch, head, query/key, channel]; the result uses [batch, query, head, value].
+pub fn noisy_hola_read(
+    query: Tensor<4>, mut keys: Vec<Tensor<4>>, mut values: Vec<Tensor<4>>,
+    mut visible: Vec<Tensor<4, Bool>>, block: Option<(Tensor<4>, Tensor<4>)>,
+    valid: Tensor<2>, sink: Tensor<1>, backend: NoisyReadBackend,
+) -> Tensor<4> {
+    let [b,h,n,dk] = query.dims();
+    let device = query.device();
+    if let Some((k,v)) = block {
+        let mask = valid.clone().reshape([b,1,1,n]).expand([b,h,n,n]).greater_elem(0.5);
+        keys.push(k);
+        values.push(v);
+        visible.push(mask);
+    }
+    assert!(!keys.is_empty(), "noisy HOLA requires a clean or active key segment");
+    let dv = values[0].dims()[3];
+    let keys = Tensor::cat(keys,2);
+    let values = Tensor::cat(values,2);
+    let visible = Tensor::cat(visible,3);
+    match backend {
+        NoisyReadBackend::Tensor => {
+            let logits = (query.matmul(keys.swap_dims(2,3))/(dk as f64).sqrt())
+                .mask_fill(visible.bool_not(),-1.0e30);
+            let probabilities = softmax(Tensor::cat(vec![logits,sink.reshape([1,h,1,1]).expand([b,h,n,1])],3),3);
+            probabilities.matmul(Tensor::cat(vec![values,Tensor::zeros([b,h,1,dv],&device)],2))
+                .swap_dims(1,2)*valid.reshape([b,n,1,1])
+        }
+        NoisyReadBackend::FusedGpu => {
+            crate::chunk::assert_fused_device(&device);
+            #[cfg(any(feature = "vulkan", feature = "cuda"))]
+            { delta_kernels::noisy_hola_read(query,keys,values,visible.float(),valid,sink).swap_dims(1,2) }
+            #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
+            { let _ = (keys,values,visible,valid,sink); unreachable!("fused noisy HOLA requires a GPU build; no CPU fallback") }
+        }
+    }
+}
+
 /// Differentiable clean tensors prepared once per layer/sequence. Snapshot work
 /// scans disjoint segments with carried state, never all prefixes per block.
 pub struct MixerCache {
@@ -70,10 +130,14 @@ impl Mixer {
         } else { rk };
         MixerCache {raw,cache_k,cache_v:rv,positions,states,starts:starts.to_vec()}
     }
-    pub fn forward_sbd_cached(&self, input: Tensor<3>, clean: &MixerCache, block: usize) -> Tensor<3> {
+    pub fn forward_sbd_cached(&self, input: Tensor<3>, clean: &MixerCache, block: usize, valid: Tensor<2>) -> Tensor<3> {
+        self.forward_sbd_cached_profiled(input,clean,block,valid,&mut crate::profile::Unprofiled)
+    }
+    pub fn forward_sbd_cached_profiled<P: crate::profile::Sections>(&self, input: Tensor<3>, clean: &MixerCache, block: usize, valid: Tensor<2>, profile: &mut P) -> Tensor<3> {
         let [b,n,d] = input.dims();
         let start = clean.starts[block];
         let device = input.device();
+        let input = input*valid.clone().unsqueeze_dim::<3>(2);
         let history = start.min(3);
         let project = |active: Tensor<3>, index: usize, weight: Tensor<2>| {
             let width = active.dims()[2];
@@ -84,7 +148,7 @@ impl Mixer {
         let rk = project(self.k.forward(input.clone()),1,self.k_conv.val());
         let rv = project(self.v.forward(input.clone()),2,self.v_conv.val());
         let q = self.normalization_backend.l2(rq.clone());
-        let k = self.normalization_backend.l2(rk);
+        let k = self.normalization_backend.l2(rk.clone());
         let v = if self.kind == MixerKind::KronLstm {self.normalization_backend.l2(rv.clone())} else {rv.clone()};
         let ew = if self.kind == MixerKind::Gdn2 {self.key_dim} else {1};
         let ww = if self.kind == MixerKind::Gdn2 {self.value_dim} else {1};
@@ -96,33 +160,34 @@ impl Mixer {
         let write = sigmoid(self.write.forward(input.clone())).reshape([b,n,self.heads,ww]);
         let recurrent = chunk::scan_selected(self.scan_backend,self.kind,chunk::ScanInput {
             q:single(q),k:single(k),v:single(v),alpha:single(alpha),erase:single(erase),write:single(write),
-        },Tensor::ones([b*n,1],&device),Tensor::zeros([b*n,1],&device),self.chunk_size,Some(initial));
+        },valid.clone().reshape([b*n,1]),Tensor::zeros([b*n,1],&device),self.chunk_size,Some(initial));
         let mut mixed = recurrent.output.reshape([b,n,self.heads,self.value_dim]);
         if let Some(cache) = &self.cache {
-            let query = hola::normalize(self.hola_backend,self.normalization_backend,&cache.q_norm,rq).swap_dims(1,2);
-            let cut = start/self.chunk_size*self.chunk_size;
-            let mut keys = Vec::new();
-            let mut vals = Vec::new();
-            let mut visible = Vec::new();
-            if cut > 0 {
-                let positions = clean.positions[cut/self.chunk_size-1].clone();
-                let ids = positions.clone().clamp_min(0.0).int();
-                keys.push(clean.cache_k.clone().swap_dims(1,2).gather(2,ids.clone().unsqueeze_dim::<4>(3).expand([b,self.heads,self.cache_capacity,self.key_dim])));
-                vals.push(clean.cache_v.clone().swap_dims(1,2).gather(2,ids.unsqueeze_dim::<4>(3).expand([b,self.heads,self.cache_capacity,self.value_dim])));
-                visible.push(positions.greater_equal_elem(0.0));
-            }
-            if cut < start {
-                keys.push(take4(&clean.cache_k,cut,start).swap_dims(1,2));
-                vals.push(take4(&clean.cache_v,cut,start).swap_dims(1,2));
-                visible.push(Tensor::<3>::ones([b,self.heads,start-cut],&device).greater_elem(0.0));
-            }
-            let keys = Tensor::cat(keys,2);
-            let vals = Tensor::cat(vals,2);
-            let visible = Tensor::cat(visible,2).unsqueeze_dim::<4>(2);
-            let logits = (query.matmul(keys.swap_dims(2,3))/(self.key_dim as f64).sqrt()).mask_fill(visible.bool_not(),-1.0e30);
-            let probabilities = softmax(Tensor::cat(vec![logits,cache.sink.val().reshape([1,self.heads,1,1]).expand([b,self.heads,n,1])],3),3);
-            let exact = probabilities.matmul(Tensor::cat(vec![vals,Tensor::zeros([b,self.heads,1,self.value_dim],&device)],2)).swap_dims(1,2);
-            mixed = mixed + exact*sigmoid(cache.gate.val()).reshape([1,1,self.heads,1]);
+            mixed = profile.section("Noisy HOLA read", || {
+                let query = hola::normalize(self.hola_backend,self.normalization_backend,&cache.q_norm,rq).swap_dims(1,2);
+                let cut = start/self.chunk_size*self.chunk_size;
+                let mut keys = Vec::new();
+                let mut vals = Vec::new();
+                let mut visible = Vec::new();
+                if cut > 0 {
+                    let positions = clean.positions[cut/self.chunk_size-1].clone();
+                    let ids = positions.clone().clamp_min(0.0).int();
+                    keys.push(clean.cache_k.clone().swap_dims(1,2).gather(2,ids.clone().unsqueeze_dim::<4>(3).expand([b,self.heads,self.cache_capacity,self.key_dim])));
+                    vals.push(clean.cache_v.clone().swap_dims(1,2).gather(2,ids.unsqueeze_dim::<4>(3).expand([b,self.heads,self.cache_capacity,self.value_dim])));
+                    visible.push(positions.greater_equal_elem(0.0).unsqueeze_dim::<4>(2).expand([b,self.heads,n,self.cache_capacity]));
+                }
+                if cut < start {
+                    keys.push(take4(&clean.cache_k,cut,start).swap_dims(1,2));
+                    vals.push(take4(&clean.cache_v,cut,start).swap_dims(1,2));
+                    visible.push(Tensor::<4>::ones([b,self.heads,n,start-cut],&device).greater_elem(0.0));
+                }
+                let block = (self.in_block_reads == InBlockReads::HolaRead).then(|| (
+                    hola::normalize(self.hola_backend,self.normalization_backend,&cache.k_norm,rk).swap_dims(1,2),
+                    rv.swap_dims(1,2),
+                ));
+                let exact = noisy_hola_read(query,keys,vals,visible,block,valid.clone(),cache.sink.val(),self.noisy_read_backend);
+                mixed + exact*sigmoid(cache.gate.val()).reshape([1,1,self.heads,1])
+            });
         }
         let gate = self.output_gate.forward(input);
         let mixed = if self.normalization_backend == crate::NormalizationBackend::FusedNormsGates {
@@ -131,7 +196,7 @@ impl Mixer {
             self.normalization_backend.rms(&self.norm,mixed*sigmoid(gate).reshape([b,n,self.heads,self.value_dim]))
         };
         let _ = d;
-        self.project_output(mixed.reshape([b,n,self.heads*self.value_dim]))
+        self.project_output(mixed.reshape([b,n,self.heads*self.value_dim]))*valid.unsqueeze_dim::<3>(2)
     }
 }
 

@@ -34,6 +34,10 @@ impl Arm {
             value => anyhow::bail!("unknown cache {value}"),
         };
         ensure!(
+            c.sbd.as_ref().is_none_or(|s| s.in_block_reads.is_none()) || cache_policy != CachePolicy::None,
+            "sbd.in_block_reads=hola_read requires HOLA in every layer; arm {} has cache=none", self.name
+        );
+        ensure!(
             c.scan_backend.supports(kind),
             "scan selector does not support mixer kind: use fused_gdn2 for GDN-2, existing fused selectors for KronLSTM"
         );
@@ -163,6 +167,10 @@ pub enum SbdFeedback {
 pub struct SbdConfig {
     pub block_lengths: Vec<usize>,
     pub feedback: SbdFeedback,
+    #[serde(skip_serializing_if = "delta_mixers::sbd::InBlockReads::is_none")]
+    pub in_block_reads: delta_mixers::sbd::InBlockReads,
+    #[serde(skip_serializing_if = "delta_mixers::sbd::NoisyReadBackend::is_tensor")]
+    pub noisy_read_backend: delta_mixers::sbd::NoisyReadBackend,
     pub candidate_width: usize,
     pub commit_count: usize,
     /// None selects fixed-count commitment; Some selects paper equation 8 (nats).
@@ -172,11 +180,13 @@ pub struct SbdConfig {
 impl Default for SbdConfig {
     fn default() -> Self {
         Self { block_lengths: vec![8], feedback: SbdFeedback::SoftFeedback,
-            candidate_width: 4, commit_count: 2, entropy_threshold: None, generate_tokens: 32 }
+            candidate_width: 4, commit_count: 2, entropy_threshold: None, generate_tokens: 32,
+            in_block_reads: delta_mixers::sbd::InBlockReads::None,
+            noisy_read_backend: delta_mixers::sbd::NoisyReadBackend::Tensor }
     }
 }
 
-// Fixed model semantics, not a configurable attention implementation.
+// Keep the historical SBD revision; optional reads enter identity through their selectors.
 const SBD_MODEL_REVISION: &str = "sbd-recurrence-only-v1";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -365,6 +375,13 @@ impl Config {
                 && sbd.commit_count > 0 && sbd.generate_tokens > 0, "invalid SBD decoding counts");
             ensure!(sbd.entropy_threshold.is_none_or(|x| x.is_finite() && x >= 0.0),
                 "SBD entropy threshold must be finite and nonnegative");
+            ensure!(
+                sbd.noisy_read_backend.is_tensor()
+                    || (matches!(self.backend.as_str(),"vulkan" | "cuda") && !self.fusion
+                        && self.key_dim == 32 && self.value_dim == 64 && self.chunk_size <= 16
+                        && self.cache_capacity <= 64 && sbd.block_lengths.iter().all(|&n| n <= 16)),
+                "sbd.noisy_read_backend=fused_gpu requires explicit non-fusion GPU execution, key32/value64, chunk/query count <=16 and capacity <=64"
+            );
         }
         ensure!(
             self.ohc_backend.is_tensor()
@@ -987,5 +1004,29 @@ mod tests {
         enabled.validate().unwrap();
         enabled.sbd.as_mut().unwrap().block_lengths = vec![0];
         assert!(enabled.validate().is_err());
+    }
+    #[test]
+    fn in_block_read_default_identity_and_hola_requirement() {
+        let mut c = Config {task:"lm".into(),sbd:Some(SbdConfig::default()),..Config::default()};
+        let omitted = serde_json::to_value(&c).unwrap();
+        assert!(omitted["sbd"].get("in_block_reads").is_none());
+        assert!(omitted["sbd"].get("noisy_read_backend").is_none());
+        let old_training = c.training_fingerprint(c.train_tokens).unwrap();
+        let old_pilot = c.pilot_fingerprint().unwrap();
+        let mut explicit = omitted.clone();
+        explicit["sbd"]["in_block_reads"] = "none".into();
+        explicit["sbd"]["noisy_read_backend"] = "tensor".into();
+        let explicit: Config = serde_json::from_value(explicit).unwrap();
+        assert_eq!(serde_json::to_value(&explicit).unwrap(),omitted);
+        assert_eq!(explicit.training_fingerprint(c.train_tokens).unwrap(),old_training);
+        assert_eq!(explicit.pilot_fingerprint().unwrap(),old_pilot);
+        c.sbd.as_mut().unwrap().in_block_reads = delta_mixers::sbd::InBlockReads::HolaRead;
+        c.arms = vec![Arm {name:"without-hola".into(),mixer:"kronlstm".into(),cache:"none".into()}];
+        assert!(c.validate().unwrap_err().to_string().contains("requires HOLA"));
+        c.arms[0].cache = "surprise".into();
+        c.validate().unwrap();
+        assert_ne!(c.training_fingerprint(c.train_tokens).unwrap(),old_training);
+        assert_ne!(c.pilot_fingerprint().unwrap(),old_pilot);
+        assert!(serde_json::from_value::<Config>(serde_json::json!({"in_block_reads":"hola_read"})).is_err());
     }
 }

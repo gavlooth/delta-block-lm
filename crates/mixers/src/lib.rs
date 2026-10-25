@@ -245,6 +245,8 @@ impl MixerConfig {
             projection_backend: self.projection_backend,
             normalization_backend: self.normalization_backend,
             convolution_backend: self.convolution_backend,
+            in_block_reads: sbd::InBlockReads::None,
+            noisy_read_backend: sbd::NoisyReadBackend::Tensor,
             heads: self.heads,
             key_dim: self.key_dim,
             value_dim: self.value_dim,
@@ -318,6 +320,10 @@ pub struct Mixer {
     #[module(skip)]
     convolution_backend: ConvolutionBackend,
     #[module(skip)]
+    in_block_reads: sbd::InBlockReads,
+    #[module(skip)]
+    noisy_read_backend: sbd::NoisyReadBackend,
+    #[module(skip)]
     heads: usize,
     #[module(skip)]
     key_dim: usize,
@@ -336,6 +342,15 @@ struct ExactMemory {
     sink: Param<Tensor<1>>,
 }
 impl Mixer {
+    pub fn with_sbd_reads(mut self, reads: sbd::InBlockReads, backend: sbd::NoisyReadBackend) -> Self {
+        assert!(reads.is_none() || self.cache.is_some(), "sbd.in_block_reads=hola_read requires HOLA in every layer");
+        self.in_block_reads = reads;
+        self.noisy_read_backend = backend;
+        self
+    }
+    pub fn set_noisy_read_backend(&mut self, backend: sbd::NoisyReadBackend) {
+        self.noisy_read_backend = backend;
+    }
     pub fn set_convolution_backend(&mut self, backend: ConvolutionBackend) {
         if backend == ConvolutionBackend::FusedGpu {
             chunk::assert_fused_device(&self.q.weight.val().device());
@@ -558,7 +573,8 @@ impl Mixer {
             let exact = if let Some(start) = block_start {
                 hola::read_frozen(cache_q, cache_k, raw_v, recurrent.scores,
                     valid.clone(), documents, self.cache_capacity, self.chunk_size,
-                    self.cache_policy, cache.sink.val(), start, self.hola_backend)
+                    self.cache_policy, cache.sink.val(), start, self.hola_backend,
+                    self.in_block_reads, self.noisy_read_backend)
             } else if P::CAPTURE_CACHE_MEMBERSHIP {
                 assert_eq!(
                     self.hola_backend,

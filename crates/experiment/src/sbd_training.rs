@@ -35,11 +35,14 @@ impl LanguageModel {
         TrainingCache {layers,starts:starts.to_vec()}
     }
     pub fn cached_block(&self, cache: &TrainingCache, block_index: usize, soft: &SoftState, hard: bool) -> Tensor<3> {
+        self.cached_block_profiled(cache,block_index,soft,hard,&mut delta_mixers::profile::Unprofiled)
+    }
+    pub fn cached_block_profiled<P: Sections>(&self, cache: &TrainingCache, block_index: usize, soft: &SoftState, hard: bool, profile: &mut P) -> Tensor<3> {
         let n = soft.observed.len();
         let start = cache.starts[block_index];
         let d = self.embedding.weight.val().dims()[1];
         let device = self.embedding.weight.val().device();
-        let valid = Tensor::ones([1,n],&device);
+        let valid = Tensor::from_data(TensorData::new(soft.active.iter().map(|&x| if x {1.0f32} else {0.0}).collect::<Vec<_>>(),[1,n]),&device);
         let mut hidden = soft.embeddings(self.embedding.weight.val(),self.sbd_mask.as_ref().unwrap().val(),hard).reshape([1,n,d]);
         let lngram_forward = |lngram: &delta_mixers::lngram::Lngram, input: Tensor<3>, clean: &Tensor<3>| {
             let history = start.min(lngram.orders.iter().copied().max().unwrap()-1 + lngram.smoothing.as_ref().map_or(0,|s|2*s.dilation));
@@ -66,7 +69,7 @@ impl LanguageModel {
                 let stage = block.ohc_mixer.as_ref().unwrap();
                 let read = stage.read_selected(streams,self.ohc_backend);
                 let input = self.normalization_backend.rms(&block.norm,read.work.clone());
-                let update = block.mixer.forward_sbd_cached(input,&clean.mixer,block_index);
+                let update = block.mixer.forward_sbd_cached_profiled(input,&clean.mixer,block_index,valid.clone(),profile);
                 streams = stage.write(read,update,valid.clone(),self.ohc_backend);
                 let stage = block.ohc_mlp.as_ref().unwrap();
                 let read = stage.read_selected(streams,self.ohc_backend);
@@ -87,7 +90,7 @@ impl LanguageModel {
                     hidden = hidden + lngram_forward(lngram,input,clean.lngram.as_ref().unwrap());
                 }
                 let input = self.normalization_backend.rms(&block.norm,hidden.clone());
-                hidden = hidden + block.mixer.forward_sbd_cached(input,&clean.mixer,block_index);
+                hidden = hidden + block.mixer.forward_sbd_cached_profiled(input,&clean.mixer,block_index,valid.clone(),profile);
                 let input = self.normalization_backend.rms(&block.ff_norm,hidden.clone());
                 hidden = hidden + block.down.forward(self.epilogue_backend.silu(block.up.forward(input)));
             }

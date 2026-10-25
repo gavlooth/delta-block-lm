@@ -88,7 +88,9 @@ impl LanguageModel {
                     delta_mixers::WaveletDyn::new(c.d_model, 4, 8, c.wavelet_backend, device)
                 }),
                 norm: norm(),
-                mixer: arm.mixer_config(c)?.init(device),
+                mixer: arm.mixer_config(c)?.init(device).with_sbd_reads(
+                    c.sbd.as_ref().map_or(delta_mixers::sbd::InBlockReads::None,|s| s.in_block_reads),
+                    c.sbd.as_ref().map_or(delta_mixers::sbd::NoisyReadBackend::Tensor,|s| s.noisy_read_backend)),
                 ff_norm: norm(),
                 up: linear(c.d_model, 2 * c.d_model),
                 down: linear(2 * c.d_model, c.d_model),
@@ -146,6 +148,9 @@ impl LanguageModel {
         for block in &mut self.blocks {
             block.mixer.set_hola_backend(backend);
         }
+    }
+    pub fn set_noisy_read_backend(&mut self, backend: delta_mixers::sbd::NoisyReadBackend) {
+        for block in &mut self.blocks { block.mixer.set_noisy_read_backend(backend); }
     }
     pub fn set_projection_backend(&mut self, backend: delta_mixers::ProjectionBackend) {
         for block in &mut self.blocks {

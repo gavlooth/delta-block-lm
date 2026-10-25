@@ -51,6 +51,9 @@ fn feedback(model: &LanguageModel, c: &Config, prefix: &[i32], soft: &mut SoftSt
 /// Paper equation 14, divided by the number of clean targets (not by mask count).
 /// Uniform sequence-level eta, independent Bernoulli masks, uniform length choice.
 pub fn training_loss(model: &LanguageModel, c: &Config, rows: &[Example], batch: &Batch, seed: u64) -> Result<Tensor<1>> {
+    training_loss_profiled(model,c,rows,batch,seed,&mut delta_mixers::profile::Unprofiled)
+}
+pub fn training_loss_profiled<P: delta_mixers::profile::Sections>(model: &LanguageModel, c: &Config, rows: &[Example], batch: &Batch, seed: u64, profile: &mut P) -> Result<Tensor<1>> {
     let s = c.sbd.as_ref().context("SBD config is required")?;
     let device = batch.input.device();
     let mut trace = crate::sbd_training::CleanInputs::default();
@@ -75,10 +78,10 @@ pub fn training_loss(model: &LanguageModel, c: &Config, rows: &[Example], batch:
             } else {
                 let cache = cache.as_ref().unwrap();
                 if s.feedback == SbdFeedback::SoftFeedback {
-                    let teacher = model.cached_block(cache,block_index,&soft,false).detach();
+                    let teacher = model.cached_block_profiled(cache,block_index,&soft,false,profile).detach();
                     soft.update(teacher.reshape([n,c.vocab()]),1.0,c.soft_temperature,c.soft_steps,s.candidate_width)?;
                 }
-                model.cached_block(cache,block_index,&soft,s.feedback == SbdFeedback::HardMask)
+                model.cached_block_profiled(cache,block_index,&soft,s.feedback == SbdFeedback::HardMask,profile)
             };
             let targets = Tensor::<2,Int>::from_data(TensorData::new(row.target[start..start+n].to_vec(),[n,1]),&device);
             let weights = Tensor::<2>::from_data(TensorData::new((0..n).map(|j| if masked[j] {row.weight[start+j]} else {0.0}).collect::<Vec<_>>(),[n,1]),&device);
@@ -250,7 +253,7 @@ fn identical(a: &[f32], b: &[f32], label: &str) -> Result<()> {
 }
 
 /// Compares model readbacks with the existing fixed numerical tolerance.
-fn compare<T: Copy + Into<f64>>(actual: &[T], reference: &[f64]) -> Result<Value> {
+pub(crate) fn compare<T: Copy + Into<f64>>(actual: &[T], reference: &[f64]) -> Result<Value> {
     const ABSOLUTE_TOLERANCE: f64 = 2e-5;
     const RELATIVE_TOLERANCE: f64 = 3e-4;
     ensure!(actual.len() == reference.len(), "SBD comparison lengths differ");
@@ -279,11 +282,13 @@ fn compare<T: Copy + Into<f64>>(actual: &[T], reference: &[f64]) -> Result<Value
 
 pub fn reference(c: &Config, device: &Device) -> Result<Value> {
     let mut reports = Vec::new();
+    let read_oracle = crate::sbd_read_reference::run(device,c.backend != "cpu")?;
     let cpu = Device::ndarray().autodiff();
     let gpu = device.clone().autodiff();
     for mixer in ["gdn2","kronlstm"] {
         for cache in ["none","surprise"] {
             for step7 in [false,true] {
+              for reads in [delta_mixers::sbd::InBlockReads::None,delta_mixers::sbd::InBlockReads::HolaRead] {
                 let mut cfg = c.clone();
                 cfg.sbd = Some(crate::config::SbdConfig::default());
                 cfg.backend = "cpu".into();
@@ -315,12 +320,19 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
                 cfg.lngram_orders = vec![2,3];
                 cfg.soft_selection_backend = crate::config::SoftSelectionBackend::Cpu;
                 let arm = Arm {name: format!("{mixer}-{cache}"),mixer: mixer.into(),cache: cache.into()};
+                cfg.arms = vec![arm.clone()];
+                cfg.sbd.as_mut().unwrap().in_block_reads = reads;
+                if cache == "none" && reads == delta_mixers::sbd::InBlockReads::HolaRead {
+                    ensure!(cfg.validate().unwrap_err().to_string().contains("requires HOLA"),"hola_read must reject layers without HOLA");
+                    continue;
+                }
                 cpu.seed(72);
                 let base = LanguageModel::new(&cfg,&arm,&cpu)?;
                 let mut tested = base.clone().fork(&gpu);
                 if c.backend != "cpu" {
                     tested.set_scan_backend(if mixer == "gdn2" {delta_mixers::ScanBackend::FusedGdn2} else {delta_mixers::ScanBackend::FusedGpu});
                     tested.set_hola_backend(delta_mixers::HolaBackend::FusedGpu);
+                    tested.set_noisy_read_backend(if reads.is_none() {delta_mixers::sbd::NoisyReadBackend::Tensor} else {delta_mixers::sbd::NoisyReadBackend::FusedGpu});
                     tested.set_convolution_backend(c.convolution_backend);
                     tested.set_normalization_backend(c.normalization_backend);
                     tested.set_ohc_backend(c.ohc_backend);
@@ -334,6 +346,15 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
                 let ref_logits = block_forward(&base,&prefix,&soft_cpu,false,&cpu);
                 let actual_logits = block_forward(&tested,&prefix,&soft_gpu,false,&gpu);
                 let logits_report = compare(&values(actual_logits.clone()),&values(ref_logits.clone()).iter().map(|&x| x as f64).collect::<Vec<_>>())?;
+                let communication = if !reads.is_none() {
+                    let changed = state(&cfg,vec![None,Some(97),None,None],&gpu)?;
+                    let changed = values(block_forward(&tested,&prefix,&changed,false,&gpu));
+                    let original = values(actual_logits.clone());
+                    let maximum = original.iter().zip(changed).enumerate().filter(|(i,_)| i/cfg.vocab() != 1)
+                        .map(|(_,(&a,b))| (a as f64-b as f64).abs()).fold(0.0,f64::max);
+                    ensure!(maximum > 0.0,"observed block token must change another query's logits through HOLA");
+                    Some(maximum)
+                } else {None};
                 let mut full = prefix.clone();
                 full.extend([31,32,33,34,35,36]);
                 let mut trace = crate::sbd_training::CleanInputs::default();
@@ -403,7 +424,11 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
                 let short = values(block_forward(&inference,&prefix,&short,false,device));
                 // Different GEMM lengths can alter arithmetic; padding comparison uses the fixed numerical tolerance.
                 let padding = compare(&padded[..2*cfg.vocab()],&short.iter().map(|&x| x as f64).collect::<Vec<_>>())?;
-                reports.push(json!({"mixer":mixer,"cache":cache,"step7":step7,"logits":logits_report,"cached_training_logits":cached_report,"cached_training_gradient_max_abs":cached_gradient_error,"cached_training_future_bit_identical":true,"all_parameter_gradients_max_abs":gradient_error,"lengths":lengths,"padding":padding,"noisy_snapshot_unchanged":true,"replay_logits_bit_identical":true,"replay_recurrent_states_bit_identical":true,"replayed_tokens":replay.replayed}));
+                let padded_cached = values(tested.cached_block(&snapshot,3,&SoftState::new(cfg.vocab(),4,vec![None;4],vec![true,true,false,false],&gpu,cfg.soft_selection_backend)?,false));
+                let padded_reconstructed = values(block_forward(&tested,&prefix,&SoftState::new(cfg.vocab(),4,vec![None;4],vec![true,true,false,false],&gpu,cfg.soft_selection_backend)?,false,&gpu));
+                let cached_padding = compare(&padded_cached,&padded_reconstructed.iter().map(|&x|x as f64).collect::<Vec<_>>())?;
+                reports.push(json!({"mixer":mixer,"cache":cache,"step7":step7,"in_block_reads":reads,"observed_cross_position_max_abs":communication,"logits":logits_report,"cached_training_logits":cached_report,"cached_training_gradient_max_abs":cached_gradient_error,"cached_training_future_bit_identical":true,"all_parameter_gradients_max_abs":gradient_error,"lengths":lengths,"padding":padding,"cached_padding":cached_padding,"noisy_snapshot_unchanged":true,"replay_logits_bit_identical":true,"replay_recurrent_states_bit_identical":true,"replayed_tokens":replay.replayed}));
+              }
             }
         }
     }
@@ -411,7 +436,7 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
     soft_config.soft_selection_backend = crate::config::SoftSelectionBackend::Cpu;
     soft_config.hard_mask_only = false;
     let soft = crate::soft::episode(&soft_config,device)?;
-    Ok(json!({"passed":true,"absolute_tolerance":2e-5,"relative_tolerance":3e-4,"full_model_cases":reports,"soft_feedback":soft,"reset_semantics":"Each Example is one document. BOS resets every clean replay; blocks never span examples. Padding freezes recurrence and is excluded from clean-prefix HOLA/history.","reference_scope":"Composed existing f64 recurrent/convolution/Step7 references; complete noisy model CPU/GPU logits and all parameter gradients, cached/reconstructed equivalence, locality and replay. No new bidirectional active-block attention is implemented."}))
+    Ok(json!({"passed":true,"absolute_tolerance":2e-5,"relative_tolerance":3e-4,"noisy_hola_f64":read_oracle,"full_model_cases":reports,"soft_feedback":soft,"reset_semantics":"Each Example is one document. BOS resets every clean replay; blocks never span examples. Padding freezes recurrence and is excluded from HOLA keys.","reference_scope":"Independent f64 noisy-HOLA forward/full VJP and finite differences; composed existing recurrent/convolution/Step7 references; complete CPU/GPU logits and all parameter gradients, cached/reconstructed equivalence, leakage, intended observed-token communication and replay."}))
 }
 
 #[cfg(test)]
