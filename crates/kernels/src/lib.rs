@@ -70,3 +70,9 @@ mod epilogue;
 mod epilogue_ops;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 pub use epilogue_ops::{silu_analytic, silu_vjp};
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod wavelet;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod wavelet_ops;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+pub use wavelet_ops::wavelet_smooth;

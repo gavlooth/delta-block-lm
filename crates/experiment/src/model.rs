@@ -17,6 +17,8 @@ use delta_mixers::{
 
 #[derive(Module, Debug)]
 pub struct Block {
+    pub(super) wavelet_norm: Option<RmsNorm>,
+    pub(super) wavelet: Option<delta_mixers::WaveletDyn>,
     pub(super) norm: RmsNorm,
     pub(super) mixer: Mixer,
     pub(super) ff_norm: RmsNorm,
@@ -58,8 +60,12 @@ impl LanguageModel {
                 .init(device)
         };
         let mut blocks = Vec::with_capacity(c.layers);
-        for _ in 0..c.layers {
+        for index in 0..c.layers {
             blocks.push(Block {
+                wavelet_norm: c.wavelet_layers.contains(&index).then(norm),
+                wavelet: c.wavelet_layers.contains(&index).then(|| {
+                    delta_mixers::WaveletDyn::new(c.d_model, 4, 8, c.wavelet_backend, device)
+                }),
                 norm: norm(),
                 mixer: arm.mixer_config(c)?.init(device),
                 ff_norm: norm(),
@@ -132,6 +138,19 @@ impl LanguageModel {
         let mut hidden =
             profile.section("Embedding", || self.embedding.forward(batch.input.clone()));
         for (index, block) in self.blocks.iter().enumerate() {
+            if let (Some(norm), Some(wavelet)) = (&block.wavelet_norm, &block.wavelet) {
+                profile.block(Some(index));
+                let normalized = profile.section("Block RMSNorm: wavelet", || {
+                    self.normalization_backend.rms(norm, hidden.clone())
+                });
+                let update = wavelet.forward_profiled(
+                    normalized,
+                    batch.valid.clone(),
+                    batch.reset.clone(),
+                    profile,
+                );
+                hidden = profile.section("Residual adds", || hidden + update);
+            }
             profile.block(Some(index));
             let normalized = profile.section("Block RMSNorm: mixer", || {
                 self.normalization_backend.rms(&block.norm, hidden.clone())

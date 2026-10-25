@@ -69,6 +69,7 @@ impl Arm {
             || !c.update_backend.is_tensor()
             || !c.loss_backend.is_tensor()
             || !c.epilogue_backend.is_native()
+            || !c.wavelet_backend.is_tensor()
     }
 }
 
@@ -182,6 +183,10 @@ pub struct Config {
     pub update_backend: UpdateBackend,
     #[serde(skip_serializing_if = "LossBackend::is_tensor")]
     pub loss_backend: LossBackend,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub wavelet_layers: Vec<usize>,
+    #[serde(skip_serializing_if = "delta_mixers::WaveletBackend::is_tensor")]
+    pub wavelet_backend: delta_mixers::WaveletBackend,
     pub context: usize,
     pub batch_size: usize,
     pub learning_rate: f64,
@@ -240,6 +245,8 @@ impl Default for Config {
             epilogue_backend: EpilogueBackend::Native,
             update_backend: UpdateBackend::Tensor,
             loss_backend: LossBackend::Tensor,
+            wavelet_layers: Vec::new(),
+            wavelet_backend: delta_mixers::WaveletBackend::Tensor,
             context: 128,
             batch_size: 1,
             learning_rate: 0.001,
@@ -275,6 +282,26 @@ impl Config {
         Ok(c)
     }
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.wavelet_layers.iter().all(|&layer| layer < self.layers)
+                && self
+                    .wavelet_layers
+                    .iter()
+                    .enumerate()
+                    .all(|(i, layer)| !self.wavelet_layers[..i].contains(layer)),
+            "wavelet_layers must contain unique in-range block indices"
+        );
+        ensure!(
+            self.wavelet_layers.is_empty() || self.d_model % 8 == 0,
+            "wavelet requires d_model divisible by eight gate groups"
+        );
+        ensure!(
+            self.wavelet_backend.is_tensor()
+                || (!self.wavelet_layers.is_empty()
+                    && matches!(self.backend.as_str(), "vulkan" | "cuda")
+                    && !self.fusion),
+            "fused wavelet requires enabled layers and an explicit non-fusion GPU backend"
+        );
         ensure!(
             matches!(self.task.as_str(), "recall" | "lm"),
             "task must be recall or lm"
@@ -670,5 +697,27 @@ mod tests {
                 backend
             );
         }
+    }
+    #[test]
+    fn wavelet_is_omitted_by_default_and_changes_identity_when_enabled() {
+        let mut c = Config::default();
+        let original = c.pilot_fingerprint().unwrap();
+        let encoded = serde_json::to_value(&c).unwrap();
+        assert!(encoded.get("wavelet_layers").is_none());
+        assert!(encoded.get("wavelet_backend").is_none());
+        c.wavelet_layers = vec![0];
+        c.validate().unwrap();
+        assert_ne!(original, c.pilot_fingerprint().unwrap());
+        c.wavelet_layers = vec![0, 0];
+        assert!(c.validate().is_err());
+        c.wavelet_layers = vec![c.layers];
+        assert!(c.validate().is_err());
+        c.wavelet_layers = vec![0];
+        c.wavelet_backend = delta_mixers::WaveletBackend::FusedGpu;
+        assert!(c.validate().is_err());
+        c.backend = "vulkan".into();
+        c.validate().unwrap();
+        c.fusion = true;
+        assert!(c.validate().is_err());
     }
 }
