@@ -81,7 +81,7 @@ mod lngram;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 mod lngram_ops;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
-pub use lngram_ops::{lngram_codes, lngram_memory};
+pub use lngram_ops::{lngram_codes, lngram_memory, lngram_table_lookup};
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 mod wavelet;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]

@@ -661,6 +661,7 @@ pub struct Report {
     pub passed: bool,
     pub cases: usize,
     pub checks: Vec<Check>,
+    pub duplicate_index_table_gradients: Vec<LookupGradientCheck>,
 }
 
 fn causality(device: &Device, backend: LngramBackend) {
@@ -689,6 +690,262 @@ fn causality(device: &Device, backend: LngramBackend) {
             }
         }
     }
+}
+
+/// Consumer-facing Tensor lookup gate: native forward, independent f64 VJP,
+/// and exact raw table-gradient bits before any optimizer or clipping.
+#[derive(Debug, serde::Serialize)]
+pub struct LookupGradientCheck {
+    layout: &'static str,
+    table_shape: [usize; 3],
+    index_shape: [usize; 2],
+    valid_lookups: usize,
+    masked_lookups: usize,
+    duplicate_hits: usize,
+    repeated_rows: usize,
+    max_hits_per_row: usize,
+    unused_rows: usize,
+    backward_repeats: usize,
+    native_forward_bit_identity: bool,
+    repeat_raw_gradient_bit_identity: bool,
+    raw_gradient_max_abs_error: f64,
+    raw_gradient_max_tolerance_ratio: f64,
+    raw_gradient_hash_algorithm: &'static str,
+    raw_gradient_hashes: Vec<String>,
+    accumulation_contract: &'static str,
+}
+
+fn raw_f32_bits<const D: usize>(value: &Tensor<D>) -> Vec<u32> {
+    value.to_data().iter::<f32>().map(f32::to_bits).collect()
+}
+
+fn raw_gradient_hash(bits: &[u32]) -> String {
+    // FNV-1a over explicitly little-endian f32 bits, independent of host endianness.
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bits.iter().flat_map(|value| value.to_le_bytes()) {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn duplicate_index_table_gradients(device: &Device) -> Vec<LookupGradientCheck> {
+    const BATCH: usize = 3;
+    const TOKENS: usize = 257;
+    const POSITIONS: usize = BATCH * TOKENS;
+    const ROUTES: usize = 3;
+    const ROWS: usize = 11;
+    const MEMORY: usize = 5;
+    const REPEATS: usize = 32;
+    const ORDER: usize = 2;
+    let device = device.clone().autodiff();
+    let host_layout =
+        HostLayout::packed(vec![vec![130, 73], vec![65, 64, 31], vec![]], TOKENS);
+    let layout = host_layout.tensor(&device);
+    let (starts, ends) = host_layout.limits_host();
+    // Derive validity independently of the device's production full_ngram mask.
+    let valid: Vec<bool> = (0..POSITIONS)
+        .map(|p| ends[p] >= starts[p] && p % TOKENS >= starts[p] as usize + ORDER - 1)
+        .collect();
+    let mut values = vec![0.; ROUTES * ROWS * MEMORY];
+    for (i, value) in values.iter_mut().enumerate() {
+        *value = (((i * 17 + 5) % 41) as f32 * 0.03125 - 0.625) as f64;
+    }
+    for route in 0..ROUTES {
+        // Padding reads a legal integer row containing dirty values. The existing
+        // validity mask must remove these NaNs before consumer arithmetic.
+        values[(route * ROWS + ROWS - 1) * MEMORY..(route + 1) * ROWS * MEMORY]
+            .fill(f64::NAN);
+    }
+    let signed = [1.0f32, -1.0, 0.01, -0.02, 0.03, -0.01, 0.25, -0.249];
+    let mut indices = vec![0i64; POSITIONS * ROUTES];
+    let mut weights = vec![0.; POSITIONS * ROUTES * MEMORY];
+    let mut reference_output = vec![0.; weights.len()];
+    let mut reference_gradient = vec![0.; values.len()];
+    let mut hits = vec![0usize; ROUTES * ROWS];
+    for p in 0..POSITIONS {
+        for route in 0..ROUTES {
+            let row = if valid[p] {
+                (p / 3 + route * 2 + usize::from(p % 7 == 0)) % 5
+            } else {
+                ROWS - 1
+            };
+            indices[p * ROUTES + route] = row as i64;
+            if valid[p] {
+                hits[route * ROWS + row] += 1;
+            }
+            for column in 0..MEMORY {
+                let out = (p * ROUTES + route) * MEMORY + column;
+                let table = (route * ROWS + row) * MEMORY + column;
+                let weight = signed[(p * 3 + route * 5 + column) % signed.len()]
+                    * (1.0 + column as f32 * 0.125 + route as f32 * 0.0625);
+                weights[out] = weight as f64;
+                if valid[p] {
+                    reference_output[out] = values[table];
+                    // Independent scalar f64 sum in ascending flattened (batch,time)
+                    // order. Every contribution is the exact uploaded f32 weight.
+                    reference_gradient[table] += weight as f64;
+                }
+            }
+        }
+    }
+    let valid_lookups = hits.iter().sum::<usize>();
+    let duplicate_hits = hits.iter().map(|&n| n.saturating_sub(1)).sum::<usize>();
+    let repeated_rows = hits.iter().filter(|&&n| n > 1).count();
+    let unused_rows = hits.iter().filter(|&&n| n == 0).count();
+    assert!(duplicate_hits > valid_lookups / 2 && repeated_rows > 0 && unused_rows > 0);
+    let padding = super::full_ngram(&layout, ORDER)
+        .bool_not()
+        .reshape([POSITIONS, 1, 1])
+        .expand([POSITIONS, ROUTES, MEMORY]);
+    let upstream = tensor(&weights, [POSITIONS, ROUTES, MEMORY], &device);
+    let mut reports = Vec::new();
+    for strided in [false, true] {
+        let table = if strided {
+            let mut reordered = vec![0.; values.len()];
+            for route in 0..ROUTES {
+                for row in 0..ROWS {
+                    for column in 0..MEMORY {
+                        reordered[(route * MEMORY + column) * ROWS + row] =
+                            values[(route * ROWS + row) * MEMORY + column];
+                    }
+                }
+            }
+            tensor(&reordered, [ROUTES, MEMORY, ROWS], &device).swap_dims(1, 2)
+        } else {
+            tensor(&values, [ROUTES, ROWS, MEMORY], &device)
+        }
+        .require_grad();
+        let mut route_indices = vec![0i64; indices.len()];
+        for p in 0..POSITIONS {
+            for route in 0..ROUTES {
+                route_indices[route * POSITIONS + p] = indices[p * ROUTES + route];
+            }
+        }
+        let index = if strided {
+            Tensor::<2, Int>::from_data(
+                TensorData::new(indices.clone(), [POSITIONS, ROUTES]),
+                &device,
+            )
+            .swap_dims(0, 1)
+        } else {
+            Tensor::<2, Int>::from_data(
+                TensorData::new(route_indices.clone(), [ROUTES, POSITIONS]),
+                &device,
+            )
+        };
+        assert_eq!(host_int(&index), route_indices, "lookup integer indices changed");
+        let native = table
+            .clone()
+            .detach()
+            .gather(
+                1,
+                index
+                    .clone()
+                    .unsqueeze_dim::<3>(2)
+                    .expand([ROUTES, POSITIONS, MEMORY]),
+            )
+            .swap_dims(0, 1);
+        let native_bits = raw_f32_bits(&native);
+        let layout_name = if strided { "noncontiguous" } else { "contiguous" };
+        let mut first_bits = None;
+        let mut hashes = Vec::with_capacity(REPEATS);
+        let mut max_abs = 0.0f64;
+        let mut max_ratio = 0.0f64;
+        #[cfg(any(feature = "vulkan", feature = "cuda"))]
+        let gpu = matches!(device.clone().inner().as_dispatch(), burn::backend::DispatchDevice::Cube(_));
+        let lookup = |table: Tensor<3>, index: Tensor<2, Int>| {
+            #[cfg(any(feature = "vulkan", feature = "cuda"))]
+            if gpu {
+                return delta_kernels::lngram_table_lookup(table, index).swap_dims(0, 1);
+            }
+            super::lookup(
+                LngramBackend::Tensor,
+                table.reshape([ROUTES * ROWS, MEMORY]),
+                index.swap_dims(0, 1),
+                ROWS,
+            )
+        };
+        for repeat in 0..REPEATS {
+            let output = lookup(table.clone(), index.clone());
+            assert_eq!(
+                raw_f32_bits(&output),
+                native_bits,
+                "{layout_name}: lookup forward must preserve native gather bits"
+            );
+            let output = output.mask_fill(padding.clone(), 0.);
+            let gradients = (output.clone() * upstream.clone()).sum().backward();
+            let gradient = table.grad(&gradients).expect("raw lookup table gradient");
+            let bits = raw_f32_bits(&gradient);
+            hashes.push(raw_gradient_hash(&bits));
+            if let Some(expected) = &first_bits {
+                assert_eq!(
+                    &bits, expected,
+                    "{layout_name}: repeat {repeat} raw table gradient changed bits"
+                );
+            } else {
+                compare(
+                    &format!("duplicate-index {layout_name} lookup output"),
+                    &host(&output),
+                    &reference_output,
+                    None,
+                );
+                let actual = host(&gradient);
+                compare(
+                    &format!("duplicate-index {layout_name} raw table gradient"),
+                    &actual,
+                    &reference_gradient,
+                    None,
+                );
+                for (&actual, &reference) in actual.iter().zip(&reference_gradient) {
+                    let error = (actual - reference).abs();
+                    max_abs = max_abs.max(error);
+                    max_ratio = max_ratio.max(error / (2e-5 + 3e-4 * reference.abs()));
+                }
+                for (row, &count) in hits.iter().enumerate() {
+                    if count == 0 {
+                        assert!(
+                            actual[row * MEMORY..(row + 1) * MEMORY]
+                                .iter()
+                                .all(|&value| value == 0.),
+                            "{layout_name}: unused or padding-only row {row} has gradient"
+                        );
+                    }
+                }
+                first_bits = Some(bits);
+            }
+        }
+        println!(
+            "Tensor lookup {layout_name}: {duplicate_hits} duplicate hits, \
+             {repeated_rows} repeated rows, {unused_rows} unused rows; \
+             raw-gradient max abs {max_abs:.6e}, tolerance ratio {max_ratio:.6e}; \
+             {REPEATS} backward repeats bit-identical, hashes {hashes:?}"
+        );
+        reports.push(LookupGradientCheck {
+            layout: layout_name,
+            table_shape: [ROUTES, ROWS, MEMORY],
+            index_shape: [ROUTES, POSITIONS],
+            valid_lookups,
+            masked_lookups: POSITIONS * ROUTES - valid_lookups,
+            duplicate_hits,
+            repeated_rows,
+            max_hits_per_row: *hits.iter().max().unwrap(),
+            unused_rows,
+            backward_repeats: REPEATS,
+            native_forward_bit_identity: true,
+            repeat_raw_gradient_bit_identity: true,
+            raw_gradient_max_abs_error: max_abs,
+            raw_gradient_max_tolerance_ratio: max_ratio,
+            raw_gradient_hash_algorithm: "fnv1a64-little-endian-f32-bits",
+            raw_gradient_hashes: hashes,
+            accumulation_contract: "GPU: one owner per destination (route,row,column), \
+                scalar f32 sum from +0 in ascending flattened (batch,time) position order; \
+                integer indices, no float atomics. CPU: existing native gather VJP. \
+                Native gather forward bits; full_ngram validity mask before arithmetic; \
+                independent scalar f64 VJP tolerance 2e-5 + 3e-4*abs(reference); \
+                32 raw-gradient f32-bit-identical backward repeats before clipping/optimizer.",
+        });
+    }
+    reports
 }
 
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
@@ -751,6 +1008,8 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
     METRICS.with(|m| m.borrow_mut().clear());
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut cases = 0;
+        let duplicate_index_table_gradients = duplicate_index_table_gradients(device);
+        cases += duplicate_index_table_gradients.len();
         for mode in [Surrogate::OneBit, Surrogate::LocalExpectation] {
             let (model, batch, layout, evaluation) = small_fixture(mode);
             check_oracle_gradients(&model, &batch, &evaluation);
@@ -836,13 +1095,14 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
             causality(device, backend);
             cases += 1;
         }
-        cases
+        (cases, duplicate_index_table_gradients)
     }));
     match result {
-        Ok(cases) => Ok(Report {
+        Ok((cases, duplicate_index_table_gradients)) => Ok(Report {
             passed: true,
             cases,
             checks: METRICS.with(|m| m.take()),
+            duplicate_index_table_gradients,
         }),
         Err(e) => Err(e
             .downcast_ref::<String>()

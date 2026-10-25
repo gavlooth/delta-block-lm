@@ -666,8 +666,9 @@ pub fn full_ngram(layout: &LngramLayout, order: usize) -> Tensor<2, Bool> {
         .expect("positive ngram order")
 }
 
-/// Rows `table[r · rows + local[p, r]]` for local addresses `[P, R]` into a `[R · rows, d_m]` table, `[P, R, d_m]`.
-/// Gathering per route (axis 1 of `[R, rows, d_m]`) keeps the backward scatter parallel over routes and row width.
+/// Rows `table[r · rows + local[p, r]]` for local addresses `[P, R]`, output `[P, R, d_m]`.
+/// GPU Tensor lookup preserves the gather values and replaces duplicate-index scatter VJPs with
+/// deterministic position-order accumulation; CPU uses the native gather fallback.
 fn lookup(
     backend: LngramBackend,
     table: Tensor<2>,
@@ -676,6 +677,19 @@ fn lookup(
 ) -> Tensor<3> {
     let [_, memory_dim] = table.dims();
     let [count, routes] = local.dims();
+    if backend == LngramBackend::Tensor {
+        #[cfg(any(feature = "vulkan", feature = "cuda"))]
+        if matches!(
+            local.device().inner().as_dispatch(),
+            burn::backend::DispatchDevice::Cube(_)
+        ) {
+            return delta_kernels::lngram_table_lookup(
+                table.reshape([routes, rows, memory_dim]),
+                local.swap_dims(0, 1),
+            )
+            .swap_dims(0, 1);
+        }
+    }
     if backend == LngramBackend::FlatSelect {
         let offsets = Tensor::<1, Int>::arange(0..routes as i64, &local.device())
             .mul_scalar(rows as i64)

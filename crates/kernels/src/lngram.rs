@@ -1,6 +1,6 @@
 //! Exact causal n-gram lookup with on-demand counterfactual VJPs.
 //! Table-gradient ownership is exclusive per (route,column), with chronological accumulation.
-use burn::backend::{TensorMetadata, ops::FloatTensorOps};
+use burn::backend::{TensorMetadata, ops::{FloatTensorOps, IntTensorOps}};
 use burn::tensor::DType;
 use burn_cubecl::{CubeBackend, tensor::CubeTensor};
 use cubecl::{frontend::Tensor as View, prelude::*};
@@ -199,6 +199,98 @@ fn table_backward_kernel(
                 dt[target] = dt[target] + dy[index3(dy, b, t, route * dm + c)];
             }
         }
+    }
+}
+
+#[cube(launch)]
+fn lookup_backward_kernel(
+    indices: &View<i32>,
+    dy: &View<f32>,
+    dt: &mut View<f32>,
+) {
+    let owner = ABSOLUTE_POS as usize;
+    let routes = dt.shape(0);
+    let rows = dt.shape(1);
+    let mem = dt.shape(2);
+    if owner < routes * mem {
+        let route = owner / mem;
+        let column = owner % mem;
+        let dt_s0 = dt.stride(0);
+        let dt_s1 = dt.stride(1);
+        let dt_s2 = dt.stride(2);
+        let index_s0 = indices.stride(0);
+        let index_s1 = indices.stride(1);
+        let dy_s0 = dy.stride(0);
+        let dy_s1 = dy.stride(1);
+        let dy_s2 = dy.stride(2);
+        for row in 0..rows {
+            dt[route * dt_s0 + row * dt_s1 + column * dt_s2] = 0.0;
+        }
+        // Each (route,column) owns every corresponding row cell, so repeated
+        // IDs accumulate serially in ascending position order without atomics.
+        for position in 0..indices.shape(1) {
+            let row = indices[route * index_s0 + position * index_s1] as usize;
+            let target = route * dt_s0 + row * dt_s1 + column * dt_s2;
+            let source = route * dy_s0 + position * dy_s1 + column * dy_s2;
+            dt[target] = dt[target] + dy[source];
+        }
+    }
+}
+pub(crate) fn table_lookup(table: CubeTensor, indices: CubeTensor) -> CubeTensor {
+    let [routes, rows, mem] = table.shape().dims::<3>();
+    let [index_routes, positions] = indices.shape().dims::<2>();
+    assert!(routes > 0 && rows > 0 && mem > 0 && positions > 0);
+    assert_eq!(routes, index_routes);
+    validate_lookup_views(&table, &indices);
+    let indices = CubeBackend::int_expand(
+        CubeBackend::int_reshape(indices, [routes, positions, 1].into()),
+        [routes, positions, mem].into(),
+    );
+    CubeBackend::float_gather(1, table, indices)
+}
+
+pub(crate) fn table_lookup_backward(
+    table: CubeTensor,
+    indices: CubeTensor,
+    dy: CubeTensor,
+) -> CubeTensor {
+    let [routes, _, mem] = table.shape().dims::<3>();
+    let [index_routes, positions] = indices.shape().dims::<2>();
+    assert_eq!([routes, positions, mem], dy.shape().dims::<3>());
+    assert_eq!(routes, index_routes);
+    validate_lookup_views(&table, &indices);
+    validate_lookup_views(&dy, &indices);
+    let dt = CubeBackend::float_empty(table.shape(), &table.device, table.dtype.into());
+    lookup_backward_kernel::launch(
+        &table.client,
+        count(&table, routes * mem),
+        CubeDim::new_1d(64),
+        indices.into_tensor_arg(),
+        dy.into_tensor_arg(),
+        dt.clone().into_tensor_arg(),
+    );
+    dt
+}
+
+fn validate_lookup_views(table: &CubeTensor, indices: &CubeTensor) {
+    assert_eq!(table.dtype, DType::F32, "Lngram table lookup requires f32");
+    assert_eq!(indices.dtype, DType::I32, "Lngram lookup indices require i32");
+    assert_eq!(table.device, indices.device);
+    for (x, element_size) in [(table, 4u64), (indices, 4u64)] {
+        let mut span = 1usize;
+        for (&dim, &stride) in x
+            .meta
+            .shape()
+            .as_slice()
+            .iter()
+            .zip(x.meta.strides().iter())
+        {
+            span = (dim - 1)
+                .checked_mul(stride)
+                .and_then(|n| span.checked_add(n))
+                .expect("Lngram table lookup address overflow");
+        }
+        assert!(span <= u32::MAX as usize && x.handle.size() / element_size <= u32::MAX as u64);
     }
 }
 fn count(x: &CubeTensor, elements: usize) -> CubeCount {

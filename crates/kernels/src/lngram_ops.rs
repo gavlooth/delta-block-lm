@@ -7,7 +7,7 @@ use burn::backend::{
         ops::{Backward, Ops, OpsKind},
     },
     backend_extension,
-    tensor::FloatTensor,
+    tensor::{FloatTensor, IntTensor},
 };
 use burn::prelude::Tensor;
 use burn_cubecl::CubeBackend;
@@ -15,6 +15,12 @@ use burn_cubecl::CubeBackend;
 #[backend_extension(Cube, Autodiff)]
 pub trait LngramOps: Backend {
     fn lngram_codes(z: FloatTensor<Self>, bits: usize) -> FloatTensor<Self>;
+    fn lngram_table_lookup(table: FloatTensor<Self>, indices: IntTensor<Self>) -> FloatTensor<Self>;
+    fn lngram_table_lookup_backward(
+        table: FloatTensor<Self>,
+        indices: IntTensor<Self>,
+        dy: FloatTensor<Self>,
+    ) -> FloatTensor<Self>;
     fn lngram_memory(
         z: FloatTensor<Self>,
         codes: FloatTensor<Self>,
@@ -45,6 +51,16 @@ impl LngramOps for CubeBackend {
     fn lngram_codes(z: FloatTensor<Self>, bits: usize) -> FloatTensor<Self> {
         crate::lngram::codes(z, bits)
     }
+    fn lngram_table_lookup(table: FloatTensor<Self>, indices: IntTensor<Self>) -> FloatTensor<Self> {
+        crate::lngram::table_lookup(table, indices)
+    }
+    fn lngram_table_lookup_backward(
+        table: FloatTensor<Self>,
+        indices: IntTensor<Self>,
+        dy: FloatTensor<Self>,
+    ) -> FloatTensor<Self> {
+        crate::lngram::table_lookup_backward(table, indices, dy)
+    }
     fn lngram_memory(
         z: FloatTensor<Self>,
         codes: FloatTensor<Self>,
@@ -73,21 +89,57 @@ impl LngramOps for CubeBackend {
         scale: f32,
     ) -> (FloatTensor<Self>, FloatTensor<Self>) {
         crate::lngram::backward(
-            z,
-            table,
-            valid,
-            docs,
-            codes,
-            dy,
-            bits,
-            order,
-            mode,
-            temperature,
-            scale,
+            z, table, valid, docs, codes, dy, bits, order, mode, temperature, scale,
         )
     }
 }
 impl<B: Backend + LngramOps, C: CheckpointStrategy> LngramOps for Autodiff<B, C> {
+    fn lngram_table_lookup(
+        table: FloatTensor<Self>,
+        indices: IntTensor<Self>,
+    ) -> FloatTensor<Self> {
+        #[derive(Debug)]
+        struct TableLookupBackward;
+        impl<B: Backend + LngramOps> Backward<B, 1> for TableLookupBackward {
+            type State = (FloatTensor<B>, IntTensor<B>);
+            fn backward(
+                self,
+                ops: Ops<Self::State, 1>,
+                grads: &mut Gradients,
+                _: &mut Checkpointer,
+            ) {
+                let dy = grads.consume::<B>(&ops.node);
+                let (table, indices) = ops.state;
+                let [parent] = ops.parents;
+                if let Some(parent) = parent {
+                    let gradient = B::lngram_table_lookup_backward(table, indices, dy);
+                    grads.register::<B>(parent.id, gradient);
+                }
+            }
+        }
+        let parents = [table.node()];
+        let table = table.into_primitive();
+        let y = B::lngram_table_lookup(table.clone(), indices.clone());
+        match TableLookupBackward
+            .prepare::<C>(parents)
+            .compute_bound()
+            .stateful()
+        {
+            OpsKind::Tracked(prep) => prep.finish((table, indices), y),
+            OpsKind::UnTracked(prep) => prep.finish(y),
+        }
+    }
+    fn lngram_table_lookup_backward(
+        table: FloatTensor<Self>,
+        indices: IntTensor<Self>,
+        dy: FloatTensor<Self>,
+    ) -> FloatTensor<Self> {
+        Self::from_inner(B::lngram_table_lookup_backward(
+            table.into_primitive(),
+            indices,
+            dy.into_primitive(),
+        ))
+    }
     fn lngram_codes(z: FloatTensor<Self>, bits: usize) -> FloatTensor<Self> {
         Self::from_inner(B::lngram_codes(z.into_primitive(), bits))
     }
@@ -257,5 +309,18 @@ pub fn lngram_codes(z: Tensor<3>, bits: usize) -> Tensor<3> {
     Tensor::from_dispatch(<Dispatch as LngramOps>::lngram_codes(
         z.into_dispatch(),
         bits,
+    ))
+}
+/// Route-wise integer table lookup: `table [R,rows,M]`, `indices [R,P]`, output `[R,P,M]`.
+/// Every index must be in `0..rows`. GPU backward uses one owner per route/channel, scans
+/// positions in ascending order, and writes the dense table gradient without atomics. This
+/// costs O(R*rows*M + P*R*M) work and no expanded `[P,rows,M]` temporary.
+pub fn lngram_table_lookup(
+    table: Tensor<3>,
+    indices: Tensor<2, burn::prelude::Int>,
+) -> Tensor<3> {
+    Tensor::from_dispatch(<Dispatch as LngramOps>::lngram_table_lookup(
+        table.into_dispatch(),
+        indices.into_dispatch(),
     ))
 }

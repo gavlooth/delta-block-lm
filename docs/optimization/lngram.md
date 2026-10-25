@@ -75,13 +75,16 @@ reservations and counts issued CubeCL launches.
 
 ## Execution designs and numerical gate
 
-`lngram_backend: tensor` is the default port: tables reshape to
-`[routes, rows_per_route, memory_dim]` and gather within each route. The real
-alternative `flat_select` forms global row IDs and selects axis zero directly.
-They share all parameters, addressing, readout and surrogate equations. The
-predecessor motivated route-gather by its more parallel repeated-index
-backward scatter; the local paired measurements decide whether that advantage
-matters here. No custom kernel is adopted merely for being fused.
+`lngram_backend: tensor` remains the default port: tables reshape to
+`[routes, rows_per_route, memory_dim]` and gather within each route. Its
+production `delta_kernels::lngram_table_lookup` helper preserves the native
+gather forward and integer indices; GPU autodiff uses the destination-owned,
+fixed-position-order table VJP described below. CPU retains the existing
+native gather VJP. The real alternative `flat_select` forms global row IDs and
+selects axis zero directly. They share all parameters, addressing, readout and
+surrogate equations. The predecessor motivated route-gather by its more
+parallel repeated-index backward scatter; the historical paired measurements
+below predate this deterministic Tensor VJP correction.
 
 The GPU-only, non-fusion `fused_gpu` path caches exact hard route symbols once
 for all orders, then combines suffix addressing and current-row gather in one
@@ -104,6 +107,85 @@ differences with hard addresses held fixed. Causality tests perturb a token,
 an entire later document and a second batch row. A small three-injection LM
 compares logits, all gradients and updated parameters to CPU tensor execution,
 and checks the production table optimizer group's fresh-state row support.
+
+### Tensor duplicate-index raw-gradient determinism
+
+The retained GDN2 extended full-model Vulkan fixture exposed an exact L1
+common-gradient mismatch at `blocks.0.lngram.tables.0.weight`. Loss and logits
+had already passed. The failure was in the **raw gradient before any optimizer
+update**, not in updated weights. This evidence is distinct from the clipping
+optimizer correction in `64590d18`; that optimizer is unchanged here.
+
+The clean-graph invariant matters: `sbd.rs::training_loss_profiled` always
+executes one `model.forward_profiled` and the same `model.loss`. The contextual
+arm differs through zero-valued context-head parameter terms. L1 per-block
+losses slice that same `clean_logits`; there is no cached noisy forward or
+circuitflows call. The factorized clone removes only Codpula. None of these
+properties, the exact singleton/restart gates, or their equality requirements
+is changed to accommodate the failure.
+
+The original Tensor route lookup was
+`reshape([routes,rows,memory_dim]).gather(1,index).swap_dims(0,1)`.
+In Burn autodiff 0.22.1, `ops/tensor.rs:1016–1037` implements the Gather VJP
+with `float_scatter` Add. CubeCL 0.22.1
+`kernel/index/scatter.rs:72–120,160–220` selects floating-point atomic Add on
+Vulkan and explicitly documents nondeterministic sums for duplicate indices.
+The CPU implementation retains serial, owned-row accumulation. Changing the
+optimizer cannot repair a raw-gradient discrepancy produced before it runs.
+
+The narrow correction keeps native gather forward and integer index semantics.
+For GPU table gradients, each destination `(route,row,column)` has one owner:
+it starts at FP32 `+0` and adds matching upstream values in ascending flattened
+`(batch,time)` position order. There are no floating-point atomics, parallel
+reduction trees, or float-encoded indices. This is the existing Tensor Lngram
+table lookup VJP, not a generic scatter replacement, a new Lngram mechanism,
+an upstream vendor patch, or a backend/default-selector change.
+
+`lngram-reference` now permanently exercises the production Tensor lookup:
+the existing native gather on CPU and the exported custom-VJP helper on Vulkan.
+The fixed fixture is B3/T257, R3,
+11 rows per route, memory width 5, order 2, with packed resets and an empty
+batch row. Only five rows per route receive valid lookups, creating many
+duplicate hits; signed, cancelling FP32 upstream weights provide the table
+VJP. Padding and incomplete suffixes address a legal NaN-poisoned row, removed
+by the existing production `full_ngram` validity mask **before** consumer
+arithmetic. Unused and padding-only table rows must have exactly zero gradient.
+Both contiguous and transposed, noncontiguous tables and integer indices are
+covered. An independent scalar FP64 sum uses the actual uploaded FP32 weights;
+the numerical rule remains `2e-5 + 3e-4*abs(reference)`.
+
+Each layout runs backward **32 times**, comparing all raw FP32 table-gradient
+bits, before clipping or optimizer work, rather than a tolerant comparison of
+updated weights. Forward bits must match native gather. The JSON
+`duplicate_index_table_gradients` report records shapes, valid/masked lookup
+counts, duplicate hits, repeated/unused rows, maximum hits per row, maximum
+raw-gradient absolute error and tolerance ratio, repeat bit identity, every
+raw-gradient hash (FNV-1a over little-endian FP32 bits), and the exact
+accumulation contract. Ordinary `checks` also retain the output and gradient
+errors against the independent FP64 reference.
+
+CPU and Vulkan `lngram-reference` commands pass under
+`artifacts/codpula-context/{lookup-cpu,lookup-vulkan}/`. Each layout has 1,074
+valid lookups, 1,059 duplicate hits, 18 unused rows, and 32 bit-identical
+raw-gradient repetitions. Vulkan maximum raw-gradient absolute error is
+`1.862645149230957e-6`, tolerance ratio `0.00330107578025247`; native forward
+bits match exactly. No equality requirement or numerical tolerance changed.
+
+One work-item owns a `(route,column)` stripe: zero its table rows, then scan
+positions in order, updating the uniquely owned destination cells. Work is
+`O(R*rows*M + P*R*M)` with one dense table-gradient output and no expanded
+`[P,rows,M]` allocation. The compatibility Tensor path can expose less GPU
+parallelism; the adopted `FusedGpu` implementation is unchanged. Historical
+timing tables below do not measure this correction. It is separate from
+`64590d18`; no baseline rerun or fixture-backend switch was used to hide the
+exposed failure.
+
+The unchanged full Vulkan Codpula model gate also passes after this correction:
+exact singleton common raw gradients, zero circuit learning on L1, and exact
+saved/restored optimizer continuation are retained. Evidence:
+`artifacts/codpula-context/vulkan/codpula-model-reference.json`; the failing
+pre-correction log remains in `artifacts/codpula-context/commands/`.
+
 
 ## Commands
 
