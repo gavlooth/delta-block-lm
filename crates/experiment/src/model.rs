@@ -18,11 +18,15 @@ use delta_mixers::{
 
 #[derive(Module, Debug)]
 pub struct Block {
+    pub(super) wavelet_norm: Option<RmsNorm>,
+    pub(super) wavelet: Option<delta_mixers::WaveletDyn>,
     pub(super) norm: RmsNorm,
     pub(super) mixer: Mixer,
     pub(super) ff_norm: RmsNorm,
     pub(super) up: Linear,
     pub(super) down: Linear,
+    /// oHC stage around the optional wavelet sublayer (only when both are enabled).
+    pub(super) ohc_wavelet: Option<OhcStage>,
     pub(super) ohc_mixer: Option<OhcStage>,
     pub(super) ohc_mlp: Option<OhcStage>,
 }
@@ -65,13 +69,18 @@ impl LanguageModel {
                 .init(device)
         };
         let mut blocks = Vec::with_capacity(c.layers);
-        for _ in 0..c.layers {
+        for index in 0..c.layers {
             blocks.push(Block {
+                wavelet_norm: c.wavelet_layers.contains(&index).then(norm),
+                wavelet: c.wavelet_layers.contains(&index).then(|| {
+                    delta_mixers::WaveletDyn::new(c.d_model, 4, 8, c.wavelet_backend, device)
+                }),
                 norm: norm(),
                 mixer: arm.mixer_config(c)?.init(device),
                 ff_norm: norm(),
                 up: linear(c.d_model, 2 * c.d_model),
                 down: linear(2 * c.d_model, c.d_model),
+                ohc_wavelet: None,
                 ohc_mixer: None,
                 ohc_mlp: None,
             });
@@ -99,6 +108,9 @@ impl LanguageModel {
         self.ohc_init = Some(StreamInitConfig::new().with_d_model(width).init(device));
         self.ohc_readout = Some(OhcReadoutConfig::new().with_d_model(width).init(device));
         for block in &mut self.blocks {
+            if block.wavelet.is_some() {
+                block.ohc_wavelet = Some(OhcStageConfig::new().with_d_model(width).init(device));
+            }
             block.ohc_mixer = Some(OhcStageConfig::new().with_d_model(width).init(device));
             block.ohc_mlp = Some(OhcStageConfig::new().with_d_model(width).init(device));
         }
@@ -158,6 +170,19 @@ impl LanguageModel {
         let mut hidden =
             profile.section("Embedding", || self.embedding.forward(batch.input.clone()));
         for (index, block) in self.blocks.iter().enumerate() {
+            if let (Some(norm), Some(wavelet)) = (&block.wavelet_norm, &block.wavelet) {
+                profile.block(Some(index));
+                let normalized = profile.section("Block RMSNorm: wavelet", || {
+                    self.normalization_backend.rms(norm, hidden.clone())
+                });
+                let update = wavelet.forward_profiled(
+                    normalized,
+                    batch.valid.clone(),
+                    batch.reset.clone(),
+                    profile,
+                );
+                hidden = profile.section("Residual adds", || hidden + update);
+            }
             profile.block(Some(index));
             let normalized = profile.section("Block RMSNorm: mixer", || {
                 self.normalization_backend.rms(&block.norm, hidden.clone())
@@ -193,6 +218,25 @@ impl LanguageModel {
         });
         for (index, block) in self.blocks.iter().enumerate() {
             profile.block(Some(index));
+            if let (Some(stage), Some(norm), Some(wavelet)) =
+                (&block.ohc_wavelet, &block.wavelet_norm, &block.wavelet)
+            {
+                let read = profile.section("oHC read: wavelet", || {
+                    stage.read_selected(streams, self.ohc_backend)
+                });
+                let normalized = profile.section("Block RMSNorm: wavelet", || {
+                    self.normalization_backend.rms(norm, read.work.clone())
+                });
+                let update = wavelet.forward_profiled(
+                    normalized,
+                    batch.valid.clone(),
+                    batch.reset.clone(),
+                    profile,
+                );
+                streams = profile.section("oHC write: wavelet", || {
+                    stage.write(read, update, batch.valid.clone(), self.ohc_backend)
+                });
+            }
             let stage = block.ohc_mixer.as_ref().unwrap();
             let read = profile.section("oHC read: mixer", || stage.read_selected(streams, self.ohc_backend));
             let normalized = profile.section("Block RMSNorm: mixer", || {

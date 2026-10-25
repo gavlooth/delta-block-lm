@@ -70,6 +70,7 @@ impl Arm {
             || !c.loss_backend.is_tensor()
             || !c.epilogue_backend.is_native()
             || !c.ohc_backend.is_tensor()
+            || !c.wavelet_backend.is_tensor()
     }
 }
 
@@ -183,6 +184,10 @@ pub struct Config {
     pub update_backend: UpdateBackend,
     #[serde(skip_serializing_if = "LossBackend::is_tensor")]
     pub loss_backend: LossBackend,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub wavelet_layers: Vec<usize>,
+    #[serde(skip_serializing_if = "delta_mixers::WaveletBackend::is_tensor")]
+    pub wavelet_backend: delta_mixers::WaveletBackend,
     /// Four orthogonal residual streams; omitted preserves the single-stream architecture.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub ohc_streams: bool,
@@ -248,6 +253,8 @@ impl Default for Config {
             loss_backend: LossBackend::Tensor,
             ohc_streams: false,
             ohc_backend: delta_mixers::ohc::OhcBackend::Tensor,
+            wavelet_layers: Vec::new(),
+            wavelet_backend: delta_mixers::WaveletBackend::Tensor,
             context: 128,
             batch_size: 1,
             learning_rate: 0.001,
@@ -289,6 +296,26 @@ impl Config {
             "fused oHC requires ohc_streams and an explicit non-fusion GPU backend"
         );
         ensure!(!self.ohc_backend.fused_read() || self.d_model <= 1024, "fused oHC read supports d_model <= 1024");
+        ensure!(
+            self.wavelet_layers.iter().all(|&layer| layer < self.layers)
+                && self
+                    .wavelet_layers
+                    .iter()
+                    .enumerate()
+                    .all(|(i, layer)| !self.wavelet_layers[..i].contains(layer)),
+            "wavelet_layers must contain unique in-range block indices"
+        );
+        ensure!(
+            self.wavelet_layers.is_empty() || self.d_model % 8 == 0,
+            "wavelet requires d_model divisible by eight gate groups"
+        );
+        ensure!(
+            self.wavelet_backend.is_tensor()
+                || (!self.wavelet_layers.is_empty()
+                    && matches!(self.backend.as_str(), "vulkan" | "cuda")
+                    && !self.fusion),
+            "fused wavelet requires enabled layers and an explicit non-fusion GPU backend"
+        );
         ensure!(
             matches!(self.task.as_str(), "recall" | "lm"),
             "task must be recall or lm"
@@ -707,5 +734,27 @@ mod tests {
                 backend
             );
         }
+    }
+    #[test]
+    fn wavelet_is_omitted_by_default_and_changes_identity_when_enabled() {
+        let mut c = Config::default();
+        let original = c.pilot_fingerprint().unwrap();
+        let encoded = serde_json::to_value(&c).unwrap();
+        assert!(encoded.get("wavelet_layers").is_none());
+        assert!(encoded.get("wavelet_backend").is_none());
+        c.wavelet_layers = vec![0];
+        c.validate().unwrap();
+        assert_ne!(original, c.pilot_fingerprint().unwrap());
+        c.wavelet_layers = vec![0, 0];
+        assert!(c.validate().is_err());
+        c.wavelet_layers = vec![c.layers];
+        assert!(c.validate().is_err());
+        c.wavelet_layers = vec![0];
+        c.wavelet_backend = delta_mixers::WaveletBackend::FusedGpu;
+        assert!(c.validate().is_err());
+        c.backend = "vulkan".into();
+        c.validate().unwrap();
+        c.fusion = true;
+        assert!(c.validate().is_err());
     }
 }

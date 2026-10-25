@@ -24,6 +24,8 @@ mod projections;
 pub mod ohc;
 pub use normalization::NormalizationBackend;
 pub mod reference;
+pub mod wavelet;
+pub use wavelet::{WaveletBackend, WaveletDyn};
 pub use checks::{NumericalReport, numerical_checks};
 pub use projections::{
     ProjectionBackend, benchmark as projection_benchmark,
