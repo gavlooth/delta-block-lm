@@ -198,6 +198,17 @@ pub(crate) fn checkpoint(
     optim: &ModuleOptimizer,
     state: &State,
 ) -> Result<()> {
+    checkpoint_with_tct(c, path, model, optim, state, None)
+}
+/// TCT chain state is written before the checkpoint directory becomes visible.
+pub(crate) fn checkpoint_with_tct(
+    c: &Config,
+    path: &Path,
+    model: &LanguageModel,
+    optim: &ModuleOptimizer,
+    state: &State,
+    tct: Option<&Value>,
+) -> Result<()> {
     if !path.exists() {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -207,6 +218,9 @@ pub(crate) fn checkpoint(
         model.clone().save_file(pending.join("model.burnpack"))?;
         optim.save(pending.join("optimizer.burnpack"))?;
         runtime::write_json(&pending.join("state.json"), state)?;
+        if let Some(chains) = tct {
+            runtime::write_json(&pending.join("tct.json"), chains)?;
+        }
         std::fs::rename(pending, path)?;
     } else {
         let previous: State = serde_json::from_slice(&std::fs::read(path.join("state.json"))?)?;
@@ -223,6 +237,16 @@ pub(crate) fn checkpoint(
             checkpoint::optimizer_file_signature(c, path.join("optimizer.burnpack"))?
                 == checkpoint::optimizer_signature(c, optim.into_bytes()?)?,
             "checkpoint destination collision: optimizer state differs; existing evidence was not overwritten"
+        );
+        let saved_tct = path.join("tct.json");
+        let previous_tct: Option<Value> = if saved_tct.exists() {
+            Some(serde_json::from_slice(&std::fs::read(saved_tct)?)?)
+        } else {
+            None
+        };
+        ensure!(
+            previous_tct.as_ref() == tct,
+            "checkpoint destination collision: TCT chain state differs"
         );
     }
     runtime::write_json(
@@ -241,6 +265,9 @@ pub fn run(
     device: &Device,
     resume: Option<&Path>,
 ) -> Result<Value> {
+    if c.sbd.as_ref().is_some_and(|s| s.training_mode == crate::tct::TrainingMode::Tct) {
+        return crate::tct::run(c, arm, seed, device, resume);
+    }
     let corpus = loaded_corpus(c)?;
     let validation = evaluations(c, corpus.as_ref(), "validation")?;
     let data = data_identity(c, corpus.as_ref(), &validation);

@@ -17,6 +17,9 @@ mod kron_benchmark;
 mod lm_retrieval;
 mod lngram;
 mod model;
+mod mask_energy;
+mod remask;
+mod tct;
 mod ohc;
 mod profile;
 mod prefix_retrieval;
@@ -48,7 +51,7 @@ fn execute() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     ensure!(
         args.len() >= 2,
-        "usage: delta-experiment <codpula-reference|codpula-model-reference|codpula-benchmark|codpula-diagnostic|prefix-retrieval-reference|prefix-retrieval-benchmark|prefix-retrieval-sbd-diagnostic|prefix-retrieval-sbd-benchmark|sbd-reference|sbd-batching-reference|sbd-batching-benchmark|sbd-batching-diagnostic|sbd-diagnostic|sbd-benchmark|sbd-train|sbd-generate|sbd-evaluate|reference|lngram-reference|lngram-benchmark|lngram-attribution|lngram-smoke|wavelet-reference|wavelet-benchmark|wavelet-smoke|ohc-reference|ohc-benchmark|ohc-learning-smoke|convolution-reference|normalization-reference|epilogue-reference|epilogue-benchmark|kron-reference|gdn-reference|gdn-directional-diagnostic|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|optimization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|gdn-benchmark|kron-model-benchmark|hola-benchmark|io-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256|fused_gdn2 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
+        "usage: delta-experiment <remask-reference|remask-generate|remask-collect|energy-fit|remask-benchmark|tct-reference|tct-train|tct-benchmark|codpula-reference|codpula-model-reference|codpula-benchmark|codpula-diagnostic|prefix-retrieval-reference|prefix-retrieval-benchmark|prefix-retrieval-sbd-diagnostic|prefix-retrieval-sbd-benchmark|sbd-reference|sbd-batching-reference|sbd-batching-benchmark|sbd-batching-diagnostic|sbd-diagnostic|sbd-benchmark|sbd-train|sbd-generate|sbd-evaluate|reference|lngram-reference|lngram-benchmark|lngram-attribution|lngram-smoke|wavelet-reference|wavelet-benchmark|wavelet-smoke|ohc-reference|ohc-benchmark|ohc-learning-smoke|convolution-reference|normalization-reference|epilogue-reference|epilogue-benchmark|kron-reference|gdn-reference|gdn-directional-diagnostic|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|optimization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|gdn-benchmark|kron-model-benchmark|hola-benchmark|io-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256|fused_gdn2 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
     );
     let command = &args[0];
     let c = Config::load(Path::new(&args[1]))?;
@@ -200,6 +203,7 @@ fn execute() -> Result<()> {
                 | "sbd-benchmark"
                 | "sbd-batching-benchmark"
                 | "codpula-benchmark"
+                | "remask-benchmark"
                 | "prefix-retrieval-benchmark"
                 | "prefix-retrieval-sbd-benchmark"
         ) || benchmark_warmups.is_none(),
@@ -233,6 +237,7 @@ fn execute() -> Result<()> {
                 | "lngram-attribution"
                 | "sbd-benchmark"
                 | "sbd-batching-benchmark"
+                | "remask-benchmark"
                 | "codpula-benchmark"
                 | "prefix-retrieval-benchmark"
                 | "prefix-retrieval-sbd-benchmark"
@@ -344,6 +349,27 @@ fn execute() -> Result<()> {
         }
     }
     let mut result = match command.as_str() {
+        "remask-reference" => {
+            let mut report = mask_energy::numerical_checks(&device)?;
+            report["runtime"] = remask::numerical_checks(&c,&device)?;
+            report
+        },
+        "tct-reference" => tct::numerical_checks(&device)?,
+        "energy-fit" => {
+            ensure!(resume.is_none() && arm_name.is_none() && seed == c.seed,
+                "energy-fit starts a fresh separate fit with its configured seed");
+            mask_energy::fit(&c,&device)?
+        },
+        "remask-generate" | "remask-collect" => {
+            let arm = c.arms.iter().find(|a|arm_name.is_none_or(|name|a.name==name)).context("arm name absent from config")?;
+            remask::checkpoint_report(&c,arm,seed,&device,resume.as_deref().context("remasking requires --resume CHECKPOINT")?,command=="remask-collect")?
+        },
+        "tct-train" => {
+            let arm = c.arms.iter().find(|a|arm_name.is_none_or(|name|a.name==name)).context("arm name absent from config")?;
+            tct::run(&c,arm,seed,&device,resume.as_deref())?
+        },
+        "tct-benchmark" => tct::benchmark(&c,&c.arms[0],seed,&device)?,
+        "remask-benchmark" => remask::benchmark(&c,&c.arms[0],seed,&device,benchmark_warmups.unwrap_or(2),benchmark_trials.unwrap_or(11))?,
         "codpula-reference" => codpula_reference::numerical_checks(&device)?,
         "codpula-model-reference" => codpula_model_checks::run(&c,&device)?,
         "codpula-continuation-reference" => codpula_model_checks::continuation_reference(&c,&device)?,

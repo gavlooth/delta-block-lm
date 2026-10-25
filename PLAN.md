@@ -289,18 +289,19 @@ Partially implemented: clean/masked objectives, soft feedback, frozen prefix rea
 
 **Gate:** any combined gain exceeds the extra partial-pass/circuit cost. Keep greedy joint-mode coordination distinct from stochastic joint sampling.
 
-### Step 11 — Test the user's energy-guided stochastic remasking
+### Step 11 — Implement the user's energy-guided stochastic remasking
 
-- Establish uniform R²D inside the active block and preserve the same eligible positions, remask counts and decode budget for each competing policy.
-- Train unary mask-set energies from a small set of paired equal-budget refinement trajectories; retain the uniform exploration mixture.
-- Compare against pure random and confidence/entropy diagnostics. Test on held-out trajectories, not the policy's training examples.
-- Add pairwise mask-set energies only after the unary experiment; include cases where jointly wrong tokens cannot be fixed one at a time.
-- Verify mask-set normalization/sampling by enumeration on small blocks; specify and measure any larger-block approximation.
-- Keep TCT as a separate training comparison so improved denoiser training is not mistaken for a policy gain.
+Implemented2026-10-25; exact design, director decisions and evidence: [docs/remasking.md](docs/remasking.md).
 
-**Deliverable:** random versus unary-energy versus pairwise-energy quality/cost curves, with policy-data generation cost reported.
+- Optional `sbd.refinement` implements R²D with K=eligible count, M_paper4/five calls per level, patience2, current Codpula FFBS and retained soft feedback. Final commitments/prefix remain immutable; new commitments wait until the episode ends.
+- Uniform, unary and pairwise are executable mask-set policies, not authorized quality-comparison arms. The learned law keeps epsilon0.1/T1 and exact fixed cardinality; unary uses stable host-f64 DP and pairwise enumerates all legal sets through L16, rejecting larger blocks. Features are contextual524->32; pairs are symmetric and include all within-block positions.
+- Actual frozen-model paired trajectory collection uses512 states/four pairs/H2 by default, identical work/draws per pair, half proposal-weighted swaps and half independent sets. Clean-target conditional joint NLL determines ranking; inactive/tied pairs get zero weight. Offline fitting trains unary first, then pair terms with predecessor softplus-margin semantics. No confidence threshold or deterministic correction-value head substitutes for this mechanism.
+- Explicit `sbd.training_mode:tct` implements streaming K_train4 chains, confidence0.9 plus scheduled minimum, all-free-position conditional joint NLL plus clean causal loss. Provisional inputs never become circuit evidence. Optional `tct.rows_per_pass` accumulates normalized neural gradients and unscaled circuit flows before one full-batch update; the selected B8 config uses four rows/pass, the first requested candidate that fit.
+- Numerical gates: exact-law enumeration/sampling, f64 energy/rank VJPs, state/RNG/immutability/padding/L1, joint TCT flows and exact chain/optimizer restart, CPU/Vulkan parity, old identities/checkpoints. Workspace tests85 passed/one pre-existing ignored; new remasking max abs3.30547e-6, TCT including row accumulation9.53674e-7, unchanged tolerance2e-5+3e-4*abs(ref).
+- Execution evidence: B1/T512 TCT per-block/batched medians17562.660/1845.395ms, 2warmups/11interleaved pairs; paired saving15711.721ms [15625.973,16349.399], so retain batched blocks. B8/T512/four-row accumulation:7267.660ms, sampled pool4399520256bytes after one warmup. B8 R²D resident-prefix episode:3342.933ms including clean replay, 38noisy batch calls; initial prefill is separate. These are execution costs, not quality evidence.
+- A pre-existing GPU continuation failure was reproduced on the unmodified Codpula base and repaired separately by deterministic native AdamW clipping (64590d18); fused optimizer arithmetic/records remain unchanged, historical causal checkpoint13 still passes.
 
-**Gate:** evidence that context-guided stochastic exploration improves on pure random at matched total work. A confidence threshold or deterministic correction-value head does not satisfy this step.
+**Deliverable/gate, as explicitly decided:** implemented commands/configs, numerical and exact-law gates, tiny context32 smokes for generation/collection/fitting/guided generation/TCT, execution measurements and documentation. No quality study, ablation, sweep, calibration grid or quality/cost curves were authorized or run.
 
 ### Step 12 — Scale only supported choices and test remaining mechanisms
 
@@ -324,3 +325,72 @@ Partially implemented: clean/masked objectives, soft feedback, frozen prefix rea
 - Keep prompt and completed-prefix tokens immutable in the initial model. Reopening completed blocks would require rebuilding recurrent state, exact-memory entries and convolution history from an earlier snapshot; it is a separate future experiment.
 - Never suppress nonfinite values or silently fall back to an independent head when the joint model fails. Preserve the failing example and report the error.
 - Build and benchmark commands have explicit time limits. A timeout is a recorded outcome, not a reason to leave a long command running while withholding the available result.
+
+## 9. Approved contextual, coordination and refinement composition
+
+Integration is isolated in `integrated11`, initially merging described parents
+`a0c173c5` and `b9e589b5`; clipping `64590d18` and deterministic Tensor Lngram
+`e50cc523` remain separate ancestors. The docs-only precision diagnosis
+`093d0085` (child of `b9e589b5`) and final described CoCommit parent join with
+another multi-parent change, without rebasing/squashing/abandoning described
+history. Preserve the original negative stress evidence and its independent
+primitive/cancellation diagnosis; it is not a production fix or a replacement
+for the unchanged actual-training objective gate. Main remains untouched until
+final gates and artifact review.
+
+The selected architecture and highest-return choices stand; this is composition
+of the approved features, not a new mechanism or a selection experiment:
+
+1. Keep permanent observations `O`, provisional reveals `R`, currently masked
+   positions `M`, and temporary announcement marks `S` distinct. Only the
+   episode-end write creates new permanent observations.
+2. Reuse CoCommit's saved noisy-prefix and shared A/B tail primitives. Unmarked
+   A selects a bundle; marked B restarts from the exact saved prefix, not from
+   A's tail state. Position-only HOLA membership and graph-free teacher changes
+   from the final CoCommit parent must be retained.
+   Production remask/TCT prefix, A/B tails and circuit preparation stay batched
+   across active blocks; do not call the single-block assignment helper in a row
+   loop. Host bundle choices may loop over metadata from a batched readback.
+   Generalize the existing output helper rather than launching one neural or
+   circuit graph per block. Explicit per-block correctness oracles are not the
+   production composition path.
+3. Standard R²D chooses `S subset M`; B jointly samples the revisable positions
+   with temporary proposal evidence `O+R` and carries R. Correction mode chooses
+   `S subset A` for `A=valid minus O`, and B may revise R. Use one coherent
+   B-prepared joint proposal, never splice A/B samples. Marks are neither
+   evidence nor final commitments. If S is empty, use A unchanged, skip B and
+   record the skipped marked pass. Feedback/energy always use the chosen
+   output's O-only full marginals and final hidden states.
+4. TCT retains unmarked all-free correction joint NLL given O, including wrong
+   provisional R. B's additional joint event targets its announced S subset A,
+   leaving other free positions marginalized. Observed-potential masking is
+   only O. Detached B proposals/marginals advance the existing confidence reveal
+   chain; its earlier provisional errors remain inputs as specified by TCT.
+   Combine neural gradients and circuit flows/counts with CoCommit's branch
+   weighting before one optimizer/circuit update.
+5. Preserve exact accumulation, not a smaller batch: ordinary SBD/CoCommit uses
+   explicit `sbd.rows_per_pass`, sampling full-batch masks/bundles once. TCT uses
+   its separate persistent-chain `tct.rows_per_pass`; the two accumulators must
+   never nest. Both retain original B*T reduction, indexed RNG and one update.
+6. Record a combination-specific algorithm revision in training/pilot identity
+   only when CoCommit composes with refinement or TCT. Old standalone/omitted
+   identities remain unchanged. Tracked configs consist of one contextual+
+   CoCommit+refinement configuration and matching TCT configuration, without
+   sparse retrieval in toy defaults or a factorial grid.
+7. Count logical R²D iterations separately from shared prefix, A/B tail/head
+   calls, circuit preparations/queries/FFBS and final clean replay. Existing
+   standalone timing tables remain historical for their own profiles and are
+   not same-cost combined-model comparisons.
+
+Final acceptance waits for the final CoCommit parent: workspace tests and
+actual Vulkan CLI; independent contextual root/event/flow, noisy-HOLA,
+retrieval-active-K/V, exact mask/energy and TCT references; combined CPU/Vulkan
+fixtures with/without real layer-3 MoBA and all requested execution layouts;
+one-B-distribution/O-R-S/marker-gradient and exact full optimizer/chain restart
+checks; historical identities/checkpoints; actual context32 combined
+train/save/load/evaluate/generate, real collection/rank-fit/guided generation,
+five-update-plus-resumed-step TCT smokes; and one full B8/T512 accumulated
+training diagnostic. Keep negative radial-stress evidence separate from
+acceptance of the actual normalized objective. No quality study, sweep,
+calibration grid, OOM fallback, lower batch/context or extra training is
+authorized. Owned scratch payloads are removed only after their proof.

@@ -227,6 +227,10 @@ pub struct SbdConfig {
     /// None selects fixed-count commitment; Some selects paper equation 8 (nats).
     pub entropy_threshold: Option<f64>,
     pub generate_tokens: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refinement: Option<crate::remask::RefinementConfig>,
+    #[serde(skip_serializing_if = "crate::tct::TrainingMode::is_sbd")]
+    pub training_mode: crate::tct::TrainingMode,
 }
 impl Default for SbdConfig {
     fn default() -> Self {
@@ -237,7 +241,8 @@ impl Default for SbdConfig {
             commitment: SbdCommitment::Fixed, dependence_threshold: dependence_threshold(),
             candidate_width: 4, commit_count: 2, entropy_threshold: None, generate_tokens: 32,
             in_block_reads: delta_mixers::sbd::InBlockReads::None,
-            noisy_read_backend: delta_mixers::sbd::NoisyReadBackend::Tensor }
+            noisy_read_backend: delta_mixers::sbd::NoisyReadBackend::Tensor,
+            refinement: None, training_mode: crate::tct::TrainingMode::Sbd }
     }
 }
 
@@ -251,6 +256,8 @@ pub struct Config {
     /// Omitted means the historical causal architecture and serialized config.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sbd: Option<SbdConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tct: Option<crate::tct::TctConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefix_block_retrieval: Option<delta_mixers::prefix_retrieval::PrefixBlockRetrieval>,
     #[serde(skip_serializing_if = "delta_mixers::prefix_retrieval::PrefixRetrievalBackend::is_tensor")]
@@ -349,6 +356,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             sbd: None,
+            tct: None,
             prefix_block_retrieval: None,
             prefix_block_retrieval_backend: delta_mixers::prefix_retrieval::PrefixRetrievalBackend::Tensor,
             task: "recall".into(),
@@ -428,6 +436,11 @@ impl Config {
         Ok(c)
     }
     pub fn validate(&self) -> Result<()> {
+        if let Some(tct) = &self.tct {
+            ensure!(tct.rows_per_pass > 0, "tct.rows_per_pass must be positive");
+            ensure!(self.sbd.as_ref().is_some_and(|s|!s.training_mode.is_sbd()),
+                "tct settings require TCT training_mode");
+        }
         if let Some(retrieval) = &self.prefix_block_retrieval {
             ensure!(self.chunk_size > 0 && retrieval.block_size > 0
                 && retrieval.block_size % self.chunk_size == 0,
@@ -461,6 +474,22 @@ impl Config {
                 || (sbd.joint_output.is_codpula()
                     && matches!(self.backend.as_str(),"vulkan" | "cuda") && !self.fusion),
                 "sbd.joint_execution=fused_gpu requires Codpula and explicit non-fusion GPU execution");
+            if let Some(refinement) = &sbd.refinement {
+                ensure!(sbd.block_lengths.iter().all(|&n| n <= 16),
+                    "remasking supports block lengths at most 16");
+                ensure!(sbd.feedback == SbdFeedback::SoftFeedback && !self.hard_mask_only,
+                    "remasking requires retained soft feedback");
+                ensure!(refinement.states > 0 && refinement.pairs_per_state > 0
+                    && refinement.horizon > 0 && refinement.fit_steps > 0
+                    && refinement.fit_batch > 0, "remasking training counts must be positive");
+            }
+            if !sbd.training_mode.is_sbd() {
+                ensure!(!sbd.joint_output.is_factorized()
+                    && sbd.block_execution == SbdBlockExecution::Batched,
+                    "TCT requires batched Codpula output");
+                ensure!(sbd.feedback == SbdFeedback::SoftFeedback && !self.hard_mask_only,
+                    "TCT requires retained soft feedback");
+            }
             ensure!(
                 sbd.noisy_read_backend.is_tensor()
                     || (matches!(self.backend.as_str(),"vulkan" | "cuda") && !self.fusion
@@ -743,6 +772,38 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn remasking_and_tct_omission_preserve_existing_identity() {
+        let c = Config {task:"lm".into(),sbd:Some(SbdConfig::default()),..Config::default()};
+        let omitted = serde_json::to_value(&c).unwrap();
+        assert!(omitted.get("tct").is_none());
+        assert!(omitted["sbd"].get("refinement").is_none());
+        assert!(omitted["sbd"].get("training_mode").is_none());
+        let mut explicit = omitted.clone();
+        explicit["sbd"]["refinement"] = serde_json::Value::Null;
+        explicit["sbd"]["training_mode"] = "sbd".into();
+        let restored: Config = serde_json::from_value(explicit).unwrap();
+        assert_eq!(omitted,serde_json::to_value(&restored).unwrap());
+        assert_eq!(c.training_fingerprint(2048).unwrap(),restored.training_fingerprint(2048).unwrap());
+        let mut enabled = c.clone();
+        enabled.sbd.as_mut().unwrap().refinement = Some(Default::default());
+        assert_ne!(c.pilot_fingerprint().unwrap(),enabled.pilot_fingerprint().unwrap());
+        enabled.sbd.as_mut().unwrap().block_lengths = vec![17];
+        assert!(enabled.validate().is_err());
+        let mut tct = c.clone();
+        tct.sbd.as_mut().unwrap().training_mode = crate::tct::TrainingMode::Tct;
+        assert!(tct.validate().is_err());
+        tct.sbd.as_mut().unwrap().joint_output = SbdJointOutput::Codpula;
+        tct.sbd.as_mut().unwrap().block_execution = SbdBlockExecution::Batched;
+        assert!(tct.validate().is_ok());
+        assert_ne!(c.training_fingerprint(2048).unwrap(),tct.training_fingerprint(2048).unwrap());
+        let unchunked=tct.training_fingerprint(2048).unwrap();
+        tct.tct=Some(crate::tct::TctConfig {rows_per_pass:1});
+        assert!(tct.validate().is_ok());
+        assert_ne!(unchunked,tct.training_fingerprint(2048).unwrap());
+        tct.tct.as_mut().unwrap().rows_per_pass=0;
+        assert!(tct.validate().is_err());
+    }
     #[test]
     fn prefix_retrieval_serialization_and_identity() {
         let baseline = Config::default();
