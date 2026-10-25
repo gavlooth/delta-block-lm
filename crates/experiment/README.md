@@ -36,7 +36,7 @@ The scoped model benchmark requires and preserves the real failed legacy report,
 
 Do not chain the expected failing diagnostic with `&&`. If the legacy checks instead pass on your backend/version, use the strict all-path benchmark; do not construct fake failed evidence.
 
-Run commands from the workspace root. The reference and soft-feedback commands are numerical checks, not training results. Step 7 adds opt-in causal Lngram injections; no SBD/block-denoising training is included.
+Run commands from the workspace root. The reference and soft-feedback commands are numerical checks, not training results. Step 7 adds opt-in causal Lngram injections. SBD training, generation and evaluation are implemented, but the within-block attention design remains undecided; see `docs/sbd.md`.
 
 ## Build and local device policy
 
@@ -382,7 +382,13 @@ isolated objectives are not additive full-step speedup estimates.
 
 `soft` is a vocabulary port of the copied relation state's convex probability update, separate visibility, expected-embedding/mask mixing, and proposal/retained-value distinction. It keeps selected probability mass rather than silently renormalizing truncated top-k candidates. Discarded probability mass contributes the mask embedding. Candidate selection is discrete, but selected weights and embeddings retain gradients. Ties use ascending vocabulary ID.
 
-The command checks sparse/full-support and truncated-support expectation and selected-weight/embedding gradients against the dense path, full-support convex updates, zero-mass behavior, deterministic ties, immutable observations, inactive padding, and visibility-only remasking that retains beliefs and answers. Hidden/padded poison values are excluded before products, and invisible mask embeddings are excluded at full visibility; endpoint poison checks cover outputs and gradients while preserving failures for active nonfinite embeddings. Each round records IDs, absolute weights, retained mass, visibility, provisional IDs and retained IDs. `soft_candidate_width`, `soft_steps`, `soft_eta`, `soft_temperature`, and `hard_mask_only` are independent configuration fields. The hard-mask-only option is only a comparison. There is no learned energy selector, circuit, commitment policy, or SBD implementation here.
+The command checks sparse/full-support and truncated-support expectation and selected-weight/embedding gradients against the dense path, full-support convex updates, zero-mass behavior, deterministic ties, immutable observations, inactive padding, and visibility-only remasking that retains beliefs and answers. Hidden/padded poison values are excluded before products, and invisible mask embeddings are excluded at full visibility; endpoint poison checks cover outputs and gradients while preserving failures for active nonfinite embeddings. Each round records IDs, absolute weights, retained mass, visibility, provisional IDs and retained IDs. `soft_candidate_width`, `soft_steps`, `soft_eta`, `soft_temperature`, and `hard_mask_only` are independent configuration fields. The hard-mask-only option is only a comparison. This standalone command does not implement an energy selector, circuit or commitment policy.
+
+## SBD architecture status
+
+`sbd-reference`, `sbd-train`, `sbd-generate` and `sbd-evaluate` retain the recurrent clean-prefix path, HOLA reads and replay. The added dense active-block attention and its dedicated oracle have been removed without replacement. Sparse/within-block attention awaits explicit selection; Step 8 is not a completed bidirectional block-denoiser architecture.
+
+Historical dense-attention SBD checkpoints are incompatible with the current SBD identity and must not be resumed or evaluated as the current architecture. Configurations without `sbd` keep their historical identity. Restore the former implementation from `saved-block-local-attention` (`cd1f1d54`) if explicitly requested.
 
 ## Deterministic recall and paired comparisons
 

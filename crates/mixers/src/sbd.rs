@@ -1,20 +1,5 @@
-//! Exact active-block attention. The caller supplies only noisy-block Q/K/V.
+//! Clean-prefix snapshots for SBD recurrence, frozen HOLA reads, and wavelet history.
 use burn::{prelude::*, tensor::activation::softmax};
-
-/// Axes are [batch,time,head,channel]. Padding contributes neither keys nor queries.
-pub fn attention(q: Tensor<4>, k: Tensor<4>, v: Tensor<4>, valid: Tensor<2>) -> Tensor<4> {
-    let [b, t, h, d] = q.dims();
-    let dv = v.dims()[3];
-    let inactive = valid.clone().lower_elem(0.5).reshape([b,t,1,1]);
-    let q = q.mask_fill(inactive.clone().expand([b,t,h,d]),0.0);
-    let k = k.mask_fill(inactive.clone().expand([b,t,h,d]),0.0);
-    let v = v.mask_fill(inactive.clone().expand([b,t,h,dv]),0.0);
-    let visible = valid.clone().reshape([b, 1, 1, t]).greater_elem(0.5);
-    let logits = q.swap_dims(1, 2).matmul(k.swap_dims(1, 2).swap_dims(2, 3)) / (d as f64).sqrt();
-    let probabilities = softmax(logits.mask_fill(visible.bool_not(), -1.0e30), 3);
-    probabilities.matmul(v.swap_dims(1, 2)).swap_dims(1, 2)
-        .mask_fill(inactive.expand([b,t,h,dv]),0.0)
-}
 
 use crate::{Mixer, MixerKind, chunk, hola};
 use burn::tensor::activation::{sigmoid,silu};
@@ -110,10 +95,9 @@ impl Mixer {
         let erase = sigmoid(self.erase.forward(input.clone())).reshape([b,n,self.heads,ew]);
         let write = sigmoid(self.write.forward(input.clone())).reshape([b,n,self.heads,ww]);
         let recurrent = chunk::scan_selected(self.scan_backend,self.kind,chunk::ScanInput {
-            q:single(q.clone()),k:single(k.clone()),v:single(v.clone()),alpha:single(alpha),erase:single(erase),write:single(write),
+            q:single(q),k:single(k),v:single(v),alpha:single(alpha),erase:single(erase),write:single(write),
         },Tensor::ones([b*n,1],&device),Tensor::zeros([b*n,1],&device),self.chunk_size,Some(initial));
-        let mut mixed = recurrent.output.reshape([b,n,self.heads,self.value_dim])
-            + attention(q,k,v,Tensor::ones([b,n],&device));
+        let mut mixed = recurrent.output.reshape([b,n,self.heads,self.value_dim]);
         if let Some(cache) = &self.cache {
             let query = hola::normalize(self.hola_backend,self.normalization_backend,&cache.q_norm,rq).swap_dims(1,2);
             let cut = start/self.chunk_size*self.chunk_size;

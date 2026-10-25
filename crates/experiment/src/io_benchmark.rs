@@ -261,7 +261,7 @@ fn shape(
     );
     let state = train::State {
         schema: 1,
-        config_sha256: data::hash(&serde_json::to_vec(&(c, c.resolved_tokens()?))?),
+        config_sha256: c.training_fingerprint(c.resolved_tokens()?)?,
         data: train::data_identity(c, Some(corpus), &validation),
         arm: arm.name.clone(),
         seed: c.seed,

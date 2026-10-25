@@ -213,7 +213,21 @@ pub fn generate(model: &LanguageModel, c: &Config, prompt: &[i32], device: &Devi
     Ok(json!({"tokens":generated,"text":String::from_utf8_lossy(&generated.iter().map(|&x| x as u8).collect::<Vec<_>>()),"finalized_tokens":generated.len(),"finalized_tokens_per_second":generated.len() as f64/seconds,"seconds":seconds,"denoising_passes":passes,"blocks":blocks,"causally_replayed_tokens":clean.replayed,"includes_replay":true,"prefill_included":false,"replay_implementation":"full clean-prefix reconstruction once per finalized block; no incremental optimization","commit_rule":if s.entropy_threshold.is_some() {"sbd_entropy_eq8"} else {"fixed_count"}}))
 }
 
+fn validate_checkpoint_identity(c: &Config, arm: &Arm, seed: u64, saved: &crate::train::State) -> Result<()> {
+    ensure!(c.sbd.is_some(), "SBD config is required");
+    ensure!(
+        saved.schema == 1
+            && saved.config_sha256 == c.training_fingerprint(c.resolved_tokens()?)?
+            && saved.arm == arm.name
+            && saved.seed == seed,
+        "SBD checkpoint mismatch: model semantics, config, arm or seed changed; dense-attention SBD checkpoints are incompatible"
+    );
+    Ok(())
+}
+
 pub fn checkpoint_report(c: &Config, arm: &Arm, seed: u64, device: &Device, checkpoint: &Path, with_generation: bool) -> Result<Value> {
+    let saved: crate::train::State = serde_json::from_slice(&std::fs::read(checkpoint.join("state.json"))?)?;
+    validate_checkpoint_identity(c,arm,seed,&saved)?;
     device.seed(seed);
     let model = crate::checkpoint::load_model(LanguageModel::new(c,arm,device)?,checkpoint.join("model.burnpack"),device)?;
     let corpus = crate::train::loaded_corpus(c)?;
@@ -235,8 +249,35 @@ fn identical(a: &[f32], b: &[f32], label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Compares model readbacks with the existing fixed numerical tolerance.
+fn compare<T: Copy + Into<f64>>(actual: &[T], reference: &[f64]) -> Result<Value> {
+    const ABSOLUTE_TOLERANCE: f64 = 2e-5;
+    const RELATIVE_TOLERANCE: f64 = 3e-4;
+    ensure!(actual.len() == reference.len(), "SBD comparison lengths differ");
+    let mut maximum_absolute_error = 0.0f64;
+    let mut maximum_tolerance_ratio = 0.0f64;
+    for (i, (&actual, &reference)) in actual.iter().zip(reference).enumerate() {
+        let actual = actual.into();
+        let error = (actual - reference).abs();
+        let ratio = error / (ABSOLUTE_TOLERANCE + RELATIVE_TOLERANCE * reference.abs());
+        ensure!(
+            actual.is_finite() && reference.is_finite() && ratio <= 1.0,
+            "SBD element {i}: {actual} vs {reference}, absolute error {error}, tolerance ratio {ratio}"
+        );
+        maximum_absolute_error = maximum_absolute_error.max(error);
+        maximum_tolerance_ratio = maximum_tolerance_ratio.max(ratio);
+    }
+    Ok(json!({
+        "passed": true,
+        "compared_elements": reference.len(),
+        "max_abs": maximum_absolute_error,
+        "maximum_tolerance_ratio": maximum_tolerance_ratio,
+        "absolute_tolerance": ABSOLUTE_TOLERANCE,
+        "relative_tolerance": RELATIVE_TOLERANCE,
+    }))
+}
+
 pub fn reference(c: &Config, device: &Device) -> Result<Value> {
-    let attention = crate::sbd_reference::numerical_checks(device)?;
     let mut reports = Vec::new();
     let cpu = Device::ndarray().autodiff();
     let gpu = device.clone().autodiff();
@@ -292,14 +333,14 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
                 let soft_gpu = state(&cfg,observed.clone(),&gpu)?;
                 let ref_logits = block_forward(&base,&prefix,&soft_cpu,false,&cpu);
                 let actual_logits = block_forward(&tested,&prefix,&soft_gpu,false,&gpu);
-                let logits_report = crate::sbd_reference::compare(&values(actual_logits.clone()),&values(ref_logits.clone()).iter().map(|&x| x as f64).collect::<Vec<_>>())?;
+                let logits_report = compare(&values(actual_logits.clone()),&values(ref_logits.clone()).iter().map(|&x| x as f64).collect::<Vec<_>>())?;
                 let mut full = prefix.clone();
                 full.extend([31,32,33,34,35,36]);
                 let mut trace = crate::sbd_training::CleanInputs::default();
                 let _ = tested.forward_profiled(&prefix_batch(&full,&gpu),&mut trace);
                 let snapshot = tested.training_cache(&trace,0,&[1,9,17,19]);
                 let cached = tested.cached_block(&snapshot,3,&soft_gpu,false);
-                let cached_report = crate::sbd_reference::compare(&values(cached.clone()),&values(actual_logits.clone()).iter().map(|&x|x as f64).collect::<Vec<_>>())?;
+                let cached_report = compare(&values(cached.clone()),&values(actual_logits.clone()).iter().map(|&x|x as f64).collect::<Vec<_>>())?;
                 let objective = |model: &LanguageModel, logits: Tensor<3>| logits.square().mean() + model.sbd_mask.as_ref().unwrap().val().sum()*0.0;
                 let ref_grads = model::checked_gradients(&base,objective(&base,ref_logits))?;
                 let actual_grads = model::checked_gradients(&tested,objective(&tested,actual_logits))?;
@@ -361,7 +402,7 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
                 let short = state(&cfg,vec![None;2],device)?;
                 let short = values(block_forward(&inference,&prefix,&short,false,device));
                 // Different GEMM lengths can alter arithmetic; padding comparison uses the fixed numerical tolerance.
-                let padding = crate::sbd_reference::compare(&padded[..2*cfg.vocab()],&short.iter().map(|&x| x as f64).collect::<Vec<_>>())?;
+                let padding = compare(&padded[..2*cfg.vocab()],&short.iter().map(|&x| x as f64).collect::<Vec<_>>())?;
                 reports.push(json!({"mixer":mixer,"cache":cache,"step7":step7,"logits":logits_report,"cached_training_logits":cached_report,"cached_training_gradient_max_abs":cached_gradient_error,"cached_training_future_bit_identical":true,"all_parameter_gradients_max_abs":gradient_error,"lengths":lengths,"padding":padding,"noisy_snapshot_unchanged":true,"replay_logits_bit_identical":true,"replay_recurrent_states_bit_identical":true,"replayed_tokens":replay.replayed}));
             }
         }
@@ -370,12 +411,41 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
     soft_config.soft_selection_backend = crate::config::SoftSelectionBackend::Cpu;
     soft_config.hard_mask_only = false;
     let soft = crate::soft::episode(&soft_config,device)?;
-    Ok(json!({"passed":true,"absolute_tolerance":2e-5,"relative_tolerance":3e-4,"attention_f64":attention,"full_model_cases":reports,"soft_feedback":soft,"reset_semantics":"Each Example is one document. BOS resets every clean replay; blocks never span examples. Padding freezes recurrence and is excluded from exact attention/history.","reference_scope":"Composed existing f64 recurrent/convolution/Step7 references plus new scalar f64 active-block attention/VJP; complete noisy model CPU/GPU logits and all parameter gradients."}))
+    Ok(json!({"passed":true,"absolute_tolerance":2e-5,"relative_tolerance":3e-4,"full_model_cases":reports,"soft_feedback":soft,"reset_semantics":"Each Example is one document. BOS resets every clean replay; blocks never span examples. Padding freezes recurrence and is excluded from clean-prefix HOLA/history.","reference_scope":"Composed existing f64 recurrent/convolution/Step7 references; complete noisy model CPU/GPU logits and all parameter gradients, cached/reconstructed equivalence, locality and replay. No new bidirectional active-block attention is implemented."}))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn checkpoint_rejects_old_dense_model_identity() {
+        let c = Config { task: "lm".into(), sbd: Some(crate::config::SbdConfig::default()), ..Config::default() };
+        let arm = &c.arms[0];
+        let mut saved = crate::train::State {
+            schema: 1,
+            config_sha256: crate::data::hash(&serde_json::to_vec(&(&c,c.resolved_tokens().unwrap())).unwrap()),
+            data: Value::Null,
+            arm: arm.name.clone(),
+            seed: c.seed,
+            step: 0,
+            tokens: 0,
+            training_seconds: 0.0,
+            initial_evaluation: Value::Null,
+        };
+        assert!(validate_checkpoint_identity(&c,arm,c.seed,&saved).is_err());
+        saved.config_sha256 = c.training_fingerprint(c.resolved_tokens().unwrap()).unwrap();
+        validate_checkpoint_identity(&c,arm,c.seed,&saved).unwrap();
+    }
+    #[test]
+    fn comparison_reports_errors_and_rejects_nonfinite_or_wrong_shapes() {
+        let report = compare(&[1.0001f32, 0.0], &[1.0, 0.0]).unwrap();
+        assert!(report["max_abs"].as_f64().unwrap() > 0.0);
+        assert_eq!(report["compared_elements"], 2);
+        assert!(compare(&[1.01], &[1.0]).is_err());
+        assert!(compare(&[f64::NAN], &[0.0]).is_err());
+        assert!(compare(&[0.0], &[f64::INFINITY]).is_err());
+        assert!(compare(&[0.0], &[]).is_err());
+    }
     #[test]
     fn variable_evaluation_covers_every_length_on_one_example() {
         let device = Device::ndarray();

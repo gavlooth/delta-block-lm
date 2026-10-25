@@ -1,10 +1,12 @@
-# Experimental plan
+# Architecture implementation and optimization plan
 
-Status: Steps 1–8 implemented and exercised on CPU and local Intel Vulkan; measured results and checkpoint-load correction are in [RESULTS.md](RESULTS.md). Step 8 has short training smoke evidence, not a quality or speedup conclusion; its independent candidate-width sweep remains unmeasured. Steps 9–12 are not implemented.
+Status: Steps 1–7 implemented and exercised on CPU and local Intel Vulkan; Step 8 is partially implemented, with sparse/within-block attention undecided pending explicit user selection. The added dense active-block attention has been removed; HOLA's pre-existing attention is unchanged. Measured results and checkpoint-load correction are in [RESULTS.md](RESULTS.md). Prior Step-8 checks and short training smokes describe the historical dense-attention implementation, not the current architecture or a quality/speedup conclusion. Steps 9–12 are not implemented.
+
+**Scope override — explicit user instruction:** implement and optimize the given architecture. Its components are requirements, not candidates that must win architecture-selection experiments. Correctness checks and focused runtime/memory measurements may verify an implementation optimization. Do not launch quality ablations, architecture comparisons, candidate sweeps, alternative-mechanism studies or research training runs unless the user explicitly requests them. This overrides experimental comparisons, sweeps and quality-adoption gates elsewhere in this document; those passages are historical proposals, not executable tasks. Steps 9–12 are implementation/optimization work only where they implement the specified architecture, not authorization to add alternatives.
 
 ## 1. Goal and fixed decisions
 
-Build a small, measurable semi-autoregressive block-denoising language model, then scale only mechanisms that improve the quality/cost trade-off. The predecessor is `diffusion-relation-extractor`; a rewrite is acceptable, and its relation-specific output heads and ontology constraints are not requirements for this LLM.
+Build and optimize the specified semi-autoregressive block-denoising language model. The predecessor is `diffusion-relation-extractor`; its relation-specific output heads and ontology constraints are not requirements for this LLM.
 
 - Rust, Burn and custom CubeCL kernels. Intel Arc/Vulkan locally; DGX Spark/CUDA for larger runs after arranging GPU access. Follow `AGENTS.md` for build limits, mold, debug-free tests and experiment records.
 - Gated DeltaNet-2 (GDN-2) is the reference mixer. KronLSTM + HOLA is the principal challenger against GDN-2 + HOLA, not an assumed winner.
@@ -12,7 +14,7 @@ Build a small, measurable semi-autoregressive block-denoising language model, th
 - Use Set Block Decoding (SBD) as the initial semi-autoregressive recipe. Block length, computational chunk length and tokens committed per denoising step are separate variables.
 - Preserve the predecessor's soft top-k diffusion mechanism as the block-denoising baseline: probability-weighted candidate feedback, separate visibility, and revisable proposals. Hard-mask-only feedback is an ablation, not a replacement. Add joint token prediction, coordination before writes, and revision after provisional writes on this foundation.
 - Energy-guided stochastic remasking is the user's research proposal against pure random remasking. It must not be replaced by confidence ranking or a deterministic correction-value predictor.
-- A more complicated mechanism must earn its place through measured quality, memory and latency, not just mathematical compatibility.
+- Preserve the specified architecture while optimizing execution time and memory. Verify numerical correctness; do not require components to earn inclusion through quality comparisons.
 
 ## 2. Sources and evidence boundaries
 
@@ -70,7 +72,7 @@ The predecessor sources needed for these components are copied under `reuse/crat
 |---|---|
 | `dre-gdn2/` | Existing CubeCL chunked scan, forward/backward operators, sequential reference and tests; adapt bidirectional encoder use to causal-prefix/block semantics |
 | `dre-core/` | Sequence layout, mixed-precision helpers and profiling; keep only dependencies needed by the new components |
-| `dre-attention/` | Existing attention kernels and reference checks; adapt masks to active-block and exact-cache reads |
+| `dre-attention/` | Existing attention kernels and reference checks for exact-cache reads; any sparse/within-block attention reuse awaits explicit user selection |
 | `dre-wavelet/`, `dre-ohc/`, `dre-lngram/` | Existing implementations and tests; preserve the three Lngram components and verify causal/block visibility before training |
 | `dre-relations/src/state.rs` | Soft distributions and separate visibility state |
 | `dre-relations/src/denoiser.rs` | Probability-weighted expected embeddings mixed with mask embeddings; adapt field embeddings to vocabulary candidates |
@@ -90,7 +92,7 @@ Initial block lengths: fixed 4, 8 and 16 plus a variable-length condition. These
 
 Proposed recurrent adaptation:
 1. Compute clean-prefix states and exact-memory contents.
-2. Noisy positions read the clean state before their block. They exchange information bidirectionally inside the block through an explicit exact-attention path.
+2. Noisy positions read the clean state before their block. Sparse/within-block attention remains undecided pending explicit user selection. The added dense active-block path is removed; no new bidirectional attention path is currently implemented. HOLA's existing attention is unchanged.
 3. Repeated denoising and coordination passes use that same clean-prefix snapshot; they do not advance persistent state.
 4. Causally replay the finalized block before extending the prefix.
 
@@ -161,7 +163,7 @@ R²D's convergence results do not transfer automatically to state-dependent mask
 
 ## 7. Step-by-step execution checklist
 
-Steps 1–8 are implemented and exercised as small pilots. Numerical, soft-feedback, build and checkpoint-continuation checks passed; three-seed recall and tiny-LM experiments were run and independently reevaluated from validated checkpoints. Recall remains near guessing, so its architecture-selection gate is not met and no retrieval winner is asserted. Tiny-LM learning is demonstrated at a deliberately short budget, not at production scale. Step 7 added causal oHC, wavelet and three Lngram injections with verified gradients and optimized kernels; their quality contribution is still under evaluation. Step 8 implements clean causal plus masked-block training, soft feedback, frozen prefix reads and clean replay; visibility checks and fixed/variable-length training smokes pass. Candidate-width sweeps, meaningful SBD quality comparisons and full-context efficiency remain unmeasured. Steps 9–12 remain pending. See [RESULTS.md](RESULTS.md) and [docs/sbd.md](docs/sbd.md).
+Steps 1–7 are implemented and exercised as small pilots. Numerical, soft-feedback, build and checkpoint-continuation checks passed; three-seed recall and tiny-LM experiments were run and independently reevaluated from validated checkpoints. Recall remains near guessing, so its historical architecture-selection gate is not met and no retrieval winner is asserted. Tiny-LM learning is demonstrated at a deliberately short budget, not at production scale. Step 7 added causal oHC, wavelet and three Lngram injections with verified gradients and optimized kernels; quality benefit remains unestablished, and the cancelled quality ablation must not be resumed. Step 8 retains clean causal plus masked-block training, soft feedback, frozen prefix reads and clean replay, but is partial: the added dense active-block attention is removed and sparse/within-block attention awaits explicit user selection. Its prior visibility checks and fixed/variable-length training smokes are historical evidence for the removed dense-attention implementation, not verification of the current architecture. Steps 9–12 remain pending. The scope override above remains in force. See [RESULTS.md](RESULTS.md) and [docs/sbd.md](docs/sbd.md).
 
 ### Step 1 — Create the small active Burn workspace
 
@@ -243,22 +245,22 @@ Steps 1–8 are implemented and exercised as small pilots. Numerical, soft-feedb
 
 **Deliverable:** the requested small backbone with attributable component measurements.
 
-**Gate:** every addition has a measured cost and quality result. If an addition is harmful or ambiguous, record it and test a specific alternative; do not silently remove it from the target design.
+**Gate:** measure component costs and verify correctness. **DO NOT IMPLEMENT OR RUN the Step 7 quality ablation against the pre-Step-7 baseline.** Cancelled by explicit user instruction; do not resume, extend, or replace it unless the user explicitly requests it. Quality benefit remains unestablished. Keep the implemented components.
 
 ### Step 8 — Train the SBD-style block-denoising path
 
-Implementation and reference gates complete; fixed/variable-length and hard-mask runs are context-32 training smokes only. Independent candidate-width sweep remains unmeasured. See [docs/sbd.md](docs/sbd.md).
+Partially implemented: clean/masked objectives, soft feedback, frozen prefix reads and clean replay remain. The added dense active-block attention and its attention-only oracle are removed; sparse/within-block attention is undecided pending explicit user selection. Prior reference gates and context-32 fixed/variable-length and hard-mask training smokes are historical evidence for the removed implementation, not completion or verification of the current attention architecture. See [docs/sbd.md](docs/sbd.md). The scope override prohibits new comparisons and sweeps without explicit user instruction.
 
 - Add the clean causal objective plus masked future-block objective, retaining the soft top-k input/update mechanism from Step 3.
-- Noisy positions read the clean state before their block and communicate within the active block; they do not advance persistent state.
+- Noisy positions read the clean state before their block without advancing persistent state. Sparse/within-block attention is not yet selected or implemented; do not substitute dense attention or another mechanism.
 - Verify short convolutions, wavelet taps, Lngram routing and exact-memory reads obey this visibility rule.
 - Causally replay each finalized block exactly once before extending the prefix.
 - Compare fixed block lengths 4/8/16 with a variable-length training condition, keeping computational chunk length independent. Include length 1 as a causal limiting-case check.
 - Sweep candidate width separately. Add larger blocks and learned/adaptive boundaries only after measuring the fixed/variable references; do not impose 16 as a permanent limit.
 
-**Deliverable:** a trainable and runnable semi-autoregressive soft top-k model.
+**Deliverable (partial):** training, soft top-k feedback and clean replay are implemented; the semi-autoregressive attention architecture remains incomplete pending explicit user selection.
 
-**Gate:** no future-target leakage; prefix replay agrees with causal execution; block NLL/accuracy and finalized tokens/s are reported. Hard-mask-only feedback is the ablation, not the default.
+**Gate (partial):** retain checks for future-target leakage and agreement between prefix replay and causal execution. Prior block NLL/accuracy and finalized tokens/s are historical dense-attention measurements, not current-architecture results. The removed attention oracle does not cover any future selected operator. Hard-mask-only feedback remains a historical ablation, not the default or authorization for a new run.
 
 ### Step 9 — Add Codpula's joint output and adaptive commitment
 

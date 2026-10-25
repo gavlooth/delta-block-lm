@@ -176,6 +176,9 @@ impl Default for SbdConfig {
     }
 }
 
+// Fixed model semantics, not a configurable attention implementation.
+const SBD_MODEL_REVISION: &str = "sbd-recurrence-only-v1";
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -579,10 +582,21 @@ impl Config {
     pub fn tokens_per_step(&self) -> usize {
         self.context * self.batch_size
     }
+    pub fn training_fingerprint(&self, target_tokens: usize) -> Result<String> {
+        let bytes = if self.sbd.is_some() {
+            serde_json::to_vec(&(self, target_tokens, SBD_MODEL_REVISION))?
+        } else {
+            // Preserve historical causal checkpoint and metrics identities.
+            serde_json::to_vec(&(self, target_tokens))?
+        };
+        Ok(crate::data::hash(&bytes))
+    }
     pub fn pilot_fingerprint(&self) -> Result<String> {
-        Ok(crate::data::hash(&serde_json::to_vec(
-            &serde_json::json!({"config":self,"precision":"float32","training_algorithm":self.scan_backend.training_algorithm(),"optimizer":"AdamW"}),
-        )?))
+        let mut identity = serde_json::json!({"config":self,"precision":"float32","training_algorithm":self.scan_backend.training_algorithm(),"optimizer":"AdamW"});
+        if self.sbd.is_some() {
+            identity["sbd_model_revision"] = SBD_MODEL_REVISION.into();
+        }
+        Ok(crate::data::hash(&serde_json::to_vec(&identity)?))
     }
     pub fn resolved_tokens(&self) -> Result<usize> {
         if let Some(path) = &self.budget_file {
@@ -944,6 +958,20 @@ mod tests {
         c.validate().unwrap();
         c.fusion = true;
         assert!(c.validate().is_err());
+    }
+    #[test]
+    fn sbd_revision_changes_only_enabled_model_fingerprints() {
+        let causal = Config::default();
+        let target_tokens = causal.train_tokens;
+        let legacy_training = |c: &Config| crate::data::hash(&serde_json::to_vec(&(c, target_tokens)).unwrap());
+        let legacy_pilot = |c: &Config| crate::data::hash(&serde_json::to_vec(
+            &serde_json::json!({"config":c,"precision":"float32","training_algorithm":c.scan_backend.training_algorithm(),"optimizer":"AdamW"}),
+        ).unwrap());
+        assert_eq!(causal.training_fingerprint(target_tokens).unwrap(), legacy_training(&causal));
+        assert_eq!(causal.pilot_fingerprint().unwrap(), legacy_pilot(&causal));
+        let enabled = Config { task: "lm".into(), sbd: Some(SbdConfig::default()), ..causal };
+        assert_ne!(enabled.training_fingerprint(target_tokens).unwrap(), legacy_training(&enabled));
+        assert_ne!(enabled.pilot_fingerprint().unwrap(), legacy_pilot(&enabled));
     }
     #[test]
     fn sbd_defaults_preserve_causal_serialization() {

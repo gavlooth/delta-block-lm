@@ -19,7 +19,6 @@ mod profile;
 mod runtime;
 mod scan_benchmark;
 mod sbd;
-mod sbd_reference;
 mod sbd_training;
 mod soft;
 mod soft_benchmark;

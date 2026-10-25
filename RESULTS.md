@@ -4,7 +4,7 @@ For the current optimized execution paths, measured speedups and known legacy GP
 
 ## Scope and stopping point
 
-Implemented and exercised the active Burn workspace, causal GDN-2 and KronLSTM, optional HOLA/recency memory, soft top-k feedback, paired associative-recall experiments, and a tiny causal language-model comparison. The Steps 1–6 sections below predate Step 7, which is reported separately at the end. SBD training, Codpula, CoCommit and energy-guided remasking are later work.
+Implemented and exercised the active Burn workspace, causal GDN-2 and KronLSTM, optional HOLA/recency memory, soft top-k feedback, paired associative-recall experiments, and a tiny causal language-model comparison. The Steps 1–6 sections below predate Step 7, which is reported separately at the end. Step 8 is partially implemented: training and replay remain, but the added dense active-block attention has been removed and sparse/within-block attention awaits explicit user selection. Its prior measurements are historical, not evidence for the current architecture. Codpula, CoCommit and energy-guided remasking remain later work.
 
 All runs used the local Intel Arc Graphics (MTL) through Vulkan, with float32 execution. No Spark or predecessor production process was used or modified.
 Run artifacts report sampled backend-reserved memory and explicit recurrent/cache/convolution storage. Exact GPU peak memory is not available here; the integrated GPU shares system memory, so reserved-pool samples must not be presented as exact physical-device peaks.
@@ -1572,11 +1572,11 @@ step). Absolute medians of the same configuration varied by up to 1.5×
 between sessions on this integrated GPU, so only within-session paired
 differences are used for decisions.
 
-### Visibility rules for Step 8 (subsequently exercised; see docs/sbd.md)
+### Retained Step-8 visibility rules (historically exercised; see docs/sbd.md)
 
-Step 7 is causal-only. For SBD, where noisy active-block positions read the
-clean prefix and communicate inside the active block without advancing
-persistent state:
+Step 7 is causal-only. The retained SBD paths read the clean prefix without
+advancing persistent state. These component rules do not select or implement
+sparse/within-block attention:
 
 - **oHC** is per token: active-block positions run the same stages on their
   own streams. Mask and candidate embeddings enter through the same stream
@@ -1585,8 +1585,7 @@ persistent state:
 - **Wavelet** taps reaching before the block read the clean prefix
   representation; taps inside the block read the active-block
   representation. With left-only taps, in-block communication is
-  left-to-right. Two-sided in-block taps would be a separate, measured
-  variant restricted to the block.
+  left-to-right; it is not a bidirectional attention path.
 - **Lngram** codes come from hidden states: suffix windows reaching before
   the block use clean-prefix codes, and windows inside the block use
   active-block codes. Smoothing and suffixes never read positions after `t`.
@@ -1609,12 +1608,12 @@ flock /tmp/delta-block-lm-gpu.lock timeout 900s target/debug/delta-experiment ln
 Details: `docs/optimization/{ohc,wavelet,lngram}.md`. Evidence:
 `artifacts/integration/step7/{gates,paired,final}/`, `artifacts/step7/`.
 
-## Step 8: recurrent block denoising
+## Step 8: recurrent block denoising — partial implementation
 
-Implemented clean causal plus masked future-block training, detached soft top-k feedback by default, hard-mask comparison, frozen clean-prefix recurrence/HOLA reads, bidirectional active-block attention, and clean replay after finalization. Existing causal configurations retain their serialization and architecture when `sbd` is absent.
+Clean causal plus masked future-block training, detached soft top-k feedback by default, hard-mask support, frozen clean-prefix recurrence/HOLA reads, and clean replay after finalization remain implemented. The added dense active-block attention and its attention-only scalar oracle have been removed. Sparse/within-block attention is undecided pending explicit user selection; there is no new bidirectional active-block attention path. HOLA's pre-existing attention is unchanged. Existing causal configurations retain their serialization and architecture when `sbd` is absent.
 
-CPU and Vulkan reference gates passed all eight mixer × HOLA × Step-7 combinations, including future-target leakage, an inside-chunk block start, padding, the length-one causal limit, and exact replay. Detailed numerical errors, commands and artifacts are in [docs/sbd.md](docs/sbd.md).
+**Historical evidence only:** the CPU and Vulkan reference gates passed all eight mixer × HOLA × Step-7 combinations before dense attention was removed, including future-target leakage, an inside-chunk block start, padding, the length-one causal limit, and exact replay. Those passes and the removed oracle's output/VJP checks do not verify the current architecture or an undecided attention operator. Detailed historical numerical errors, commands and artifacts are in [docs/sbd.md](docs/sbd.md); no new measurement is asserted here.
 
-Fixed lengths 1/4/8/16, variable lengths and hard-mask feedback have end-to-end training smoke evidence at context 32, batch 1, four steps per condition. These establish execution, not useful quality or a speedup. The original variable-length evaluation covered L1 only with one example; the corrected evaluation-only report covers every configured length without retraining. Keep the original metrics as historical evidence.
+The historical implementation, which included dense active-block attention with a causal length-one special case, has end-to-end training smoke evidence for fixed lengths 1/4/8/16, variable lengths and hard-mask feedback at context 32, batch 1, four steps per condition. These establish execution of that earlier implementation only, not current-architecture quality or speed. The original variable-length evaluation covered L1 only with one example; the corrected evaluation-only report covers every configured length without retraining. All original and corrected metrics remain historical evidence.
 
-Full-context efficiency, independent candidate-width sweeps and meaningful quality comparisons remain unmeasured. No Step 9–12 implementation is included.
+Step 8's attention architecture is incomplete until the user explicitly selects the sparse/within-block design. Full-context efficiency, independent candidate-width results and meaningful quality conclusions remain unestablished; no new experiments or replacement are specified. No Step 9–12 implementation is included.

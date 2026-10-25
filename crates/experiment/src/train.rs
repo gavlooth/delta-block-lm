@@ -219,7 +219,7 @@ pub fn run(
     let data = data_identity(c, corpus.as_ref(), &validation);
     let target_tokens = c.resolved_tokens()?;
     let quantum = c.tokens_per_step();
-    let fingerprint = data::hash(&serde_json::to_vec(&(c, target_tokens))?);
+    let fingerprint = c.training_fingerprint(target_tokens)?;
     ensure!(
         target_tokens >= quantum && target_tokens % quantum == 0,
         "token budget must be a positive multiple of batch*context ({quantum})"
@@ -645,7 +645,7 @@ pub(crate) fn metrics_contract(
 ) -> Result<Value> {
     Ok(
         json!({"schema":1,"measurement_implementation_version":MEASUREMENT_VERSION,"task":c.task,
-        "config_sha256":data::hash(&serde_json::to_vec(&(c,target_tokens))?),"target_tokens":target_tokens,
+        "config_sha256":c.training_fingerprint(target_tokens)?,"target_tokens":target_tokens,
         "data":data,"device":device,"precision":"float32","optimizer":"AdamW",
         "all_model_parameters_trained":true,"training_algorithm":c.arms[0].training_algorithm(c),"custom_gpu_kernel_proof":c.arms[0].uses_custom_gpu(c)}),
     )

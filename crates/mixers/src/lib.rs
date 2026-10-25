@@ -500,7 +500,7 @@ impl Mixer {
             sigmoid(write).reshape([b, t, self.heads, write_width])
         });
         let recurrent = profile.section("Recurrent scan", || {
-            let inputs = chunk::ScanInput { q: q.clone(), k: k.clone(), v: v.clone(), alpha, erase, write };
+            let inputs = chunk::ScanInput { q, k, v, alpha, erase, write };
             if let Some(start) = block_start {
                 assert!(start > 0 && start < t);
                 let take = |x: Tensor<4>, first: usize, last: usize| {
@@ -525,10 +525,8 @@ impl Mixer {
                     alpha: single(inputs.alpha), erase: single(inputs.erase), write: single(inputs.write),
                 }, valid.clone().slice([0..b, start..t]).reshape([b*n, 1]),
                 reset.clone().slice([0..b, start..t]).reshape([b*n, 1]), self.chunk_size, Some(initial));
-                let exact = sbd::attention(take(q, start, t), take(k, start, t),
-                    take(v, start, t), valid.clone().slice([0..b, start..t]));
                 chunk::ScanOutput {
-                    output: Tensor::cat(vec![prefix.output, active.output.reshape([b,n,self.heads,self.value_dim]) + exact], 1),
+                    output: Tensor::cat(vec![prefix.output, active.output.reshape([b,n,self.heads,self.value_dim])], 1),
                     scores: Tensor::cat(vec![prefix.scores, Tensor::zeros([b,n,self.heads,1], &input.device())], 1),
                     final_state: prefix.final_state,
                 }
