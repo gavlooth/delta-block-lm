@@ -711,10 +711,20 @@ mod tests {
         c.ohc_streams = false;
         assert!(c.validate().is_err());
         c.ohc_streams = true;
-        c.ohc_backend = delta_mixers::ohc::OhcBackend::FusedReadWrite;
-        c.validate().unwrap();
-        c.d_model = 1025;
-        assert!(c.validate().is_err());
+        for backend in [
+            delta_mixers::ohc::OhcBackend::FusedReadWrite,
+            delta_mixers::ohc::OhcBackend::FusedGate,
+            delta_mixers::ohc::OhcBackend::TransposedGate,
+        ] {
+            c.ohc_backend = backend;
+            c.d_model = 256;
+            c.validate().unwrap();
+            let encoded = serde_json::to_value(&c).unwrap();
+            let decoded: Config = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded.ohc_backend, backend);
+            c.d_model = 1025;
+            assert!(c.validate().is_err());
+        }
     }
     #[test]
     fn legacy_selector_defaults_without_changing_serialized_identity() {

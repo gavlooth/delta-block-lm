@@ -179,12 +179,14 @@ impl OhcStage {
             self.d_model
         );
 
-        let flat = streams.clone().cast(burn::tensor::DType::F32).reshape([
-            batch,
-            tokens,
-            STREAMS * width,
-        ]);
-        let projected = backend.gate_norm(streams.clone(), self.gate_projection.forward(flat));
+        let projected = if matches!(backend, OhcBackend::FusedGate | OhcBackend::TransposedGate) {
+            backend.project_gate(streams.clone(), self.gate_projection.weight.val())
+        } else {
+            let flat = streams.clone().cast(burn::tensor::DType::F32).reshape([
+                batch, tokens, STREAMS * width,
+            ]);
+            backend.gate_norm(streams.clone(), self.gate_projection.forward(flat))
+        };
 
         let read_weights = sigmoid(
             projected.clone().narrow(2, 0, STREAMS) * self.read_scale.val().unsqueeze::<3>()

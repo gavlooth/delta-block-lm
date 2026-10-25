@@ -20,13 +20,37 @@ pub enum OhcBackend {
     Tensor,
     FusedGpu,
     FusedReadWrite,
+    FusedGate,
+    TransposedGate,
 }
 impl OhcBackend {
     pub fn is_tensor(&self) -> bool {
         *self == Self::Tensor
     }
     pub fn fused_read(&self) -> bool {
-        *self == Self::FusedReadWrite
+        matches!(self, Self::FusedReadWrite | Self::FusedGate | Self::TransposedGate)
+    }
+    /// Gate projection and flattened-stream RMS; all choices preserve the same W.
+    pub fn project_gate(&self, streams: Tensor<4>, weight: Tensor<2>) -> Tensor<3> {
+        let [b, t, _, d] = streams.dims();
+        if *self == Self::FusedGate {
+            #[cfg(any(feature = "vulkan", feature = "cuda"))]
+            {
+                return delta_kernels::ohc_gate_project(streams, weight);
+            }
+            #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
+            {
+                let _ = (streams, weight);
+                panic!("fused oHC has no CPU fallback");
+            }
+        }
+        let flat = streams.clone().cast(burn::tensor::DType::F32).reshape([b * t, 4 * d]);
+        let projected = if *self == Self::TransposedGate {
+            weight.transpose().matmul(flat.transpose()).transpose()
+        } else {
+            flat.matmul(weight)
+        };
+        self.gate_norm(streams, projected.reshape([b, t, 16]))
     }
     pub fn gate_norm(&self, streams: Tensor<4>, projected: Tensor<3>) -> Tensor<3> {
         if self.fused_read() {
@@ -86,7 +110,7 @@ impl OhcBackend {
                 rotation.matmul(streams)
                     + gates.unsqueeze_dim::<4>(3) * update.unsqueeze_dim::<4>(2)
             }
-            Self::FusedGpu | Self::FusedReadWrite => {
+            Self::FusedGpu | Self::FusedReadWrite | Self::FusedGate | Self::TransposedGate => {
                 #[cfg(any(feature = "vulkan", feature = "cuda"))]
                 {
                     delta_kernels::ohc_write(streams, rotation, gates, update)

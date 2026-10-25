@@ -94,3 +94,9 @@ mod ohc_read;
 mod ohc_read_ops;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 pub use ohc_read_ops::{ohc_gate_norm, ohc_quaternion, ohc_weighted_read};
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod ohc_gate;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod ohc_gate_ops;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+pub use ohc_gate_ops::ohc_gate_project;

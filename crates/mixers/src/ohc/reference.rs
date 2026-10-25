@@ -285,12 +285,15 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
             OhcBackend::Tensor,
             OhcBackend::FusedGpu,
             OhcBackend::FusedReadWrite,
+            OhcBackend::FusedGate,
+            OhcBackend::TransposedGate,
         ]
     } else {
         vec![OhcBackend::Tensor]
     };
     let write_cases = write_checks(&device, &modes)?;
     let read_cases = read_component_checks(&device, &modes)?;
+    let projection_cases = projection_checks(&device, &modes)?;
     let mut cases = Vec::new();
     for (tokens, d) in [(1, 3), (5, 7), (17, 3)] {
         for zero in [false, true] {
@@ -612,7 +615,7 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
         passed: true,
         absolute_tolerance: 2e-5,
         relative_tolerance: 3e-4,
-        cases: [cases, write_cases, read_cases].concat(),
+        cases: [cases, write_cases, read_cases, projection_cases].concat(),
         so4: serde_json::json!({"qtq_max_abs":worst,"determinant_error":det_error,"squared_norm_error":norm_error,"initial_q_minus_i_max_abs":near_identity,"identity_init_max_abs":identity}),
     })
 }
@@ -879,6 +882,67 @@ fn read_component_checks(
                 max = max.max(compare("read all input gradients", actual, expected)?);
             }
             cases.push(serde_json::json!({"read_primitives_independent_f64":true,"backend":backend,"strided_streams_projected_gates_weights_gamma_logits_adjoints":strided,"custom_norm_epsilon":epsilon,"max_abs_error":max}));
+        }
+    }
+    Ok(cases)
+}
+
+/// Separate f64 projection oracle, including multiple deterministic reduction tiles.
+fn projection_checks(device: &Device, modes: &[OhcBackend]) -> Result<Vec<serde_json::Value>, String> {
+    let mut cases = Vec::new();
+    let (b, t, d) = (2, 129, 7);
+    for zero in [false, true] {
+        for strided in [false, true] {
+            let raw = |n: usize, a: f32| (0..n).map(|i| if zero { 0. } else { ((i + 1) as f32 * a).sin() * 0.3 }).collect::<Vec<_>>();
+            let x = if strided {
+                Tensor::<4>::from_data(TensorData::new(raw(b*t*4*d, 0.13), [b,t,d,4]), device).swap_dims(2,3)
+            } else {
+                Tensor::<4>::from_data(TensorData::new(raw(b*t*4*d, 0.13), [b,t,4,d]), device)
+            }.require_grad();
+            let w = if strided {
+                Tensor::<2>::from_data(TensorData::new(raw(4*d*16, 0.17), [16,4*d]), device).transpose()
+            } else {
+                Tensor::<2>::from_data(TensorData::new(raw(4*d*16, 0.17), [4*d,16]), device)
+            }.require_grad();
+            let adj = Tensor::<3>::from_data(TensorData::new((0..b*t*16).map(|i| ((i+1) as f32 * 0.19).cos() * 0.2).collect::<Vec<_>>(), [b,16,t]), device).swap_dims(1,2);
+            let (xv, wv, av) = (values(x.clone()), values(w.clone()), values(adj.clone()));
+            let mut tape = Tape::default();
+            let xi: Vec<_> = xv.iter().map(|&v| tape.constant(v as f64)).collect();
+            let wi: Vec<_> = wv.iter().map(|&v| tape.constant(v as f64)).collect();
+            let mut expected = Vec::new();
+            let mut loss = tape.constant(0.);
+            for n in 0..b*t {
+                let row = &xi[n*4*d..(n+1)*4*d];
+                let inv = tape.inv_norm(row, 1. / (4*d) as f64, 1e-6);
+                for j in 0..16 {
+                    let terms: Vec<_> = (0..4*d).map(|k| tape.mul(row[k], wi[k*16+j])).collect();
+                    let dot = tape.sum(&terms);
+                    let y = tape.mul(dot, inv);
+                    expected.push(tape.v[y]);
+                    let term = tape.scale(y, av[n*16+j] as f64);
+                    loss = tape.add(loss, term);
+                }
+            }
+            let grads = tape.gradients(loss);
+            let dx: Vec<_> = xi.iter().map(|&i| grads[i]).collect();
+            let dw: Vec<_> = wi.iter().map(|&i| grads[i]).collect();
+            for &backend in modes.iter().filter(|m| m.fused_read()) {
+                let run = || backend.project_gate(x.clone(), w.clone());
+                let y = run();
+                let mut error = compare("projected gate", &values(y.clone()), &expected)?;
+                let g = (y * adj.clone()).sum().backward();
+                error = error.max(compare("gate projection dx", &values(x.grad(&g).ok_or("projection dx")?), &dx)?);
+                let actual_dw = values(w.grad(&g).ok_or("projection dw")?);
+                error = error.max(compare("gate projection dw", &actual_dw, &dw)?);
+                for _ in 0..2 {
+                    let g = (run() * adj.clone()).sum().backward();
+                    let repeat = values(w.grad(&g).ok_or("repeated projection dw")?);
+                    if actual_dw.iter().zip(&repeat).any(|(a,b)| a.to_bits() != b.to_bits()) {
+                        return Err(format!("nondeterministic gate weight gradient: {backend:?}"));
+                    }
+                }
+                cases.push(serde_json::json!({"projection_independent_f64":true,"backend":backend,"batch":b,"tokens":t,"width":d,"zeros":zero,"strided_streams_weights_adjoints":strided,"weight_gradient_bitwise_repeats":3,"max_abs_error":error}));
+            }
         }
     }
     Ok(cases)

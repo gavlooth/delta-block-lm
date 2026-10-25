@@ -184,3 +184,74 @@ The four-trajectory final run samples **1,159,548,352 bytes** of pool reservatio
 `backward-profile` is intentionally unchanged: its full-model runner includes enabled oHC, but its existing independent mixer/MLP component fixtures do not attribute oHC. Use `ohc-attribution` for the new pieces, or interpret that older profiler's residual coverage as including them.
 
 The final selected reference report contains **49 cases**, all passing. Its largest raw component-gradient difference is `0.002126` in the zero-input pipeline; all elements satisfy the unchanged `2e-5 + 3e-4 * abs(reference)` criterion. Across all backends, the final SO(4) maxima remain `3.293e-7` for `QᵀQ-I`, `4.815e-7` for determinant error, and `3.586e-7` for squared norm error; exact identity initialization remains bit-exact.
+
+## Combined Step-7 gate-projection candidates
+
+Two additional execution selectors keep the parameter layout, four-stream architecture, existing selectors and tensor default unchanged:
+
+- **`fused_gate`** replaces the skinny gate GEMM and flattened-stream RMS with one token-local CubeCL operation. Each 256-thread workgroup computes all 16 projection channels, sharing the tree reductions over 16 input partitions. It reads the existing `[4d,16]` weight directly; loading the entire D256 weight into shared memory would require 64 KiB per group, so this candidate does not do that. The analytic input VJP also computes the projected adjoint. Weight gradients use shared 32-token by 16-feature/16-channel tiles, one partial per 128 tokens, then a fixed-order second-pass sum. There are no float atomics. Forward uses one launch; backward uses three. Gate scale/bias/sigmoid, the existing weighted-read primitive, quaternion primitive and fused write retain their existing implementations.
+- **`transposed_gate`** reuses the library GEMM as `[16,4d] × [4d,BT]`, then transposes the result to `[BT,16]` and uses the existing fused flattened RMS, weighted read, quaternion map and write. The long token dimension becomes GEMM N rather than M. Transposes are views where the library accepts them; any materialization required by library projection or reshape is included in the timings. No alternate weight parameter or checkpoint layout is introduced.
+
+These deliberately test the largest attributed read-side cost without rewriting the entire read and its seven trainable gate inputs at once. Both retain the ordinary differentiable sigmoid epilogues, so their remaining launch cost is visible rather than attributed to projection fusion.
+
+`ohc-reference` includes both candidates in the complete independent-f64 pipeline and adds a separate scalar-tape projection check over B2/T129/D7, with multiple partial-reduction tiles and a tail. It checks projection outputs, stream gradients and every weight gradient for contiguous and strided streams, weights and adjoints, including zeros. Each weight-gradient result must repeat bit-for-bit across three evaluations. The complete model gate uses the configuration's explicit candidate selector. `ohc-benchmark` selects a three-arm paired comparison against `fused_read_write` when either new selector is requested, and also checks three bitwise-identical gate-weight gradients at the measured B/T/D.
+
+For B8/T512/D256 the custom projection retains the existing 256 KiB projected output and allocates a 256 KiB projected adjoint plus 2 MiB of temporary weight partials during backward. Neither new selector adds parameters. The combined model has 14 stages (eight mixer/MLP, three wavelet and three Lngram), so retained stream-input tensor sizes sum to 224 MiB; this is not an allocator peak. Readout and stream initialization are unchanged.
+
+### Gate-projection correctness and reproduction
+
+Both Vulkan reference commands pass **93 component cases** with the unchanged `2e-5 + 3e-4 * abs(reference)` tolerance. The dedicated projection cases have maximum error **4.511e-7** for `fused_gate` and **1.020e-6** for `transposed_gate`; all three repeated weight gradients are bitwise identical. Across the complete component suite the largest raw error remains **0.002126** in a zero-input gradient whose reference magnitude is large; every element satisfies the same tolerance.
+
+The CPU complete-model gate and all 17 CPU component cases pass. Against the CPU model, `fused_gate` has logits/every-parameter-gradient/first-AdamW-update maximum errors **1.192e-7 / 4.917e-7 / 2.757e-7**; `transposed_gate` has **1.192e-7 / 4.694e-7 / 2.757e-7**. Both causal/document perturbation errors are zero, with internal resets, padding and tail length nine.
+
+From the `s7-ohcgate` workspace root, the build and acceptance commands are:
+
+```sh
+../build.sh s7-ohcgate
+timeout 180s /tmp/delta-bins/s7-ohcgate/delta-experiment ohc-reference artifacts/step7/ohcgate/reference-cpu.json
+flock /tmp/delta-block-lm-gpu.lock flock /tmp/delta-block-lm-build.lock timeout 240s /tmp/delta-bins/s7-ohcgate/delta-experiment ohc-reference artifacts/step7/ohcgate/reference-fused.json
+flock /tmp/delta-block-lm-gpu.lock flock /tmp/delta-block-lm-build.lock timeout 240s /tmp/delta-bins/s7-ohcgate/delta-experiment ohc-reference artifacts/step7/ohcgate/reference-transposed.json
+flock /tmp/delta-block-lm-gpu.lock flock /tmp/delta-block-lm-build.lock timeout 600s /tmp/delta-bins/s7-ohcgate/delta-experiment ohc-benchmark artifacts/step7/ohcgate/paired-ohc.json --warmups 2 --trials 11
+flock /tmp/delta-block-lm-gpu.lock flock /tmp/delta-block-lm-build.lock timeout 300s /tmp/delta-bins/s7-ohcgate/delta-experiment ohc-attribution artifacts/step7/ohcgate/paired-ohc.json
+```
+
+The measured local-package development build takes **7.61 seconds** (zero lock wait). There are no dependency, feature, profile or crate-layout changes. The only build warnings are the existing `Device::ndarray` deprecations.
+
+### Combined measurement and selection
+
+`artifacts/step7/ohcgate/paired-ohc.json` is a copy of `artifacts/integration/step7/paired-ohc.json`, changing only `artifact_dir` and the explicit oHC selector. Wavelet and Lngram remain `fused_gpu` on blocks 0–2, alongside all eight mixer/MLP oHC stages. The benchmark uses identical model parameters, training windows, seed one and optimizer settings across independent trajectories. There are two warmups and 11 paired, rotating/reversed trials per arm, on Intel Arc MTL / Vulkan / Mesa 26.2.4, f32, fusion and autotune off. Complete steps include all gradient checks, clipping and AdamW.
+
+| B8/T512/D256/four blocks, combined configuration | `fused_read_write` | `fused_gate` | `transposed_gate` |
+|---|---:|---:|---:|
+| Complete guarded-step median, ms | 2026.663 | **1763.317** | 1835.388 |
+| Paired baseline-minus-candidate median, ms | — | **263.346** | 198.485 |
+| Paired difference MAD, ms | — | 15.492 | 13.738 |
+| Candidate wins | — | 11/11 | 11/11 |
+| Complete-step launches | 5592 | 5550 | 5578 |
+| Isolated stage pipeline F, ms | 19.904 | 16.097 | **15.007** |
+| Isolated stage pipeline F+B, ms | 83.111 | **64.317** | 67.458 |
+| Isolated stage pipeline F / F+B launches | 61 / 196 | 60 / 193 | 61 / 195 |
+
+The isolated pipeline includes stream initialization, one full read/write with `F(u)=0.2u`, and learned normalized readout; it is not the read primitive alone. At the actual B8/T512/D256 shape, all three gate-weight gradients repeat bit-for-bit across three evaluations. The complete benchmark finishes in 87.86 seconds. Sampled pool reservation is 1,609,421,376 bytes across all scratch trajectories and allocator reuse, not single-model peak memory.
+
+The same two-warmup/11-trial attribution protocol gives:
+
+| Resident per-stage piece | F, ms | F+B, ms | F / F+B launches |
+|---|---:|---:|---:|
+| Original gate GEMM only | 5.711 | 23.553 | 1 / 13 |
+| Original fused flattened RMS only | 0.732 | 1.585 | 1 / 11 |
+| `fused_gate` projection plus flattened RMS | 2.535 | **6.787** | 1 / 13 |
+| Transposed library projection plus flattened RMS | **1.889** | 9.170 | 2 / 15 |
+| `fused_read_write` complete read | 8.332 | 33.764 | 30 / 87 |
+| `fused_gate` complete read | 4.307 | **14.587** | 29 / 84 |
+| `transposed_gate` complete read | **3.482** | 17.543 | 30 / 86 |
+| Existing fused per-stream RMS plus weighted read | 1.076 | 3.746 | 1 / 12 |
+| Existing fused quaternion map | 0.289 | 0.632 | 1 / 11 |
+| Readout, once per model | 9.044 | 38.913 | 24 / 96 |
+| Tensor gate RMS and sigmoid epilogue | 1.715 | 9.156 | 32 / 100 |
+
+Attribution F+B launch counts include each piece's own square-sum objective and gradient traversal, not just its custom kernels. The custom projection itself has one forward and three backward launches. Rows with different objectives or independent intermediates are not additive timings. Readout, gate sigmoid epilogues and stream initialization remain unchanged; the main measured gain comes from replacing the badly shaped projection and its backward, not from eliminating all elementwise launches.
+
+**Decision:** select explicit **`ohc_backend: "fused_gate"`** for this combined B8/T512 workload. Its paired complete-step gain is **263.346 ms**, approximately **13.0%** of the same-run baseline median, with 11/11 wins and a median difference well above twice its MAD. It also beats the transposed candidate in all 11 paired trials: median transposed-minus-fused **76.373 ms**, MAD **16.725 ms**. Keep `transposed_gate` as the measured library alternative; it is faster forward-only but slower for training. Existing selectors and defaults are unchanged. The measured run does not include an oHC-off arm, so it does not establish a new architecture-overhead number; the historical 2514 ms combined baseline is not a paired comparison with this run.
+
+Both enabled candidates have 7,082,167 parameters, equal to `fused_read_write`. Relative to the same combined architecture without oHC, the 14 stages plus initialization/readout add 239,631 parameters (958,524 f32 bytes); neither candidate changes that cost. This result selects an execution path for the existing small Step-7 workload, not a quality conclusion or authorization to scale it.
