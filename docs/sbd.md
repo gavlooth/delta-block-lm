@@ -10,6 +10,15 @@ With `sbd` absent, the architecture, config serialization, random initialization
 
 Enabled-SBD training and pilot configuration fingerprints include a recurrence-only semantic revision after dense attention removal. Although tensor shapes are unchanged, old dense-SBD checkpoints are rejected for resume, `sbd-evaluate` and `sbd-generate`; they remain historical artifacts, not current-model inputs. Configurations without `sbd` retain their hashes.
 
+The optional model selector `prefix_block_retrieval` extends HOLA's single
+softmax with the always-visible own-block clean prefix plus top-k completed
+same-document earlier blocks; it is off in existing SBD configurations.
+All noisy queries use own block `floor(start/B)`, including positions across
+a B boundary; cached/unfinished-chunk duplicates are excluded. The
+recurrence-only descriptions below apply when the new selector is omitted. See
+[prefix block retrieval](optimization/prefix-block-retrieval.md) for exact
+semantics, execution selectors, independent numerical checks and costs.
+
 For each training sequence, choose one entry of `sbd.block_lengths` uniformly, then partition its target positions with that length, including a short final block. A singleton entry is a fixed-length condition. The variable condition can use `[1,4,8,16]` or the paper's `[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]`. Draw one sequence-level mask probability uniformly in (0,1), and independent Bernoulli masks. Unmasked targets inside the active block are explicit observed evidence, including targets to the right of a masked position. No other future targets are visible.
 
 The objective is clean causal mean NLL plus the sum of masked block NLLs divided by the number of clean targets. This is equation 14's sum objective with a common token normalization, not an independently mask-normalized auxiliary loss. All-observed draws contribute zero masked loss. A detached first noisy pass supplies top-k candidate IDs, original probability weights and retained mass. The second pass uses Step 3's weighted embedding plus the mask embedding, with visibility `1 / soft_steps`. Selection is discrete; the second pass's embedding values remain differentiable. The mask is a separate trainable vector. Teacher probabilities are detached deliberately, rather than training through a proposal-generation graph. Hard-mask training skips this teacher pass.

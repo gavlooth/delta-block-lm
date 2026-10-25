@@ -18,6 +18,8 @@ pub mod convolution;
 pub mod gdn2_reference;
 pub use convolution::ConvolutionBackend;
 mod hola;
+pub mod prefix_retrieval;
+pub mod prefix_checks;
 pub mod lngram;
 pub mod normalization;
 pub mod ohc;
@@ -242,6 +244,7 @@ impl MixerConfig {
             cache_policy: self.cache_policy,
             scan_backend: self.scan_backend,
             hola_backend: self.hola_backend,
+            prefix_retrieval: None,
             projection_backend: self.projection_backend,
             normalization_backend: self.normalization_backend,
             convolution_backend: self.convolution_backend,
@@ -312,6 +315,8 @@ pub struct Mixer {
     #[module(skip)]
     hola_backend: HolaBackend,
     #[module(skip)]
+    prefix_retrieval: Option<prefix_retrieval::PrefixReadConfig>,
+    #[module(skip)]
     projection_backend: ProjectionBackend,
     #[module(skip)]
     normalization_backend: NormalizationBackend,
@@ -378,6 +383,15 @@ impl Mixer {
             chunk::assert_fused_device(&self.q.weight.val().device());
         }
         self.hola_backend = backend;
+    }
+    pub fn set_prefix_retrieval(&mut self, config: prefix_retrieval::PrefixReadConfig) {
+        assert!(self.cache.is_some(), "prefix retrieval requires HOLA");
+        assert!(config.block_size > 0 && config.block_size % self.chunk_size == 0);
+        assert!(config.blocks_per_query > 0);
+        if !config.backend.is_tensor() {
+            assert_eq!((self.key_dim,self.value_dim),(32,64));
+        }
+        self.prefix_retrieval = Some(config);
     }
     pub fn forward(&self, input: Tensor<3>) -> Tensor<3> {
         let [b, t, _] = input.dims();
@@ -555,7 +569,25 @@ impl Mixer {
                     ),
                 )
             });
-            let exact = if let Some(start) = block_start {
+            let exact = if let Some(config) = self.prefix_retrieval {
+                if P::CAPTURE_CACHE_MEMBERSHIP && block_start.is_none() {
+                    let replay = profile.replayed_cache_selection();
+                    let prefix_replay = profile.replayed_prefix_visibility();
+                    let (read,selections) = hola::read_prefix_with_selection(cache_q,cache_k,raw_v,
+                        recurrent.scores,valid.clone(),documents,self.cache_capacity,self.chunk_size,
+                        self.cache_policy,cache.sink.val(),config,replay.as_deref(),prefix_replay.as_deref());
+                    for selection in selections {
+                        profile.cache_membership(selection.chunk_start,selection.chunk_start+self.chunk_size<t,
+                            &selection.kept_slots,&selection.positions);
+                        profile.prefix_visibility(selection.prefix_visible.as_ref());
+                    }
+                    read.output
+                } else {
+                    hola::read_prefix(cache_q, cache_k, raw_v, recurrent.scores,
+                        valid.clone(), documents, self.cache_capacity, self.chunk_size,
+                        self.cache_policy, cache.sink.val(), block_start, config)
+                }
+            } else if let Some(start) = block_start {
                 hola::read_frozen(cache_q, cache_k, raw_v, recurrent.scores,
                     valid.clone(), documents, self.cache_capacity, self.chunk_size,
                     self.cache_policy, cache.sink.val(), start, self.hola_backend)

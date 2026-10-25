@@ -1610,10 +1610,41 @@ Details: `docs/optimization/{ohc,wavelet,lngram}.md`. Evidence:
 
 ## Step 8: recurrent block denoising — partial implementation
 
-Clean causal plus masked future-block training, detached soft top-k feedback by default, hard-mask support, frozen clean-prefix recurrence/HOLA reads, and clean replay after finalization remain implemented. The added dense active-block attention and its attention-only scalar oracle have been removed. Sparse/within-block attention is undecided pending explicit user selection; there is no new bidirectional active-block attention path. HOLA's pre-existing attention is unchanged. Existing causal configurations retain their serialization and architecture when `sbd` is absent.
+Clean causal plus masked future-block training, detached soft top-k feedback by default, hard-mask support, frozen clean-prefix recurrence/HOLA reads, and clean replay after finalization remain implemented. The earlier dense active-block attention and its attention-only scalar oracle were removed. Optional prefix block retrieval is specified separately below and is not enabled in existing SBD configurations. Existing causal configurations retain their serialization and architecture when `sbd` is absent.
 
 **Historical evidence only:** the CPU and Vulkan reference gates passed all eight mixer × HOLA × Step-7 combinations before dense attention was removed, including future-target leakage, an inside-chunk block start, padding, the length-one causal limit, and exact replay. Those passes and the removed oracle's output/VJP checks do not verify the current architecture or an undecided attention operator. Detailed historical numerical errors, commands and artifacts are in [docs/sbd.md](docs/sbd.md); no new measurement is asserted here.
 
 The historical implementation, which included dense active-block attention with a causal length-one special case, has end-to-end training smoke evidence for fixed lengths 1/4/8/16, variable lengths and hard-mask feedback at context 32, batch 1, four steps per condition. These establish execution of that earlier implementation only, not current-architecture quality or speed. The original variable-length evaluation covered L1 only with one example; the corrected evaluation-only report covers every configured length without retraining. All original and corrected metrics remain historical evidence.
 
-Step 8's attention architecture is incomplete until the user explicitly selects the sparse/within-block design. Full-context efficiency, independent candidate-width results and meaningful quality conclusions remain unestablished; no new experiments or replacement are specified. No Step 9–12 implementation is included.
+Execution-only validation of the explicit retrieval selector is recorded below. Meaningful full-context quality conclusions remain unestablished; no new quality experiment or comparison is included. No Step 9–12 implementation is included.
+
+## Step 8: optional prefix block retrieval
+
+`prefix_block_retrieval` implements MoBA coverage in selected HOLA layers:
+the causal own block is always included, in addition to top-k completed
+same-document earlier blocks. Original K/V share the existing softmax with
+cache/chunk entries and sink; cached and current-chunk duplicates are omitted.
+Selection is detached. Omission preserves historical serialization and
+initialization; enabled identities include `prefix-block-moba-own-v1`.
+The explicit fixture is `configs/lm512-step8-retrieval.json`; existing
+configurations are not enabled.
+
+The CPU/GPU tensor implementation and indexed CubeCL implementation have an
+independent scalar f64 selection/read/VJP gate, and the noisy-read helper also
+accepts the independently selected active-block segment in the same softmax.
+This work records correctness and execution costs only, not training quality,
+an alternative attention mechanism or a quality comparison. Semantics, memory
+formulas, reproduction and measurement evidence are in
+[prefix-block-retrieval.md](docs/optimization/prefix-block-retrieval.md).
+
+MoBA gates pass: 10 CPU and 20 Vulkan scalar-f64 cases, configured model
+forward/gradient/AdamW checks, CPU/Vulkan SBD snapshots, all six historical
+checkpoint arms and 68 workspace tests (one GPU-sharing test ignored).
+At B8/T512 clean AdamW steps, medians are off 1863.765 ms, tensor 2234.488 ms
+and fused 2015.634 ms. Fused saves paired 211.244 ms [197.175,218.854] against
+tensor (11/11), but retrieval costs paired 139.102 ms versus off.
+The T2048 isolated fused forward/VJP medians are 18.417/271.405 ms versus
+1713.428/2901.180 ms tensor. Full-SBD B1/T512 off/on medians are
+44258.335/43128.916 ms, paired saving 1869.235 ms [1129.419,2438.515] (10/11);
+that includes replacing legacy frozen-read tensor assembly with fused
+execution, not a quality result.

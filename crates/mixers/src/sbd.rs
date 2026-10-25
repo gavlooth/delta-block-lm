@@ -10,6 +10,7 @@ pub struct MixerCache {
     raw: [Tensor<3>;3],
     cache_k: Tensor<4>,
     cache_v: Tensor<4>,
+    prefix_summaries: Option<Tensor<4>>,
     positions: Vec<Tensor<3>>,
     states: Vec<Tensor<4>>,
     starts: Vec<usize>,
@@ -68,7 +69,15 @@ impl Mixer {
             positions = selections.into_iter().map(|s| s.positions).collect();
             ck
         } else { rk };
-        MixerCache {raw,cache_k,cache_v:rv,positions,states,starts:starts.to_vec()}
+        let prefix_summaries = self.prefix_retrieval.and_then(|config| {
+            if config.backend.is_tensor() || t<config.block_size {return None;}
+            #[cfg(any(feature="vulkan",feature="cuda"))]
+            {Some(delta_kernels::prefix_summaries(cache_k.clone(),Tensor::ones([b,t],&device),
+                Tensor::ones([b,t],&device),config.block_size))}
+            #[cfg(not(any(feature="vulkan",feature="cuda")))]
+            {panic!("fused prefix retrieval requires a GPU feature; no CPU fallback")}
+        });
+        MixerCache {raw,cache_k,cache_v:rv,prefix_summaries,positions,states,starts:starts.to_vec()}
     }
     pub fn forward_sbd_cached(&self, input: Tensor<3>, clean: &MixerCache, block: usize) -> Tensor<3> {
         let [b,n,d] = input.dims();
@@ -99,6 +108,18 @@ impl Mixer {
         },Tensor::ones([b*n,1],&device),Tensor::zeros([b*n,1],&device),self.chunk_size,Some(initial));
         let mut mixed = recurrent.output.reshape([b,n,self.heads,self.value_dim]);
         if let Some(cache) = &self.cache {
+            if let Some(config) = self.prefix_retrieval {
+                let query = hola::normalize(self.hola_backend,self.normalization_backend,&cache.q_norm,rq);
+                let cut = start/self.chunk_size*self.chunk_size;
+                let positions = if cut > 0 { clean.positions[cut/self.chunk_size-1].clone() }
+                    else { Tensor::full([b,self.heads,self.cache_capacity],-1.0,&device) };
+                let t = clean.cache_k.dims()[1];
+                let exact = crate::prefix_retrieval::noisy_read(query,clean.cache_k.clone(),clean.cache_v.clone(),
+                    Tensor::ones([b,t],&device),Tensor::ones([b,t],&device),
+                    Tensor::ones([b,n],&device),Tensor::ones([b,n],&device),positions,
+                    start,self.chunk_size,cache.sink.val(),config,None,clean.prefix_summaries.clone());
+                mixed = mixed + exact*sigmoid(cache.gate.val()).reshape([1,1,self.heads,1]);
+            } else {
             let query = hola::normalize(self.hola_backend,self.normalization_backend,&cache.q_norm,rq).swap_dims(1,2);
             let cut = start/self.chunk_size*self.chunk_size;
             let mut keys = Vec::new();
@@ -123,6 +144,7 @@ impl Mixer {
             let probabilities = softmax(Tensor::cat(vec![logits,cache.sink.val().reshape([1,self.heads,1,1]).expand([b,self.heads,n,1])],3),3);
             let exact = probabilities.matmul(Tensor::cat(vec![vals,Tensor::zeros([b,self.heads,1,self.value_dim],&device)],2)).swap_dims(1,2);
             mixed = mixed + exact*sigmoid(cache.gate.val()).reshape([1,1,self.heads,1]);
+            }
         }
         let gate = self.output_gate.forward(input);
         let mixed = if self.normalization_backend == crate::NormalizationBackend::FusedNormsGates {

@@ -296,6 +296,10 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
                 cfg.cache_capacity = 4;
                 cfg.scan_backend = delta_mixers::ScanBackend::TensorSolver;
                 cfg.hola_backend = delta_mixers::HolaBackend::Tensor;
+                cfg.prefix_block_retrieval_backend = delta_mixers::prefix_retrieval::PrefixRetrievalBackend::Tensor;
+                cfg.prefix_block_retrieval = if cache == "surprise" {
+                    c.prefix_block_retrieval.clone().map(|mut retrieval| {retrieval.layers=vec![0];retrieval})
+                } else {None};
                 cfg.projection_backend = delta_mixers::ProjectionBackend::Separate;
                 cfg.normalization_backend = delta_mixers::NormalizationBackend::Tensor;
                 cfg.convolution_backend = delta_mixers::ConvolutionBackend::Tensor;
@@ -321,13 +325,20 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
                 if c.backend != "cpu" {
                     tested.set_scan_backend(if mixer == "gdn2" {delta_mixers::ScanBackend::FusedGdn2} else {delta_mixers::ScanBackend::FusedGpu});
                     tested.set_hola_backend(delta_mixers::HolaBackend::FusedGpu);
+                    if let Some(retrieval) = &cfg.prefix_block_retrieval {
+                        tested.blocks[0].mixer.set_prefix_retrieval(delta_mixers::prefix_retrieval::PrefixReadConfig {
+                            block_size: retrieval.block_size, blocks_per_query: retrieval.blocks_per_query,
+                            backend: c.prefix_block_retrieval_backend,
+                        });
+                    }
                     tested.set_convolution_backend(c.convolution_backend);
                     tested.set_normalization_backend(c.normalization_backend);
                     tested.set_ohc_backend(c.ohc_backend);
                     tested.set_wavelet_backend(c.wavelet_backend);
                     tested.set_lngram_backend(c.lngram_backend);
                 }
-                let prefix: Vec<i32> = std::iter::once(256).chain((0..18).map(|x| (x*7+11)%256)).collect();
+                let prefix_length = cfg.prefix_block_retrieval.as_ref().map_or(19,|r|r.block_size+cfg.chunk_size+3);
+                let prefix: Vec<i32> = std::iter::once(256).chain((0..prefix_length-1).map(|x| ((x*7+11)%256) as i32)).collect();
                 let observed = vec![None,Some(65),None,None];
                 let soft_cpu = state(&cfg,observed.clone(),&cpu)?;
                 let soft_gpu = state(&cfg,observed.clone(),&gpu)?;
@@ -338,7 +349,7 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
                 full.extend([31,32,33,34,35,36]);
                 let mut trace = crate::sbd_training::CleanInputs::default();
                 let _ = tested.forward_profiled(&prefix_batch(&full,&gpu),&mut trace);
-                let snapshot = tested.training_cache(&trace,0,&[1,9,17,19]);
+                let snapshot = tested.training_cache(&trace,0,&[1,9,17,prefix.len()]);
                 let cached = tested.cached_block(&snapshot,3,&soft_gpu,false);
                 let cached_report = compare(&values(cached.clone()),&values(actual_logits.clone()).iter().map(|&x|x as f64).collect::<Vec<_>>())?;
                 let objective = |model: &LanguageModel, logits: Tensor<3>| logits.square().mean() + model.sbd_mask.as_ref().unwrap().val().sum()*0.0;
@@ -354,7 +365,7 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
                     perturbed[at] ^= 127;
                     let mut trace = crate::sbd_training::CleanInputs::default();
                     let _ = tested.forward_profiled(&prefix_batch(&perturbed,&gpu),&mut trace);
-                    let snapshot = tested.training_cache(&trace,0,&[1,9,17,19]);
+                    let snapshot = tested.training_cache(&trace,0,&[1,9,17,prefix.len()]);
                     identical(&reference_cached,&values(tested.cached_block(&snapshot,3,&soft_gpu,false)),"training snapshot future locality")?;
                 }
                 let gradient_error = crate::kron_benchmark::compare_parameters("SBD full-model gradients",

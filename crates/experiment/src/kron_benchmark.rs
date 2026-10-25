@@ -260,6 +260,7 @@ impl ModuleMapper for PerturbParameters {
 struct FixedCacheSelection {
     layer: Option<usize>,
     kept: std::collections::BTreeMap<usize, Vec<Tensor<3, Int>>>,
+    prefix: std::collections::BTreeMap<usize, Vec<Option<Tensor<4, Bool>>>>,
     replay: bool,
 }
 impl delta_mixers::profile::Sections for FixedCacheSelection {
@@ -288,6 +289,14 @@ impl delta_mixers::profile::Sections for FixedCacheSelection {
         } else {
             None
         }
+    }
+    fn prefix_visibility(&mut self, visible: Option<&Tensor<4, Bool>>) {
+        if !self.replay {
+            self.prefix.entry(self.layer.expect("prefix selection outside a block")).or_default().push(visible.cloned());
+        }
+    }
+    fn replayed_prefix_visibility(&self) -> Option<Vec<Option<Tensor<4, Bool>>>> {
+        if self.replay { self.layer.and_then(|layer| self.prefix.get(&layer).cloned()) } else { None }
     }
 }
 impl FixedCacheSelection {
@@ -374,6 +383,7 @@ fn cpu_reference(c: &Config, arm: &Arm, rows: &[Example]) -> Result<CpuReference
         let batch = Batch::new(rows, &device);
         let logits = base.forward(&batch);
         let objective = base.loss(logits.clone(), &batch);
+        let objective = if let Some(mask) = &base.sbd_mask {objective+mask.val().sum()*0.0} else {objective};
         let loss = model::scalar(objective.clone())?;
         let gradients = model::checked_gradients(&base, objective)?;
         let gradient_values = parameters(&base, Some(&gradients))?;
@@ -427,6 +437,8 @@ fn prepare_model_case_kind(
     config.projection_backend = delta_mixers::ProjectionBackend::Separate;
     config.normalization_backend = delta_mixers::NormalizationBackend::Tensor;
     config.convolution_backend = delta_mixers::ConvolutionBackend::Tensor;
+    config.prefix_block_retrieval_backend = delta_mixers::prefix_retrieval::PrefixRetrievalBackend::Tensor;
+    if !hola { config.prefix_block_retrieval = None; }
     let arm = Arm {
         name: if kind == MixerKind::Gdn2 {
             if hola { "gdn-hola" } else { "gdn" }
@@ -501,6 +513,16 @@ fn prepare_model_case_kind(
         let mut model = base.clone();
         model.set_scan_backend(backend);
         model.set_hola_backend(hola_backend);
+        if let Some(retrieval) = &c.prefix_block_retrieval {
+            if hola {
+                for &layer in &retrieval.layers {
+                    model.blocks[layer].mixer.set_prefix_retrieval(delta_mixers::prefix_retrieval::PrefixReadConfig {
+                        block_size: retrieval.block_size, blocks_per_query: retrieval.blocks_per_query,
+                        backend: c.prefix_block_retrieval_backend,
+                    });
+                }
+            }
+        }
         model.set_projection_backend(c.projection_backend);
         model.set_normalization_backend(c.normalization_backend);
         model.set_convolution_backend(c.convolution_backend);
@@ -524,6 +546,7 @@ fn prepare_model_case_kind(
         let clock = Instant::now();
         let logits = model.forward(&batch);
         let objective = model.loss(logits.clone(), &batch);
+        let objective = if let Some(mask) = &model.sbd_mask {objective+mask.val().sum()*0.0} else {objective};
         let loss = model::scalar(objective.clone())?;
         let grads = model::checked_gradients(&model, objective)?;
         runtime::sync(device)?;

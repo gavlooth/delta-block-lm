@@ -71,6 +71,8 @@ impl Arm {
     pub fn uses_custom_gpu(&self, c: &Config) -> bool {
         c.scan_backend.is_fused()
             || (self.cache != "none" && c.hola_backend.is_fused())
+            || (!c.prefix_block_retrieval_backend.is_tensor()
+                && c.prefix_block_retrieval.as_ref().is_some_and(|r|!r.layers.is_empty()))
             || !c.normalization_backend.is_tensor()
             || c.convolution_backend == delta_mixers::ConvolutionBackend::FusedGpu
             || !c.update_backend.is_tensor()
@@ -178,6 +180,7 @@ impl Default for SbdConfig {
 
 // Fixed model semantics, not a configurable attention implementation.
 const SBD_MODEL_REVISION: &str = "sbd-recurrence-only-v1";
+const PREFIX_RETRIEVAL_REVISION: &str = "prefix-block-moba-own-v1";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -185,6 +188,10 @@ pub struct Config {
     /// Omitted means the historical causal architecture and serialized config.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sbd: Option<SbdConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix_block_retrieval: Option<delta_mixers::prefix_retrieval::PrefixBlockRetrieval>,
+    #[serde(skip_serializing_if = "delta_mixers::prefix_retrieval::PrefixRetrievalBackend::is_tensor")]
+    pub prefix_block_retrieval_backend: delta_mixers::prefix_retrieval::PrefixRetrievalBackend,
     pub task: String,
     pub backend: String,
     /// Burn's compile-time CubeCL fusion backend; omitted means historical unfused execution.
@@ -279,6 +286,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             sbd: None,
+            prefix_block_retrieval: None,
+            prefix_block_retrieval_backend: delta_mixers::prefix_retrieval::PrefixRetrievalBackend::Tensor,
             task: "recall".into(),
             backend: "cpu".into(),
             fusion: false,
@@ -356,6 +365,20 @@ impl Config {
         Ok(c)
     }
     pub fn validate(&self) -> Result<()> {
+        if let Some(retrieval) = &self.prefix_block_retrieval {
+            ensure!(self.chunk_size > 0 && retrieval.block_size > 0
+                && retrieval.block_size % self.chunk_size == 0,
+                "prefix retrieval block_size must be a positive multiple of chunk_size");
+            ensure!(retrieval.blocks_per_query >= 1, "prefix retrieval blocks_per_query must be positive");
+            ensure!(retrieval.layers.iter().all(|&layer| layer < self.layers),
+                "prefix retrieval layer indices must be in range");
+            ensure!(retrieval.layers.is_empty() || (self.cache_capacity > 0 && self.arms.iter().all(|arm| arm.cache != "none")),
+                "prefix retrieval requires HOLA in every selected layer");
+        }
+        ensure!(self.prefix_block_retrieval_backend.is_tensor()
+            || (self.prefix_block_retrieval.is_some() && self.backend == "vulkan"
+                && self.key_dim == 32 && self.value_dim == 64 && (1..=64).contains(&self.cache_capacity) && !self.fusion),
+            "fused prefix retrieval requires selected layers, K32/V64 and non-fusion Vulkan");
         if let Some(sbd) = &self.sbd {
             ensure!(self.task == "lm", "SBD requires byte language modeling");
             ensure!(!self.autotune, "SBD variable-shape matmuls are not covered by the autotune preflight");
@@ -583,7 +606,10 @@ impl Config {
         self.context * self.batch_size
     }
     pub fn training_fingerprint(&self, target_tokens: usize) -> Result<String> {
-        let bytes = if self.sbd.is_some() {
+        let bytes = if self.prefix_block_retrieval.is_some() {
+            serde_json::to_vec(&(self,target_tokens,
+                self.sbd.as_ref().map(|_|SBD_MODEL_REVISION),PREFIX_RETRIEVAL_REVISION))?
+        } else if self.sbd.is_some() {
             serde_json::to_vec(&(self, target_tokens, SBD_MODEL_REVISION))?
         } else {
             // Preserve historical causal checkpoint and metrics identities.
@@ -595,6 +621,9 @@ impl Config {
         let mut identity = serde_json::json!({"config":self,"precision":"float32","training_algorithm":self.scan_backend.training_algorithm(),"optimizer":"AdamW"});
         if self.sbd.is_some() {
             identity["sbd_model_revision"] = SBD_MODEL_REVISION.into();
+        }
+        if self.prefix_block_retrieval.is_some() {
+            identity["prefix_block_retrieval_revision"] = PREFIX_RETRIEVAL_REVISION.into();
         }
         Ok(crate::data::hash(&serde_json::to_vec(&identity)?))
     }
@@ -634,6 +663,40 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prefix_retrieval_serialization_and_identity() {
+        let baseline = Config::default();
+        let value = serde_json::to_value(&baseline).unwrap();
+        assert!(value.get("prefix_block_retrieval").is_none());
+        assert!(value.get("prefix_block_retrieval_backend").is_none());
+        let restored: Config = serde_json::from_value(value).unwrap();
+        assert_eq!(baseline.pilot_fingerprint().unwrap(), restored.pilot_fingerprint().unwrap());
+        assert_eq!(baseline.training_fingerprint(2048).unwrap(), restored.training_fingerprint(2048).unwrap());
+        let mut enabled = baseline.clone();
+        enabled.arms[0].cache = "surprise".into();
+        let historical = enabled.clone();
+        enabled.prefix_block_retrieval = Some(delta_mixers::prefix_retrieval::PrefixBlockRetrieval {
+            layers: vec![0], block_size: 64, blocks_per_query: 2,
+        });
+        assert!(enabled.validate().is_ok());
+        assert_ne!(historical.pilot_fingerprint().unwrap(), enabled.pilot_fingerprint().unwrap());
+        assert_ne!(historical.training_fingerprint(2048).unwrap(), enabled.training_fingerprint(2048).unwrap());
+        let previous = crate::data::hash(&serde_json::to_vec(&(&enabled,2048)).unwrap());
+        assert_ne!(previous,enabled.training_fingerprint(2048).unwrap());
+        enabled.prefix_block_retrieval.as_mut().unwrap().block_size = 0;
+        assert!(enabled.validate().is_err());
+        enabled.prefix_block_retrieval.as_mut().unwrap().block_size = 17;
+        assert!(enabled.validate().is_err());
+        enabled.prefix_block_retrieval.as_mut().unwrap().block_size = 64;
+        enabled.prefix_block_retrieval.as_mut().unwrap().blocks_per_query = 0;
+        assert!(enabled.validate().is_err());
+        enabled.prefix_block_retrieval.as_mut().unwrap().blocks_per_query = 2;
+        enabled.prefix_block_retrieval.as_mut().unwrap().layers = vec![enabled.layers];
+        assert!(enabled.validate().is_err());
+        enabled.prefix_block_retrieval.as_mut().unwrap().layers = vec![0];
+        enabled.arms[0].cache = "none".into();
+        assert!(enabled.validate().is_err());
+    }
     #[test]
     fn lngram_omission_preserves_serialization_and_enabled_changes_identity() {
         let baseline = Config::default();

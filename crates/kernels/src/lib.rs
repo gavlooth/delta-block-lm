@@ -27,6 +27,12 @@ mod hola_ops;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 pub use hola_ops::{HolaReadOutput, hola_read};
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod prefix;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod prefix_ops;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+pub use prefix_ops::{prefix_read, prefix_hola_read, prefix_summaries};
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
 mod norm;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 mod norm_ops;
