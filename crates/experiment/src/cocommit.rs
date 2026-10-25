@@ -61,9 +61,9 @@ fn add_branch_losses(
     Ok(())
 }
 
-pub(super) fn training_loss_profiled<P: Sections>(model: &LanguageModel, c: &Config, rows: &[Example], batch: &Batch, seed: u64, profile: &mut P) -> Result<SbdTrainingResult> {
-    let s = c.sbd.as_ref().context("CoCommit requires SBD")?;
-    let options = s.cocommit.as_ref().context("CoCommit config is required")?;
+pub(super) fn training_loss_sampled_profiled<P:Sections>(model:&LanguageModel,c:&Config,rows:&[Example],batch:&Batch,blocks:&[TrainingBlock],bundles:&[Vec<bool>],profile:&mut P)->Result<SbdTrainingResult> {
+    let s=c.sbd.as_ref().context("CoCommit requires SBD")?;
+    ensure!(s.cocommit.is_some() && blocks.len()==bundles.len(),"invalid sampled CoCommit bundle layout");
     if model.codpula.is_some() {
         ensure!(rows.iter().all(|row| row.weight.iter().all(|&w| w == 1.0)),"Codpula joint event loss requires unit valid target weights");
     }
@@ -80,22 +80,22 @@ pub(super) fn training_loss_profiled<P: Sections>(model: &LanguageModel, c: &Con
         if let Some(bias) = &circuit.gate_head.bias { loss = loss + bias.val().sum()*0.0; }
     }
     let mut result = SbdTrainingResult { loss, circuit_flows: None };
-    let blocks = sbd::sample_training_blocks(c,rows,seed)?;
-    let bundles = sample_bundles(&blocks,options.training_bundle_max,seed);
+    let teacher_model=(s.feedback==SbdFeedback::SoftFeedback && blocks.iter().any(|block|block.masked.len()>1)).then(||model.valid());
     for block in blocks.iter().filter(|block|block.masked.len()==1) {
         let logits = clean_logits.clone().slice([block.row..block.row+1,block.start..block.start+1,0..c.vocab()]);
         result.loss = result.loss + sbd::masked_training_loss(logits,block,&rows[block.row],rows.len(),c.vocab(),&device);
     }
     if s.block_execution == SbdBlockExecution::PerBlock {
-        for (block,marks) in blocks.iter().zip(&bundles).filter(|(block,_)|block.masked.len()>1) {
+        for (block,marks) in blocks.iter().zip(bundles).filter(|(block,_)|block.masked.len()>1) {
             let row = &rows[block.row];
             let n = block.masked.len();
             let observed = (0..n).map(|j|(!block.masked[j]).then_some(row.target[block.start+j] as usize)).collect();
             let mut soft = sbd::state(c,observed,&device)?;
             let cache = model.training_cache(&trace,block.row,&[block.start+1]);
             if s.feedback == SbdFeedback::SoftFeedback {
-                let teacher = model.cached_block_profiled(&cache,0,&soft,false,profile);
-                sbd::update_feedback(model,c,teacher,&mut soft,1.0)?;
+                let teacher_model=teacher_model.as_ref().unwrap();
+                let teacher=teacher_model.cached_block_profiled(&cache.detached(),0,&soft,false,profile);
+                sbd::update_feedback(teacher_model,c,teacher,&mut soft,1.0)?;
             }
             let prefix = model.cached_block_prefix_profiled(&cache,0,&soft,s.feedback==SbdFeedback::HardMask,profile);
             let a = model.cached_block_tail_profiled(&cache,0,prefix.clone(),None,profile);
@@ -114,7 +114,7 @@ pub(super) fn training_loss_profiled<P: Sections>(model: &LanguageModel, c: &Con
     let mut targets = Vec::with_capacity(count*width);
     let mut target_weights = Vec::with_capacity(count*width);
     let mut marks = Vec::with_capacity(count*width);
-    for (block,bundle) in blocks.iter().zip(&bundles).filter(|(block,_)|block.masked.len()>1) {
+    for (block,bundle) in blocks.iter().zip(bundles).filter(|(block,_)|block.masked.len()>1) {
         cache_blocks.push((block.row,block.start+1));
         let row = &rows[block.row];
         for j in 0..width {
@@ -129,8 +129,9 @@ pub(super) fn training_loss_profiled<P: Sections>(model: &LanguageModel, c: &Con
     let cache = model.training_cache_batched(&trace,&cache_blocks);
     let mut soft = SoftState::new(c.vocab(),s.candidate_width,observed,active,&device,c.soft_selection_backend)?;
     if s.feedback == SbdFeedback::SoftFeedback {
-        let teacher = model.cached_blocks_profiled(&cache,&soft,false,profile);
-        sbd::update_feedback(model,c,teacher,&mut soft,1.0)?;
+        let teacher_model=teacher_model.as_ref().unwrap();
+        let teacher=teacher_model.cached_blocks_profiled(&cache.detached(),&soft,false,profile);
+        sbd::update_feedback(teacher_model,c,teacher,&mut soft,1.0)?;
     }
     let prefix = model.cached_blocks_prefix_profiled(&cache,&soft,s.feedback==SbdFeedback::HardMask,profile);
     let (a,b) = model.cached_blocks_pair_profiled(&cache,prefix,marker_tensor(&marks,count,width,&device),profile);
@@ -156,8 +157,28 @@ pub(super) fn reconstruct_output(model: &LanguageModel, prefix: &[i32], soft: &S
     let (cache,hidden) = prepare_reconstruction(model,prefix,soft,hard,device);
     model.cached_block_tail_profiled(&cache,0,hidden,marks,&mut Unprofiled)
 }
+fn checked_entropy_rows(values:&[f32],vocab:usize,active:&[bool])->Result<Vec<f64>> {
+    ensure!(vocab>0 && values.len()==active.len()*vocab,"invalid CoCommit probability shape");
+    values.chunks_exact(vocab).zip(active).enumerate().map(|(index,(row,&active))|{
+        if !active {return Ok(0.0);}
+        let mut mass=0.0f64;
+        let mut entropy=0.0f64;
+        for &value in row {
+            ensure!(value.is_finite() || value==f32::NEG_INFINITY,
+                "CoCommit probability row {index} contains NaN or positive infinity");
+            if value==f32::NEG_INFINITY {continue;}
+            let probability=f64::from(value).exp();
+            mass+=probability;
+            if probability>0.0 {entropy-=probability*f64::from(value);}
+        }
+        ensure!(mass.is_finite() && mass>0.0 && entropy.is_finite(),
+            "CoCommit probability row {index} has zero or nonfinite support");
+        Ok(entropy)
+    }).collect()
+}
 struct Prediction {
-    logs: Tensor<3>,
+    host_logs: Vec<f32>,
+    entropies: Vec<f64>,
     proposals: Vec<usize>,
     scores: Option<Vec<f64>>,
     feedback: Tensor<2>,
@@ -169,20 +190,25 @@ fn prediction(model: &LanguageModel, c: &Config, output: DenoisingOutput, soft: 
     if model.codpula.is_some() && n>1 {
         let (circuit,tokens,observed) = sbd::prepare_circuit(model,output,soft,temperature)?;
         let logs = circuit.marginals(tokens.clone(),observed.clone())?.log();
+        let host_logs=logs.clone().into_data().try_to_vec::<f32>().map_err(|e|anyhow::anyhow!("CoCommit probabilities {e:?}"))?;
+        let entropies=checked_entropy_rows(&host_logs,c.vocab(),&soft.active)?;
         let proposals = if assignments {circuit.sample(tokens.clone(),observed.clone(),seed)?} else {Vec::new()};
         let scores = if assignments && c.sbd.as_ref().unwrap().commitment==SbdCommitment::Dependence {
             Some(circuit.dependence_scores(tokens,observed,&proposals)?.remove(0))
         } else {None};
-        Ok(Prediction { feedback: logs.clone().reshape([n,c.vocab()]), logs,
+        Ok(Prediction { feedback: logs.reshape([n,c.vocab()]), host_logs,entropies,
             proposals:if assignments {proposals.into_iter().next().context("missing single-block joint proposal")?} else {Vec::new()},
             scores, feedback_temperature:1.0,circuit:Some(circuit) })
     } else {
         let logs = log_softmax(output.logits.clone(),2);
+        let host_logs=logs.into_data().try_to_vec::<f32>().map_err(|e|anyhow::anyhow!("CoCommit probabilities {e:?}"))?;
+        let entropies=checked_entropy_rows(&host_logs,c.vocab(),&soft.active)?;
         let proposals = if assignments {
-            let values = logs.clone().into_data().try_to_vec::<f32>().map_err(|e|anyhow::anyhow!("CoCommit probabilities {e:?}"))?;
-            values.chunks_exact(c.vocab()).map(|row| (0..row.len()).max_by(|&a,&b|row[a].total_cmp(&row[b]).then(b.cmp(&a))).unwrap()).collect()
+            host_logs.chunks_exact(c.vocab()).zip(&soft.active).map(|(row,&active)|{
+                if active {(0..row.len()).max_by(|&a,&b|row[a].total_cmp(&row[b]).then(b.cmp(&a))).unwrap()}else{0}
+            }).collect()
         } else {Vec::new()};
-        Ok(Prediction { logs, proposals, scores:None, feedback:output.logits.reshape([n,c.vocab()]),feedback_temperature:c.soft_temperature,circuit:None })
+        Ok(Prediction { host_logs,entropies,proposals,scores:None,feedback:output.logits.reshape([n,c.vocab()]),feedback_temperature:c.soft_temperature,circuit:None })
     }
 }
 fn select(c: &Config, prediction: &Prediction, soft: &SoftState, last_pass: bool) -> Result<Vec<usize>> {
@@ -193,12 +219,7 @@ fn select(c: &Config, prediction: &Prediction, soft: &SoftState, last_pass: bool
         ensure!(unresolved.iter().all(|&i|scores[i].is_finite()),"CoCommit dependence requires finite supported scores");
         return Ok(sbd::dependence_commits(&unresolved,scores,s.dependence_threshold,last_pass));
     }
-    let logs = prediction.logs.clone().into_data().try_to_vec::<f32>().map_err(|e|anyhow::anyhow!("CoCommit entropy {e:?}"))?;
-    let mut order = unresolved.into_iter().map(|i| {
-        let row = &logs[i*c.vocab()..(i+1)*c.vocab()];
-        let entropy = row.iter().filter(|&&x|x.is_finite()).map(|&x|-(x as f64).exp()*x as f64).sum::<f64>();
-        (i,entropy)
-    }).collect::<Vec<_>>();
+    let mut order=unresolved.into_iter().map(|i|(i,prediction.entropies[i])).collect::<Vec<_>>();
     order.sort_by(|a,b|a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
     let take = if let Some(gamma) = s.entropy_threshold {
         let mut take = 1;
@@ -254,6 +275,7 @@ pub(super) fn evaluate(model: &LanguageModel, c: &Config, examples: &[Example], 
                 if n==1 {
                     let output = sbd::block_forward(&model,prefix,&soft,s.feedback==SbdFeedback::HardMask,device);
                     let logs = log_softmax(output.logits,2).into_data().try_to_vec::<f32>().map_err(|e|anyhow::anyhow!("CoCommit singleton {e:?}"))?;
+                    checked_entropy_rows(&logs,c.vocab(),&[true])?;
                     if row.weight[start] != 0.0 {
                         nll -= logs[row.target[start] as usize] as f64;
                         let best = (0..c.vocab()).max_by(|&a,&b|logs[a].total_cmp(&logs[b]).then(b.cmp(&a))).unwrap();
@@ -283,8 +305,8 @@ pub(super) fn evaluate(model: &LanguageModel, c: &Config, examples: &[Example], 
                     nll += model::scalar(circuit_a.log_partition(clean.clone(),observed.clone())?-circuit_a.log_partition(clean.clone(),all)?)?;
                     marked_nll += model::scalar(circuit_b.log_partition(clean.clone(),observed.clone())?-circuit_b.log_partition(clean,marker_tensor(&marks,1,n,device).greater_elem(0.5))?)?;
                 }
-                let av = a.logs.into_data().try_to_vec::<f32>().map_err(|e|anyhow::anyhow!("CoCommit A evaluation {e:?}"))?;
-                let bv = b.logs.into_data().try_to_vec::<f32>().map_err(|e|anyhow::anyhow!("CoCommit B evaluation {e:?}"))?;
+                let av=a.host_logs;
+                let bv=b.host_logs;
                 for j in 0..n {
                     if row.weight[start+j]==0.0 {continue;}
                     let gold = row.target[start+j] as usize;
@@ -332,5 +354,17 @@ mod tests {
         for bundle in sample_bundles(&blocks,1,77).iter().skip(1) {
             assert_eq!(bundle.iter().filter(|&&x|x).count(),1);
         }
+    }
+    #[test]
+    fn entropy_rejects_nonfinite_or_unsupported_active_rows() {
+        let negative_infinity=f32::NEG_INFINITY;
+        for row in [[f32::NAN,0.0],[f32::INFINITY,0.0],
+            [negative_infinity,negative_infinity],[-1000.0,-1000.0]] {
+            assert!(checked_entropy_rows(&row,2,&[true]).is_err());
+        }
+        assert_eq!(checked_entropy_rows(&[negative_infinity,0.0],2,&[true]).unwrap(),vec![0.0]);
+        let entropy=checked_entropy_rows(&[negative_infinity,0.5f32.ln(),0.5f32.ln()],3,&[true]).unwrap();
+        assert!((entropy[0]-std::f64::consts::LN_2).abs()<1e-7);
+        assert_eq!(checked_entropy_rows(&[f32::NAN,f32::INFINITY],2,&[false]).unwrap(),vec![0.0]);
     }
 }

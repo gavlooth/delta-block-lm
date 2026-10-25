@@ -25,6 +25,7 @@ mod prefix_retrieval;
 mod runtime;
 mod scan_benchmark;
 mod sbd;
+mod sbd_step;
 mod sbd_training;
 mod sbd_read_reference;
 mod sbd_benchmark;

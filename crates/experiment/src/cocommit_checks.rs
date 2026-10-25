@@ -231,7 +231,7 @@ fn retrieval_case(device: &Device) -> Result<Value> {
             "plain_sbd":plain_stress,"cocommit":stress,
             "interpretation":"raw sum-squared normalized-feature objective is retained as stress evidence; user-authorized acceptance uses normalized training losses if the plain SBD discriminator also fails"}}))
 }
-fn cocommit_checkpoint_continuation(device: &Device, seed: u64) -> Result<Value> {
+fn cocommit_checkpoint_continuation(c:&Config,device:&Device,seed:u64)->Result<Value> {
     let mut cfg=Config::default();
     cfg.task="lm".into(); cfg.backend="cpu".into();
     cfg.d_model=16; cfg.layers=4; cfg.heads=4; cfg.key_dim=32; cfg.value_dim=64;
@@ -247,7 +247,24 @@ fn cocommit_checkpoint_continuation(device: &Device, seed: u64) -> Result<Value>
     cfg.update_backend=crate::config::UpdateBackend::Tensor;
     cfg.epilogue_backend=crate::config::EpilogueBackend::Native;
     cfg.ohc_streams=true; cfg.ohc_backend=delta_mixers::ohc::OhcBackend::Tensor;
-    cfg.sbd=Some(SbdConfig {block_lengths:vec![4],in_block_reads:InBlockReads::HolaRead,
+    cfg.gradient_clip=0.05;
+    cfg.learning_rate=c.learning_rate;cfg.weight_decay=c.weight_decay;
+    cfg.soft_selection_backend=crate::config::SoftSelectionBackend::Cpu;
+    #[cfg(any(feature="vulkan",feature="cuda"))]
+    if matches!(device.clone().inner().as_dispatch(),burn::backend::DispatchDevice::Cube(_)) {
+        cfg.backend=c.backend.clone();
+        cfg.scan_backend=c.scan_backend;cfg.hola_backend=c.hola_backend;
+        cfg.projection_backend=c.projection_backend;cfg.normalization_backend=c.normalization_backend;
+        cfg.convolution_backend=c.convolution_backend;cfg.ohc_backend=c.ohc_backend;
+        cfg.head_backend=c.head_backend;cfg.loss_backend=c.loss_backend;
+        cfg.update_backend=c.update_backend;cfg.epilogue_backend=c.epilogue_backend;
+        cfg.soft_selection_backend=c.soft_selection_backend;
+    }
+    let source=c.sbd.as_ref().context("checkpoint gate needs SBD config")?;
+    cfg.sbd=Some(SbdConfig {block_lengths:vec![4],feedback:source.feedback,block_execution:source.block_execution,in_block_reads:InBlockReads::HolaRead,rows_per_pass:Some(1),
+        noisy_read_backend:if cfg.backend=="cpu" {delta_mixers::sbd::NoisyReadBackend::Tensor}else{source.noisy_read_backend},
+        joint_output:source.joint_output,
+        joint_execution:if cfg.backend=="cpu" {crate::codpula::CodpulaExecution::Tensor}else{source.joint_execution},
         cocommit:Some(CocommitConfig::default()),..SbdConfig::default()});
     let arm=Arm{name:"cocommit-checkpoint".into(),mixer:"kronlstm".into(),cache:"surprise".into()};
     cfg.arms=vec![arm.clone()]; cfg.validate()?;
@@ -256,18 +273,25 @@ fn cocommit_checkpoint_continuation(device: &Device, seed: u64) -> Result<Value>
         Example{input:sequence[..8].to_vec(),target:sequence[1..].to_vec(),weight:vec![1.0;8],groups:vec![None;8]}
     }).collect::<Vec<_>>();
     let train_device=device.clone().autodiff(); train_device.seed(seed);
-    let step=|model:LanguageModel,optimizer:&mut burn::optim::ModuleOptimizer,rows:&[Example],step_seed:u64|->Result<(LanguageModel,f64)> {
+    let step=|model:LanguageModel,optimizer:&mut burn::optim::ModuleOptimizer,rows:&[Example],step_seed:u64|->Result<(LanguageModel,f64,usize)> {
         let batch=Batch::new(rows,&train_device);
-        let result=crate::cocommit::training_loss_profiled(&model,&cfg,rows,&batch,step_seed,&mut Unprofiled)?;
-        let loss_value=model::scalar(result.loss.clone())?;
-        let gradients=model::checked_gradients(&model,result.loss)?;
-        let updated=crate::train::optimizer_step(&cfg,model,optimizer,gradients,result.circuit_flows)?;
-        Ok((updated,loss_value))
+        let result=crate::sbd_step::backward(&model,&cfg,rows,&batch,step_seed)?;
+        ensure!(result.passes==2 && result.rows_per_pass==1,"checkpoint fixture did not accumulate both single-row passes");
+        let loss_value=result.loss;
+        let clipped=parameters(&model,Some(&result.gradients))?.iter().filter(|(_,values)|
+            values.iter().map(|&x|f64::from(x).powi(2)).sum::<f64>().sqrt()>f64::from(cfg.gradient_clip)).count();
+        ensure!(clipped>0,"production continuation fixture did not engage clipping");
+        let updated=crate::train::optimizer_step(&cfg,model,optimizer,result.gradients,result.circuit_flows)?;
+        Ok((updated,loss_value,clipped))
     };
-    let mut initial=LanguageModel::new(&cfg,&arm,&train_device)?;
-    requested_scan(&mut initial,&train_device);
+    let initial=LanguageModel::new(&cfg,&arm,&train_device)?;
     let mut uninterrupted_optimizer=crate::train::optimizer(&cfg);
-    let (trained,first_loss)=step(initial,&mut uninterrupted_optimizer,&examples,seed+1)?;
+    let (trained,first_loss,first_clipped)=step(initial,&mut uninterrupted_optimizer,&examples,seed+1)?;
+    let circuit_time=|model:&LanguageModel|->Result<Option<f64>>{
+        model.codpula.as_ref().map(|head|model::scalar(head.probability.step.val().float())).transpose()
+    };
+    let saved_time=circuit_time(&trained)?;
+    if trained.codpula.is_some(){ensure!(saved_time==Some(1.0),"initial probability update was not recorded");}
     let stamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
     let directory=std::env::temp_dir().join(format!("cocommit-checkpoint-{}-{stamp}",std::process::id()));
     let path=directory.join("checkpoint-1");
@@ -275,14 +299,13 @@ fn cocommit_checkpoint_continuation(device: &Device, seed: u64) -> Result<Value>
         data:json!({"fixture_sha256":crate::data::fixture_hash(&examples)}),arm:arm.name.clone(),
         seed,step:1,tokens:16,training_seconds:0.0,initial_evaluation:Value::Null};
     crate::train::checkpoint(&cfg,&path,&trained,&uninterrupted_optimizer,&state)?;
-    let mut restored=crate::checkpoint::load_model(LanguageModel::new(&cfg,&arm,&train_device)?,path.join("model.burnpack"),&train_device)?;
-    requested_scan(&mut restored,&train_device);
+    let restored=crate::checkpoint::load_model(LanguageModel::new(&cfg,&arm,&train_device)?,path.join("model.burnpack"),&train_device)?;
     let mut restored_optimizer=crate::checkpoint::load_optimizer(&cfg,path.join("optimizer.burnpack"))?;
     let loaded_parameters=parameters(&restored,None)?;
     let trained_parameters=parameters(&trained,None)?;
+    ensure_exact_parameter_bits(&loaded_parameters,&trained_parameters,"reloaded CoCommit model")?;
     let model_equal=compare_parameter_gradients(&loaded_parameters,&trained_parameters)?;
-    ensure!(values(restored.cocommit_marker.as_ref().unwrap().val().clone())==
-        values(trained.cocommit_marker.as_ref().unwrap().val().clone()),"checkpoint changed CoCommit marker values");
+    ensure!(circuit_time(&restored)?==saved_time,"checkpoint changed circuit optimizer time");
     ensure!(values(trained.cocommit_marker.as_ref().unwrap().val().clone()).iter().any(|&x|x!=0.0),
         "diagnostic training step did not update CoCommit marker");
     let signature=crate::checkpoint::optimizer_signature(&cfg,uninterrupted_optimizer.into_bytes()?)?;
@@ -296,20 +319,35 @@ fn cocommit_checkpoint_continuation(device: &Device, seed: u64) -> Result<Value>
             for value in &mut row.target {*value=(*value+index as i32+1)%256;}
         }
         let step_seed=seed+2+index as u64;
-        let (next,loss_a)=step(uninterrupted,&mut uninterrupted_optimizer,&next_rows,step_seed)?;
-        let (loaded_next,loss_b)=step(continued,&mut restored_optimizer,&next_rows,step_seed)?;
-        ensure!(loss_a==loss_b,"CoCommit checkpoint continuation loss differs at step {}",index+2);
-        let equal=compare_parameter_gradients(&parameters(&loaded_next,None)?,&parameters(&next,None)?)?;
+        let (next,loss_a,clipped_a)=step(uninterrupted,&mut uninterrupted_optimizer,&next_rows,step_seed)?;
+        let (loaded_next,loss_b,clipped_b)=step(continued,&mut restored_optimizer,&next_rows,step_seed)?;
+        ensure!(clipped_a==clipped_b,"continued clipping decisions differ");
+        ensure!(loss_a.to_bits()==loss_b.to_bits(),"CoCommit checkpoint continuation loss differs at step {}",index+2);
+        let loaded_values=parameters(&loaded_next,None)?;
+        let expected_values=parameters(&next,None)?;
+        ensure_exact_parameter_bits(&loaded_values,&expected_values,"continued CoCommit model")?;
+        let equal=compare_parameter_gradients(&loaded_values,&expected_values)?;
+        ensure!(circuit_time(&loaded_next)?==circuit_time(&next)?,"continued circuit optimizer time differs");
+        if next.codpula.is_some() {
+            ensure!(circuit_time(&next)?==Some((index+2) as f64),"row-accumulated step did not perform exactly one circuit update");
+        }
         ensure!(crate::checkpoint::optimizer_signature(&cfg,uninterrupted_optimizer.into_bytes()?)?==
             crate::checkpoint::optimizer_signature(&cfg,restored_optimizer.into_bytes()?)?,
             "CoCommit AdamW marker moments diverged at step {}",index+2);
-        continuation.push(json!({"step":index+2,"loss":loss_a,"parameters":equal,"optimizer_and_marker_moments_identical":true}));
+        continuation.push(json!({"step":index+2,"loss":loss_a,"parameters":equal,"optimizer_and_marker_moments_identical":true,
+            "clipped_parameter_tensors":clipped_a}));
         uninterrupted=next; continued=loaded_next;
     }
     let checkpoint_path=path.display().to_string();
     std::fs::remove_dir_all(&directory)?;
     Ok(json!({"passed":true,"checkpoint":checkpoint_path,"first_loss":first_loss,"loaded_parameters":model_equal,
-        "marker_values_identical":true,"marker_optimizer_moments_identical":true,"continuation":continuation}))
+        "marker_values_identical":true,"marker_optimizer_moments_identical":true,"continuation":continuation,
+        "backward_path":"sbd_step::backward","batch_size":cfg.batch_size,"rows_per_pass":1,"backward_passes":2,
+        "optimizer_path":"train::optimizer_step including configured clipping, AdamW and one circuit update",
+        "optimizer_backend":cfg.update_backend,"feedback":source.feedback,"joint_output":source.joint_output,
+        "circuit_time_identical":true,"saved_circuit_time":saved_time,"continued_circuit_time":circuit_time(&uninterrupted)?,
+        "probability_rows_and_dual_momenta_included":uninterrupted.codpula.is_some(),
+        "clip_threshold":cfg.gradient_clip,"first_step_clipped_tensors":first_clipped}))
 }
 fn model_case(c: &Config, device: &Device, ohc: bool, codpula: bool) -> Result<Value> {
     let mut cfg = c.clone();
@@ -343,7 +381,7 @@ fn model_case(c: &Config, device: &Device, ohc: bool, codpula: bool) -> Result<V
         block_lengths: vec![1, 4],
         in_block_reads: InBlockReads::HolaRead,
         feedback: SbdFeedback::HardMask,
-        cocommit: Some(CocommitConfig::default()),
+        cocommit: Some(CocommitConfig {execution:crate::config::CocommitExecution::Doubled,..CocommitConfig::default()}),
         ..SbdConfig::default()
     });
     if codpula { cfg.sbd.as_mut().unwrap().joint_output=SbdJointOutput::Codpula; }
@@ -469,7 +507,17 @@ fn model_case(c: &Config, device: &Device, ohc: bool, codpula: bool) -> Result<V
         "paired_layout_timing":layout_execution
     });
     let mut soft_feedback = sbd::state(&cfg,vec![None;4],target)?;
-    let teacher = requested.cached_block(&cache,0,&soft_feedback,false).detach();
+    let tracked_teacher = requested.cached_block(&cache,0,&soft_feedback,false);
+    let frozen_model=requested.valid();
+    let frozen_teacher=frozen_model.cached_block(&cache.detached(),0,&soft_feedback,false);
+    ensure!(!frozen_teacher.logits.is_require_grad() && !frozen_teacher.features.is_require_grad(),
+        "frozen feedback teacher unexpectedly retains gradients");
+    let frozen_teacher_equivalence=json!({
+        "logits":compare(&values(tracked_teacher.logits.clone()),&values(frozen_teacher.logits.clone()))?,
+        "features":compare(&values(tracked_teacher.features.clone()),&values(frozen_teacher.features.clone()))?,
+        "requires_grad":false
+    });
+    let teacher = tracked_teacher.detach();
     soft_feedback.update(teacher.logits.reshape([4,cfg.vocab()]),1.0,cfg.soft_temperature,cfg.soft_steps,cfg.sbd.as_ref().unwrap().candidate_width)?;
     let soft_a = crate::cocommit::reconstruct_output(&requested,prefix,&soft_feedback,false,None,target);
     let soft_b = crate::cocommit::reconstruct_output(&requested,prefix,&soft_feedback,false,Some(Tensor::<2>::zeros([1,4],target)),target);
@@ -493,6 +541,7 @@ fn model_case(c: &Config, device: &Device, ohc: bool, codpula: bool) -> Result<V
     Ok(json!({"passed":true,"ohc_streams":ohc,"device":crate::runtime::identity(target),
         "reconstruction_vs_legacy":baseline,"cpu_vs_requested_device":cpu_vs_requested,
         "zero_marker_a_b":zero_equivalence,"soft_feedback_zero_marker":soft_equivalence,
+        "frozen_feedback_teacher":frozen_teacher_equivalence,
         "nonzero_marker_changes_logits":true,"marker_gradient_max_abs":marker_gradient_max,
         "shared_clean_cache_repeat":cache_repeat,"shared_prefix_reuse":shared_reuse,"per_block_vs_batched":batch_execution,
         "combined_fresh_circuit_subset_event":circuit_check,
@@ -521,7 +570,7 @@ fn scalar_marker_reference(streams: &[f64], marker: &[f64], selected: &[bool], d
     (marked, vjp)
 }
 
-fn scalar_split_tail_reference(prefix: &[f64], marker: &[f64], selected: &[bool], weights: &[f64]) -> Vec<f64> {
+fn scalar_affine_tail_reference(prefix: &[f64], marker: &[f64], selected: &[bool], weights: &[f64]) -> Vec<f64> {
     let width = marker.len();
     assert_eq!(prefix.len(), selected.len() * width);
     assert_eq!(weights.len(), width * width);
@@ -532,7 +581,7 @@ fn scalar_split_tail_reference(prefix: &[f64], marker: &[f64], selected: &[bool]
             let index = position * width + feature;
             marked[feature] = prefix[index] + if selected[position] { marker[feature] } else { 0.0 };
         }
-        // Independent plain-f64 recurrence: one complete linear tail block over the saved h.
+        // Independent plain-f64 affine tail over the saved representation; not a recurrence.
         for out in 0..width {
             let mut value = 0.0;
             for input in 0..width { value += weights[out * width + input] * marked[input]; }
@@ -540,6 +589,91 @@ fn scalar_split_tail_reference(prefix: &[f64], marker: &[f64], selected: &[bool]
         }
     }
     output
+}
+
+fn scalar_kron_temporary_reference(
+    hidden:&[f64],marker:&[f64;2],selected:&[bool],saved:&[f64;4],chain:bool,
+)->(Vec<f64>,Vec<f64>,Vec<f64>) {
+    let mut output=Vec::new();let mut states=Vec::new();let mut scores=Vec::new();
+    let mut previous=*saved;
+    for (position,&marked) in selected.iter().enumerate() {
+        let h=[hidden[position*2]+if marked {marker[0]}else{0.0},
+            hidden[position*2+1]+if marked {marker[1]}else{0.0}];
+        let q=h;let k=h.map(|x|x*0.6+0.2);let v=h.map(|x|x*0.4-0.1);
+        let alpha=h.map(|x|x*0.05+0.7);
+        let erase=h[0]*0.02+0.3;let write=h[1]*0.03+0.2;
+        let initial=if chain {previous}else{*saved};
+        let mut next=[0.0;4];let mut prediction=0.0;
+        for key in 0..2 {for value in 0..2 {
+            next[key*2+value]=alpha[key]*initial[key*2+value];
+            prediction+=k[key]*next[key*2+value]*v[value];
+        }}
+        let correction=write-erase*prediction;
+        for key in 0..2 {for value in 0..2 {
+            next[key*2+value]+=k[key]*correction*v[value];
+        }}
+        for value in 0..2 {output.push((0..2).map(|key|q[key]*next[key*2+value]).sum());}
+        scores.push((k.iter().map(|x|x*x).sum::<f64>()
+            *v.iter().map(|x|(correction*x).powi(2)).sum::<f64>()).sqrt());
+        states.extend(next);previous=next;
+    }
+    (output,states,scores)
+}
+
+fn kron_temporary_tail_case(device:&Device)->Result<Value> {
+    let hidden=[0.25,-0.5,0.75,1.0,-1.25,0.125];
+    let saved=[0.25,-0.125,0.375,0.5];
+    let selected=[true,false,true];let marker=[0.125,-0.25];
+    let hidden_tensor=Tensor::<2>::from_data(TensorData::new(hidden.map(|x|x as f32).to_vec(),[3,2]),device);
+    let clean=Tensor::<4>::from_data(TensorData::new(saved.map(|x|x as f32).to_vec(),[1,1,2,2]),device);
+    let hidden_before=values(hidden_tensor.clone());let clean_before=values(clean.clone());
+    let immutable=||->Result<()> {
+        ensure!(values(hidden_tensor.clone()).iter().zip(&hidden_before).all(|(a,b)|a.to_bits()==b.to_bits()),
+            "temporary tail overwrote saved A/B hidden representation");
+        ensure!(values(clean.clone()).iter().zip(&clean_before).all(|(a,b)|a.to_bits()==b.to_bits()),
+            "temporary tail overwrote frozen clean recurrent snapshot");
+        Ok(())
+    };
+    let run=|marker:[f64;2]| {
+        let marks=Tensor::<2>::from_data([[1.0f32],[0.0],[1.0]],device);
+        let marker=Tensor::<2>::from_data([marker.map(|x|x as f32)],device);
+        let h=hidden_tensor.clone()+marks.matmul(marker);
+        let q=h.clone().reshape([3,1,1,2]);
+        let input=delta_mixers::chunk::ScanInput {
+            q:q.clone(),k:q.clone()*0.6+0.2,v:q.clone()*0.4-0.1,alpha:q.clone()*0.05+0.7,
+            erase:q.clone().slice([0..3,0..1,0..1,0..1])*0.02+0.3,
+            write:q.slice([0..3,0..1,0..1,1..2])*0.03+0.2,
+        };
+        let initial=clean.clone().expand([3,1,2,2]);
+        let initial_before=values(initial.clone());
+        let result=delta_mixers::chunk::scan_selected(delta_mixers::ScanBackend::TensorSolver,
+            delta_mixers::MixerKind::KronLstm,input,Tensor::ones([3,1],device),Tensor::zeros([3,1],device),
+            1,Some(initial.clone()));
+        ensure!(values(initial).iter().zip(&initial_before).all(|(a,b)|a.to_bits()==b.to_bits()),
+            "temporary scan overwrote duplicated initial snapshots");
+        Ok::<_,anyhow::Error>(result)
+    };
+    let expected_a=scalar_kron_temporary_reference(&hidden,&[0.0;2],&selected,&saved,false);
+    let expected_b=scalar_kron_temporary_reference(&hidden,&marker,&selected,&saved,false);
+    let a=run([0.0;2])?;immutable()?;
+    let b=run(marker)?;immutable()?;
+    let report=|actual:delta_mixers::chunk::ScanOutput,expected:&(Vec<f64>,Vec<f64>,Vec<f64>)|->Result<Value>{
+        Ok(json!({"output":compare_f64(&values(actual.output),&expected.0)?,
+            "every_temporary_state":compare_f64(&values(actual.final_state),&expected.1)?,
+            "edit_scores":compare_f64(&values(actual.scores),&expected.2)?}))
+    };
+    let wrong=scalar_kron_temporary_reference(&hidden,&marker,&selected,&saved,true);
+    let chain_gap=wrong.0.iter().zip(&expected_b.0).map(|(a,b)|(a-b).abs()).fold(0.0f64,f64::max);
+    let marker_gap=expected_a.0.iter().zip(&expected_b.0).map(|(a,b)|(a-b).abs()).fold(0.0f64,f64::max);
+    ensure!(chain_gap>1.0e-3,"Kron tail fixture does not distinguish incorrect sequential chaining");
+    ensure!(marker_gap>1.0e-3,"Kron tail fixture does not exercise a nonzero marker effect");
+    Ok(json!({"passed":true,"device":crate::runtime::identity(device),"backend":"tensor_solver",
+        "reference":"independent f64 Kron decay, scalar prediction/erase/write, outer-product edit and query read",
+        "shape":{"active_positions":3,"heads":1,"keys":2,"values":2,"time_per_temporary_scan":1},
+        "A":report(a,&expected_a)?,"B":report(b,&expected_b)?,
+        "A_B_saved_hidden_and_clean_state_bitwise_unchanged":true,"duplicated_initial_snapshots_bitwise_unchanged":true,
+        "same_frozen_state_for_every_position":true,"nonzero_marker_output_gap":marker_gap,
+        "incorrect_sequential_chaining_output_gap":chain_gap}))
 }
 
 fn compare_f64(actual: &[f32], reference: &[f64]) -> Result<Value> {
@@ -576,10 +710,10 @@ pub fn run(c: &Config, device: &Device) -> Result<Value> {
     let gradients = (marked_tensor.clone()*cotangent_tensor).sum().backward();
     let marker_backward = compare_f64(&values(marker_tensor.grad(&gradients).context("independent stream marker VJP")?),&marker_vjp)?;
     let weights = [0.1, -0.2, 0.05, 0.3, -0.15, 0.2, 0.25, -0.1, 0.4, 0.12, -0.3, 0.08, 0.2, -0.05, 0.16, 0.11];
-    let recurrence = scalar_split_tail_reference(&streams,&weights[..4],&selected,&weights);
-    ensure!(recurrence.iter().all(|x|x.is_finite()),"non-finite scalar split-tail reference");
+    let affine = scalar_affine_tail_reference(&streams,&weights[..4],&selected,&weights);
+    ensure!(affine.iter().all(|x|x.is_finite()),"non-finite scalar affine-tail reference");
     let tail_marker=[0.15,-0.1,0.05,0.2];
-    let expected_tail=scalar_split_tail_reference(&streams,&tail_marker,&selected,&weights);
+    let expected_tail=scalar_affine_tail_reference(&streams,&tail_marker,&selected,&weights);
     let matrix=Tensor::<2>::from_data(TensorData::new(weights.iter().map(|&x|x as f32).collect::<Vec<_>>(),[4,4]),&fixture_device);
     let tail_input=Tensor::<2>::from_data(TensorData::new(streams.iter().map(|&x|x as f32).collect::<Vec<_>>(),[2,4]),&fixture_device);
     let tail_marks=Tensor::<2>::from_data([[1.0f32],[0.0]],&fixture_device).expand([2,4]);
@@ -587,6 +721,8 @@ pub fn run(c: &Config, device: &Device) -> Result<Value> {
     let tail_actual=tail_input+tail_marker_tensor.unsqueeze_dim::<2>(0)*tail_marks;
     let tail_actual=tail_actual.matmul(matrix.transpose());
     let tail_reference=compare_f64(&values(tail_actual),&expected_tail)?;
+    let kron_tail=json!({"cpu":kron_temporary_tail_case(&Device::ndarray())?,
+        "requested_device":kron_temporary_tail_case(device)?});
     let cpu = model_case(c,&Device::ndarray(),true,false).context("CPU oHC CoCommit checks")?;
     let ordinary = model_case(c,device,false,false).context("requested-device ordinary stream CoCommit checks")?;
     let ohc = model_case(c,device,true,false).context("requested-device oHC CoCommit checks")?;
@@ -594,30 +730,37 @@ pub fn run(c: &Config, device: &Device) -> Result<Value> {
     let retrieval = if c.backend=="vulkan" { Some(retrieval_case(device).context("full D256 MoBA retrieval split-tail check")?) } else { None };
     let implicit=serde_json::to_value(CocommitConfig::default())?;
     let mut explicit_config=CocommitConfig::default();
-    explicit_config.execution=crate::config::CocommitExecution::Doubled;
+    explicit_config.execution=crate::config::CocommitExecution::Separate;
     let explicit=serde_json::to_value(explicit_config)?;
     ensure!(implicit==explicit && !implicit.as_object().unwrap().contains_key("execution"),
-        "omitted doubled execution selector changed CoCommit serialization");
+        "omitted separate execution selector changed CoCommit serialization");
     let mut fingerprint_config=Config::default();
     fingerprint_config.sbd=Some(SbdConfig{cocommit:Some(CocommitConfig::default()),..SbdConfig::default()});
     let implicit_fingerprint=fingerprint_config.pilot_fingerprint()?;
-    fingerprint_config.sbd.as_mut().unwrap().cocommit.as_mut().unwrap().execution=crate::config::CocommitExecution::Doubled;
+    fingerprint_config.sbd.as_mut().unwrap().cocommit.as_mut().unwrap().execution=crate::config::CocommitExecution::Separate;
     let explicit_fingerprint=fingerprint_config.pilot_fingerprint()?;
-    ensure!(implicit_fingerprint==explicit_fingerprint,"omitted doubled execution selector changed config fingerprint");
-    let checkpoint=cocommit_checkpoint_continuation(device,c.seed).context("CoCommit AdamW marker checkpoint continuation")?;
+    ensure!(implicit_fingerprint==explicit_fingerprint,"omitted separate execution selector changed config fingerprint");
+    let checkpoint=cocommit_checkpoint_continuation(c,device,c.seed).context("CoCommit production optimizer marker checkpoint continuation")?;
+    let clipping=crate::update::clipping_checks(device)?;
+    let membership=delta_mixers::checks::membership_schedule_checks(device).map_err(anyhow::Error::msg)?;
     let omitted_selector=omitted_selector_check()?;
     let training_cases=training_equivalence(c,device)?;
+    let row_accumulation=row_accumulation_equivalence(device).context("full-batch versus exact row-accumulated SBD and CoCommit")?;
     Ok(json!({"passed":true,"command":"cocommit-reference","device":crate::runtime::identity(device),
         "precision":"float32","absolute_tolerance":ABS_TOL,"relative_tolerance":REL_TOL,
         "reference_fixtures":{"independent_ohc_stream_marker_forward_and_vjp":{"passed":true,"forward":marker_forward,"vjp":marker_backward,"positions":2,"streams":4,"stream_width":1,"flattened_hidden_width":4},
-            "plain_f64_split_tail_recurrence":{"passed":true,"report":tail_reference,"positions":2,"width":4,"finite_values":expected_tail.len()}},
+            "plain_f64_affine_tail":{"passed":true,"report":tail_reference,"positions":2,"width":4,"finite_values":expected_tail.len()},
+            "plain_f64_kron_temporary_tail_recurrence":kron_tail},
         "cpu_ohc":cpu,"requested_device_ordinary_stream":ordinary,"requested_device_ohc":ohc,"fresh_circuit":circuit,
         "full_D256_MoBA_retrieval":retrieval,"checkpoint_continuation":checkpoint,
+        "production_clipping":clipping,"membership_schedule":membership,
         "omitted_execution_selector":{"serialization_identical":true,"pilot_fingerprint_identical":true},
         "omitted_cocommit_selector":omitted_selector,"full_training_equivalence":training_cases,
+        "full_vs_row_accumulation":row_accumulation,
         "coverage":{"cached_and_reconstructed_tail":true,"zero_marker_a_b_equivalence":true,
             "nonzero_marker_effect":true,"length_one_causal_bypass":true,"soft_hard_feedback":true,
             "per_block_vs_batched":true,"retrieval":retrieval.is_some(),"circuit_freshness_and_subset_events":true,
+            "full_vs_row_accumulation_all_four_objectives":true,
             "checkpoint_marker_and_adamw_continuation":true,"disabled_initialization_and_identity":"disabled-model numerical equivalence exercised"}}))
 }
 
@@ -677,7 +820,7 @@ fn training_equivalence(c:&Config,device:&Device)->Result<Value> {
         cfg.sbd=Some(SbdConfig{block_lengths:vec![4],feedback,
             block_execution:crate::config::SbdBlockExecution::Batched,in_block_reads:InBlockReads::HolaRead,
             joint_output:if joint {SbdJointOutput::Codpula}else{SbdJointOutput::Factorized},
-            cocommit:Some(CocommitConfig::default()),..SbdConfig::default()});
+            cocommit:Some(CocommitConfig{execution:crate::config::CocommitExecution::Doubled,..CocommitConfig::default()}),..SbdConfig::default()});
         let arm=Arm{name:"cocommit-training-gate".into(),mixer:"kronlstm".into(),cache:"surprise".into()};
         cfg.arms=vec![arm.clone()];cfg.validate()?;
         let examples=(0..2).map(|row| {
@@ -718,6 +861,134 @@ fn training_equivalence(c:&Config,device:&Device)->Result<Value> {
             "includes_clean_loss_both_student_branches_and_all_parameter_gradients":true}));
     }}
     Ok(json!({"passed":true,"cases":reports,"device":crate::runtime::identity(device),"config_seed":c.seed}))
+}
+
+fn compare_row_backward(
+    actual_model:&LanguageModel,actual:&crate::sbd_step::Backward,
+    reference_model:&LanguageModel,reference:&crate::sbd_step::Backward,
+)->Result<Value> {
+    ensure!(actual.loss.is_finite() && reference.loss.is_finite(),"non-finite row-accumulation loss");
+    let error=(actual.loss-reference.loss).abs();
+    let tolerance=ABS_TOL+REL_TOL*reference.loss.abs();
+    ensure!(error<=tolerance,"row-accumulation scalar loss exceeded tolerance: error={error}, tolerance={tolerance}");
+    let gradients=compare_parameter_gradients(
+        &parameters(actual_model,Some(&actual.gradients))?,
+        &parameters(reference_model,Some(&reference.gradients))?,
+    ).context("every row-accumulation parameter gradient")?;
+    let flows=match (&actual.circuit_flows,&reference.circuit_flows) {
+        (None,None)=>json!({"passed":true,"present":false}),
+        (Some(actual),Some(reference))=>{
+            ensure!(actual.active_blocks==reference.active_blocks,"row-accumulation circuit active_blocks differs");
+            let mut tensors=serde_json::Map::new();
+            macro_rules! tensor {
+                ($field:ident)=>{
+                    ensure!(actual.$field.dims()==reference.$field.dims(),"circuit flow {} shape differs",stringify!($field));
+                    tensors.insert(stringify!($field).into(),
+                        compare(&values(actual.$field.clone()),&values(reference.$field.clone()))
+                            .with_context(||format!("row-accumulation circuit flow {}",stringify!($field)))?);
+                };
+            }
+            tensor!(emission_positive);tensor!(emission_negative);
+            tensor!(transition_positive);tensor!(transition_negative);
+            tensor!(root_positive);tensor!(root_negative);
+            tensor!(emission_reach);tensor!(transition_reach);tensor!(root_reach);
+            json!({"passed":true,"present":true,"active_blocks":actual.active_blocks,"tensors":tensors})
+        }
+        _=>anyhow::bail!("row-accumulation circuit flow presence differs"),
+    };
+    Ok(json!({"passed":true,"loss":{"actual":actual.loss,"reference":reference.loss,"max_abs":error,
+        "maximum_tolerance_ratio":error/tolerance},"all_parameter_gradients":gradients,"all_circuit_flows":flows,
+        "actual_passes":actual.passes,"reference_passes":reference.passes,
+        "actual_rows_per_pass":actual.rows_per_pass,"reference_rows_per_pass":reference.rows_per_pass}))
+}
+
+fn row_accumulation_equivalence(device:&Device)->Result<Value> {
+    let cpu=Device::ndarray().autodiff();
+    let target=device.clone().autodiff();
+    let seed=41;
+    let examples=(0..2).map(|row| {
+        let tokens=std::iter::once(256).chain((0..20).map(|position|((position*37+row*13+5)%256) as i32)).collect::<Vec<_>>();
+        Example{input:tokens[..20].to_vec(),target:tokens[1..].to_vec(),weight:vec![1.0;20],groups:vec![None;20]}
+    }).collect::<Vec<_>>();
+    let mut reports=Vec::new();
+    for cocommit in [false,true] {for joint in [SbdJointOutput::Factorized,SbdJointOutput::Codpula] {
+        let mut cfg=Config::default();
+        cfg.task="lm".into();cfg.backend="cpu".into();cfg.budget_file=None;
+        cfg.d_model=16;cfg.layers=4;cfg.heads=4;cfg.key_dim=32;cfg.value_dim=64;
+        cfg.context=20;cfg.batch_size=2;cfg.chunk_size=16;cfg.cache_capacity=4;
+        cfg.association_counts=vec![1];cfg.ohc_streams=true;
+        cfg.sbd=Some(SbdConfig{block_lengths:vec![4],feedback:SbdFeedback::SoftFeedback,
+            block_execution:crate::config::SbdBlockExecution::Batched,in_block_reads:InBlockReads::HolaRead,
+            joint_output:joint,cocommit:cocommit.then(CocommitConfig::default),rows_per_pass:None,
+            ..SbdConfig::default()});
+        let arm=Arm{name:"sbd-row-accumulation-gate".into(),mixer:"kronlstm".into(),cache:"surprise".into()};
+        cfg.arms=vec![arm.clone()];cfg.validate()?;
+        let mut chunked=cfg.clone();chunked.sbd.as_mut().unwrap().rows_per_pass=Some(1);chunked.validate()?;
+        // The oracle draws on the complete batch, never restarts either RNG at a row boundary.
+        let blocks=sbd::sample_training_blocks(&cfg,&examples,seed)?;
+        ensure!(blocks==sbd::sample_training_blocks(&chunked,&examples,seed)?,"row selector changed full-batch masks");
+        ensure!((0..2).all(|row|blocks.iter().any(|block|block.row==row)),"row fixture must sample active blocks in both rows");
+        let maximum=cfg.sbd.as_ref().unwrap().cocommit.as_ref().map(|options|options.training_bundle_max);
+        let bundles=maximum.map(|maximum|crate::cocommit::sample_bundles(&blocks,maximum,seed));
+        if let Some(maximum)=maximum {
+            let chunk_blocks=sbd::sample_training_blocks(&chunked,&examples,seed)?;
+            ensure!(bundles.as_ref().unwrap()==&crate::cocommit::sample_bundles(&chunk_blocks,maximum,seed),
+                "row selector changed full-batch CoCommit bundles");
+        }
+        let mut reconstructed=Vec::new();
+        let mut reconstructed_bundles=Vec::new();
+        let mut partition_metadata=Vec::new();
+        for row_start in 0..examples.len() {
+            for (index,block) in blocks.iter().enumerate().filter(|(_,block)|block.row==row_start) {
+                let mut local=block.clone();local.row-=row_start;
+                partition_metadata.push(json!({"original_block_index":index,"original_row":block.row,
+                    "local_row":local.row,"start":local.start,"length":local.length,"masked":local.masked,
+                    "bundle":bundles.as_ref().map(|bundles|&bundles[index])}));
+                local.row+=row_start;reconstructed.push(local);
+                if let Some(bundles)=&bundles {reconstructed_bundles.push(bundles[index].clone());}
+            }
+        }
+        ensure!(reconstructed==blocks,"partitioning changed full sampled masks or block order");
+        if let Some(bundles)=&bundles {ensure!(&reconstructed_bundles==bundles,"partitioning changed bundle-to-block alignment");}
+        cpu.seed(1907);
+        let mut reference=LanguageModel::new(&cfg,&arm,&cpu)?;
+        if cocommit {
+            let marker=Tensor::from_data(TensorData::new((0..64).map(|i|(i as f32-31.5)*0.0007).collect::<Vec<_>>(),[4,16]),&cpu).require_grad();
+            reference.cocommit_marker=Some(reference.cocommit_marker.take().unwrap().map(|_|marker));
+        }
+        let mut actual=reference.clone().fork(&target);requested_scan(&mut actual,&target);
+        let cpu_batch=Batch::new(&examples,&cpu);
+        let target_batch=Batch::new(&examples,&target);
+        let sampled=sbd::training_loss_sampled_profiled(&reference,&cfg,&examples,&cpu_batch,
+            &blocks,bundles.as_deref(),&mut Unprofiled)?;
+        let sampled_loss=model::scalar(sampled.loss.clone())?;
+        let sampled=crate::sbd_step::Backward{loss:sampled_loss,
+            gradients:model::checked_gradients(&reference,sampled.loss)?,circuit_flows:sampled.circuit_flows,
+            passes:1,rows_per_pass:examples.len()};
+        let full=crate::sbd_step::backward(&reference,&cfg,&examples,&cpu_batch,seed)?;
+        let split=crate::sbd_step::backward(&reference,&chunked,&examples,&cpu_batch,seed)?;
+        ensure!(full.passes==1 && full.rows_per_pass==2,"omitted row selector did not retain a full-batch pass");
+        ensure!(split.passes==2 && split.rows_per_pass==1,"explicit single-row selector did not run both passes");
+        ensure!(full.circuit_flows.is_some()==(joint==SbdJointOutput::Codpula),"fixture circuit flow presence differs from joint output");
+        let sampled_oracle=json!({"full":compare_row_backward(&reference,&full,&reference,&sampled)?,
+            "chunked":compare_row_backward(&reference,&split,&reference,&sampled)?,
+            "same_full_batch_masks_and_bundles":true,"partitioned_blocks":partition_metadata});
+        let cpu_report=compare_row_backward(&reference,&split,&reference,&full)?;
+        let requested_full=crate::sbd_step::backward(&actual,&cfg,&examples,&target_batch,seed)?;
+        let requested_split=crate::sbd_step::backward(&actual,&chunked,&examples,&target_batch,seed)?;
+        ensure!(requested_full.passes==1 && requested_split.passes==2 && requested_split.rows_per_pass==1,
+            "requested-device row pass metadata differs");
+        let requested=compare_row_backward(&actual,&requested_split,&actual,&requested_full)?;
+        let cross_device=json!({"full":compare_row_backward(&actual,&requested_full,&reference,&full)?,
+            "chunked":compare_row_backward(&actual,&requested_split,&reference,&split)?});
+        reports.push(json!({"passed":true,"cocommit":cocommit,"joint_output":joint,"feedback":SbdFeedback::SoftFeedback,
+            "seed":seed,"model_seed":1907,"shape":{"batch":2,"context":20,"width":16,"layers":4,"block":4},
+            "ohc_streams":true,"in_block_reads":InBlockReads::HolaRead,"cpu":cpu_report,
+            "requested_device":requested,"cpu_vs_requested":cross_device,"direct_full_sampled_oracle":sampled_oracle}));
+    }}
+    Ok(json!({"passed":true,"cases":reports,"device":crate::runtime::identity(device),
+        "absolute_tolerance":ABS_TOL,"relative_tolerance":REL_TOL,"loss_normalization":"full B2/T20",
+        "sampled_once_before_partitioning":true,"circuit_flows":"all nine tensors and exact active_blocks; sums are unscaled"}))
 }
 
 fn visibility_case(model:&LanguageModel,c:&Config,example:&Example,device:&Device)->Result<Value> {
@@ -792,4 +1063,13 @@ fn gradient_error_details(model:&LanguageModel,actual:&[(Vec<usize>,Vec<f32>)],r
     let maximum=parameters.iter().map(|p|p["ratio"].as_f64().unwrap()).fold(0.0f64,f64::max);
     json!({"passed":maximum<=1.0,"maximum_tolerance_ratio":maximum,
         "objective":"sum A/B squared logits and squared normalized features","parameters":parameters})
+}
+
+fn ensure_exact_parameter_bits(actual:&[(Vec<usize>,Vec<f32>)],expected:&[(Vec<usize>,Vec<f32>)],context:&str)->Result<()> {
+    ensure!(actual.len()==expected.len(),"{context}: parameter count differs");
+    for (index,((shape,a),(expected_shape,b))) in actual.iter().zip(expected).enumerate(){
+        ensure!(shape==expected_shape && a.len()==b.len() && a.iter().zip(b).all(|(&x,&y)|x.to_bits()==y.to_bits()),
+            "{context}: parameter {index} is not bit-identical");
+    }
+    Ok(())
 }

@@ -181,8 +181,9 @@ impl LanguageModel {
         }
         if model.cocommit_config.is_some() {
             let streams = if c.ohc_streams { 4 } else { 1 };
-            model.cocommit_marker = Some(Param::initialized(
-                ParamId::new(), Tensor::zeros([streams,c.d_model],device).require_grad()));
+            let marker=Tensor::zeros([streams,c.d_model],device);
+            let marker=if device.is_autodiff() {marker.require_grad()} else {marker};
+            model.cocommit_marker=Some(Param::initialized(ParamId::new(),marker));
         }
         Ok(model)
     }

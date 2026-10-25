@@ -1,9 +1,11 @@
-//! Same-input tensor/fused HOLA checks against an independent scalar f64 VJP.
+//! Same-input tensor/fused HOLA checks against independent scalar references.
+//! Membership-only schedules also match the old attention/selection path exactly.
 //! CPU transfers happen only in these explicit checks, never in the operator.
 use super::{ATOL, RTOL, compare, values};
 use crate::{CachePolicy, HolaBackend, hola};
 use burn::prelude::*;
 use serde::Serialize;
+use serde_json::{Value, json};
 use std::time::Instant;
 
 #[derive(Debug, Serialize)]
@@ -598,6 +600,298 @@ fn fixture_checks(device: &Device, backends: &[HolaBackend]) -> Result<Vec<HolaC
     Ok(reports)
 }
 
+/// Prove every position-only schedule snapshot, including the empty initial cache.
+///
+/// With the CPU feature, always exercise ndarray independently of the requested
+/// device. A requested CubeCL device additionally exercises its tensor path and
+/// every fused HOLA selector. This check performs no training or timing study.
+pub fn membership_schedule_checks(device: &Device) -> Result<Value, String> {
+    let mut cases = Vec::new();
+    #[cfg(feature = "cpu")]
+    membership_schedule_device_checks(
+        &Device::ndarray().autodiff(),
+        "cpu_ndarray",
+        &[HolaBackend::Tensor],
+        &mut cases,
+    )?;
+    #[cfg(any(feature = "vulkan", feature = "cuda"))]
+    let configured_gpu_checked = matches!(
+        device.clone().inner().as_dispatch(),
+        burn::backend::DispatchDevice::Cube(_)
+    );
+    #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
+    let configured_gpu_checked = false;
+    if configured_gpu_checked {
+        membership_schedule_device_checks(
+            &device.clone().autodiff(),
+            "configured_gpu",
+            &[
+                HolaBackend::Tensor,
+                HolaBackend::FusedGpu,
+                HolaBackend::FusedGpuPairs,
+                HolaBackend::FusedGpuPairsNorms,
+            ],
+            &mut cases,
+        )?;
+    }
+    #[cfg(not(feature = "cpu"))]
+    if !configured_gpu_checked {
+        membership_schedule_device_checks(
+            &device.clone().autodiff(),
+            "configured_device",
+            &[HolaBackend::Tensor],
+            &mut cases,
+        )?;
+    }
+    // CPU-only builds still use the same public device-taking interface.
+    let _ = device;
+    Ok(json!({
+        "passed": true,
+        "max_abs": 0.0,
+        "precision": "float32_exact_integer_positions",
+        "absolute_tolerance": 0.0,
+        "relative_tolerance": 0.0,
+        "oracle": "cache_reference::evaluate.final_positions_on_repacked_truncated_prefixes",
+        "oracle_qkv_width": 1,
+        "legacy_comparator": "hola::read_with_selection.positions",
+        "layout": ["batch", "heads", "ceil(time/chunk)+1", "capacity"],
+        "initial_snapshot": "all_minus_one",
+        "snapshots": "initial_and_after_every_chunk_including_partial",
+        "cpu_checked": cfg!(feature = "cpu"),
+        "configured_gpu_checked": configured_gpu_checked,
+        "scores_nondifferentiable": true,
+        "cases": cases,
+    }))
+}
+
+/// Each prefix must be repacked row by row: truncating the flattened arrays
+/// would silently reuse row zero's suffix as the next batch row.
+fn membership_prefix_oracle(f: &Fixture, end: usize) -> Vec<f64> {
+    if end == 0 {
+        return vec![-1.; f.b * f.h * f.capacity];
+    }
+    let mut scores = Vec::with_capacity(f.b * end * f.h);
+    let mut valid = Vec::with_capacity(f.b * end);
+    let mut docs = Vec::with_capacity(f.b * end);
+    for row in 0..f.b {
+        scores.extend(
+            f.scores[row * f.t * f.h..(row * f.t + end) * f.h]
+                .iter()
+                .map(|&x| f64::from(x)),
+        );
+        valid.extend(
+            f.valid[row * f.t..row * f.t + end]
+                .iter()
+                .map(|&x| x >= 0.5),
+        );
+        docs.extend(
+            f.docs[row * f.t..row * f.t + end]
+                .iter()
+                .map(|&x| x as usize),
+        );
+    }
+    let zeros = vec![0.; f.b * end * f.h];
+    crate::cache_reference::evaluate(
+        &zeros,
+        &zeros,
+        &zeros,
+        &scores,
+        &valid,
+        &docs,
+        [f.b, end, f.h, 1, 1],
+        f.capacity,
+        f.chunk,
+        f.policy,
+        &zeros,
+    )
+    .final_positions
+}
+
+fn membership_schedule_device_checks(
+    device: &Device,
+    scope: &'static str,
+    backends: &[HolaBackend],
+    reports: &mut Vec<Value>,
+) -> Result<(), String> {
+    for policy in [CachePolicy::Surprise, CachePolicy::Recency] {
+        for capacity in [1, 4, 16] {
+            for chunk in [1, 16] {
+                // The long case includes all packed edge cases. The short
+                // case additionally leaves an underfilled, partial first chunk.
+                for time in [7, 83] {
+                    if time == 7 && chunk == 1 {
+                        continue;
+                    }
+                    let mut f = Fixture::new(2, time, capacity, chunk, policy, true);
+                    f.name = if time == 7 {
+                        "short_partial_chunk_exact_ties"
+                    } else {
+                        "ties_internal_and_full_chunk_padding_resets_repeated_labels_invalid_last_doc"
+                    };
+                    if time == 83 {
+                        // Row zero must retain eligible old entries through
+                        // all-padding; row one's invalid final doc 77 must
+                        // instead empty the cache at that same boundary.
+                        f.valid[16..32].fill(0.);
+                    }
+                    for row in 0..f.b {
+                        for pos in 0..f.t {
+                            for head in 0..f.h {
+                                f.scores[(row * f.t + pos) * f.h + head] =
+                                    if f.valid[row * f.t + pos] < 0.5 {
+                                        1000.
+                                    } else if pos == 2 {
+                                        8.
+                                    } else {
+                                        ((pos * (head + 1) + 2 * row) % 5) as f32
+                                    };
+                            }
+                        }
+                    }
+                    let snapshots = time.div_ceil(chunk) + 1;
+                    let boundaries = (0..snapshots)
+                        .map(|index| (index * chunk).min(time))
+                        .collect::<Vec<_>>();
+                    let expected = boundaries
+                        .iter()
+                        .map(|&end| membership_prefix_oracle(&f, end))
+                        .collect::<Vec<_>>();
+                    let scores = Tensor::<4>::from_data(
+                        TensorData::new(f.scores.clone(), [f.b, time, f.h, 1]),
+                        device,
+                    )
+                    .require_grad();
+                    let valid = Tensor::<2>::from_data(
+                        TensorData::new(f.valid.clone(), [f.b, time]),
+                        device,
+                    );
+                    let docs = Tensor::<2>::from_data(
+                        TensorData::new(f.docs.clone(), [f.b, time]),
+                        device,
+                    );
+                    // Keep the actual old tensor reader, not schedule_selected
+                    // invoked a second time. Width one avoids unnecessary
+                    // attention work while preserving its original selector.
+                    let zeros = Tensor::<4>::zeros([f.b, time, f.h, 1], device);
+                    let (_, selections) = hola::read_with_selection(
+                        zeros.clone(),
+                        zeros.clone(),
+                        zeros,
+                        scores.clone(),
+                        valid.clone(),
+                        docs.clone(),
+                        capacity,
+                        chunk,
+                        policy,
+                        Tensor::zeros([f.h], device),
+                        None,
+                    );
+                    if selections.len() + 1 != snapshots {
+                        return Err("legacy membership snapshot count mismatch".into());
+                    }
+                    let mut legacy = vec![vec![-1.; f.b * f.h * capacity]];
+                    for (index, selection) in selections.into_iter().enumerate() {
+                        if selection.chunk_start != index * chunk
+                            || selection.positions.dims() != [f.b, f.h, capacity]
+                        {
+                            return Err("legacy membership boundary metadata mismatch".into());
+                        }
+                        legacy.push(
+                            values(selection.positions)
+                                .into_iter()
+                                .map(f64::from)
+                                .collect(),
+                        );
+                    }
+                    for &backend in backends {
+                        let result: Result<Value, String> = (|| {
+                            let schedule = hola::schedule_selected(
+                                backend,
+                                scores.clone(),
+                                valid.clone(),
+                                docs.clone(),
+                                capacity,
+                                chunk,
+                                policy,
+                            );
+                            let shape = [f.b, f.h, snapshots, capacity];
+                            if schedule.dims() != shape {
+                                return Err(format!(
+                                    "membership schedule shape {:?} != {shape:?}",
+                                    schedule.dims()
+                                ));
+                            }
+                            if !scores.is_tracked() || schedule.is_tracked() {
+                                return Err(
+                                    "membership schedule must be untracked despite tracked scores".into(),
+                                );
+                            }
+                            let observed = values(schedule.clone());
+                            let mut max_abs = 0.0f64;
+                            let mut legacy_max_abs = 0.0f64;
+                            for index in 0..snapshots {
+                                let mut boundary = Vec::with_capacity(f.b * f.h * capacity);
+                                for row_head in 0..f.b * f.h {
+                                    let start = (row_head * snapshots + index) * capacity;
+                                    boundary.extend_from_slice(&observed[start..start + capacity]);
+                                }
+                                max_abs = max_abs.max(compare(
+                                    &format!("membership scalar oracle boundary {index}"),
+                                    &boundary,
+                                    &expected[index],
+                                    0.,
+                                    0.,
+                                )?);
+                                legacy_max_abs = legacy_max_abs.max(compare(
+                                    &format!("membership old reader boundary {index}"),
+                                    &boundary,
+                                    &legacy[index],
+                                    0.,
+                                    0.,
+                                )?);
+                            }
+                            // A separate tracked leaf permits backward even
+                            // though a correct membership schedule has no tape.
+                            let anchor = Tensor::<1>::ones([1], device).require_grad();
+                            let gradients = (schedule.sum() + anchor.clone()).backward();
+                            if scores.grad(&gradients).is_some()
+                                || anchor.grad(&gradients).is_none()
+                            {
+                                return Err(
+                                    "membership scores differentiated or gradient probe did not run".into(),
+                                );
+                            }
+                            Ok(json!({
+                                "passed": true,
+                                "scope": scope,
+                                "hola_backend": backend,
+                                "selection": policy,
+                                "fixture": f.name,
+                                "shape": {"batch": f.b, "tokens": time, "heads": f.h,
+                                    "capacity": capacity, "chunk": chunk},
+                                "score_shape": [f.b, time, f.h, 1],
+                                "metadata_shape": [f.b, time],
+                                "schedule_shape": shape,
+                                "checked_prefix_lengths": boundaries,
+                                "boundaries_checked": snapshots,
+                                "max_abs": max_abs,
+                                "legacy_max_abs": legacy_max_abs,
+                                "scores_nondifferentiable": true,
+                                "schedule_tracked": false,
+                            }))
+                        })();
+                        reports.push(result.map_err(|error| format!(
+                            "membership schedule {scope} backend={backend:?} policy={policy:?} B{}/T{time}/H{}/capacity{capacity}/chunk{chunk}: {error}",
+                            f.b, f.h,
+                        ))?);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn timed(
     f: &Fixture,
     x: &Inputs,
@@ -692,4 +986,55 @@ pub fn hola_paired_benchmark(
         retained_output_bytes: 4 * rows * 64,
         dense_rank_or_attention_matrix_bytes: 0,
     })
+}
+
+/// Resident forward-only membership costs; selection has no backward.
+pub fn membership_schedule_benchmark(device:&Device,warmups:usize,trials:usize)->Result<serde_json::Value,String>{
+    if warmups<2 || trials<11 {return Err("membership timing needs two warmups and eleven pairs".into());}
+    let supported={
+        #[cfg(any(feature="vulkan",feature="cuda"))]
+        {matches!(device.clone().inner().as_dispatch(),burn::backend::DispatchDevice::Cube(_))}
+        #[cfg(not(any(feature="vulkan",feature="cuda")))]
+        {false}
+    };
+    if !supported{return Err("membership timing requires the configured fused GPU device".into());}
+    let fixture=Fixture::new(1,512,16,16,CachePolicy::Surprise,false);
+    let inputs=fixture.upload(&device.clone().autodiff());
+    let q=inputs.q.detach();let k=inputs.k.detach();let v=inputs.v.detach();
+    let scores=inputs.scores.detach();
+    let sink=Tensor::<1>::zeros([4],device);
+    let run=|fused:bool|->Result<(Tensor<4>,f64),String>{
+        device.sync().map_err(|error|format!("membership pre-sync: {error:?}"))?;
+        let start=Instant::now();
+        let schedule=if fused {
+            hola::schedule_selected(HolaBackend::FusedGpu,scores.clone(),inputs.valid.clone(),inputs.docs.clone(),16,16,CachePolicy::Surprise)
+        }else{
+            let (read,selections)=hola::read_with_selection(q.clone(),k.clone(),v.clone(),scores.clone(),inputs.valid.clone(),inputs.docs.clone(),16,16,CachePolicy::Surprise,sink.clone(),None);
+            std::hint::black_box(read);
+            let mut positions=Vec::with_capacity(selections.len()+1);
+            positions.push(Tensor::<3>::full([1,4,16],-1.0,device));
+            positions.extend(selections.into_iter().map(|selection|selection.positions));
+            Tensor::stack(positions,2)
+        };
+        device.sync().map_err(|error|format!("membership post-sync: {error:?}"))?;
+        Ok((schedule,start.elapsed().as_secs_f64()*1000.0))
+    };
+    let mut samples:[Vec<f64>;2]=std::array::from_fn(|_|Vec::new());
+    for iteration in 0..warmups+trials{
+        let mut results:[Option<Tensor<4>>;2]=[None,None];
+        for mode in if iteration%2==0 {[0,1]}else{[1,0]}{
+            let (schedule,time)=run(mode==1)?;
+            results[mode]=Some(schedule);
+            if iteration>=warmups{samples[mode].push(time);}
+        }
+        let old=values(results[0].take().unwrap());
+        let new=values(results[1].take().unwrap());
+        if old!=new{return Err("timed membership schedules differ".into());}
+    }
+    let median=|values:&[f64]|{let mut sorted=values.to_vec();sorted.sort_by(f64::total_cmp);sorted[sorted.len()/2]};
+    Ok(serde_json::json!({"shape":{"batch":1,"time":512,"heads":4,"capacity":16,"chunk":16},
+        "warmups":warmups,"trials":trials,"legacy_full_read_ms":samples[0],"position_only_ms":samples[1],
+        "legacy_full_read_median_ms":median(&samples[0]),"position_only_median_ms":median(&samples[1]),
+        "membership_max_abs":0,"schedule_bytes":1*4*33*16*4,"backward":"not applicable: membership is discrete and detached",
+        "scope":"resident no-gradient Q/K/V/scores/valid/documents; old full tensor attention read solely to obtain membership vs adopted fused selection only; excludes cache-query normalization and uploads; synchronized alternating order"}))
 }

@@ -138,10 +138,12 @@ fn training_loss_per_block<P: delta_mixers::profile::Sections>(model: &LanguageM
     let [batch_size,sequence_length,_] = clean_logits.dims();
     let denominator = (batch_size*sequence_length) as f64;
     let mut selected = blocks.iter().peekable();
+    let teacher_model=(s.feedback==SbdFeedback::SoftFeedback && blocks.iter().any(|block|block.masked.len()>1)).then(||model.valid());
     for (row_index,row) in rows.iter().enumerate() {
         let Some(length) = selected.peek().filter(|block| block.row == row_index).map(|block| block.length) else {continue;};
         let starts = (0..row.target.len()).step_by(length).map(|start|start+1).collect::<Vec<_>>();
         let cache = (length > 1).then(|| model.training_cache(trace,row_index,&starts));
+        let teacher_cache=teacher_model.as_ref().and_then(|_|cache.as_ref().map(|cache|cache.detached()));
         while selected.peek().is_some_and(|block| block.row == row_index) {
             let block = selected.next().unwrap();
             let n = block.masked.len();
@@ -155,8 +157,9 @@ fn training_loss_per_block<P: delta_mixers::profile::Sections>(model: &LanguageM
             let cache = cache.as_ref().unwrap();
             let block_index = block.start/block.length;
             if s.feedback == SbdFeedback::SoftFeedback {
-                let teacher = model.cached_block_profiled(cache,block_index,&soft,false,profile);
-                update_feedback(model,c,teacher,&mut soft,1.0)?;
+                let teacher_model=teacher_model.as_ref().unwrap();
+                let teacher=teacher_model.cached_block_profiled(teacher_cache.as_ref().unwrap(),block_index,&soft,false,profile);
+                update_feedback(teacher_model,c,teacher,&mut soft,1.0)?;
             }
             let output = model.cached_block_profiled(cache,block_index,&soft,s.feedback == SbdFeedback::HardMask,profile);
             if model.codpula.is_some() {
@@ -208,8 +211,10 @@ fn training_loss_batched<P: delta_mixers::profile::Sections>(model: &LanguageMod
     let cache = model.training_cache_batched(trace,&cache_blocks);
     let mut soft = SoftState::new(c.vocab(),s.candidate_width,observed,active,&device,c.soft_selection_backend)?;
     if s.feedback == SbdFeedback::SoftFeedback {
-        let teacher = model.cached_blocks_profiled(&cache,&soft,false,profile);
-        update_feedback(model,c,teacher,&mut soft,1.0)?;
+        let teacher_model=model.valid();
+        let teacher_cache=cache.detached();
+        let teacher=teacher_model.cached_blocks_profiled(&teacher_cache,&soft,false,profile);
+        update_feedback(&teacher_model,c,teacher,&mut soft,1.0)?;
     }
     let output = model.cached_blocks_profiled(&cache,&soft,s.feedback == SbdFeedback::HardMask,profile);
     if model.codpula.is_some() {
@@ -232,11 +237,17 @@ pub fn training_loss(model: &LanguageModel, c: &Config, rows: &[Example], batch:
     training_loss_profiled(model,c,rows,batch,seed,&mut delta_mixers::profile::Unprofiled)
 }
 pub fn training_loss_profiled<P: delta_mixers::profile::Sections>(model: &LanguageModel, c: &Config, rows: &[Example], batch: &Batch, seed: u64, profile: &mut P) -> Result<SbdTrainingResult> {
-    let s = c.sbd.as_ref().context("SBD config is required")?;
+    let blocks=sample_training_blocks(c,rows,seed)?;
+    let bundles=c.sbd.as_ref().and_then(|s|s.cocommit.as_ref())
+        .map(|options|crate::cocommit::sample_bundles(&blocks,options.training_bundle_max,seed));
+    training_loss_sampled_profiled(model,c,rows,batch,&blocks,bundles.as_deref(),profile)
+}
+pub(crate) fn training_loss_sampled_profiled<P:delta_mixers::profile::Sections>(model:&LanguageModel,c:&Config,rows:&[Example],batch:&Batch,blocks:&[TrainingBlock],bundles:Option<&[Vec<bool>]>,profile:&mut P)->Result<SbdTrainingResult> {
+    let s=c.sbd.as_ref().context("SBD config is required")?;
     if s.cocommit.is_some() {
-        return crate::cocommit::training_loss_profiled(model,c,rows,batch,seed,profile);
+        return crate::cocommit::training_loss_sampled_profiled(model,c,rows,batch,blocks,bundles.context("CoCommit bundles required")?,profile);
     }
-    if s.joint_output == SbdJointOutput::Codpula {
+    if model.codpula.is_some() {
         ensure!(rows.iter().all(|row|row.weight.iter().all(|&weight|weight == 1.0)),
             "Codpula joint event loss requires unit valid target weights");
     }
@@ -250,10 +261,9 @@ pub fn training_loss_profiled<P: delta_mixers::profile::Sections>(model: &Langua
         if let Some(bias) = &circuit.gate_head.bias { loss = loss + bias.val().sum()*0.0; }
     }
     let result = SbdTrainingResult {loss,circuit_flows:None};
-    let blocks = sample_training_blocks(c,rows,seed)?;
     match s.block_execution {
-        SbdBlockExecution::PerBlock => training_loss_per_block(model,c,rows,clean_logits,&trace,&blocks,result,profile),
-        SbdBlockExecution::Batched => training_loss_batched(model,c,rows,clean_logits,&trace,&blocks,result,profile),
+        SbdBlockExecution::PerBlock => training_loss_per_block(model,c,rows,clean_logits,&trace,blocks,result,profile),
+        SbdBlockExecution::Batched => training_loss_batched(model,c,rows,clean_logits,&trace,blocks,result,profile),
     }
 }
 

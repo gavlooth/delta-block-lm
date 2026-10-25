@@ -1,10 +1,10 @@
-# Steps 1–9: implementation and measured results
+# Steps 1–10: implementation and measured results
 
 For the current optimized execution paths, measured speedups and known legacy GPU-solver limitation, see [Early GPU kernel optimization](#early-gpu-kernel-optimization). The current recommended batch-8 configuration and its combined measurements are in [Batch-8 component optimization round](#batch-8-component-optimization-round). Step 7 (oHC, wavelet mixer, three Lngram injections) is in [Step 7: oHC, wavelet and Lngram](#step-7-ohc-wavelet-and-lngram). The first sections retain the original pilot measurements.
 
 ## Scope and stopping point
 
-Implemented and exercised the active Burn workspace, causal GDN-2 and KronLSTM, optional HOLA/recency memory, soft top-k feedback, paired associative-recall experiments, and a tiny causal language-model comparison. The Steps 1–6 sections below predate Step 7, which is reported separately at the end. Step 8 includes user-selected in-block reads through HOLA. Step 9 adds Codpula joint output and dependence-adaptive commitment; this turn's evaluation scope is numerical correctness, execution cost and a tiny smoke, not a quality study. Earlier dense-attention measurements remain historical. CoCommit and energy-guided remasking remain later work.
+Implemented and exercised the active Burn workspace, causal GDN-2 and KronLSTM, optional HOLA/recency memory, soft top-k feedback, paired associative-recall experiments, and a tiny causal language-model comparison. The Steps 1–6 sections below predate Step 7, which is reported separately at the end. Step 8 includes user-selected in-block reads through HOLA. Step 9 adds Codpula joint output and dependence-adaptive commitment. Step 10 adds CoCommit's shared-prefix unmarked/marked tails, including a fresh marked circuit. These additions are evaluated for numerical correctness, execution cost and a tiny smoke, not a quality study. Earlier dense-attention measurements remain historical. Energy-guided remasking remains later work.
 
 All runs used the local Intel Arc Graphics (MTL) through Vulkan, with float32 execution. No Spark or predecessor production process was used or modified.
 Run artifacts report sampled backend-reserved memory and explicit recurrent/cache/convolution storage. Exact GPU peak memory is not available here; the integrated GPU shares system memory, so reserved-pool samples must not be presented as exact physical-device peaks.
@@ -2007,3 +2007,50 @@ Evidence: `artifacts/codpula/`, particularly `cpu-tests.txt`,
 `b1/codpula-benchmark.json`, `b1/codpula-isolated.json`,
 `codpula-diagnostic.json`, `smoke/`, `adoption.json` and
 `checkpoint-cleanup.json`.
+
+## Step 10: CoCommit
+
+Implemented one last-block marked tail from saved pre-tail ordinary/oHC streams, a trainable full-stream marker, unmarked plus marked-subset supervision, and factorized/Codpula cached/reconstructed/per-block/batched training, evaluation and generation. Combined assignment rebuilds its circuit, proposals and dependence scores from marked token potentials and gates. Prefix snapshots and final observations stay immutable; only final clean replay writes persistent state. Omitted selectors preserve historical serialization/fingerprints and the length-one causal bypass.
+
+### Numerical evidence and exact restart
+
+`artifacts/cocommit/cocommit-reference.json` passes the unchanged `2e-5 + 3e-4*abs(reference)` criterion. Independent f64 marker/VJP, affine saved-input and real temporary Kron recurrence references are separate from the model graph. Kron temporary output/state error is at most `2.35451e-8`; zero-marker A/B and tracked/frozen teacher outputs are exact. The reference deliberately distinguishes independent temporary active queries from incorrectly chaining their states.
+
+Complete loss/all-parameter-gradient gates cover factorized/Codpula × hard/soft feedback, batching/reconstruction, padding/visibility, right-to-left in-block communication and leakage. Real D256/H4/K32/V64 tail MoBA retrieval with prefix219/L8 passes normalized training/event supervision with gradient max absolute error `1.57356e-5` and maximum tolerance ratio about `.539`. The larger B2 row-accumulation matrix has CPU/Vulkan gradient max absolute error `2.19345e-5`, maximum ratio `.25556` (different elements); final full-versus-grouped execution itself reaches only `.02247` of tolerance. All nine circuit flow tensors and exact context counts agree.
+
+The raw unnormalized squared-logit/feature stress objective failed both with CoCommit (ratio `11.6143`) and at the same shape/weights without CoCommit (plain SBD+MoBA ratio `21.0719`). This is the requested discriminator's **case (a)**, retained as a known pre-existing ill-conditioned-objective result. No tolerance, gradient set, retrieval path or workload was weakened; the approved normalized objective is the acceptance gate.
+
+Enabled save/load/continue uses actual `train::optimizer_step`, two row groups at B2, soft feedback, Codpula flows, active clipping (`.05`), configured AdamW and marker moments. Parameters/losses and moment signatures continue bitwise identically; circuit time is identical after its single update per step. Historical causal checkpoint continuation also passes with exact next-step parameters/moments and zero logit error. The clipping-only standalone commit `64590d18` is preserved as merge ancestry. The Tensor-Lngram fix `e50cc523` is not needed by this profile's passing FusedGpu restart and is left to parent integration.
+
+Final workspace tests: 54 experiment, 7 kernel and 16 mixer tests pass; the one GPU-sharing-only test remains explicitly ignored by the CPU test invocation. Nonfinite selection tests reject NaN/+inf/all-zero support and preserve genuine `-inf` zero mass without replacing failed rows.
+
+### Memory execution
+
+The original unchanged B8/T512/L8 run failed a `3,489,660,928`-byte allocation while preparing membership through a complete TensorHOLA read. The exact position-only path reuses the existing fused schedule; 90 independent-oracle/old-read comparisons have zero membership error across ties, resets, documents, padding and capacities. Frozen teacher execution avoids an unused autodiff graph; its logits/features match the tracked-then-detached path bitwise.
+
+Repeated whole-B8 graphs still exceeded available allocation behavior after those changes; preserved failures are `b8-oom.json`, `b8-feedback-oom.json` and `b8-memory-trace.json`. The explicit common `sbd.rows_per_pass: 4` helper now processes every B8 example in two four-row groups, sampling full masks/bundles once, scaling local losses by row fraction, summing gradients/flows, and performing one clipping/AdamW/circuit update. There is no allocation catch, retry or hidden smaller workload.
+
+The resulting unchanged B8/T512/L8 diagnostic with the selected separate tails completes in **6,893.824 ms**, with **49,928 launches** and **3,951,724,736 bytes** sampled backend pool reservation, after two warmups (`14,261.864/6,266.990 ms`, first-use compilation in the first). It is a single diagnostic, not a paired speedup against Step 9's historical 8.00 s or the archived doubled-tail diagnostic. Pool reservation is not physical-device peak memory.
+
+The reusable cached prefix/tail/pair output API does not absorb tokens. Parent integration owns R²D/TCT's coherent marked denoiser calls and keeps temporary announcements/provisional reveals separate from permanent evidence and episode completion. No combined-feature or quality study is inferred here.
+
+### Paired complete-step cost
+
+B1/T512/L8, same materialized starting weights, fixed example0/mask seed1, two warmups and 11 alternating pairs. Every step includes clean/frozen-teacher/student passes, all loss/flow/backward work, finite checks, clipping and AdamW; no evaluation or checkpoint I/O.
+
+| Path | Median ms | Launches | Sampled reserved bytes |
+| --- | ---: | ---: | ---: |
+| CoCommit off | 1,286.855 | 23,032 | 1,946,849,280 |
+| CoCommit separate — selected | 1,408.335 | 26,022 | 1,946,848,192 |
+| CoCommit doubled | 1,393.231 | 25,506 | 1,946,850,624 |
+
+Selected-on paired overhead **116.839 ms [89.963,121.664]**, about9.1% of the off median. Separate-minus-doubled saving **24.124 ms [−23.326,49.555]** does not exclude zero, so the default remains the simpler shared-cache **separate** execution. This overrides the reversible initial 2C recommendation according to its measurement rule. The isolated tail's positive doubled forward/backward saving **18.533 [15.919,22.519] ms** is not substituted for whole-step evidence.
+
+Position-only schedule preparation independently reduces the old full-read-only-for-membership median **99.272→1.038 ms**; paired saving **98.227 [91.325,104.213] ms**, exact membership each pair, **8,448 bytes** schedule storage. This is resident B1/H4/T512/C16/chunk16 forward-only selection work, not a complete-model speedup. Pool samples above share three resident models and allocator reuse, not independent physical-device peaks.
+
+Evidence: `artifacts/cocommit/paired/cocommit-benchmark.json`, `adoption.json`, `cocommit-reference.json`, `cocommit-diagnostic.json`, `historical/checkpoint-check.json`, and `workspace-tests.json`; full decisions and API semantics are in `docs/cocommit.md`.
+
+### Tiny execution smoke
+
+Context32/B1 trained exactly96 target bytes in3 steps, then loaded its checkpoint for enabled block evaluation and generation. Eight tokens were finalized and causally replayed in one block/one denoising pass. This verifies execution, not quality. The unused recall association-count validation setting is[2] for this small context; the B8/T512 workload is unchanged. Smoke model/optimizer payloads and historical diagnostic copies were deleted after checks; small configs/state/metrics/reports remain (`checkpoint-cleanup.json`).
+

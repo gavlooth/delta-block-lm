@@ -16,6 +16,19 @@ use burn_cubecl::CubeBackend;
 
 #[backend_extension(Cube, Autodiff, Fusion: cfg(feature = "fusion"))]
 pub trait HolaOps: Backend {
+    #[fusion(meta = |scores: &TensorSpec, _valid, _documents, capacity: &usize, chunk: &usize, _recency| {
+        let [batch, time, heads, _] = scores.shape.dims::<4>();
+        TensorSpec::new([batch, heads, time.div_ceil(*chunk) + 1, *capacity].into(), scores.dtype)
+    })]
+    fn hola_schedule(
+        scores: FloatTensor<Self>,
+        valid: FloatTensor<Self>,
+        documents: FloatTensor<Self>,
+        capacity: usize,
+        chunk: usize,
+        recency: bool,
+    ) -> FloatTensor<Self>;
+
     #[fusion(meta = |q: &TensorSpec, _k, v: &TensorSpec, _scores, _valid, _documents, _sink, capacity: &usize, chunk: &usize, _recency, _pairs| {
         let [batch, time, heads, _] = q.shape.dims::<4>();
         (
@@ -71,6 +84,17 @@ pub trait HolaOps: Backend {
 }
 
 impl HolaOps for CubeBackend {
+    fn hola_schedule(
+        scores: FloatTensor<Self>,
+        valid: FloatTensor<Self>,
+        documents: FloatTensor<Self>,
+        capacity: usize,
+        chunk: usize,
+        recency: bool,
+    ) -> FloatTensor<Self> {
+        crate::hola::run_schedule(scores, valid, documents, capacity, chunk, recency)
+    }
+
     fn hola_read(
         q: FloatTensor<Self>,
         k: FloatTensor<Self>,
@@ -123,6 +147,25 @@ impl HolaOps for CubeBackend {
 }
 
 impl<B: Backend + HolaOps, C: CheckpointStrategy> HolaOps for Autodiff<B, C> {
+    fn hola_schedule(
+        scores: FloatTensor<Self>,
+        valid: FloatTensor<Self>,
+        documents: FloatTensor<Self>,
+        capacity: usize,
+        chunk: usize,
+        recency: bool,
+    ) -> FloatTensor<Self> {
+        // Membership is discrete metadata, with no tracked input parents.
+        <Self as AutodiffBackend>::from_inner(B::hola_schedule(
+            scores.into_primitive(),
+            valid.into_primitive(),
+            documents.into_primitive(),
+            capacity,
+            chunk,
+            recency,
+        ))
+    }
+
     fn hola_read(
         q: FloatTensor<Self>,
         k: FloatTensor<Self>,
@@ -301,6 +344,33 @@ pub struct HolaReadOutput {
     /// Descending score, then ascending original position; empty slots are -1.
     /// Nondifferentiable, like the internal position schedule.
     pub final_positions: Option<Tensor<3>>,
+}
+
+/// Discrete original-position cache membership, without an attention read.
+///
+/// Scores are [batch,time,head,1], masks/documents [batch,time]. The output is
+/// [batch,head,ceil(time/chunk_size)+1,capacity]: an all--1 initial snapshot,
+/// then descending-score/ascending-position membership after each full or partial
+/// chunk. Recency ranks by original position instead of score. Eligibility uses
+/// the last physical slot's document, including padding, exactly as `hola_read`.
+/// No input receives a gradient. Uses the existing f32 CubeCL selection kernel;
+/// capacity is 1..=64 and chunk_size is 1..=16, with no CPU fallback.
+pub fn hola_schedule(
+    scores: Tensor<4>,
+    valid: Tensor<2>,
+    documents: Tensor<2>,
+    capacity: usize,
+    chunk_size: usize,
+    recency: bool,
+) -> Tensor<4> {
+    Tensor::from_dispatch(<Dispatch as HolaOps>::hola_schedule(
+        scores.into_dispatch(),
+        valid.into_dispatch(),
+        documents.into_dispatch(),
+        capacity,
+        chunk_size,
+        recency,
+    ))
 }
 
 /// Exact original-KV memory; Q/K learned RMS norms and output gate stay external.

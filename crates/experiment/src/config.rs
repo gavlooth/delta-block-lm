@@ -203,12 +203,12 @@ fn is_default_dependence_threshold(value: &f64) -> bool { *value == dependence_t
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CocommitExecution {
-    #[default]
     Doubled,
+    #[default]
     Separate,
 }
 impl CocommitExecution {
-    pub fn is_doubled(&self) -> bool { *self == Self::Doubled }
+    pub fn is_separate(&self) -> bool { *self == Self::Separate }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -218,13 +218,13 @@ pub struct CocommitConfig {
     pub rounds: usize,
     pub training_bundle_max: usize,
     pub visible_loss_weight: f64,
-    #[serde(skip_serializing_if = "CocommitExecution::is_doubled")]
+    #[serde(skip_serializing_if = "CocommitExecution::is_separate")]
     pub execution: CocommitExecution,
 }
 impl Default for CocommitConfig {
     fn default() -> Self {
         Self { tail_layers: 1, rounds: 1, training_bundle_max: 16, visible_loss_weight: 0.2,
-            execution: CocommitExecution::Doubled }
+            execution: CocommitExecution::Separate }
     }
 }
 
@@ -250,6 +250,9 @@ pub struct SbdConfig {
     pub noisy_read_backend: delta_mixers::sbd::NoisyReadBackend,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cocommit: Option<CocommitConfig>,
+    /// Optional exact row chunk size for SBD backward accumulation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows_per_pass: Option<usize>,
     pub candidate_width: usize,
     pub commit_count: usize,
     /// None selects fixed-count commitment; Some selects paper equation 8 (nats).
@@ -266,7 +269,7 @@ impl Default for SbdConfig {
             candidate_width: 4, commit_count: 2, entropy_threshold: None, generate_tokens: 32,
             in_block_reads: delta_mixers::sbd::InBlockReads::None,
             noisy_read_backend: delta_mixers::sbd::NoisyReadBackend::Tensor,
-            cocommit: None }
+            cocommit: None, rows_per_pass: None }
     }
 }
 
@@ -474,6 +477,8 @@ impl Config {
             "fused prefix retrieval requires selected layers, K32/V64 and non-fusion Vulkan");
         if let Some(sbd) = &self.sbd {
             ensure!(self.task == "lm", "SBD requires byte language modeling");
+            ensure!(sbd.rows_per_pass.is_none_or(|rows| rows > 0),
+                "sbd.rows_per_pass must be positive when specified");
             ensure!(!self.autotune, "SBD variable-shape matmuls are not covered by the autotune preflight");
             ensure!(!sbd.block_lengths.is_empty() && sbd.block_lengths.iter().all(|&n| n > 0),
                 "SBD block lengths must be positive");

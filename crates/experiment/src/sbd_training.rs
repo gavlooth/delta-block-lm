@@ -19,6 +19,14 @@ struct LayerCache {
     mixer: MixerCache,
 }
 pub struct TrainingCache { layers: Vec<LayerCache>, starts: Vec<usize> }
+impl TrainingCache {
+    pub fn detached(&self)->Self {
+        Self {layers:self.layers.iter().map(|x|LayerCache{
+            wavelet:x.wavelet.as_ref().map(WaveletCache::detached),lngram:x.lngram.as_ref().map(|x|x.clone().detach()),
+            mixer:x.mixer.detached(),
+        }).collect(),starts:self.starts.clone()}
+    }
+}
 #[derive(Clone)]
 struct BatchedLngramCache {
     history: Option<(Tensor<3>,Tensor<2>)>,
@@ -72,6 +80,9 @@ struct BatchedLayerCache {
 }
 pub struct BatchedTrainingCache { layers: Vec<BatchedLayerCache>, blocks: usize }
 impl BatchedLngramCache {
+    fn detached(&self)->Self {
+        Self {history:self.history.as_ref().map(|(values,valid)|(values.clone().detach(),valid.clone()))}
+    }
     fn duplicate_rows(&self) -> Self {
         Self { history: self.history.as_ref().map(|(values,valid)| (
             Tensor::cat(vec![values.clone(),values.clone()],0),
@@ -80,6 +91,12 @@ impl BatchedLngramCache {
     }
 }
 impl BatchedTrainingCache {
+    pub fn detached(&self)->Self {
+        Self {layers:self.layers.iter().map(|x|BatchedLayerCache{
+            wavelet:x.wavelet.as_ref().map(BatchedWaveletCache::detached),
+            lngram:x.lngram.as_ref().map(BatchedLngramCache::detached),mixer:x.mixer.detached(),
+        }).collect(),blocks:self.blocks}
+    }
     fn duplicate_rows_from(&self, first: usize) -> Self {
         Self {
             layers: self.layers.iter().enumerate().map(|(index,layer)| if index < first {

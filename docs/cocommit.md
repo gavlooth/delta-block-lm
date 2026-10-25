@@ -260,7 +260,7 @@ Checkpoint identity includes enabled semantic revision, tail depth, rounds, bund
 | Q11 | Marked-output feedback. |
 | Q12 | Train existing neural parameters plus the marker. |
 | Q13 | Immutable observations; no visible revision. |
-| Q14 | Doubled tail batch without retrieval, shared-cache separate calls with retrieval; choose final execution by paired measurement. |
+| Q14 | Two shared-cache C-row tail calls by final paired measurement; optional doubled execution retained and verified, not selected. The original recommendation was reversible and subject to this measurement. |
 | Q15 | Exact causal singleton bypass. |
 | Q16 | Combine both branch contexts/counts and update the circuit once. |
 | Q17 | Saved-h zero-marker equivalence check only; no trained sequential-depth comparison. |
@@ -350,7 +350,7 @@ B8/T512/L8 above means **512 independent L8 block-row evaluations**, as in batch
 
 ## 7. Correctness plan
 
-No checks in this section have been run for CoCommit. Use the unchanged elementwise criterion for f32 tensor/GPU comparisons:
+The implementation checks below use the unchanged elementwise criterion for f32 tensor/GPU comparisons; executed results are recorded in §9:
 
 `abs(actual - ref) <= 2e-5 + 3e-4 * abs(ref)`.
 
@@ -380,3 +380,66 @@ Extend existing reference commands/reports and the crate's existing test binary.
 6. **Scope of measurements.** Run saved-h zero-marker equivalence as correctness, CoCommit off/on complete-step timing as cost accounting, and equivalent tail-layout paired timing. Run only the authorized few-step context32 smoke and checkpoint/evaluation/generation checks. Do not run trained comparison arms, sequential-depth models, quality studies, sweeps or ablations. Include all partial tails, queries, feedback and replay in reported cost.
 
 The numerical gates and measured component budget below determine implementation readiness, not quality improvement. The planning scenario remains an estimate until measurements replace it. No quality conclusion follows from a correctness gate, a cost comparison or the tiny execution smoke.
+
+## 9. Implementation and numerical results
+
+The enabled selector is `sbd.cocommit`; omission keeps historical serialization, fingerprints, initialization and checkpoint compatibility. `configs/lm512-cocommit.json` adds it to the existing Codpula profile. Factorized and Codpula outputs share the same saved-prefix/tail APIs. `cocommit.rs` handles both branch losses, bundle selection and marked reassignment; `sbd_training.rs` exposes per-block and batched prefix, tail and paired-tail calls. These APIs do not write tokens or persistent recurrent/cache/history state.
+
+The marker is a trainable zero-initialized parameter appended after ordinary model initialization. Its gradient is enabled explicitly. Both student branches retain gradients through the same saved prefix. Teacher feedback is detached by definition; its execution uses frozen model parameters and detached cache aliases rather than building an unused graph before detaching its outputs. The teacher still uses the same selected membership, embeddings, gates, circuit and soft-top-k update.
+
+### 9.1 Numerical and restart gates
+
+All comparisons retain `2e-5 + 3e-4*abs(reference)`; no tolerance was enlarged. The reference command covers independent f64 additive marker/VJP and saved-input tail calculations, zero-marker A/B identity, ordinary and oHC representations, cached/reconstructed/per-block/batched layouts, hard/soft feedback, factorized/Codpula complete training losses and every parameter gradient, leakage and immutable clean snapshots, singleton causal identity, and a fresh marked circuit with subset-event loss. Generalized event enumeration and circuit VJPs/flows are also exercised by `codpula-reference`.
+
+The independent f64 temporary Kron-tail oracle includes decay, prediction/erase/write, outer-product state edit and query read. Each of three active positions starts from the same duplicated clean state. CPU/Vulkan maximum output/state difference is `2.3545074445685543e-8`; saved hidden/state/snapshots remain bitwise unchanged. A deliberately chained reference differs by `.12951689897`, so the test distinguishes the required independent temporary recurrence from an incorrect recurrent active-block scan. Separate full-model fused gates cover the configured K32/V64 execution.
+
+Real prefix retrieval uses the Step-8 retrieval configuration's D256/H4/K32/V64 tail with a 219-token prefix and L8 active block, not an empty or synthetic no-retrieval substitute. The normalized training/event objective passed CPU/Vulkan logits, loss and all-gradient checks: maximum absolute difference `1.5735626220703125e-5`, maximum tolerance ratio `0.53899813473`, loss difference `9.5367431640625e-7`.
+
+An artificial unnormalized squared-logit/feature stress objective had failed at ratio `11.6143281239` with CoCommit. The required same-shape/same-weights plain SBD+MoBA discriminator also failed, at ratio `21.0718978301`: this is case (a), a pre-existing ill-conditioned-objective result, not a CoCommit-specific pass. Both failure reports are retained. The approved normalized objective above is the acceptance gate; no retrieval path or gradient group was excluded.
+
+Enabled checkpoint continuation uses the actual `train::optimizer_step`, including soft feedback, Codpula flow update, active clipping at threshold `.05`, configured AdamW, and marker moments. Saved/loaded/continued parameters and losses are bitwise equal, marker moment signatures match, and circuit update time advances identically from 1 to 2. The historical causal `checkpoint-check` also passed with bitwise-equal next-step parameters, zero logit error and exact optimizer moments before/after continuation. These are production-step restart gates, not direct AdamW-only tests.
+
+The final enabled continuation also uses two one-row backward groups at B2 before that single production optimizer step. Full-versus-grouped checks cover ordinary SBD and CoCommit, factorized and Codpula, soft feedback/oHC/in-block reads, CPU and Vulkan, loss, every parameter gradient, all nine flow tensors and exact context counts. The final accumulation-only maximum tolerance ratio is `.02246959246`; CPU/Vulkan across the enlarged fixtures reaches maximum absolute gradient difference `2.193450927734375e-5` and maximum ratio `.25555908324` (different elements). The real-retrieval fixture remains the largest accepted tolerance ratio (about `.539`); absolute error alone is not the criterion.
+
+Probability-row selection now rejects NaN, positive infinity, and unsupported/all-zero rows before proposals or entropy. Legitimate `-inf` zero mass contributes zero to entropy; no uniform replacement is used. Focused regression cases cover these failures and supported point-mass/mixed-zero rows.
+
+### 9.2 Exact execution changes and memory failures
+
+The original unchanged B8/T512/L8 diagnostic failed requesting `3,489,660,928` bytes while a complete TensorHOLA read was computed only to obtain cache membership. Position-only preparation now invokes the existing fused selection schedule directly and shares its ranking, stable ties, reset/document/padding and cache-membership semantics. It does not compute/discard attention values or change model math. Ninety fitting-shape cases compare CPU, Tensor and fused selectors against both an independent scalar oracle and the old full-read path at every cache boundary; maximum membership difference is exactly zero.
+
+After that change, B8 progressed to teacher circuit marginals but again requested `3,489,660,928` bytes while retaining an unused teacher autodiff graph. Both failures are preserved (`b8-oom.json`, `b8-feedback-oom.json`); neither supplies a completed step timing. The no-gradient teacher execution described above removes that unused graph without changing feedback values or student gradients.
+
+Frozen teacher logits/features match tracked-then-detached execution bitwise and have no gradient tracking. This removed unused graphs but did not by itself make repeated full B8 steps fit: a section-synchronized first step returned with sampled pool reservation reaching `5,424,969,344` bytes, then the next ordinary warm step still failed the same `3,489,660,928`-byte request. `b8-memory-trace.json` retains that diagnosis. Explicit row accumulation below addresses the remaining complete-step memory pressure without a hidden retry.
+
+The explicit execution selector `sbd.rows_per_pass` divides full-batch examples into row groups before backward. Masks and CoCommit bundles are sampled once in original full-batch row order; each group receives its corresponding immutable choices. Local losses are multiplied by `group_rows/full_batch_rows`, parameter gradients are summed, and circuit flows/counts are summed without a per-group update. Finite-gradient checks, clipping, AdamW and circuit row updates occur once after all groups. This preserves total examples, tokens, denominators and RNG consumption; it is not a smaller workload or an allocation-error fallback. The B8 profile explicitly selects four rows per pass (two groups); B1 naturally uses one group.
+
+With that explicit two-group execution and the evidence-selected separate tails, the unchanged B8/T512/L8 workload completed: **6,893.824 ms**, **49,928 launches**, **3,951,724,736 bytes** sampled pool reservation. Two warmups were `14,261.864` and `6,266.990 ms`; the first includes first-use compilation. This is one post-warmup diagnostic, not a paired speedup against the historical 8.00 s result. All 4,096 clean targets and the full sampled noisy work are included, with one final optimizer/circuit update. Pool samples are not physical-device peak memory. The earlier doubled diagnostic (`6,243.454 ms`, `48,903` launches, `5,888,443,520` sampled bytes) is retained separately; these single diagnostics do not establish a B8 layout speedup.
+
+### 9.3 Composition hooks
+
+The cached prefix/tail/pair output API is independent of absorbing writes. R²D and TCT integration must call the coordinated A/B denoiser when this selector is enabled rather than silently using unmarked `cached_blocks`. Their temporary announcements/provisional reveals must remain distinct from immutable final observations; episode completion owns final writes. Step-11 semantics are not changed here, and the parent integrates that combined path.
+
+### 9.4 Paired execution cost and selection
+
+B1/T512/L8 uses the same materialized initial ordinary parameters, example index 0 and mask seed 1, independent optimizer histories, two warmups and 11 alternating interleaved trials. Full steps include host examples/uploads, the clean pass, frozen teacher/feedback, student prefix, both tails/heads, circuit/event/flow work, scalar reads, complete backward, finite-gradient checks, clipping and AdamW. No training quality comparison is made.
+
+| Full step | Median ms | Issued launches | Sampled pool reservation, bytes |
+| --- | ---: | ---: | ---: |
+| CoCommit off | 1,286.855 | 23,032 | 1,946,849,280 |
+| On, separate tails — selected | 1,408.335 | 26,022 | 1,946,848,192 |
+| On, doubled tail batch | 1,393.231 | 25,506 | 1,946,850,624 |
+
+The paired selected-on overhead is **116.839 ms**, bootstrap 95% interval **[89.963,121.664] ms** (about 9.1% of the off median). Separate-minus-doubled paired saving is **24.124 ms [−23.326,49.555]**; the complete-step interval includes zero, so **separate is the selected default**, following the recorded measurement rule rather than the earlier speculative 2C recommendation. Both paths remain numerically verified. Retrieval always shares banks rather than duplicating full clean KV.
+
+Resident isolated tails do show a doubled saving: separate/doubled forward medians **33.772/25.977 ms**, forward+backward **101.624/83.565 ms**; paired gains **7.547 [7.346,8.115] ms** and **18.533 [15.919,22.519] ms**. This does not establish a complete-step saving.
+
+Position-only schedule preparation is adopted independently: old membership-through-full-read median **99.272 ms**, position-only **1.038 ms**, paired saving **98.227 [91.325,104.213] ms**, exact positions on every pair. This resident B1/H4/T512/C16/chunk16 measurement excludes uploads/query normalization; schedule storage is **8,448 bytes**, and membership has no backward. Whole-model gains cannot be obtained by multiplying this isolated difference by the layer count.
+
+Pool reservation samples include all three resident benchmark models and allocator reuse, not independent per-model live memory or physical-device peaks. Reports: `artifacts/cocommit/paired/cocommit-benchmark.json`, `cocommit-reference.json`, `cocommit-diagnostic.json`, `historical/checkpoint-check.json`, `adoption.json`, and `workspace-tests.json`.
+
+### 9.5 Authorized execution smoke
+
+The context32/B1 run trained exactly **96 target bytes in three steps**, then loaded its final checkpoint for block evaluation and generation. Generation finalized and causally replayed **eight tokens**, one block and one denoising pass. These outputs exercise enabled inference, not model quality. Inference-only construction leaves the marker untracked; training construction enables its gradient. The smoke's unused recall-count validation setting was set to `[2]` so the context32 config is valid; B8/T512 measurements are unchanged.
+
+Disposable smoke model/optimizer payloads, historical diagnostic copies and an earlier failed temporary fixture's payloads were removed; configurations, state, metrics and numerical reports remain. `checkpoint-cleanup.json` records seven removed payload files. Original historical checkpoints and main's working files remain untouched. No training study, trained comparison arm, sweep or sequential-depth comparison was run.
+

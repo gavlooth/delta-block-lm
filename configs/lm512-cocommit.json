@@ -55,6 +55,7 @@
   "lngram_backend": "fused_gpu",
   "soft_selection_backend": "gpu",
   "sbd": {
+    "rows_per_pass": 4,
     "block_lengths": [
       8
     ],

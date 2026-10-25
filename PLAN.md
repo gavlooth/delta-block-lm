@@ -277,6 +277,14 @@ Partially implemented: clean/masked objectives, soft feedback, frozen prefix rea
 
 ### Step 10 — Add CoCommit, then test the combination
 
+**Implementation, numerical gates and execution-cost measurement complete (2026-10-25).** The authorized scope is correctness, off/on cost accounting, equivalent layouts and a tiny execution smoke, not a quality study.
+
+- One complete final block, one round, full saved oHC streams and independent marker entries are integrated with hard/soft feedback, factorized/Codpula output, reconstruction, batching, evaluation and generation. Marked potentials/gates create a new circuit; no temporary tail writes persistent state.
+- Independent f64 marker/temporary-Kron and circuit-event references, CPU/Vulkan logits/loss/every-gradient, padding/leakage, real prefix219 tail MoBA, and historical/enabled production checkpoint gates pass unchanged `2e-5 + 3e-4*abs(ref)`. Enabled restart includes clipping/AdamW/marker moments and one circuit update.
+- B1/T512 medians off/separate/doubled1286.855/1408.335/1393.231ms. Selected separate overhead116.839ms[89.963,121.664]; doubled saving24.124ms[-23.326,49.555] is not established for the complete step.
+- Position-only membership reuses existing fused selection and passes90 exact oracle/old-read cases; isolated paired saving98.227ms[91.325,104.213]. Frozen teachers avoid unused autodiff graphs. Explicit `sbd.rows_per_pass:4` preserves all B8/T512 work/RNG/bundles with two backward groups and one optimizer/circuit update; full/chunk all-gradient/all-flow gates pass. Selected B8 diagnostic6893.824ms,49928 launches,3,951,724,736 sampled pool bytes; original OOMs retained.
+- `docs/cocommit.md` records all adopted decisions and the evidence-selected layout override. Remasking/TCT combined dispatch and provisional-evidence semantics are owned by parent integration, using the independent saved-prefix/tail/output API.
+
 - Implement the unmarked selection tail and marked assignment tail starting from the same saved pre-tail hidden states.
 - Train the marked branch; start with one tail layer and one coordination round on the tiny model.
 - Check saved-h zero-marker equivalence; measure CoCommit off/on step cost and equivalent tail execution layouts only. No trained comparison arm, quality study, sweep or ablation is authorized.
