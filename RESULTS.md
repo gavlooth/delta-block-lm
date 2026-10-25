@@ -1791,3 +1791,103 @@ its newly created local target removed. All passing builds/tests used the
 required shared target. Existing Burn ndarray deprecation warnings remain;
 there were no acceptance failures.
 
+## SBD block-axis execution batching
+
+The execution-only selector `sbd.block_execution: batched` stacks selected
+multi-token blocks from every row along the batch axis. Clean snapshots are
+prepared for all rows together; frozen states, HOLA/retrieval starts and local
+histories remain specific to each block. Soft feedback retains the detached
+teacher and differentiable second pass. Padding uses the maximum configured
+length, with inactive keys and zero loss weights. Singleton targets still use
+clean causal logits. No parameter, model equation, training study or quality
+comparison was added.
+
+The omitted/default selector remains `per_block` and is excluded from
+serialization, preserving historical fingerprints. A pinned regression checks
+the pre-change length/eta/token RNG sequence, including masks for blocks that
+are subsequently skipped. Both explicit execution choices use that sampler.
+
+### Correctness
+
+All comparisons retained `2e-5 + 3e-4*abs(reference)`.
+Each backend passed 24 no-retrieval and 40 retrieval-inclusive
+architecture/feedback cases: both mixers, HOLA off/on, Step-7 off/on, valid
+in-block-read selections, soft feedback/hard mask, multiple rows and starts,
+lengths 1/4/8/16, short/padded tails, all-observed draws and actual completed-block
+retrieval selection. Loss comparisons check every parameter-gradient element,
+not a sample or an aggregate direction.
+
+| Batched versus per-block maximum absolute error | CPU | Vulkan |
+| --- | ---: | ---: |
+| Noisy/teacher logits | 1.63913e-7 | 4.47035e-8 |
+| Total SBD loss | 1.90735e-6 | 1.90735e-6 |
+| Every parameter gradient | 3.12925e-7 | 5.96047e-8 |
+| Largest elementwise tolerance ratio | 0.008266 | 0.001374 |
+
+The existing f64 noisy-HOLA and prefix-read gates, cached/reconstructed SBD
+comparisons, clean configured Step-7/retrieval model gates and historical
+checkpoint/optimizer continuation all passed. Workspace tests passed **49
+experiment + 7 kernel + 16 mixer tests**, with one GPU-sharing test ignored.
+The final GPU build took 8.47 seconds wall time; tests took 11.59 seconds.
+
+The first B8 diagnostic failed at the existing noisy-HOLA key-VJP's
+65,535-workgroup assertion, not from memory exhaustion. The existing kernel now
+uses the repository's multidimensional dispatch pattern with surplus-workgroup
+returns; forward and analytic VJP arithmetic are unchanged. A 67,200-workgroup
+GPU fixture passed the independent scalar-f64 forward/full-VJP oracle with
+maximum absolute error 3.43394e-7 and tolerance ratio 0.004088. No new read
+operator or chunked alternative was needed.
+
+### Paired complete training steps
+
+Intel Arc integrated GPU, Vulkan, Mesa 26.2.4, f32; width 256, four layers,
+H4/K32/V64, computational chunk 16, HOLA capacity 16, full Step-7 components,
+L8 soft feedback, seed 1, byte vocabulary 257. Both arms use the same model,
+examples, mask seeds, precision and optimizer settings. Each row below is a
+separate same-process comparison with **two warmups and 11 interleaved pairs**;
+order alternates, with independent AdamW trajectories from identical weights.
+The measured step includes host examples/upload, clean preparation, both noisy
+passes, loss/scalar readback, backward, finite checks, clipping and AdamW.
+There is no evaluation or checkpoint I/O. Final-code sessions held the GPU lock
+for 560.87 and 567.51 seconds respectively.
+
+| B1/T512 workload | Per-block median | Batched median | Paired saving | 95% paired bootstrap interval | Batched faster |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HOLA active-block reads, retrieval absent | 42,144.517 ms | 1,617.483 ms | 40,568.800 ms | [35,569.793, 44,211.076] ms | 11/11 |
+| Same, with configured layer-3 MoBA retrieval | 44,178.291 ms | 1,819.748 ms | 42,358.543 ms | [39,231.935, 43,705.788] ms | 11/11 |
+
+The median ratios are 26.06× and 24.28×. Paired savings are medians of
+within-pair differences, not differences of marginal medians. These rows do
+not measure retrieval's architecture cost against off; only execution differs
+within each row. Both intervals exclude zero, so **both
+`configs/lm512-sbd.json` and `configs/lm512-step8-retrieval.json` adopt explicit
+`batched` execution**. Omitted configurations keep `per_block`.
+
+| Work measurement | Per-block | Batched |
+| --- | ---: | ---: |
+| Issued launches, B1/T512 without retrieval | 211,269 | 24,242 |
+| Issued launches, B1/T512 with retrieval | 209,934 | 24,208 |
+
+Launch counts come from one additional complete step at the same step index
+and mask seed in each arm. Masks vary with the step seed, so these counts are
+not the earlier diagnostic's approximately 370k-launch draw. Sampled maximum
+pool reservation was 1,931,060,160 bytes in the no-retrieval session and
+2,200,545,536 bytes in the retrieval session; each includes both resident
+runners and allocator reuse, not a per-arm live-activation peak.
+
+### B8/T512 diagnostic
+
+One batched-only no-retrieval step after one warm step completed in
+**8,167.400 ms**, issuing **27,145 launches**, with **8,818,099,392 bytes**
+sampled maximum pool reservation. The warm step took 9,468.817 ms.
+B8 fits without block chunking. This single diagnostic establishes executable
+scale, not a paired B8 speedup; sampled reservation is not exact live bytes or
+physical-device peak. Retrieval-enabled B8 timing was not measured.
+
+All small final reports, resolved inputs, lock/timeout command records and the
+Bun reproduction runner are under `artifacts/batching/`. The first dispatch
+failure is recorded in `b8-first-attempt.json`; pre-dispatch-fix timing is
+separately retained in `before-large-grid.json` and is not the adoption
+evidence above. Historical diagnostic model/optimizer payloads were removed;
+numerical reports remain. No training study, ablation or sweep was run.
+

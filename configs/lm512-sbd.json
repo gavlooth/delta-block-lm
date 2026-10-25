@@ -39,6 +39,7 @@
   "soft_selection_backend": "gpu",
   "sbd": {
     "block_lengths": [8],
+    "block_execution": "batched",
     "in_block_reads": "hola_read",
     "noisy_read_backend": "fused_gpu",
     "feedback": "soft_feedback",

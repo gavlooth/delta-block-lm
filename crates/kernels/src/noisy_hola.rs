@@ -13,6 +13,7 @@ fn read(q: &View<f32>, k: &View<f32>, v: &View<f32>, visible: &View<f32>, valid:
     let lane = UNIT_POS as usize;
     let row = CUBE_POS as usize;
     let n = q.shape(2);
+    if row >= q.shape(0)*q.shape(1)*n { terminate!(); }
     let h = row/n%q.shape(1);
     let b = row/(n*q.shape(1));
     let t = row%n;
@@ -71,6 +72,7 @@ fn query_vjp(q: &View<f32>, k: &View<f32>, v: &View<f32>, valid: &View<f32>, p: 
     let lane = UNIT_POS as usize;
     let row = CUBE_POS as usize;
     let n = q.shape(2);
+    if row >= q.shape(0)*q.shape(1)*n { terminate!(); }
     let h = row/n%q.shape(1);
     let b = row/(n*q.shape(1));
     let t = row%n;
@@ -100,6 +102,7 @@ fn key_vjp(q: &View<f32>, k: &View<f32>, valid: &View<f32>, p: &View<f32>, dp: &
     let lane = UNIT_POS as usize;
     let row = CUBE_POS as usize;
     let m = k.shape(2);
+    if row >= k.shape(0)*k.shape(1)*m { terminate!(); }
     let s = row%m;
     let h = row/m%q.shape(1);
     let b = row/(m*q.shape(1));
@@ -124,7 +127,13 @@ fn sink_vjp(partial: &View<f32>, sink: &mut View<f32>) {
     }
 }
 fn empty(x: &CubeTensor, shape: impl Into<Shape>) -> CubeTensor { CubeBackend::float_empty(shape.into(),&x.device,DType::F32.into()) }
-fn count(n: usize) -> CubeCount { assert!(n <= 65535); CubeCount::Static(n as u32,1,1) }
+fn count(reference: &CubeTensor, groups: usize) -> CubeCount {
+    let (max_x,max_y,_) = reference.client.properties().hardware.max_cube_count;
+    let x = groups.min(max_x.min(65535) as usize).max(1);
+    let y = groups.div_ceil(x);
+    assert!(y <= max_y as usize,"noisy HOLA exceeds device workgroup limits");
+    CubeCount::Static(x as u32,y as u32,1)
+}
 fn validate(q: &CubeTensor, k: &CubeTensor, v: &CubeTensor, visible: &CubeTensor, valid: &CubeTensor, sink: &CubeTensor) -> (usize,usize,usize,usize) {
     let [b,h,n,d] = q.shape().dims::<4>();
     let m = k.shape().dims::<4>()[2];
@@ -143,7 +152,7 @@ pub(crate) fn forward(q: CubeTensor,k: CubeTensor,v: CubeTensor,visible: CubeTen
     let y = empty(&q,[b,h,n,64]);
     let p = empty(&q,[b,h,n,m+1]);
     let lanes = (m+1).next_power_of_two().max(64);
-    read::launch(&q.client,count(b*h*n),CubeDim::new_1d(lanes as u32),q.clone().into_tensor_arg(),k.into_tensor_arg(),v.into_tensor_arg(),visible.into_tensor_arg(),valid.into_tensor_arg(),sink.into_tensor_arg(),y.clone().into_tensor_arg(),p.clone().into_tensor_arg(),lanes);
+    read::launch(&q.client,count(&q,b*h*n),CubeDim::new_1d(lanes as u32),q.clone().into_tensor_arg(),k.into_tensor_arg(),v.into_tensor_arg(),visible.into_tensor_arg(),valid.into_tensor_arg(),sink.into_tensor_arg(),y.clone().into_tensor_arg(),p.clone().into_tensor_arg(),lanes);
     (y,p)
 }
 pub(crate) fn backward(q: CubeTensor,k: CubeTensor,v: CubeTensor,valid: CubeTensor,p: CubeTensor,y: CubeTensor,dy: CubeTensor) -> (CubeTensor,CubeTensor,CubeTensor,CubeTensor) {
@@ -156,8 +165,8 @@ pub(crate) fn backward(q: CubeTensor,k: CubeTensor,v: CubeTensor,valid: CubeTens
     let partial = empty(&q,[b,h,n]);
     let dp = empty(&q,[b,h,n,m]);
     let lanes = (m+1).next_power_of_two().max(64);
-    query_vjp::launch(&q.client,count(b*h*n),CubeDim::new_1d(lanes as u32),q.clone().into_tensor_arg(),k.clone().into_tensor_arg(),v.into_tensor_arg(),valid.clone().into_tensor_arg(),p.clone().into_tensor_arg(),y.into_tensor_arg(),dy.clone().into_tensor_arg(),dq.clone().into_tensor_arg(),dp.clone().into_tensor_arg(),partial.clone().into_tensor_arg(),lanes);
-    key_vjp::launch(&q.client,count(b*h*m),CubeDim::new_1d(64),q.clone().into_tensor_arg(),k.into_tensor_arg(),valid.into_tensor_arg(),p.into_tensor_arg(),dp.into_tensor_arg(),dy.into_tensor_arg(),dk.clone().into_tensor_arg(),dv.clone().into_tensor_arg());
+    query_vjp::launch(&q.client,count(&q,b*h*n),CubeDim::new_1d(lanes as u32),q.clone().into_tensor_arg(),k.clone().into_tensor_arg(),v.into_tensor_arg(),valid.clone().into_tensor_arg(),p.clone().into_tensor_arg(),y.into_tensor_arg(),dy.clone().into_tensor_arg(),dq.clone().into_tensor_arg(),dp.clone().into_tensor_arg(),partial.clone().into_tensor_arg(),lanes);
+    key_vjp::launch(&q.client,count(&q,b*h*m),CubeDim::new_1d(64),q.clone().into_tensor_arg(),k.into_tensor_arg(),valid.into_tensor_arg(),p.into_tensor_arg(),dp.into_tensor_arg(),dy.into_tensor_arg(),dk.clone().into_tensor_arg(),dv.clone().into_tensor_arg());
     sink_vjp::launch(&q.client,CubeCount::Static(h.div_ceil(64) as u32,1,1),CubeDim::new_1d(64),partial.into_tensor_arg(),ds.clone().into_tensor_arg());
     (dq,dk,dv,ds)
 }

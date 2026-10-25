@@ -164,11 +164,25 @@ pub enum SbdFeedback {
     SoftFeedback,
     HardMask,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SbdBlockExecution {
+    #[default]
+    PerBlock,
+    Batched,
+}
+impl SbdBlockExecution {
+    pub fn is_per_block(&self) -> bool {
+        *self == Self::PerBlock
+    }
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SbdConfig {
     pub block_lengths: Vec<usize>,
     pub feedback: SbdFeedback,
+    #[serde(skip_serializing_if = "SbdBlockExecution::is_per_block")]
+    pub block_execution: SbdBlockExecution,
     #[serde(skip_serializing_if = "delta_mixers::sbd::InBlockReads::is_none")]
     pub in_block_reads: delta_mixers::sbd::InBlockReads,
     #[serde(skip_serializing_if = "delta_mixers::sbd::NoisyReadBackend::is_tensor")]
@@ -182,6 +196,7 @@ pub struct SbdConfig {
 impl Default for SbdConfig {
     fn default() -> Self {
         Self { block_lengths: vec![8], feedback: SbdFeedback::SoftFeedback,
+            block_execution: SbdBlockExecution::PerBlock,
             candidate_width: 4, commit_count: 2, entropy_threshold: None, generate_tokens: 32,
             in_block_reads: delta_mixers::sbd::InBlockReads::None,
             noisy_read_backend: delta_mixers::sbd::NoisyReadBackend::Tensor }
@@ -1067,6 +1082,31 @@ mod tests {
         enabled.validate().unwrap();
         enabled.sbd.as_mut().unwrap().block_lengths = vec![0];
         assert!(enabled.validate().is_err());
+    }
+    #[test]
+    fn block_execution_defaults_preserve_sbd_identity() {
+        let mut c = Config {task:"lm".into(),sbd:Some(SbdConfig::default()),..Config::default()};
+        let omitted = serde_json::to_value(&c).unwrap();
+        assert!(omitted["sbd"].get("block_execution").is_none());
+        let training = c.training_fingerprint(c.train_tokens).unwrap();
+        let pilot = c.pilot_fingerprint().unwrap();
+        let mut explicit = omitted.clone();
+        explicit["sbd"]["block_execution"] = "per_block".into();
+        let explicit: Config = serde_json::from_value(explicit).unwrap();
+        assert_eq!(explicit.sbd.as_ref().unwrap().block_execution,SbdBlockExecution::PerBlock);
+        assert_eq!(serde_json::to_value(&explicit).unwrap(),omitted);
+        assert_eq!(explicit.training_fingerprint(c.train_tokens).unwrap(),training);
+        assert_eq!(explicit.pilot_fingerprint().unwrap(),pilot);
+        c.sbd.as_mut().unwrap().block_execution = SbdBlockExecution::Batched;
+        let encoded = serde_json::to_value(&c).unwrap();
+        assert_eq!(encoded["sbd"]["block_execution"],"batched");
+        let restored: Config = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored.sbd.as_ref().unwrap().block_execution,SbdBlockExecution::Batched);
+        assert_ne!(c.training_fingerprint(c.train_tokens).unwrap(),training);
+        assert_ne!(c.pilot_fingerprint().unwrap(),pilot);
+        let mut invalid = omitted;
+        invalid["sbd"]["block_execution"] = "automatic".into();
+        assert!(serde_json::from_value::<Config>(invalid).is_err());
     }
     #[test]
     fn in_block_read_default_identity_and_hola_requirement() {

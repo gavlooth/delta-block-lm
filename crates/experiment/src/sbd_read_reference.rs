@@ -127,7 +127,13 @@ pub fn run(device:&Device,gpu:bool) -> Result<Value> {
         if gpu {paths.push(fixture.tensor(device,NoisyReadBackend::Tensor)?);paths.push(fixture.tensor(device,NoisyReadBackend::FusedGpu)?);}
         cases.push(json!({"batch":b,"heads":h,"queries":n,"cache_slots":cache,"unfinished_chunk":unfinished,"finite_differences":finite,"paths":paths}));
     }
-    Ok(json!({"passed":true,"cases":cases,"scope":"independent scalar f64 forward and full VJP of noisy query, all three K/V segments, sink and sigmoid gate; central finite differences sampled in every nonempty input; random values, padding, empty cache, cut==start and unfinished clean chunks"}))
+    if gpu {
+        let fixture=Fixture::new(160,4,2,96,7,32,64,1201);
+        let paths=vec![fixture.tensor(device,NoisyReadBackend::Tensor)?,fixture.tensor(device,NoisyReadBackend::FusedGpu)?];
+        cases.push(json!({"batch":160,"heads":4,"queries":2,"cache_slots":96,"unfinished_chunk":7,
+            "key_gradient_workgroups":160*4*(96+7+2),"dispatch_dimensions":2,"paths":paths}));
+    }
+    Ok(json!({"passed":true,"cases":cases,"scope":"independent scalar f64 forward and full VJP of noisy query, all three K/V segments, sink and sigmoid gate; central finite differences sampled in every nonempty input of small fixtures; random values, padding, empty cache, cut==start and unfinished clean chunks; GPU additionally checks more than 65535 key-gradient workgroups against the same scalar f64 oracle"}))
 }
 #[cfg(test)]
 mod tests {

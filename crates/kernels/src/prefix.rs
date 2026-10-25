@@ -71,9 +71,10 @@ fn summary_kernel(k: &View<f32>, valid: &View<f32>, documents: &View<f32>,
 fn select_kernel(
     q: &View<f32>, k: &View<f32>, query_valid: &View<f32>, valid: &View<f32>,
     documents: &View<f32>, query_documents: &View<f32>, schedule: &View<f32>,
-    summaries: &View<f32>, ids: &mut View<f32>, #[comptime] capacity: usize, #[comptime] chunk: usize,
+    summaries: &View<f32>, starts: &View<f32>, ids: &mut View<f32>,
+    #[comptime] capacity: usize, #[comptime] chunk: usize,
     #[comptime] block: usize, #[comptime] top: usize, #[comptime] own: usize, #[comptime] blocks: usize,
-    #[comptime] start: usize, #[comptime] frozen: bool, #[comptime] active_size: usize,
+    #[comptime] frozen: bool, #[comptime] active_size: usize,
 ) {
     let lane = UNIT_POS as usize;
     let row = CUBE_POS as usize;
@@ -83,6 +84,7 @@ fn select_kernel(
     let t = row/heads%n;
     let b = row/(heads*n);
     if b >= q.shape(0) { terminate!(); }
+    let start = starts[b*starts.stride(0)] as usize;
     let absolute = start+t;
     let mut cut = absolute/chunk*chunk;
     let mut end = absolute+1;
@@ -298,13 +300,14 @@ fn query_backward(q: &View<f32>, k: &View<f32>, v: &View<f32>, ids: &View<f32>,
 
 #[cube(launch)]
 fn kv_backward(q: &View<f32>, ids: &View<f32>, pairs: &View<f32>, upstream: &View<f32>,
-    dk: &mut View<f32>, dv: &mut View<f32>, #[comptime] capacity: usize,
+    starts: &View<f32>, dk: &mut View<f32>, dv: &mut View<f32>, #[comptime] capacity: usize,
     #[comptime] chunk: usize, #[comptime] block: usize, #[comptime] top: usize, #[comptime] own: usize,
-    #[comptime] start: usize, #[comptime] frozen: bool, #[comptime] active_size: usize) {
+    #[comptime] frozen: bool, #[comptime] active_size: usize) {
     let lane=UNIT_POS as usize; let token=CUBE_POS as usize;
     let heads=q.shape(2); let time=dk.shape(1); let n=q.shape(1);
     let h=token%heads; let s=token/heads%time; let b=token/(heads*time);
     if b>=q.shape(0) {terminate!();}
+    let start = starts[b*starts.stride(0)] as usize;
     let slots=capacity+chunk+top*block+own+active_size;
     let mut key_gradient=0.0f32; let mut value_gradient=0.0f32;
     for t in 0..n {
@@ -403,14 +406,15 @@ pub(crate) fn run_summaries(k: CubeTensor,valid: CubeTensor,documents: CubeTenso
 
 pub(crate) fn run_read(q: CubeTensor,k: CubeTensor,v: CubeTensor,query_valid: CubeTensor,
     valid: CubeTensor,documents: CubeTensor,query_documents: CubeTensor,schedule: CubeTensor,
-    summaries: CubeTensor,sink: CubeTensor,ak: CubeTensor,av: CubeTensor,chunk: usize,block: usize,top: usize,own: usize,start: usize,frozen: bool,active: bool)
+    summaries: CubeTensor,sink: CubeTensor,ak: CubeTensor,av: CubeTensor,starts: CubeTensor,
+    chunk: usize,block: usize,top: usize,own: usize,frozen: bool,active: bool)
     -> (CubeTensor,CubeTensor,CubeTensor) {
     let [b,n,h,dk]=q.shape().dims::<4>(); let time=k.shape().dims::<4>()[1];
     let capacity=schedule.shape().dims::<4>()[3];
     assert!(b>0 && n>0 && h>0 && dk==32 && (1..=16).contains(&chunk));
     assert!(block>0 && block%chunk==0 && capacity>0);
     assert!(own<=block-chunk);
-    assert!(time<=1<<24 && if frozen {start<=time} else {start+n<=time});
+    assert!(time<=1<<24);
     assert!(time.checked_add(if active {n}else{0}).is_some_and(|positions|positions<=1<<24),
         "prefix retrieval positions must be exactly representable as f32");
     if active {
@@ -425,8 +429,9 @@ pub(crate) fn run_read(q: CubeTensor,k: CubeTensor,v: CubeTensor,query_valid: Cu
     assert_eq!(query_valid.shape().dims::<2>(),[b,n]);
     assert_eq!(query_documents.shape().dims::<2>(),[b,n]);
     assert_eq!(sink.shape().dims::<1>(),[h]);
+    assert_eq!(starts.shape().dims::<1>(),[b]);
     assert_eq!(schedule.shape().dims::<4>(),[b,h,if frozen {1} else {time.div_ceil(chunk)+1},capacity]);
-    for x in [&q,&k,&v,&query_valid,&valid,&documents,&query_documents,&schedule,&summaries,&sink,&ak,&av] {
+    for x in [&q,&k,&v,&query_valid,&valid,&documents,&query_documents,&schedule,&summaries,&sink,&ak,&av,&starts] {
         assert_eq!(x.dtype,DType::F32); assert_eq!(x.device,q.device);
         crate::hola::assert_u32_tensor(x);
     }
@@ -440,8 +445,8 @@ pub(crate) fn run_read(q: CubeTensor,k: CubeTensor,v: CubeTensor,query_valid: Cu
     select_kernel::launch(&q.client,count(&q,b*n*h),CubeDim::new_1d(64),
         q.clone().into_tensor_arg(),k.clone().into_tensor_arg(),query_valid.into_tensor_arg(),
         valid.into_tensor_arg(),documents.into_tensor_arg(),query_documents.into_tensor_arg(),
-        schedule.into_tensor_arg(),summaries.into_tensor_arg(),ids.clone().into_tensor_arg(),capacity,chunk,block,top,own,
-        blocks,start,frozen,active_size);
+        schedule.into_tensor_arg(),summaries.into_tensor_arg(),starts.into_tensor_arg(),
+        ids.clone().into_tensor_arg(),capacity,chunk,block,top,own,blocks,frozen,active_size);
     read_kernel::launch(&q.client,count(&q,b*n*h),CubeDim::new_1d(64),q.clone().into_tensor_arg(),
         k.into_tensor_arg(),v.into_tensor_arg(),ids.clone().into_tensor_arg(),sink.into_tensor_arg(),
         ak.into_tensor_arg(),av.into_tensor_arg(),output.clone().into_tensor_arg(),stats.clone().into_tensor_arg(),slots,active);
@@ -449,7 +454,7 @@ pub(crate) fn run_read(q: CubeTensor,k: CubeTensor,v: CubeTensor,query_valid: Cu
 }
 pub(crate) fn run_backward(q: CubeTensor,k: CubeTensor,v: CubeTensor,ids: CubeTensor,sink: CubeTensor,
     ak: CubeTensor,av: CubeTensor,output: CubeTensor,stats: CubeTensor,upstream: CubeTensor,
-    capacity: usize,chunk: usize,block: usize,top: usize,own: usize,start: usize,frozen: bool,active: bool)
+    starts: CubeTensor,capacity: usize,chunk: usize,block: usize,top: usize,own: usize,frozen: bool,active: bool)
     -> (CubeTensor,CubeTensor,CubeTensor,CubeTensor,CubeTensor,CubeTensor) {
     let [b,n,h,_]=q.shape().dims::<4>(); let time=k.shape().dims::<4>()[1];
     let active_size=if active {n}else{0};
@@ -465,7 +470,7 @@ pub(crate) fn run_backward(q: CubeTensor,k: CubeTensor,v: CubeTensor,ids: CubeTe
         pairs.clone().into_tensor_arg(),rows.clone().into_tensor_arg(),slots,active);
     kv_backward::launch(&q.client,count(&q,b*time*h),CubeDim::new_1d(64),q.clone().into_tensor_arg(),
         ids.clone().into_tensor_arg(),pairs.clone().into_tensor_arg(),upstream.clone().into_tensor_arg(),
-        dk.clone().into_tensor_arg(),dv.clone().into_tensor_arg(),capacity,chunk,block,top,own,start,frozen,active_size);
+        starts.into_tensor_arg(),dk.clone().into_tensor_arg(),dv.clone().into_tensor_arg(),capacity,chunk,block,top,own,frozen,active_size);
     if active {
         active_backward::launch(&q.client,count(&q,b*n*h),CubeDim::new_1d(64),q.clone().into_tensor_arg(),
             ids.into_tensor_arg(),pairs.into_tensor_arg(),upstream.into_tensor_arg(),

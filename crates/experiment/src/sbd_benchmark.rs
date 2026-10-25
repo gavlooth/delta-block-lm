@@ -138,3 +138,53 @@ pub fn diagnostic(c:&Config,device:&Device) -> Result<Value> {
     }
     Ok(json!({"completed":true,"config":c,"device":runtime::identity(device),"steps":rows,"warmups_per_mode":1,"measured_steps_per_mode":1,"precision":"float32","method":"complete SBD loss/backward/checks/clipping/AdamW after one warm step per mode; synchronization only before/after each noisy HOLA forward section to expose its time; section includes query/key norms, cache gathers, segment assembly, one softmax/value read and existing sigmoid gate; clean preparation, other noisy work and backward remain outside that section","share_limitation":"forward-section time divided by the observed complete-step time, not full forward/backward HOLA cost or additive GPU utilization; inserted synchronization changes overlap, so this diagnostic is not the ordinary paired-step adoption measurement","count_method":"all layers have HOLA; noisy block evaluation count equals noisy HOLA section calls divided by layers, including detached teacher and differentiable denoising passes; all-observed and length-one blocks do not call the denoiser","memory_note":"pool reservation sampled after forward/backward/update; allocator reuse and resident model/optimizer values are included; not exact live bytes or physical-device peak"}))
 }
+
+/// Compare only block execution; model, masks and optimizer work stay identical.
+pub fn batching(c:&Config,device:&Device,warmups:usize,trials:usize) -> Result<Value> {
+    use crate::config::SbdBlockExecution;
+    ensure!(warmups>=2 && trials>=11,"batch timing requires >=2 warmups and >=11 paired trials");
+    ensure!(c.sbd.is_some() && c.arms.len()==1,"batch timing requires SBD and one arm");
+    ensure!(matches!(c.backend.as_str(),"vulkan"|"cuda") && !c.fusion,"batch timing requires explicit non-fusion GPU execution");
+    let target=device.clone().autodiff();
+    target.seed(c.seed);
+    let base=LanguageModel::new(c,&c.arms[0],&target)?;
+    let corpus=train::loaded_corpus(c)?;
+    let mut configs=[c.clone(),c.clone()];
+    configs[0].sbd.as_mut().unwrap().block_execution=SbdBlockExecution::PerBlock;
+    configs[1].sbd.as_mut().unwrap().block_execution=SbdBlockExecution::Batched;
+    let mut runners=configs.iter().map(|config|Runner{model:Some(base.clone()),optim:train::optimizer(config),step:0,peak:None}).collect::<Vec<_>>();
+    let mut samples:[Vec<f64>;2]=std::array::from_fn(|_|Vec::new());
+    let started=Instant::now();
+    let path=c.artifact_dir.join("sbd-batching-benchmark.json");
+    for iteration in 0..warmups+trials {
+        for mode in if iteration%2==0 {[0,1]}else{[1,0]} {
+            runtime::write_json(&path,&json!({"completed":false,"config":c,"warmups":warmups,"trials":trials,"iteration":iteration,"next_mode":mode,"samples_ms":samples}))?;
+            ensure!(started.elapsed().as_secs_f64()<c.max_seconds,"batch timing reached max_seconds; partial report retained");
+            let ms=runners[mode].step(&configs[mode],corpus.as_ref(),&target)?;
+            if iteration>=warmups {samples[mode].push(ms);}
+        }
+    }
+    let mut rows=Vec::new();
+    for mode in 0..2 {
+        let dispatches=launches(||{runners[mode].step(&configs[mode],corpus.as_ref(),&target)?;Ok(())})?;
+        rows.push(json!({"selection":(["per_block","batched"][mode]),"median_ms":median(&samples[mode]),"samples_ms":samples[mode],"launches":dispatches,"sampled_peak_pool_reserved_bytes":runners[mode].peak}));
+    }
+    let difference=paired(&samples[0],&samples[1]);
+    Ok(json!({"completed":true,"config":c,"device":runtime::identity(device),"precision":"float32","warmups":warmups,"trials":trials,"steps":rows,"per_block_minus_batched":difference,"batched_beyond_noise":difference["bootstrap_95_percent_ms"][0].as_f64().unwrap()>0.0,"method":"same-session paired complete SBD training steps, alternating execution order, identical initialization and step-specific examples/mask seeds, independent AdamW trajectories; includes uploads, both noisy passes, backward, checks, clipping and update; excludes cold JIT and warmups","memory_note":"pool reservation sampled after forward/backward/update; includes both live runners, not peak live activation bytes"}))
+}
+
+/// One batched-only diagnostic at the configured batch and context.
+pub fn batching_diagnostic(c:&Config,device:&Device) -> Result<Value> {
+    use crate::config::SbdBlockExecution;
+    ensure!(c.sbd.is_some() && c.arms.len()==1,"batch diagnostic requires SBD and one arm");
+    ensure!(c.sbd.as_ref().unwrap().block_execution==SbdBlockExecution::Batched,"batch diagnostic requires batched execution");
+    let target=device.clone().autodiff();
+    target.seed(c.seed);
+    let base=LanguageModel::new(c,&c.arms[0],&target)?;
+    let corpus=train::loaded_corpus(c)?;
+    let mut runner=Runner{model:Some(base),optim:train::optimizer(c),step:0,peak:None};
+    let warm_ms=runner.step(c,corpus.as_ref(),&target)?;
+    let mut milliseconds=0.0;
+    let dispatches=launches(||{milliseconds=runner.step(c,corpus.as_ref(),&target)?;Ok(())})?;
+    Ok(json!({"completed":true,"config":c,"device":runtime::identity(device),"selection":"batched","warm_step_ms":warm_ms,"complete_step_ms":milliseconds,"launches":dispatches,"sampled_peak_pool_reserved_bytes":runner.peak,"warmups":1,"measured_steps":1,"precision":"float32","method":"one warm and one complete batched SBD training step, including uploads, detached teacher, second noisy pass, backward, checks, clipping and AdamW","memory_note":"pool reservation sampled after forward/backward/update, not peak live activation bytes"}))
+}

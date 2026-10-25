@@ -58,9 +58,68 @@ Clean preparation is O(T), plus one state-extraction scan segment per block per 
 
 Paired complete-step cost tables, launch counts and sampled memory are recorded in [RESULTS.md](../RESULTS.md#step-8-recurrent-block-denoising-through-hola). The complete-step benchmark is `sbd-benchmark CONFIG --warmups 2 --trials 11`. It measures the real SBD loss/backward/checks/clipping/AdamW path, not clean-only training, and performs no evaluation or checkpoint writes.
 
-The B8/T512 attempt reached its 3100-second deadline before one three-mode iteration report; it provides no paired throughput result. The accepted B1/T512 diagnostic measured 128 noisy block evaluations and 512 layer HOLA reads per step. Its synchronized noisy-HOLA forward sections used 10.77% / 11.74% / 9.18% of observed complete-step time for `none` / tensor `hola_read` / fused `hola_read`; these are forward-only shares, not full read/VJP cost or ordinary paired-step timing. `sbd-diagnostic CONFIG` performs one warm and one observed step per mode.
+### Block-axis execution
 
-The accepted B1/T512 two-warmup/11-pair session measured an in-block tensor-read cost of +601.87 ms per complete step (95% paired interval [+328.46, +1508.97]). Replacing that read by the mathematically identical fused kernel saved a paired median 2390.35 ms [+1667.56, +3176.01], faster in 10/11 pairs, so `configs/lm512-sbd.json` explicitly selects `fused_gpu`. The tensor default remains unchanged. Cache gather and segment concatenation were not replaced, and no SBD per-block loop optimization was attempted.
+`sbd.block_execution` selects `per_block` (the omitted default) or `batched`.
+The default is excluded from serialization, so omission preserves existing
+fingerprints. Both paths use the same sampler; a regression pins the original
+length, sequence-mask-probability and token-mask draws, including all-observed
+blocks.
+
+The batched path prepares clean snapshots for all rows together, then stacks
+selected multi-token blocks along the batch axis. Each row has its own frozen
+recurrent state, convolution/wavelet/Lngram history, HOLA slots and original
+prefix start. Blocks are right-padded to the maximum configured length; inactive
+positions have zero loss weight and are excluded from read keys. Length-one
+targets retain their clean causal logits. Soft feedback still uses a detached
+teacher pass followed by the differentiable second pass, each batched.
+
+`sbd-reference` includes the block-execution comparisons;
+`sbd-batching-reference` runs only those comparisons.
+`sbd-batching-benchmark CONFIG --warmups 2 --trials 11` compares complete
+per-block and batched training steps with alternating execution order.
+`sbd-batching-diagnostic CONFIG` measures one configured batched workload after
+one warm step. Reports include issued launches and sampled pool reservation.
+
+CPU and Vulkan acceptance each passed 24 no-retrieval and 40
+retrieval-inclusive architecture/feedback cases. CPU batching maxima were
+1.63913e-7 for logits, 1.90735e-6 for total loss and 3.12925e-7 for every-parameter
+gradients. Vulkan maxima were 4.47035e-8, 1.90735e-6 and 5.96047e-8 respectively.
+The largest elementwise tolerance ratio was 0.008266 under the unchanged
+`2e-5 + 3e-4*abs(reference)` criterion. The large-grid noisy-read scalar-f64
+forward/full-VJP case passed with maximum error 3.43394e-7.
+Workspace tests passed 49 experiment + 7 kernel + 16 mixer tests, with one
+GPU-sharing test ignored. Clean Step-7/retrieval model gates and historical
+checkpoint continuation also passed. Evidence is under `artifacts/batching/`.
+
+The batched-only B8/T512 diagnostic completed in 8167.400 ms with 27,145 launches
+and 8,818,099,392 bytes sampled pool reservation. This is one observed step
+after one warm step, not a paired throughput result or an exact live-memory
+peak. B8 fit without chunking. Its first attempt hit the existing noisy-HOLA
+key-VJP's one-dimensional 65,535-workgroup limit; extending the existing
+dispatch grid fixed it without changing the read or derivative arithmetic.
+The scalar-f64 regression covers 67,200 key-gradient workgroups.
+
+Final-code B1/T512 complete-step pairs (two warmups, 11 interleaved pairs) measured:
+
+| Workload | Per-block median | Batched median | Paired saving [95% interval] | Faster |
+| --- | ---: | ---: | ---: | ---: |
+| HOLA, retrieval absent | 42,144.517 ms | 1,617.483 ms | 40,568.800 [35,569.793, 44,211.076] ms | 11/11 |
+| HOLA plus layer-3 MoBA | 44,178.291 ms | 1,819.748 ms | 42,358.543 [39,231.935, 43,705.788] ms | 11/11 |
+
+Both intervals exclude zero, so `configs/lm512-sbd.json` and
+`configs/lm512-step8-retrieval.json` select `batched`. An additional matched
+step counted 211,269→24,242 launches without retrieval and 209,934→24,208 with
+retrieval. Masks vary by step; these counts use a different draw from the
+earlier 370k-launch diagnostic. Paired-session pool reservation sampled
+1,931,060,160 and 2,200,545,536 bytes respectively, including both live runners.
+See [RESULTS.md](../RESULTS.md#sbd-block-axis-execution-batching) for the method,
+sampling limitations and exact evidence paths.
+
+
+The earlier per-block B8/T512 attempt reached its 3100-second deadline before one three-mode iteration report; it provides no paired throughput result. The accepted B1/T512 diagnostic measured 128 noisy block evaluations and 512 layer HOLA reads per step. Its synchronized noisy-HOLA forward sections used 10.77% / 11.74% / 9.18% of observed complete-step time for `none` / tensor `hola_read` / fused `hola_read`; these are forward-only shares, not full read/VJP cost or ordinary paired-step timing. `sbd-diagnostic CONFIG` performs one warm and one observed step per mode.
+
+The accepted B1/T512 two-warmup/11-pair session measured an in-block tensor-read cost of +601.87 ms per complete step (95% paired interval [+328.46, +1508.97]). Replacing that read by the mathematically identical fused kernel saved a paired median 2390.35 ms [+1667.56, +3176.01], faster in 10/11 pairs, so `configs/lm512-sbd.json` explicitly selects `fused_gpu`. The tensor default remains unchanged. Cache gather and segment concatenation were not replaced in that session, which did not attempt SBD per-block loop optimization.
 
 Historical preparation tensor counts for the earlier dense-attention implementation's canonical B8/T512/L8, four-layer H4/K32/V64 configuration were: retained block-start recurrent states, 64 MiB of f32 values; references to normalized clean sublayer inputs, 40 MiB; cached four-level wavelet approximations, 48 MiB; raw short-convolution projections, 32 MiB; HOLA K/V projections, 24 MiB; and cache-position metadata, about 256 KiB. These were structural tensor-value counts, not an incremental or peak allocator measurement; autograd intermediates, scan checkpoints, model parameters and AdamW state add memory. They have not been remeasured after removal. The historical training metrics below sampled the device pool after forward/backward/update and reported that reservation with its limitations; they do not measure the current architecture.
 

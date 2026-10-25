@@ -1,5 +1,5 @@
 //! SBD recurrent adaptation: clean NTP plus masked future-block prediction.
-use crate::{config::{Arm, Config, SbdFeedback}, data::{Batch, Example, Rng}, model::{self, LanguageModel}, runtime, soft::SoftState};
+use crate::{config::{Arm, Config, SbdBlockExecution, SbdFeedback}, data::{Batch, Example, Rng}, model::{self, LanguageModel}, runtime, soft::SoftState};
 use anyhow::{Context, Result, ensure};
 use burn::{module::Module, prelude::*, tensor::activation::log_softmax};
 use serde_json::{Value, json};
@@ -48,6 +48,113 @@ fn feedback(model: &LanguageModel, c: &Config, prefix: &[i32], soft: &mut SoftSt
     }
     Ok(())
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrainingBlock {
+    pub row: usize,
+    pub start: usize,
+    pub length: usize,
+    pub masked: Vec<bool>,
+}
+/// Samples in row order, drawing every mask before skipping an all-observed block.
+pub fn sample_training_blocks(c: &Config, rows: &[Example], seed: u64) -> Result<Vec<TrainingBlock>> {
+    let s = c.sbd.as_ref().context("SBD config is required")?;
+    let mut rng = Rng(seed);
+    let mut blocks = Vec::new();
+    for (row_index,row) in rows.iter().enumerate() {
+        let length = s.block_lengths[rng.index(s.block_lengths.len())];
+        let eta = (rng.next() as f64 + 0.5) / (u64::MAX as f64 + 1.0);
+        for start in (0..row.target.len()).step_by(length) {
+            let n = length.min(row.target.len()-start);
+            let masked: Vec<bool> = (0..n).map(|_| (rng.next() as f64 / u64::MAX as f64) < eta).collect();
+            if masked.iter().any(|&x| x) {
+                blocks.push(TrainingBlock {row:row_index,start,length,masked});
+            }
+        }
+    }
+    Ok(blocks)
+}
+fn masked_training_loss(logits: Tensor<3>, block: &TrainingBlock, row: &Example, row_count: usize, vocab: usize, device: &Device) -> Tensor<1> {
+    let n = block.masked.len();
+    let targets = Tensor::<2,Int>::from_data(TensorData::new(row.target[block.start..block.start+n].to_vec(),[n,1]),device);
+    let weights = Tensor::<2>::from_data(TensorData::new((0..n)
+        .map(|j| if block.masked[j] {row.weight[block.start+j]} else {0.0}).collect::<Vec<_>>(),[n,1]),device);
+    let selected = log_softmax(logits.reshape([n,vocab]),1).gather(1,targets);
+    -(selected*weights).sum() / (row_count*row.target.len()) as f64
+}
+fn training_loss_per_block<P: delta_mixers::profile::Sections>(model: &LanguageModel, c: &Config, rows: &[Example], clean_logits: Tensor<3>, trace: &crate::sbd_training::CleanInputs, blocks: &[TrainingBlock], mut loss: Tensor<1>, profile: &mut P) -> Result<Tensor<1>> {
+    let s = c.sbd.as_ref().unwrap();
+    let device = clean_logits.device();
+    let mut selected = blocks.iter().peekable();
+    for (row_index,row) in rows.iter().enumerate() {
+        let Some(length) = selected.peek().filter(|block| block.row == row_index).map(|block| block.length) else {continue;};
+        let starts = (0..row.target.len()).step_by(length).map(|start|start+1).collect::<Vec<_>>();
+        let cache = (length > 1).then(|| model.training_cache(trace,row_index,&starts));
+        while selected.peek().is_some_and(|block| block.row == row_index) {
+            let block = selected.next().unwrap();
+            let n = block.masked.len();
+            let observed = (0..n).map(|j| (!block.masked[j]).then_some(row.target[block.start+j] as usize)).collect();
+            let mut soft = state(c,observed,&device)?;
+            let logits = if n == 1 {
+                clean_logits.clone().slice([row_index..row_index+1,block.start..block.start+1,0..c.vocab()])
+            } else {
+                let cache = cache.as_ref().unwrap();
+                let block_index = block.start/block.length;
+                if s.feedback == SbdFeedback::SoftFeedback {
+                    let teacher = model.cached_block_profiled(cache,block_index,&soft,false,profile).detach();
+                    soft.update(teacher.reshape([n,c.vocab()]),1.0,c.soft_temperature,c.soft_steps,s.candidate_width)?;
+                }
+                model.cached_block_profiled(cache,block_index,&soft,s.feedback == SbdFeedback::HardMask,profile)
+            };
+            loss = loss + masked_training_loss(logits,block,row,rows.len(),c.vocab(),&device);
+        }
+    }
+    Ok(loss)
+}
+fn training_loss_batched<P: delta_mixers::profile::Sections>(model: &LanguageModel, c: &Config, rows: &[Example], clean_logits: Tensor<3>, trace: &crate::sbd_training::CleanInputs, blocks: &[TrainingBlock], mut loss: Tensor<1>, profile: &mut P) -> Result<Tensor<1>> {
+    let s = c.sbd.as_ref().unwrap();
+    let device = clean_logits.device();
+    for block in blocks.iter().filter(|block| block.masked.len() == 1) {
+        let logits = clean_logits.clone().slice([block.row..block.row+1,block.start..block.start+1,0..c.vocab()]);
+        loss = loss + masked_training_loss(logits,block,&rows[block.row],rows.len(),c.vocab(),&device);
+    }
+    let count = blocks.iter().filter(|block| block.masked.len() > 1).count();
+    if count == 0 {
+        return Ok(loss);
+    }
+    let max_length = *s.block_lengths.iter().max().unwrap();
+    let mut cache_blocks = Vec::with_capacity(count);
+    let mut observed = Vec::with_capacity(count*max_length);
+    let mut active = Vec::with_capacity(count*max_length);
+    let mut targets = Vec::with_capacity(count*max_length);
+    let mut weights = Vec::with_capacity(count*max_length);
+    let mut denominators = Vec::with_capacity(count);
+    for block in blocks.iter().filter(|block| block.masked.len() > 1) {
+        cache_blocks.push((block.row,block.start+1));
+        let row = &rows[block.row];
+        let n = block.masked.len();
+        for j in 0..max_length {
+            let real = j < n;
+            observed.push(if real && !block.masked[j] {Some(row.target[block.start+j] as usize)} else {None});
+            active.push(real);
+            targets.push(if real {row.target[block.start+j]} else {0});
+            weights.push(if real && block.masked[j] {row.weight[block.start+j]} else {0.0});
+        }
+        denominators.push((rows.len()*row.target.len()) as f32);
+    }
+    let cache = model.training_cache_batched(trace,&cache_blocks);
+    let mut soft = SoftState::new(c.vocab(),s.candidate_width,observed,active,&device,c.soft_selection_backend)?;
+    if s.feedback == SbdFeedback::SoftFeedback {
+        let teacher = model.cached_blocks_profiled(&cache,&soft,false,profile).detach();
+        soft.update(teacher.reshape([count*max_length,c.vocab()]),1.0,c.soft_temperature,c.soft_steps,s.candidate_width)?;
+    }
+    let logits = model.cached_blocks_profiled(&cache,&soft,s.feedback == SbdFeedback::HardMask,profile);
+    let targets = Tensor::<2,Int>::from_data(TensorData::new(targets,[count*max_length,1]),&device);
+    let weights = Tensor::<3>::from_data(TensorData::new(weights,[count,max_length,1]),&device);
+    let denominators = Tensor::<1>::from_data(TensorData::new(denominators,[count]),&device);
+    let selected = log_softmax(logits.reshape([count*max_length,c.vocab()]),1).gather(1,targets)
+        .reshape([count,max_length,1]);
+    Ok(loss - ((selected*weights).sum_dim(1).reshape([count])/denominators).sum())
+}
 /// Paper equation 14, divided by the number of clean targets (not by mask count).
 /// Uniform sequence-level eta, independent Bernoulli masks, uniform length choice.
 pub fn training_loss(model: &LanguageModel, c: &Config, rows: &[Example], batch: &Batch, seed: u64) -> Result<Tensor<1>> {
@@ -55,41 +162,16 @@ pub fn training_loss(model: &LanguageModel, c: &Config, rows: &[Example], batch:
 }
 pub fn training_loss_profiled<P: delta_mixers::profile::Sections>(model: &LanguageModel, c: &Config, rows: &[Example], batch: &Batch, seed: u64, profile: &mut P) -> Result<Tensor<1>> {
     let s = c.sbd.as_ref().context("SBD config is required")?;
-    let device = batch.input.device();
     let mut trace = crate::sbd_training::CleanInputs::default();
     let clean_logits = model.forward_profiled(batch,&mut trace);
     let mut loss = model.loss(clean_logits.clone(), batch);
     // In L=1 or an all-observed draw the mask has an exactly zero derivative.
     loss = loss + model.sbd_mask.as_ref().unwrap().val().sum() * 0.0;
-    let mut rng = Rng(seed);
-    for (row_index,row) in rows.iter().enumerate() {
-        let length = s.block_lengths[rng.index(s.block_lengths.len())];
-        let eta = (rng.next() as f64 + 0.5) / (u64::MAX as f64 + 1.0);
-        let starts = (0..row.target.len()).step_by(length).map(|s|s+1).collect::<Vec<_>>();
-        let cache = (length > 1).then(|| model.training_cache(&trace,row_index,&starts));
-        for (block_index,start) in (0..row.target.len()).step_by(length).enumerate() {
-            let n = length.min(row.target.len()-start);
-            let masked: Vec<bool> = (0..n).map(|_| (rng.next() as f64 / u64::MAX as f64) < eta).collect();
-            if !masked.iter().any(|&x| x) { continue; }
-            let observed = (0..n).map(|j| (!masked[j]).then_some(row.target[start+j] as usize)).collect();
-            let mut soft = state(c, observed, &device)?;
-            let logits = if n == 1 {
-                clean_logits.clone().slice([row_index..row_index+1,start..start+1,0..c.vocab()])
-            } else {
-                let cache = cache.as_ref().unwrap();
-                if s.feedback == SbdFeedback::SoftFeedback {
-                    let teacher = model.cached_block_profiled(cache,block_index,&soft,false,profile).detach();
-                    soft.update(teacher.reshape([n,c.vocab()]),1.0,c.soft_temperature,c.soft_steps,s.candidate_width)?;
-                }
-                model.cached_block_profiled(cache,block_index,&soft,s.feedback == SbdFeedback::HardMask,profile)
-            };
-            let targets = Tensor::<2,Int>::from_data(TensorData::new(row.target[start..start+n].to_vec(),[n,1]),&device);
-            let weights = Tensor::<2>::from_data(TensorData::new((0..n).map(|j| if masked[j] {row.weight[start+j]} else {0.0}).collect::<Vec<_>>(),[n,1]),&device);
-            let selected = log_softmax(logits.reshape([n,c.vocab()]),1).gather(1,targets);
-            loss = loss - (selected*weights).sum() / (rows.len()*row.target.len()) as f64;
-        }
+    let blocks = sample_training_blocks(c,rows,seed)?;
+    match s.block_execution {
+        SbdBlockExecution::PerBlock => training_loss_per_block(model,c,rows,clean_logits,&trace,&blocks,loss,profile),
+        SbdBlockExecution::Batched => training_loss_batched(model,c,rows,clean_logits,&trace,&blocks,loss,profile),
     }
-    Ok(loss)
 }
 
 pub fn evaluate(model: &LanguageModel, c: &Config, examples: &[Example], device: &Device) -> Result<Value> {
@@ -453,6 +535,32 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sampled_blocks_keep_original_random_draw_order() {
+        let mut c = Config {task:"lm".into(),sbd:Some(crate::config::SbdConfig {
+            block_lengths:vec![1,4,8],..Default::default()
+        }),..Config::default()};
+        let rows = [9,5,7,4].into_iter().map(|n|fixture(vec![0;n])).collect::<Vec<_>>();
+        let original = [
+            (0,vec![
+                (0,0,4,"1011"),(0,4,4,"1010"),(0,8,4,"1"),
+                (1,0,4,"0011"),(2,1,1,"1"),(2,3,1,"1"),(2,5,1,"1"),(2,6,1,"1"),
+                (3,0,4,"0011"),
+            ]),
+            (1,vec![
+                (0,0,8,"01100110"),(0,8,8,"1"),(1,0,4,"0110"),(2,0,8,"1111111"),
+            ]),
+        ];
+        for (seed,draws) in original {
+            let expected = draws.into_iter().map(|(row,start,length,mask)| TrainingBlock {
+                row,start,length,masked:mask.bytes().map(|value|value == b'1').collect(),
+            }).collect::<Vec<_>>();
+            for execution in [SbdBlockExecution::PerBlock,SbdBlockExecution::Batched] {
+                c.sbd.as_mut().unwrap().block_execution = execution;
+                assert_eq!(sample_training_blocks(&c,&rows,seed).unwrap(),expected);
+            }
+        }
+    }
     #[test]
     fn checkpoint_rejects_old_dense_model_identity() {
         let c = Config { task: "lm".into(), sbd: Some(crate::config::SbdConfig::default()), ..Config::default() };
