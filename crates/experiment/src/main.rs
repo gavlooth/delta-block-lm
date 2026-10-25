@@ -12,6 +12,7 @@ mod hola_tune;
 mod io_benchmark;
 mod kron_benchmark;
 mod lm_retrieval;
+mod lngram;
 mod model;
 mod profile;
 mod runtime;
@@ -36,7 +37,7 @@ fn execute() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     ensure!(
         args.len() >= 2,
-        "usage: delta-experiment <reference|convolution-reference|normalization-reference|epilogue-reference|epilogue-benchmark|kron-reference|gdn-reference|gdn-directional-diagnostic|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|optimization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|gdn-benchmark|kron-model-benchmark|hola-benchmark|io-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256|fused_gdn2 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
+        "usage: delta-experiment <reference|lngram-reference|lngram-benchmark|lngram-attribution|lngram-smoke|convolution-reference|normalization-reference|epilogue-reference|epilogue-benchmark|kron-reference|gdn-reference|gdn-directional-diagnostic|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|optimization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|gdn-benchmark|kron-model-benchmark|hola-benchmark|io-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256|fused_gdn2 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
     );
     let command = &args[0];
     let c = Config::load(Path::new(&args[1]))?;
@@ -181,6 +182,8 @@ fn execute() -> Result<()> {
                 | "soft-step"
                 | "optimization-benchmark"
                 | "io-benchmark"
+                | "lngram-benchmark"
+                | "lngram-attribution"
         ) || benchmark_warmups.is_none(),
         "--warmups is only valid for Kron benchmarks/profile; hola-benchmark uses two warmups per mode"
     );
@@ -206,6 +209,8 @@ fn execute() -> Result<()> {
                 | "soft-step"
                 | "optimization-benchmark"
                 | "io-benchmark"
+                | "lngram-benchmark"
+                | "lngram-attribution"
         ) || benchmark_trials.is_none(),
         "--trials is only valid for a benchmark command"
     );
@@ -310,6 +315,10 @@ fn execute() -> Result<()> {
         }
     }
     let mut result = match command.as_str() {
+        "lngram-reference" => lngram::reference(&c, &device)?,
+        "lngram-benchmark" => lngram::benchmark(&c, &device, benchmark_warmups.unwrap_or(2), benchmark_trials.unwrap_or(11))?,
+        "lngram-attribution" => lngram::attribution(&c, &device, benchmark_warmups.unwrap_or(2), benchmark_trials.unwrap_or(11))?,
+        "lngram-smoke" => lngram::learning_smoke(&c, &device)?,
         "io-benchmark" => io_benchmark::run(
             &c,
             &c.arms[0],
@@ -580,6 +589,8 @@ fn execute() -> Result<()> {
                 | "io-benchmark"
                 | "gdn-benchmark"
                 | "gdn-directional-diagnostic"
+                | "lngram-benchmark"
+                | "lngram-attribution"
         ) || result["completed"] == true,
         "profile/benchmark failed or hit its deadline; separate partial report retained"
     );
@@ -598,6 +609,8 @@ fn execute() -> Result<()> {
                 | "gemm-micro"
                 | "update-loss-reference"
                 | "soft-reference"
+                | "lngram-reference"
+                | "lngram-smoke"
         ) || result["passed"] == true,
         "numerical/checkpoint diagnostic/certification failed; separate report retained"
     );

@@ -18,6 +18,7 @@ pub mod convolution;
 pub mod gdn2_reference;
 pub use convolution::ConvolutionBackend;
 mod hola;
+pub mod lngram;
 pub mod normalization;
 pub mod profile;
 mod projections;

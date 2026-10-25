@@ -70,3 +70,9 @@ mod epilogue;
 mod epilogue_ops;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 pub use epilogue_ops::{silu_analytic, silu_vjp};
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod lngram;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod lngram_ops;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+pub use lngram_ops::{lngram_codes, lngram_memory};

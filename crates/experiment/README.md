@@ -1,4 +1,4 @@
-# Small causal experiments (plan steps 1, 3, 5 and 6)
+# Small causal experiments (plan steps 1, 3, 5, 6 and 7)
 
 ## Measured optimized local path
 
@@ -36,7 +36,7 @@ The scoped model benchmark requires and preserves the real failed legacy report,
 
 Do not chain the expected failing diagnostic with `&&`. If the legacy checks instead pass on your backend/version, use the strict all-path benchmark; do not construct fake failed evidence.
 
-Run commands from the workspace root. The reference and soft-feedback commands are numerical checks, not training results. No step-7 additions or SBD/block-denoising training are included.
+Run commands from the workspace root. The reference and soft-feedback commands are numerical checks, not training results. Step 7 adds opt-in causal Lngram injections; no SBD/block-denoising training is included.
 
 ## Build and local device policy
 
@@ -482,3 +482,26 @@ timeout 400s bun scripts/certify-experiments.ts target/debug/delta-experiment ar
 ```
 
 The batch script never builds or trains. It writes schema-2 manifests, command outcomes and new stdout/stderr to a unique `artifacts/certification-batch-*` namespace; every filename has a configuration-index prefix, so normalized-path collisions or repeated arguments cannot overwrite an earlier stage. Summary values and per-seed diagnostics are ordered by the explicit `paired_seeds`, independently of manifest entry order; duplicate/unknown seeds fail. For manually pinned evidence, invoke the executable directly with a 300-second limit and the manifest path. Certification creates separate versioned reports; it does not mutate old `metrics.json` files to make the ordinary comparison cache accept them.
+
+## Causal Lngram commands
+
+`lngram_layers` selects injection block indices; `lngram_orders` selects the
+orders inside each injection. The target uses three injections at `[0,1,2]`,
+each with `[2,3]` orders. Omitted layers leave historical parameters, execution
+and serialized fingerprints unchanged. Enabling the component requires a new
+training run. `lngram_backend` explicitly selects `tensor` (route gather,
+default), `flat_select` (global row selection), or GPU-only non-fusion
+`fused_gpu` (exact symbol cache and analytic memory VJPs). `lngram_surrogate`
+selects `one_bit` or `local_expectation`.
+
+`lngram-reference CONFIG` checks the independent FP64 scalar oracle, packing,
+causality, both surrogate gradients, CPU-model equivalence and table optimizer
+groups. `lngram-benchmark CONFIG --warmups 2 --trials 11` measures isolated F/FB
+and paired complete guarded steps with the component off, tensor and fused.
+`lngram-attribution CONFIG --warmups 2 --trials 11` separates the per-injection
+discretizer, codes/addresses, per-order gather and OneBit terms, readout,
+smoothing and table AdamW costs and launches. `lngram-smoke CONFIG` trains
+paired tiny synthetic byte-pattern models for 200 steps. All reports/configs
+for this slice are under `artifacts/step7/lngram/`.
+See `../../docs/optimization/lngram.md` for causal adaptations, memory,
+numerical-oracle scope, exact locked commands and measured results.

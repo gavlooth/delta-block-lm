@@ -17,6 +17,8 @@ use delta_mixers::{
 
 #[derive(Module, Debug)]
 pub struct Block {
+    pub(super) lngram_norm: Option<RmsNorm>,
+    pub(super) lngram: Option<delta_mixers::lngram::Lngram>,
     pub(super) norm: RmsNorm,
     pub(super) mixer: Mixer,
     pub(super) ff_norm: RmsNorm,
@@ -58,8 +60,10 @@ impl LanguageModel {
                 .init(device)
         };
         let mut blocks = Vec::with_capacity(c.layers);
-        for _ in 0..c.layers {
+        for index in 0..c.layers {
             blocks.push(Block {
+                lngram_norm: c.lngram_layers.contains(&index).then(norm),
+                lngram: c.lngram_layers.contains(&index).then(|| c.lngram_config().init(device)),
                 norm: norm(),
                 mixer: arm.mixer_config(c)?.init(device),
                 ff_norm: norm(),
@@ -119,6 +123,15 @@ impl LanguageModel {
     pub fn set_epilogue_backend(&mut self, backend: crate::config::EpilogueBackend) {
         self.epilogue_backend = backend;
     }
+    pub fn set_lngram_backend(&mut self, backend: delta_mixers::lngram::LngramBackend) {
+        for block in &mut self.blocks {
+            if let Some(lngram) = &mut block.lngram { lngram.backend = backend; }
+        }
+    }
+    pub fn lngram_table_ids(&self) -> Vec<burn::module::ParamId> {
+        self.blocks.iter().filter_map(|block| block.lngram.as_ref())
+            .flat_map(|lngram| lngram.tables.iter().map(|table| table.weight.id)).collect()
+    }
     pub fn loss(&self, logits: Tensor<3>, batch: &Batch) -> Tensor<1> {
         loss_selected(logits, batch, self.loss_backend)
     }
@@ -131,8 +144,17 @@ impl LanguageModel {
     pub fn forward_profiled<P: Sections>(&self, batch: &Batch, profile: &mut P) -> Tensor<3> {
         let mut hidden =
             profile.section("Embedding", || self.embedding.forward(batch.input.clone()));
+        let lngram_layout = self.blocks.iter().any(|block| block.lngram.is_some()).then(||
+            delta_mixers::lngram::LngramLayout::new(batch.valid.clone(), batch.reset.clone()));
         for (index, block) in self.blocks.iter().enumerate() {
             profile.block(Some(index));
+            if let (Some(norm), Some(lngram)) = (&block.lngram_norm, &block.lngram) {
+                let normalized = profile.section("Block RMSNorm: Lngram", ||
+                    self.normalization_backend.rms(norm, hidden.clone()));
+                let update = profile.section("Lngram", ||
+                    lngram.forward(normalized, lngram_layout.as_ref().expect("active Lngram layout")));
+                hidden = profile.section("Residual adds", || hidden + update);
+            }
             let normalized = profile.section("Block RMSNorm: mixer", || {
                 self.normalization_backend.rms(&block.norm, hidden.clone())
             });

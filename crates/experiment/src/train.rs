@@ -23,7 +23,7 @@ pub(crate) fn optimizer_config(c: &Config) -> AdamWConfig {
         .with_grad_clipping(Some(GradientClippingConfig::Norm(c.gradient_clip)))
 }
 pub(crate) fn optimizer(c: &Config) -> ModuleOptimizer {
-    if c.update_backend.is_tensor() {
+    let optimizer = if c.update_backend.is_tensor() {
         optimizer_config(c).init()
     } else {
         crate::update::FusedAdamW {
@@ -31,7 +31,13 @@ pub(crate) fn optimizer(c: &Config) -> ModuleOptimizer {
             clip: c.gradient_clip,
         }
         .into()
-    }
+    };
+    if c.lngram_layers.is_empty() { return optimizer; }
+    optimizer.with_group(
+        burn::module::ParamGroup::from_regex(r"(^|\.)lngram\.tables\.[0-9]+\.weight$").expect("Lngram table parameter path"),
+        crate::update::LngramAdamW { fused: !c.update_backend.is_tensor(), clip: c.gradient_clip },
+        None,
+    )
 }
 pub(crate) fn loaded_corpus(c: &Config) -> Result<Option<Corpus>> {
     if c.task == "lm" {

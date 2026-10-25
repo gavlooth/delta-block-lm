@@ -57,6 +57,31 @@ impl Optimizer for FusedAdamW {
         state
     }
 }
+
+/// Lngram tables use the predecessor's 5x learning rate and zero decay.
+/// Dense Adam moments are intentional: unused rows with fresh state stay bit-identical.
+#[derive(Clone)]
+pub struct LngramAdamW {
+    pub fused: bool,
+    pub clip: f32,
+}
+impl Optimizer for LngramAdamW {
+    type State<const D: usize> = AdamWState<D>;
+    fn step<const D: usize>(
+        &self, lr: f64, tensor: Tensor<D>, grad: Tensor<D>, state: Option<Self::State<D>>,
+    ) -> (Tensor<D>, Option<Self::State<D>>) {
+        if self.fused {
+            FusedAdamW { decay: 0.0, clip: self.clip }.step(lr * 5.0, tensor, grad, state)
+        } else {
+            let grad = burn::grad_clipping::GradientClippingConfig::Norm(self.clip).init().clip_gradient(grad);
+            burn::optim::AdamWConfig::new().with_weight_decay(0.0).build().step(lr * 5.0, tensor, grad, state)
+        }
+    }
+    fn to_device<const D: usize>(mut state: Self::State<D>, device: &Device) -> Self::State<D> {
+        state.momentum = state.momentum.to_device(device);
+        state
+    }
+}
 pub fn square_sum<const D: usize>(gradient: Tensor<D>) -> Tensor<1> {
     #[cfg(any(feature = "vulkan", feature = "cuda"))]
     {
