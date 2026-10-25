@@ -39,6 +39,7 @@ pub struct Block {
 #[derive(Module, Debug)]
 pub struct LanguageModel {
     pub(super) embedding: Embedding,
+    pub(super) sbd_mask: Option<Param<Tensor<1>>>,
     pub(super) blocks: Vec<Block>,
     pub(super) norm: RmsNorm,
     pub(super) head: Linear,
@@ -98,6 +99,7 @@ impl LanguageModel {
             });
         }
         let model = Self {
+            sbd_mask: c.sbd.as_ref().map(|_| init.init([c.d_model], device)),
             embedding: EmbeddingConfig::new(c.vocab(), c.d_model)
                 .with_initializer(init.clone())
                 .init(device),
@@ -204,11 +206,16 @@ impl LanguageModel {
         self.forward_profiled(batch, &mut Unprofiled)
     }
     pub fn forward_profiled<P: Sections>(&self, batch: &Batch, profile: &mut P) -> Tensor<3> {
+        let hidden = profile.section("Embedding", || self.embedding.forward(batch.input.clone()));
+        self.forward_embedded(hidden, batch, profile, None)
+    }
+    pub(super) fn forward_noisy(&self, embeddings: Tensor<3>, batch: &Batch, start: usize) -> Tensor<3> {
+        self.forward_embedded(embeddings, batch, &mut Unprofiled, Some(start))
+    }
+    fn forward_embedded<P: Sections>(&self, mut hidden: Tensor<3>, batch: &Batch, profile: &mut P, start: Option<usize>) -> Tensor<3> {
         if self.ohc_init.is_some() {
-            return self.forward_ohc_profiled(batch, profile);
+            return self.forward_ohc_profiled(hidden, batch, profile, start);
         }
-        let mut hidden =
-            profile.section("Embedding", || self.embedding.forward(batch.input.clone()));
         let lngram_layout = self
             .blocks
             .iter()
@@ -222,6 +229,7 @@ impl LanguageModel {
                 let normalized = profile.section("Block RMSNorm: wavelet", || {
                     self.normalization_backend.rms(norm, hidden.clone())
                 });
+                if P::CAPTURE_CLEAN_INPUTS { profile.clean_input(index,"wavelet",&normalized); }
                 let update = wavelet.forward_profiled(
                     normalized,
                     batch.valid.clone(),
@@ -235,6 +243,7 @@ impl LanguageModel {
                 let normalized = profile.section("Block RMSNorm: Lngram", || {
                     self.normalization_backend.rms(norm, hidden.clone())
                 });
+                if P::CAPTURE_CLEAN_INPUTS { profile.clean_input(index,"lngram",&normalized); }
                 let update = profile.section("Lngram", || {
                     lngram.forward(
                         normalized,
@@ -246,12 +255,12 @@ impl LanguageModel {
             let normalized = profile.section("Block RMSNorm: mixer", || {
                 self.normalization_backend.rms(&block.norm, hidden.clone())
             });
-            let update = block.mixer.forward_profiled(
-                normalized,
-                batch.valid.clone(),
-                batch.reset.clone(),
-                profile,
-            );
+            if P::CAPTURE_CLEAN_INPUTS { profile.clean_input(index,"mixer",&normalized); }
+            let update = if let Some(start) = start {
+                block.mixer.forward_sbd(normalized, batch.valid.clone(), batch.reset.clone(), start)
+            } else {
+                block.mixer.forward_profiled(normalized, batch.valid.clone(), batch.reset.clone(), profile)
+            };
             hidden = profile.section("Residual adds", || hidden + update);
             let normalized = profile.section("Block RMSNorm: MLP", || {
                 self.normalization_backend
@@ -270,8 +279,7 @@ impl LanguageModel {
     pub fn set_ohc_backend(&mut self, backend: OhcBackend) {
         self.ohc_backend = backend;
     }
-    fn forward_ohc_profiled<P: Sections>(&self, batch: &Batch, profile: &mut P) -> Tensor<3> {
-        let hidden = profile.section("Embedding", || self.embedding.forward(batch.input.clone()));
+    fn forward_ohc_profiled<P: Sections>(&self, hidden: Tensor<3>, batch: &Batch, profile: &mut P, start: Option<usize>) -> Tensor<3> {
         let mut streams = profile.section("oHC stream init", || {
             self.ohc_init
                 .as_ref()
@@ -296,6 +304,7 @@ impl LanguageModel {
                 let normalized = profile.section("Block RMSNorm: wavelet", || {
                     self.normalization_backend.rms(norm, read.work.clone())
                 });
+                if P::CAPTURE_CLEAN_INPUTS { profile.clean_input(index,"wavelet",&normalized); }
                 let update = wavelet.forward_profiled(
                     normalized,
                     batch.valid.clone(),
@@ -315,6 +324,7 @@ impl LanguageModel {
                 let normalized = profile.section("Block RMSNorm: Lngram", || {
                     self.normalization_backend.rms(norm, read.work.clone())
                 });
+                if P::CAPTURE_CLEAN_INPUTS { profile.clean_input(index,"lngram",&normalized); }
                 let update = profile.section("Lngram", || {
                     lngram.forward(
                         normalized,
@@ -333,12 +343,12 @@ impl LanguageModel {
                 self.normalization_backend
                     .rms(&block.norm, read.work.clone())
             });
-            let update = block.mixer.forward_profiled(
-                normalized,
-                batch.valid.clone(),
-                batch.reset.clone(),
-                profile,
-            );
+            if P::CAPTURE_CLEAN_INPUTS { profile.clean_input(index,"mixer",&normalized); }
+            let update = if let Some(start) = start {
+                block.mixer.forward_sbd(normalized, batch.valid.clone(), batch.reset.clone(), start)
+            } else {
+                block.mixer.forward_profiled(normalized, batch.valid.clone(), batch.reset.clone(), profile)
+            };
             streams = profile.section("oHC write: mixer", || {
                 stage.write(read, update, batch.valid.clone(), self.ohc_backend)
             });

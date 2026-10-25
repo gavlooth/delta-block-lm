@@ -358,3 +358,57 @@ fn read_impl<const TRACE: bool>(
         selections,
     )
 }
+
+/// Read the exact cache at `start`: completed chunks' selected slots plus the
+/// unfinished clean chunk. No noisy K/V enters the cache or this read.
+pub(crate) fn read_frozen(
+    q: Tensor<4>, k: Tensor<4>, v: Tensor<4>, scores: Tensor<4>,
+    valid: Tensor<2>, documents: Tensor<2>, capacity: usize, chunk: usize,
+    policy: CachePolicy, sink: Tensor<1>, start: usize, backend: HolaBackend,
+) -> Tensor<4> {
+    let [b,t,h,dk] = q.dims();
+    let dv = v.dims()[3];
+    let n = t-start;
+    let cut = start / chunk * chunk;
+    let device = q.device();
+    let take = |x: &Tensor<4>, a: usize, z: usize| {
+        let d = x.dims()[3];
+        x.clone().slice([0..b,a..z,0..h,0..d])
+    };
+    let clean = read_selected(backend, take(&q,0,start), take(&k,0,start), take(&v,0,start),
+        take(&scores,0,start), valid.clone().slice([0..b,0..start]),
+        documents.clone().slice([0..b,0..start]), capacity, chunk, policy, sink.clone());
+    let mut keys = Vec::new();
+    let mut values = Vec::new();
+    let mut docs = Vec::new();
+    let mut present = Vec::new();
+    if cut > 0 {
+        let positions = read_detailed_selected(backend, take(&q,0,cut), take(&k,0,cut), take(&v,0,cut),
+            take(&scores,0,cut), valid.clone().slice([0..b,0..cut]),
+            documents.clone().slice([0..b,0..cut]), capacity, chunk, policy, sink.clone()).final_positions;
+        let ids = positions.clone().clamp_min(0.0).int();
+        keys.push(k.clone().swap_dims(1,2).gather(2, ids.clone().unsqueeze_dim::<4>(3).expand([b,h,capacity,dk])));
+        values.push(v.clone().swap_dims(1,2).gather(2, ids.clone().unsqueeze_dim::<4>(3).expand([b,h,capacity,dv])));
+        docs.push(documents.clone().unsqueeze_dim::<3>(1).expand([b,h,t]).gather(2,ids));
+        present.push(positions.greater_equal_elem(0.0));
+    }
+    if cut < start {
+        keys.push(take(&k,cut,start).swap_dims(1,2));
+        values.push(take(&v,cut,start).swap_dims(1,2));
+        docs.push(documents.clone().slice([0..b,cut..start]).unsqueeze_dim::<3>(1).expand([b,h,start-cut]));
+        present.push(valid.clone().slice([0..b,cut..start]).unsqueeze_dim::<3>(1).expand([b,h,start-cut]).greater_elem(0.5));
+    }
+    let keys = Tensor::cat(keys,2);
+    let values = Tensor::cat(values,2);
+    let docs = Tensor::cat(docs,2);
+    let present = Tensor::cat(present,2);
+    let query_docs = documents.slice([0..b,start..t]).reshape([b,1,n,1]);
+    let visible = present.unsqueeze_dim::<4>(2)
+        .bool_and(docs.unsqueeze_dim::<4>(2).equal(query_docs));
+    let logits = (take(&q,start,t).swap_dims(1,2).matmul(keys.swap_dims(2,3)) / (dk as f64).sqrt())
+        .mask_fill(visible.bool_not(), -1.0e30);
+    let probabilities = softmax(Tensor::cat(vec![logits, sink.reshape([1,h,1,1]).expand([b,h,n,1])],3),3);
+    let active = probabilities.matmul(Tensor::cat(vec![values,Tensor::zeros([b,h,1,dv],&device)],2))
+        .swap_dims(1,2) * valid.slice([0..b,start..t]).reshape([b,n,1,1]);
+    Tensor::cat(vec![clean,active],1)
+}

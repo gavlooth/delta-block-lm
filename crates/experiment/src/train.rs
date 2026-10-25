@@ -288,9 +288,12 @@ pub fn run(
             "train",
         )?;
         let batch = Batch::new(&rows, &train_device);
-        let logits = model.forward(&batch);
+        let loss = if c.sbd.is_some() {
+            crate::sbd::training_loss(&model,c,&rows,&batch,seed.wrapping_add(step as u64))?
+        } else {
+            model.loss(model.forward(&batch), &batch)
+        };
         peak(&mut peak_reserved, device);
-        let loss = model.loss(logits, &batch);
         let value = model::scalar(loss.clone())?;
         let grads = model::checked_gradients(&model, loss)?;
         peak(&mut peak_reserved, device);
@@ -390,6 +393,10 @@ pub fn run(
         "byte_associative_retrieval_diagnostic":retrieval,
         "warm_decode_latency_ms":decode_ms,"decode_method":"next-token logits by full causal-prefix recomputation, context fixed; no incremental-state optimization",
         "checkpoint":checkpoint_path});
+    if c.sbd.is_some() {
+        metrics["sbd_validation"] = crate::sbd::evaluate(&model,c,&validation,device)?;
+        metrics["sbd_generation"] = crate::sbd::generate(&model,c,&validation[0].input[..validation[0].input.len().min(17)],device)?;
+    }
     metrics["initial_validation"] = initial;
     metrics["initial_validation_trusted"] = json!(initial_trusted);
     metrics["initial_validation_provenance"] = json!(if initial_trusted {
@@ -410,12 +417,12 @@ pub fn pilot(c: &Config, device: &Device) -> Result<Value> {
         let train_device = device.clone().autodiff();
         let mut model = LanguageModel::new(c, arm, &train_device)?;
         let mut optim = optimizer(c);
-        let batch = Batch::new(
-            &data::examples(c, corpus.as_ref(), c.seed, 0, c.batch_size, "train")?,
-            &train_device,
-        );
+        let rows = data::examples(c, corpus.as_ref(), c.seed, 0, c.batch_size, "train")?;
+        let batch = Batch::new(&rows,&train_device);
         let first = Instant::now();
-        let loss = model.loss(model.forward(&batch), &batch);
+        let loss = if c.sbd.is_some() {
+            crate::sbd::training_loss(&model,c,&rows,&batch,c.seed)?
+        } else {model.loss(model.forward(&batch),&batch)};
         let grads = model::checked_gradients(&model, loss)?;
         model = optim.step(c.learning_rate, model, grads);
         runtime::sync(device)?;
@@ -434,7 +441,9 @@ pub fn pilot(c: &Config, device: &Device) -> Result<Value> {
                 "train",
             )?;
             let batch = Batch::new(&rows, &train_device);
-            let loss = model.loss(model.forward(&batch), &batch);
+            let loss = if c.sbd.is_some() {
+                crate::sbd::training_loss(&model,c,&rows,&batch,c.seed.wrapping_add(steps as u64 + 1))?
+            } else {model.loss(model.forward(&batch),&batch)};
             let grads = model::checked_gradients(&model, loss)?;
             model = optim.step(c.learning_rate, model, grads);
             runtime::sync(device)?;

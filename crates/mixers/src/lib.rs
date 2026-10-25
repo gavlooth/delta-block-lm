@@ -26,6 +26,7 @@ mod projections;
 pub use normalization::NormalizationBackend;
 pub mod reference;
 pub mod wavelet;
+pub mod sbd;
 pub use checks::{NumericalReport, numerical_checks};
 pub use projections::{
     ProjectionBackend, benchmark as projection_benchmark,
@@ -403,6 +404,16 @@ impl Mixer {
         reset: Tensor<2>,
         profile: &mut P,
     ) -> Tensor<3> {
+        self.forward_inner(input, valid, reset, profile, None)
+    }
+    /// Clean prefix plus one temporary block. Only the prefix advances recurrent memory.
+    pub fn forward_sbd(&self, input: Tensor<3>, valid: Tensor<2>, reset: Tensor<2>, start: usize) -> Tensor<3> {
+        self.forward_inner(input, valid, reset, &mut profile::Unprofiled, Some(start))
+    }
+    fn forward_inner<P: profile::Sections>(
+        &self, input: Tensor<3>, valid: Tensor<2>, reset: Tensor<2>, profile: &mut P,
+        block_start: Option<usize>,
+    ) -> Tensor<3> {
         let [b, t, _] = input.dims();
         assert!(t > 0);
         assert_eq!(valid.dims(), [b, t]);
@@ -489,23 +500,45 @@ impl Mixer {
             sigmoid(write).reshape([b, t, self.heads, write_width])
         });
         let recurrent = profile.section("Recurrent scan", || {
-            chunk::scan_selected(
-                self.scan_backend,
-                self.kind,
-                chunk::ScanInput {
-                    q,
-                    k,
-                    v,
-                    alpha,
-                    erase,
-                    write,
-                },
-                valid.clone(),
-                reset,
-                self.chunk_size,
-                None,
-            )
+            let inputs = chunk::ScanInput { q: q.clone(), k: k.clone(), v: v.clone(), alpha, erase, write };
+            if let Some(start) = block_start {
+                assert!(start > 0 && start < t);
+                let take = |x: Tensor<4>, first: usize, last: usize| {
+                    let width = x.dims()[3];
+                    x.slice([0..b, first..last, 0..self.heads, 0..width])
+                };
+                let prefix = chunk::scan_selected(self.scan_backend, self.kind, chunk::ScanInput {
+                    q: take(inputs.q.clone(), 0, start), k: take(inputs.k.clone(), 0, start),
+                    v: take(inputs.v.clone(), 0, start), alpha: take(inputs.alpha.clone(), 0, start),
+                    erase: take(inputs.erase.clone(), 0, start), write: take(inputs.write.clone(), 0, start),
+                }, valid.clone().slice([0..b, 0..start]), reset.clone().slice([0..b, 0..start]), self.chunk_size, None);
+                let n = t - start;
+                let single = |x: Tensor<4>| {
+                    let width = x.dims()[3];
+                    take(x, start, t).reshape([b*n, 1, self.heads, width])
+                };
+                let initial = prefix.final_state.clone().unsqueeze_dim::<5>(1)
+                    .expand([b, n, self.heads, self.key_dim, self.value_dim])
+                    .reshape([b*n, self.heads, self.key_dim, self.value_dim]);
+                let active = chunk::scan_selected(self.scan_backend, self.kind, chunk::ScanInput {
+                    q: single(inputs.q), k: single(inputs.k), v: single(inputs.v),
+                    alpha: single(inputs.alpha), erase: single(inputs.erase), write: single(inputs.write),
+                }, valid.clone().slice([0..b, start..t]).reshape([b*n, 1]),
+                reset.clone().slice([0..b, start..t]).reshape([b*n, 1]), self.chunk_size, Some(initial));
+                let exact = sbd::attention(take(q, start, t), take(k, start, t),
+                    take(v, start, t), valid.clone().slice([0..b, start..t]));
+                chunk::ScanOutput {
+                    output: Tensor::cat(vec![prefix.output, active.output.reshape([b,n,self.heads,self.value_dim]) + exact], 1),
+                    scores: Tensor::cat(vec![prefix.scores, Tensor::zeros([b,n,self.heads,1], &input.device())], 1),
+                    final_state: prefix.final_state,
+                }
+            } else {
+                chunk::scan_selected(self.scan_backend, self.kind, inputs, valid.clone(), reset.clone(), self.chunk_size, None)
+            }
         });
+        if P::CAPTURE_RECURRENT_STATE {
+            profile.recurrent_state(&recurrent.final_state);
+        }
         let mut mixed = recurrent.output;
         if let Some(cache) = &self.cache {
             let (cache_q, cache_k) = profile.section("HOLA RMSNorms", || {
@@ -524,7 +557,11 @@ impl Mixer {
                     ),
                 )
             });
-            let exact = if P::CAPTURE_CACHE_MEMBERSHIP {
+            let exact = if let Some(start) = block_start {
+                hola::read_frozen(cache_q, cache_k, raw_v, recurrent.scores,
+                    valid.clone(), documents, self.cache_capacity, self.chunk_size,
+                    self.cache_policy, cache.sink.val(), start, self.hola_backend)
+            } else if P::CAPTURE_CACHE_MEMBERSHIP {
                 assert_eq!(
                     self.hola_backend,
                     HolaBackend::Tensor,

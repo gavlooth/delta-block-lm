@@ -18,6 +18,9 @@ mod ohc;
 mod profile;
 mod runtime;
 mod scan_benchmark;
+mod sbd;
+mod sbd_reference;
+mod sbd_training;
 mod soft;
 mod soft_benchmark;
 mod train;
@@ -39,7 +42,7 @@ fn execute() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     ensure!(
         args.len() >= 2,
-        "usage: delta-experiment <reference|lngram-reference|lngram-benchmark|lngram-attribution|lngram-smoke|wavelet-reference|wavelet-benchmark|wavelet-smoke|ohc-reference|ohc-benchmark|ohc-learning-smoke|convolution-reference|normalization-reference|epilogue-reference|epilogue-benchmark|kron-reference|gdn-reference|gdn-directional-diagnostic|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|optimization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|gdn-benchmark|kron-model-benchmark|hola-benchmark|io-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256|fused_gdn2 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
+        "usage: delta-experiment <sbd-reference|sbd-train|sbd-generate|reference|lngram-reference|lngram-benchmark|lngram-attribution|lngram-smoke|wavelet-reference|wavelet-benchmark|wavelet-smoke|ohc-reference|ohc-benchmark|ohc-learning-smoke|convolution-reference|normalization-reference|epilogue-reference|epilogue-benchmark|kron-reference|gdn-reference|gdn-directional-diagnostic|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|optimization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|gdn-benchmark|kron-model-benchmark|hola-benchmark|io-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256|fused_gdn2 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
     );
     let command = &args[0];
     let c = Config::load(Path::new(&args[1]))?;
@@ -325,6 +328,11 @@ fn execute() -> Result<()> {
         }
     }
     let mut result = match command.as_str() {
+        "sbd-reference" => sbd::reference(&c, &device)?,
+        "sbd-generate" | "sbd-evaluate" => {
+            let arm = c.arms.iter().find(|a| arm_name.is_none_or(|name| a.name == name)).context("arm name absent from config")?;
+            sbd::checkpoint_report(&c,arm,seed,&device,resume.as_deref().context("sbd-generate/evaluate requires --resume CHECKPOINT")?,command == "sbd-generate")?
+        }
         "lngram-reference" => lngram::reference(&c, &device)?,
         "lngram-benchmark" => lngram::benchmark(
             &c,
@@ -541,7 +549,8 @@ fn execute() -> Result<()> {
             benchmark_trials.unwrap_or(5),
             legacy_stress_report.as_deref(),
         )?,
-        "smoke" | "train" => {
+        "smoke" | "train" | "sbd-train" => {
+            ensure!(command != "sbd-train" || c.sbd.is_some(), "sbd-train requires sbd config");
             let arm = if let Some(name) = arm_name {
                 c.arms
                     .iter()
@@ -646,6 +655,7 @@ fn execute() -> Result<()> {
             command.as_str(),
             "checkpoint-check"
                 | "certify"
+                | "sbd-reference"
                 | "kron-reference"
                 | "gdn-reference"
                 | "hola-reference"
