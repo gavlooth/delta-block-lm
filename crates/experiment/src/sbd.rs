@@ -376,6 +376,9 @@ pub(super) fn advance_generation_state(
 
 pub fn generate(model: &LanguageModel, c: &Config, prompt: &[i32], device: &Device) -> Result<Value> {
     let s = c.sbd.as_ref().context("SBD config is required")?;
+    if s.refinement.is_some() {
+        return crate::remask::generate(model,c,prompt,device);
+    }
     ensure!(!prompt.is_empty(),"generation requires a clean prefix");
     let model = model.valid();
     let mut clean = CleanPrefix::new(&model,prompt.to_vec(),device);

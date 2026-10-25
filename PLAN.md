@@ -287,18 +287,19 @@ Partially implemented: clean/masked objectives, soft feedback, frozen prefix rea
 
 **Gate:** any combined gain exceeds the extra partial-pass/circuit cost. Keep greedy joint-mode coordination distinct from stochastic joint sampling.
 
-### Step 11 — Test the user's energy-guided stochastic remasking
+### Step 11 — Implement the user's energy-guided stochastic remasking
 
-- Establish uniform R²D inside the active block and preserve the same eligible positions, remask counts and decode budget for each competing policy.
-- Train unary mask-set energies from a small set of paired equal-budget refinement trajectories; retain the uniform exploration mixture.
-- Compare against pure random and confidence/entropy diagnostics. Test on held-out trajectories, not the policy's training examples.
-- Add pairwise mask-set energies only after the unary experiment; include cases where jointly wrong tokens cannot be fixed one at a time.
-- Verify mask-set normalization/sampling by enumeration on small blocks; specify and measure any larger-block approximation.
-- Keep TCT as a separate training comparison so improved denoiser training is not mistaken for a policy gain.
+Implemented2026-10-25; exact design, director decisions and evidence: [docs/remasking.md](docs/remasking.md).
 
-**Deliverable:** random versus unary-energy versus pairwise-energy quality/cost curves, with policy-data generation cost reported.
+- Optional `sbd.refinement` implements R²D with K=eligible count, M_paper4/five calls per level, patience2, current Codpula FFBS and retained soft feedback. Final commitments/prefix remain immutable; new commitments wait until the episode ends.
+- Uniform, unary and pairwise are executable mask-set policies, not authorized quality-comparison arms. The learned law keeps epsilon0.1/T1 and exact fixed cardinality; unary uses stable host-f64 DP and pairwise enumerates all legal sets through L16, rejecting larger blocks. Features are contextual524->32; pairs are symmetric and include all within-block positions.
+- Actual frozen-model paired trajectory collection uses512 states/four pairs/H2 by default, identical work/draws per pair, half proposal-weighted swaps and half independent sets. Clean-target conditional joint NLL determines ranking; inactive/tied pairs get zero weight. Offline fitting trains unary first, then pair terms with predecessor softplus-margin semantics. No confidence threshold or deterministic correction-value head substitutes for this mechanism.
+- Explicit `sbd.training_mode:tct` implements streaming K_train4 chains, confidence0.9 plus scheduled minimum, all-free-position conditional joint NLL plus clean causal loss. Provisional inputs never become circuit evidence. Optional `tct.rows_per_pass` accumulates normalized neural gradients and unscaled circuit flows before one full-batch update; the selected B8 config uses four rows/pass, the first requested candidate that fit.
+- Numerical gates: exact-law enumeration/sampling, f64 energy/rank VJPs, state/RNG/immutability/padding/L1, joint TCT flows and exact chain/optimizer restart, CPU/Vulkan parity, old identities/checkpoints. Workspace tests85 passed/one pre-existing ignored; new remasking max abs3.30547e-6, TCT including row accumulation9.53674e-7, unchanged tolerance2e-5+3e-4*abs(ref).
+- Execution evidence: B1/T512 TCT per-block/batched medians17562.660/1845.395ms, 2warmups/11interleaved pairs; paired saving15711.721ms [15625.973,16349.399], so retain batched blocks. B8/T512/four-row accumulation:7267.660ms, sampled pool4399520256bytes after one warmup. B8 R²D resident-prefix episode:3342.933ms including clean replay, 38noisy batch calls; initial prefill is separate. These are execution costs, not quality evidence.
+- A pre-existing GPU continuation failure was reproduced on the unmodified Codpula base and repaired separately by deterministic native AdamW clipping (64590d18); fused optimizer arithmetic/records remain unchanged, historical causal checkpoint13 still passes.
 
-**Gate:** evidence that context-guided stochastic exploration improves on pure random at matched total work. A confidence threshold or deterministic correction-value head does not satisfy this step.
+**Deliverable/gate, as explicitly decided:** implemented commands/configs, numerical and exact-law gates, tiny context32 smokes for generation/collection/fitting/guided generation/TCT, execution measurements and documentation. No quality study, ablation, sweep, calibration grid or quality/cost curves were authorized or run.
 
 ### Step 12 — Scale only supported choices and test remaining mechanisms
 

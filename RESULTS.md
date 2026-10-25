@@ -1,4 +1,4 @@
-# Steps 1–9: implementation and measured results
+# Implementation and measured results
 
 For the current optimized execution paths, measured speedups and known legacy GPU-solver limitation, see [Early GPU kernel optimization](#early-gpu-kernel-optimization). The current recommended batch-8 configuration and its combined measurements are in [Batch-8 component optimization round](#batch-8-component-optimization-round). Step 7 (oHC, wavelet mixer, three Lngram injections) is in [Step 7: oHC, wavelet and Lngram](#step-7-ohc-wavelet-and-lngram). The first sections retain the original pilot measurements.
 
@@ -2007,3 +2007,52 @@ Evidence: `artifacts/codpula/`, particularly `cpu-tests.txt`,
 `b1/codpula-benchmark.json`, `b1/codpula-isolated.json`,
 `codpula-diagnostic.json`, `smoke/`, `adoption.json` and
 `checkpoint-cleanup.json`.
+
+## Step11: stochastic remasking and trajectory correction
+
+Implemented2026-10-25 in the separate remasking workspace. Exact decisions and methods: [docs/remasking.md](docs/remasking.md), especially §§9/14. The user's learned mask-set distribution remains stochastic with epsilon0.1/T1; it is not confidence ranking or a deterministic correction-value model. No quality study, policy comparison, ablation, sweep or calibration grid was authorized or run.
+
+### Mechanism and training
+
+Optional `sbd.refinement` selects uniform R²D, unary or pairwise mask energies. K is the eligible count; M_paper4 means five calls/level, and patience2 means three identical complete predictions. Existing final commitments/prefix never change; all new commitments wait until episode end. Current Codpula FFBS and retained soft candidate feedback remain in use. Unary exact DP and all-pair exact enumeration cover L<=16; larger blocks are rejected.
+
+The524->32 energy features reuse final hidden states and candidate embeddings/probabilities. Energies are factorized into unary local terms and symmetric bilinear selected-position pairs. Offline rank fitting freezes the denoiser and ports predecessor eligible-masked softplus-margin semantics. Actual trajectories fork identical states/draws for equal H2 work; half candidates are proposal-weighted swaps, half independent sets. Clean-target conditional joint NLL assigns preference. No relation ontology or token-logit gradient correction is ported.
+
+TCT is explicit `sbd.training_mode:tct`: streaming four-round chains, confidence0.9 plus scheduled minimum, self-generated provisional inputs, permanent-O-only circuit evidence, all-free-position conditional joint NLL plus clean causal loss. Its state/RNG/loader and candidate rows persist; no autograd or stale clean cache persists. `tct.rows_per_pass` accumulates batch-normalized neural gradients and unscaled circuit flows before one optimizer/EM update.
+
+### Correctness and compatibility
+
+- 85 workspace tests pass (62 experiment/7 kernel/16 mixer); one pre-existing GPU-sharing test is ignored.
+- 990 mask-law cases enumerate every n=0..16 and r across supported laws; max logZ error 1.13687e-13 and probability error 3.33067e-16. Fixed-seed 65,536-draw checks have max frequency error 0.00291679 below simultaneous limit 0.01355672.
+- CPU/Vulkan energy/features/rank max abs 3.305467803915718e-6, max tolerance ratio 0.00687248; joint TCT including chunking max 9.5367431640625e-7/ratio 0.00337868. Criterion remains **2e-5+3e-4*abs(ref)**.
+- Full-batch versus chunked tensor/fused gradients and all flow fields agree within tolerance; token decisions and indexed RNG agree. Exact restart traverses partial reveals, final fully revealed supervision and refill with identical neural/circuit/optimizer state.
+- Absent selectors retain old serialization/fingerprints; actual historical causal checkpoint 13 check passes. Existing SBD CPU/Vulkan matrix and complete Codpula gate pass. The contextual profile is implemented separately; new joint dispatch uses model presence/`!is_factorized`, while combined-profile gating belongs to parent integration.
+
+The inherited GPU continuation failure reproduced unchanged on Codpula bd39717e and is repaired separately in **64590d18**. Raw neural gradients match, but native clipping had an unordered `square().sum()` norm feeding parameter rescaling. Fixed-output dimensional reduction preserves native AdamW state/formula. The adopted fused optimizer kernel is unchanged: its final partial array has at most 64 entries and one nonzero final-sum cube. Tensor/fused dual flows use fixed owners/reductions, not competing float atomics. Exact historical `checkpoint-check` and unchanged update-loss f64 reference pass (max 1.30508e-7); see [Codpula §10.4](docs/codpula.md#104-deterministic-native-optimizer-clipping-2026-10-25).
+
+### Execution costs
+
+All costs here are **old homogeneous `joint_output:codpula`**, Intel Arc Graphics(MTL)/Mesa26.2.4, Vulkan f32, no fusion/autotuning, full D256/four-layer Step7/HOLA model. They are not contextual-profile timings.
+
+| Work | B1/T512 | B8/T512 diagnostic |
+|---|---:|---:|
+| R²D resident-prefix L8 episode, including clean replay |2740.755ms median|3342.933ms|
+| Refinement component,38noisy batch calls |2641.888ms median|2912.708ms|
+| Per noisy batch call |69.523ms|76.650ms|
+| Completed-prefix clean replay component |98.867ms median|430.226ms|
+| TCT batched complete optimizer step |1845.395ms median|7267.660ms,4rows/pass|
+
+Generation uses one8-token active block/row after a512-token immutable prefix; B8 performs304noisy row evaluations and finalizes64tokens. State initialization, head/sampler/readbacks and520-position clean replay are included. Initial513-position cache preparation is separate; its fresh-process samples3.146883s/B1 and1.030727s/B8 may include JIT/setup and are not paired throughput evidence. R²D B1 uses2warmups/11samples; B8 uses1warmup/1diagnostic. Earlier replay-excluding costs were replaced by the complete boundary, not used for adoption.
+
+TCT layout timing is2warmups/11same-session alternating interleaved pairs, common initial model/data/chains/RNG, independent optimizer trajectories, complete backward/finite checks/neural+circuit updates and refill. Per-block median17562.660ms versus batched1845.395ms; paired saving15711.721ms, bootstrap95% interval **[15625.973,16349.399]**,11/11 faster. Retain batched blocks. Pool reservation sampled1,452,711,808bytes with both B1 runners resident, not a per-runner peak.
+
+Full B8 TCT failed a2GiB buffer allocation with tensor and fused circuits. Exact row accumulation fixed the graph peak without reducing the batch: **four rows/pass fit on the first corrected attempt**, two passes/one full-batch update,7267.660ms after one warmup. Sampled reservation4,399,520,256bytes, not an exact physical/live peak. Smaller chunks were not tried. Circuit execution stays tensor; `configs/lm512-tct.json` records rows_per_pass4. The~8s ordinary SBD baseline uses a different objective/teacher workload, so no paired TCT-vs-SBD speed or quality inference is drawn.
+
+### Tiny command smokes and evidence
+
+Context32/full model commands completed: uniform R²D generation, actual trajectory collection, offline unary-then-pair fitting, fitted guided generation and TCT warm-start training. Collection used the selected512state/fourpair/H2 recipe(2,048pairs);2numerically non-tied pairs supplied real supervision, with no tolerance change or fake labels. Work:8,222source +8,192branch +4,096endpoint row-call units =20,510, packed into133noisy dispatches. Fit performed2unary +2pairwise updates; each generation smoke finalized/replayed8tokens using38calls. Final TCT smoke performed5updates/160target visits and loaded64unique bytes, exercising endpoint supervision/refill and schema2.
+
+The initial8-state collection produced only numerical ties; expanding to the already-selected default recipe supplied two real labels. This is smoke plumbing, not ranking/quality evidence. All29owned smoke/diagnostic model/optimizer/energy payloads were deleted after their gates; JSON datasets, states, reports and hashes remain. Original historical payloads and unrelated scratch directories were untouched.
+
+Evidence: `artifacts/remasking/{summary,continuation-base,checkpoint-cleanup}.json`, `remask-reference.json`, `cpu/remask-reference.json`, `tct/tct-reference.json`, `historical/checkpoint-check.json`, `remask{,-timing-b1}/remask-benchmark.json`, `timing-b1/tct-benchmark.json`, `tct/tct-benchmark.json`, `smoke-trajectories-full.json`, `smoke-energy.fit.json` and `smoke-tct-final/`. Main was not moved/rebased; duplicate main specification docs remain for the director.
+

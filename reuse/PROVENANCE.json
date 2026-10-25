@@ -14,6 +14,33 @@
   "active_source_adaptations": [
     {
       "ported_on": "2026-10-25",
+      "component": "Stochastic mask-set energies and outcome-ranked refinement",
+      "source_files": [
+        {
+          "path": "crates/dre-relations/src/energy_guidance.rs",
+          "sha256": "20ffff5b3a9081b97f0012786cd1b96f7b3c386fbad8198921af2c0141b829fb",
+          "lines": ["186-210", "224-299", "371-393", "680-683", "739-764", "825-912", "1106-1182"],
+          "used": "Factorized local and symmetric bilinear terms, early padding zeroing, shared projections and categorical gathers, ordered host f64 final energies, exact eligible-masked softplus rank semantics and detached proposal-weighted corruption discipline"
+        },
+        {
+          "path": "docs/references/guidance.md",
+          "sha256": "d60a126ac534c63193f699ce7e553d4bdb2b20bf784fbe2c171ff9058127b6ab",
+          "lines": ["7-20", "24-46", "63-73", "173-212"],
+          "used": "Preserved user decisions: no second Transformer, factorized energy, rank fitting, ordered f64 final evaluation, no edge-by-vocabulary expansion and immutable facts outside learned energy"
+        }
+      ],
+      "destinations": ["crates/experiment/src/mask_energy.rs", "crates/experiment/src/remask.rs"],
+      "changes": [
+        "Replace relation assignments with eligible fixed-cardinality position mask sets",
+        "Use contextual 2D+12 to 32 features and symmetric bilinear position terms, not a constant binary compatibility that degenerates at fixed cardinality",
+        "Sample the explicit uniform/energy mixture with exact unary cardinality DP or pairwise enumeration through length 16; do not rerank token assignments by argmin energy",
+        "Outcome-rank equal-call refinement branches against clean-target conditional NLL; adapt proposal-weighted categorical corruption to same-size position swaps",
+        "Drop all relation ontology and exact relation-solving code; immutable observations, padding and block limits remain hard checks",
+        "No per-step token-logit gradient correction is enabled or ported"
+      ]
+    },
+    {
+      "ported_on": "2026-10-25",
       "component": "Codpula short-chain inference, indexed sampling and dependence commitments",
       "source_files": [
         {
