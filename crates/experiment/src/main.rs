@@ -346,6 +346,7 @@ fn execute() -> Result<()> {
     let mut result = match command.as_str() {
         "codpula-reference" => codpula_reference::numerical_checks(&device)?,
         "codpula-model-reference" => codpula_model_checks::run(&c,&device)?,
+        "codpula-continuation-reference" => codpula_model_checks::continuation_reference(&c,&device)?,
         "codpula-benchmark" => sbd_benchmark::codpula(&c,&device,benchmark_warmups.unwrap_or(2),benchmark_trials.unwrap_or(11))?,
         "codpula-diagnostic" => sbd_benchmark::batching_diagnostic(&c,&device)?,
         "sbd-reference" => {

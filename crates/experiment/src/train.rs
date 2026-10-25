@@ -24,7 +24,7 @@ pub(crate) fn optimizer_config(c: &Config) -> AdamWConfig {
 }
 pub(crate) fn optimizer(c: &Config) -> ModuleOptimizer {
     let optimizer = if c.update_backend.is_tensor() {
-        optimizer_config(c).init()
+        crate::update::TensorAdamW {decay:c.weight_decay,clip:c.gradient_clip}.into()
     } else {
         crate::update::FusedAdamW {
             decay: c.weight_decay,
