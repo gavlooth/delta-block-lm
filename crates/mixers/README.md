@@ -230,3 +230,16 @@ KronLSTM recurrence, boundary-state objectives and explicit padding freezes.
 The HOLA adaptation follows [the original method](https://arxiv.org/html/2607.02303)
 with mixer-specific committed-edit scores, not a claim of reproducing its
 published training results.
+
+## Causal Lngram
+
+`lngram::Lngram` ports the predecessor's exact latent n-gram tables, gated
+readout and both counterfactual discretizer surrogates. `LngramLayout` derives
+document IDs from the LM's `valid`/`reset` tensors. Suffix lookups stay inside
+their document; smoothing uses only current and left taps with zero extension.
+The default route-wise gather, global-row select and GPU analytic memory paths
+share parameters. The tensor surrogate explicitly disables tracking on frozen
+rows; the fused path reads counterfactual rows on demand with deterministic
+exclusive-owner table VJPs, without expanded counterfactual activations.
+See `../../docs/optimization/lngram.md` for the three-injection mapping, table
+optimizer groups, memory, numerical gates and paired workload measurements.

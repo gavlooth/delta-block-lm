@@ -71,6 +71,12 @@ mod epilogue_ops;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 pub use epilogue_ops::{silu_analytic, silu_vjp};
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod lngram;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod lngram_ops;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+pub use lngram_ops::{lngram_codes, lngram_memory};
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
 mod wavelet;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 mod wavelet_ops;
@@ -87,4 +93,4 @@ mod ohc_read;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 mod ohc_read_ops;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
-pub use ohc_read_ops::{ohc_gate_norm, ohc_weighted_read, ohc_quaternion};
+pub use ohc_read_ops::{ohc_gate_norm, ohc_quaternion, ohc_weighted_read};

@@ -59,6 +59,7 @@ fn select(m: &mut LanguageModel, mode: usize) {
         if mode == 0 {
             block.wavelet = None;
             block.wavelet_norm = None;
+            block.ohc_wavelet = None;
         } else if let Some(w) = block.wavelet.as_mut() {
             w.backend = if mode == 1 {
                 WaveletBackend::Tensor

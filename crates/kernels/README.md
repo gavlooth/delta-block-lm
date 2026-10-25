@@ -157,3 +157,20 @@ extension registration for the active operators, rather than predecessor metadat
 Source provenance,
 copy date and inherited MIT OR Apache-2.0 license remain recorded in
 `reuse/PROVENANCE.json`.
+
+## Causal Lngram memory
+
+`lngram_codes` computes exact hard symbols once per injection.
+`lngram_memory` reuses that cache for exact suffix addresses and table gather
+per order. Its analytic logit VJP reads current/counterfactual table rows on
+demand for OneBit or LocalExpectation; it does not retain expanded
+`[B,T,R,bits_or_alphabet,memory_dim]` counterfactual tensors. One invocation per
+`(route,column)` owns every table-gradient element in that route and column,
+walking `(batch,time)` chronologically. Repeated hits are summed without
+floating-point atomics, and a regression checks bitwise repeatability.
+
+Inputs are FP32 strided tensors, with nondifferentiable valid/document tensors.
+Incomplete suffixes and padding read no table row. The selector is explicitly
+GPU-only and non-fusion; CPU keeps the tensor port. Existing tables, projections
+and optimizer records are unchanged. Numerical, attribution, memory and paired
+whole-step evidence are in `../../docs/optimization/lngram.md`.

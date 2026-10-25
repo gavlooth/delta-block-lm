@@ -6,6 +6,13 @@ use delta_mixers::{
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+fn lngram_one_bit(value: &delta_mixers::lngram::SurrogateGradient) -> bool {
+    *value == delta_mixers::lngram::SurrogateGradient::OneBit
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Arm {
@@ -71,6 +78,8 @@ impl Arm {
             || !c.epilogue_backend.is_native()
             || !c.ohc_backend.is_tensor()
             || !c.wavelet_backend.is_tensor()
+            || (!c.lngram_layers.is_empty()
+                && c.lngram_backend == delta_mixers::lngram::LngramBackend::FusedGpu)
     }
 }
 
@@ -193,6 +202,23 @@ pub struct Config {
     pub ohc_streams: bool,
     #[serde(skip_serializing_if = "delta_mixers::ohc::OhcBackend::is_tensor")]
     pub ohc_backend: delta_mixers::ohc::OhcBackend,
+    /// Three target injections are independent of the per-injection n-gram orders.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub lngram_layers: Vec<usize>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub lngram_orders: Vec<usize>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub lngram_routes: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub lngram_bits: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub lngram_memory_dim: usize,
+    #[serde(skip_serializing_if = "delta_mixers::lngram::LngramBackend::is_tensor")]
+    pub lngram_backend: delta_mixers::lngram::LngramBackend,
+    #[serde(skip_serializing_if = "lngram_one_bit")]
+    pub lngram_surrogate: delta_mixers::lngram::SurrogateGradient,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub lngram_no_smoothing: bool,
     pub context: usize,
     pub batch_size: usize,
     pub learning_rate: f64,
@@ -255,6 +281,14 @@ impl Default for Config {
             ohc_backend: delta_mixers::ohc::OhcBackend::Tensor,
             wavelet_layers: Vec::new(),
             wavelet_backend: delta_mixers::WaveletBackend::Tensor,
+            lngram_layers: Vec::new(),
+            lngram_orders: Vec::new(),
+            lngram_routes: 0,
+            lngram_bits: 0,
+            lngram_memory_dim: 0,
+            lngram_backend: delta_mixers::lngram::LngramBackend::Tensor,
+            lngram_surrogate: delta_mixers::lngram::SurrogateGradient::OneBit,
+            lngram_no_smoothing: false,
             context: 128,
             batch_size: 1,
             learning_rate: 0.001,
@@ -292,10 +326,15 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.ohc_backend.is_tensor()
-                || (self.ohc_streams && matches!(self.backend.as_str(), "vulkan" | "cuda") && !self.fusion),
+                || (self.ohc_streams
+                    && matches!(self.backend.as_str(), "vulkan" | "cuda")
+                    && !self.fusion),
             "fused oHC requires ohc_streams and an explicit non-fusion GPU backend"
         );
-        ensure!(!self.ohc_backend.fused_read() || self.d_model <= 1024, "fused oHC read supports d_model <= 1024");
+        ensure!(
+            !self.ohc_backend.fused_read() || self.d_model <= 1024,
+            "fused oHC read supports d_model <= 1024"
+        );
         ensure!(
             self.wavelet_layers.iter().all(|&layer| layer < self.layers)
                 && self
@@ -359,6 +398,43 @@ impl Config {
             self.context >= 8 && self.batch_size > 0 && self.layers > 0 && self.d_model > 0,
             "invalid model shape"
         );
+        let mut lngram_layers = std::collections::BTreeSet::new();
+        ensure!(
+            self.lngram_layers
+                .iter()
+                .all(|&i| i < self.layers && lngram_layers.insert(i)),
+            "lngram_layers must be distinct existing block indices"
+        );
+        ensure!(
+            self.lngram_backend != delta_mixers::lngram::LngramBackend::FusedGpu
+                || (matches!(self.backend.as_str(), "vulkan" | "cuda") && !self.fusion),
+            "fused_gpu Lngram requires an explicit non-fusion GPU backend"
+        );
+        if !self.lngram_layers.is_empty() {
+            let config = self.lngram_config();
+            let mut orders = std::collections::BTreeSet::new();
+            ensure!(
+                config.routes > 0
+                    && config.memory_dim > 0
+                    && (1..=8).contains(&config.bits_per_route),
+                "Lngram routes/memory_dim must be positive and bits must be 1..=8"
+            );
+            ensure!(
+                !config.orders.is_empty()
+                    && config.orders.iter().all(|&n| n > 0 && orders.insert(n)),
+                "Lngram orders must be distinct positive integers"
+            );
+            for &n in &config.orders {
+                let rows = u32::try_from(n)
+                    .ok()
+                    .and_then(|n| config.alphabet().checked_pow(n))
+                    .and_then(|rows| rows.checked_mul(config.routes));
+                ensure!(
+                    rows.is_some_and(|rows| rows <= i32::MAX as usize),
+                    "Lngram table exceeds i32 row addresses"
+                );
+            }
+        }
         ensure!(
             self.heads == 4 && self.key_dim == 32 && self.value_dim == 64 && self.chunk_size == 16,
             "preserve inherited 4x32x64, chunk16 kernel dimensions"
@@ -427,6 +503,33 @@ impl Config {
         );
         Ok(())
     }
+    pub fn lngram_config(&self) -> delta_mixers::lngram::LngramConfig {
+        delta_mixers::lngram::LngramConfig::new()
+            .with_d_model(self.d_model)
+            .with_routes(if self.lngram_routes == 0 {
+                (self.d_model / 8).max(1)
+            } else {
+                self.lngram_routes
+            })
+            .with_bits_per_route(if self.lngram_bits == 0 {
+                4
+            } else {
+                self.lngram_bits
+            })
+            .with_memory_dim(if self.lngram_memory_dim == 0 {
+                8
+            } else {
+                self.lngram_memory_dim
+            })
+            .with_orders(if self.lngram_orders.is_empty() {
+                vec![2, 3]
+            } else {
+                self.lngram_orders.clone()
+            })
+            .with_backend(self.lngram_backend)
+            .with_surrogate(self.lngram_surrogate)
+            .with_smoothing(!self.lngram_no_smoothing)
+    }
     pub fn vocab(&self) -> usize {
         if self.task == "lm" {
             257
@@ -478,6 +581,42 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lngram_omission_preserves_serialization_and_enabled_changes_identity() {
+        let baseline = Config::default();
+        let value = serde_json::to_value(&baseline).unwrap();
+        assert!(
+            value
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|key| !key.starts_with("lngram_"))
+        );
+        let decoded: Config = serde_json::from_value(value).unwrap();
+        assert!(decoded.lngram_layers.is_empty());
+        let mut enabled = baseline.clone();
+        enabled.lngram_layers = vec![0, 1];
+        assert_ne!(
+            baseline.pilot_fingerprint().unwrap(),
+            enabled.pilot_fingerprint().unwrap()
+        );
+        assert_eq!(enabled.lngram_config().orders, vec![2, 3]);
+        enabled.lngram_layers = vec![0, 0];
+        assert!(enabled.validate().is_err());
+        enabled.lngram_layers = vec![enabled.layers];
+        assert!(enabled.validate().is_err());
+        enabled.lngram_layers = vec![0];
+        enabled.lngram_orders = vec![2, 2];
+        assert!(enabled.validate().is_err());
+        let mut fused = Config::default();
+        fused.lngram_layers = vec![0];
+        fused.lngram_backend = delta_mixers::lngram::LngramBackend::FusedGpu;
+        assert!(fused.validate().is_err());
+        fused.backend = "vulkan".into();
+        assert!(fused.validate().is_ok());
+        fused.fusion = true;
+        assert!(fused.validate().is_err());
+    }
     #[test]
     fn pilot_identity_includes_cache_and_optimizer() {
         let c = Config::default();

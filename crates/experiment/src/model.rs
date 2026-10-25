@@ -12,21 +12,27 @@ use burn::{
 };
 use delta_mixers::{
     Mixer,
+    ohc::{
+        OhcBackend, OhcReadout, OhcReadoutConfig, OhcStage, OhcStageConfig, StreamInit,
+        StreamInitConfig,
+    },
     profile::{Sections, Unprofiled},
-    ohc::{OhcBackend, OhcReadout, OhcReadoutConfig, OhcStage, OhcStageConfig, StreamInit, StreamInitConfig},
 };
 
 #[derive(Module, Debug)]
 pub struct Block {
     pub(super) wavelet_norm: Option<RmsNorm>,
     pub(super) wavelet: Option<delta_mixers::WaveletDyn>,
+    pub(super) lngram_norm: Option<RmsNorm>,
+    pub(super) lngram: Option<delta_mixers::lngram::Lngram>,
     pub(super) norm: RmsNorm,
     pub(super) mixer: Mixer,
     pub(super) ff_norm: RmsNorm,
     pub(super) up: Linear,
     pub(super) down: Linear,
-    /// oHC stage around the optional wavelet sublayer (only when both are enabled).
+    /// oHC stages around the optional wavelet and Lngram sublayers (only when oHC is enabled).
     pub(super) ohc_wavelet: Option<OhcStage>,
+    pub(super) ohc_lngram: Option<OhcStage>,
     pub(super) ohc_mixer: Option<OhcStage>,
     pub(super) ohc_mlp: Option<OhcStage>,
 }
@@ -71,6 +77,11 @@ impl LanguageModel {
         let mut blocks = Vec::with_capacity(c.layers);
         for index in 0..c.layers {
             blocks.push(Block {
+                lngram_norm: c.lngram_layers.contains(&index).then(norm),
+                lngram: c
+                    .lngram_layers
+                    .contains(&index)
+                    .then(|| c.lngram_config().init(device)),
                 wavelet_norm: c.wavelet_layers.contains(&index).then(norm),
                 wavelet: c.wavelet_layers.contains(&index).then(|| {
                     delta_mixers::WaveletDyn::new(c.d_model, 4, 8, c.wavelet_backend, device)
@@ -81,6 +92,7 @@ impl LanguageModel {
                 up: linear(c.d_model, 2 * c.d_model),
                 down: linear(2 * c.d_model, c.d_model),
                 ohc_wavelet: None,
+                ohc_lngram: None,
                 ohc_mixer: None,
                 ohc_mlp: None,
             });
@@ -101,7 +113,11 @@ impl LanguageModel {
             loss_backend: c.loss_backend,
             update_backend: c.update_backend,
         };
-        Ok(if c.ohc_streams { model.with_ohc(c.d_model, device) } else { model })
+        Ok(if c.ohc_streams {
+            model.with_ohc(c.d_model, device)
+        } else {
+            model
+        })
     }
     /// Attach only the added architecture, keeping all ordinary parameters shared with a clone.
     pub(super) fn with_ohc(mut self, width: usize, device: &Device) -> Self {
@@ -110,6 +126,9 @@ impl LanguageModel {
         for block in &mut self.blocks {
             if block.wavelet.is_some() {
                 block.ohc_wavelet = Some(OhcStageConfig::new().with_d_model(width).init(device));
+            }
+            if block.lngram.is_some() {
+                block.ohc_lngram = Some(OhcStageConfig::new().with_d_model(width).init(device));
             }
             block.ohc_mixer = Some(OhcStageConfig::new().with_d_model(width).init(device));
             block.ohc_mlp = Some(OhcStageConfig::new().with_d_model(width).init(device));
@@ -154,6 +173,27 @@ impl LanguageModel {
     pub fn set_epilogue_backend(&mut self, backend: crate::config::EpilogueBackend) {
         self.epilogue_backend = backend;
     }
+    pub fn set_lngram_backend(&mut self, backend: delta_mixers::lngram::LngramBackend) {
+        for block in &mut self.blocks {
+            if let Some(lngram) = &mut block.lngram {
+                lngram.backend = backend;
+            }
+        }
+    }
+    pub fn set_wavelet_backend(&mut self, backend: delta_mixers::WaveletBackend) {
+        for block in &mut self.blocks {
+            if let Some(wavelet) = &mut block.wavelet {
+                wavelet.backend = backend;
+            }
+        }
+    }
+    pub fn lngram_table_ids(&self) -> Vec<burn::module::ParamId> {
+        self.blocks
+            .iter()
+            .filter_map(|block| block.lngram.as_ref())
+            .flat_map(|lngram| lngram.tables.iter().map(|table| table.weight.id))
+            .collect()
+    }
     pub fn loss(&self, logits: Tensor<3>, batch: &Batch) -> Tensor<1> {
         loss_selected(logits, batch, self.loss_backend)
     }
@@ -169,6 +209,13 @@ impl LanguageModel {
         }
         let mut hidden =
             profile.section("Embedding", || self.embedding.forward(batch.input.clone()));
+        let lngram_layout = self
+            .blocks
+            .iter()
+            .any(|block| block.lngram.is_some())
+            .then(|| {
+                delta_mixers::lngram::LngramLayout::new(batch.valid.clone(), batch.reset.clone())
+            });
         for (index, block) in self.blocks.iter().enumerate() {
             if let (Some(norm), Some(wavelet)) = (&block.wavelet_norm, &block.wavelet) {
                 profile.block(Some(index));
@@ -184,6 +231,18 @@ impl LanguageModel {
                 hidden = profile.section("Residual adds", || hidden + update);
             }
             profile.block(Some(index));
+            if let (Some(norm), Some(lngram)) = (&block.lngram_norm, &block.lngram) {
+                let normalized = profile.section("Block RMSNorm: Lngram", || {
+                    self.normalization_backend.rms(norm, hidden.clone())
+                });
+                let update = profile.section("Lngram", || {
+                    lngram.forward(
+                        normalized,
+                        lngram_layout.as_ref().expect("active Lngram layout"),
+                    )
+                });
+                hidden = profile.section("Residual adds", || hidden + update);
+            }
             let normalized = profile.section("Block RMSNorm: mixer", || {
                 self.normalization_backend.rms(&block.norm, hidden.clone())
             });
@@ -214,8 +273,18 @@ impl LanguageModel {
     fn forward_ohc_profiled<P: Sections>(&self, batch: &Batch, profile: &mut P) -> Tensor<3> {
         let hidden = profile.section("Embedding", || self.embedding.forward(batch.input.clone()));
         let mut streams = profile.section("oHC stream init", || {
-            self.ohc_init.as_ref().unwrap().forward(hidden, batch.valid.clone())
+            self.ohc_init
+                .as_ref()
+                .unwrap()
+                .forward(hidden, batch.valid.clone())
         });
+        let lngram_layout = self
+            .blocks
+            .iter()
+            .any(|block| block.lngram.is_some())
+            .then(|| {
+                delta_mixers::lngram::LngramLayout::new(batch.valid.clone(), batch.reset.clone())
+            });
         for (index, block) in self.blocks.iter().enumerate() {
             profile.block(Some(index));
             if let (Some(stage), Some(norm), Some(wavelet)) =
@@ -237,25 +306,61 @@ impl LanguageModel {
                     stage.write(read, update, batch.valid.clone(), self.ohc_backend)
                 });
             }
+            if let (Some(stage), Some(norm), Some(lngram)) =
+                (&block.ohc_lngram, &block.lngram_norm, &block.lngram)
+            {
+                let read = profile.section("oHC read: Lngram", || {
+                    stage.read_selected(streams, self.ohc_backend)
+                });
+                let normalized = profile.section("Block RMSNorm: Lngram", || {
+                    self.normalization_backend.rms(norm, read.work.clone())
+                });
+                let update = profile.section("Lngram", || {
+                    lngram.forward(
+                        normalized,
+                        lngram_layout.as_ref().expect("active Lngram layout"),
+                    )
+                });
+                streams = profile.section("oHC write: Lngram", || {
+                    stage.write(read, update, batch.valid.clone(), self.ohc_backend)
+                });
+            }
             let stage = block.ohc_mixer.as_ref().unwrap();
-            let read = profile.section("oHC read: mixer", || stage.read_selected(streams, self.ohc_backend));
-            let normalized = profile.section("Block RMSNorm: mixer", || {
-                self.normalization_backend.rms(&block.norm, read.work.clone())
+            let read = profile.section("oHC read: mixer", || {
+                stage.read_selected(streams, self.ohc_backend)
             });
-            let update = block.mixer.forward_profiled(normalized, batch.valid.clone(), batch.reset.clone(), profile);
-            streams = profile.section("oHC write: mixer", || stage.write(read, update, batch.valid.clone(), self.ohc_backend));
+            let normalized = profile.section("Block RMSNorm: mixer", || {
+                self.normalization_backend
+                    .rms(&block.norm, read.work.clone())
+            });
+            let update = block.mixer.forward_profiled(
+                normalized,
+                batch.valid.clone(),
+                batch.reset.clone(),
+                profile,
+            );
+            streams = profile.section("oHC write: mixer", || {
+                stage.write(read, update, batch.valid.clone(), self.ohc_backend)
+            });
             let stage = block.ohc_mlp.as_ref().unwrap();
-            let read = profile.section("oHC read: MLP", || stage.read_selected(streams, self.ohc_backend));
+            let read = profile.section("oHC read: MLP", || {
+                stage.read_selected(streams, self.ohc_backend)
+            });
             let normalized = profile.section("Block RMSNorm: MLP", || {
-                self.normalization_backend.rms(&block.ff_norm, read.work.clone())
+                self.normalization_backend
+                    .rms(&block.ff_norm, read.work.clone())
             });
             let update = profile.section("MLP: up", || block.up.forward(normalized));
             let update = profile.section("MLP: SiLU", || self.epilogue_backend.silu(update));
             let update = profile.section("MLP: down", || block.down.forward(update));
-            streams = profile.section("oHC write: MLP", || stage.write(read, update, batch.valid.clone(), self.ohc_backend));
+            streams = profile.section("oHC write: MLP", || {
+                stage.write(read, update, batch.valid.clone(), self.ohc_backend)
+            });
         }
         profile.block(None);
-        let hidden = profile.section("oHC readout", || self.ohc_readout.as_ref().unwrap().readout(streams));
+        let hidden = profile.section("oHC readout", || {
+            self.ohc_readout.as_ref().unwrap().readout(streams)
+        });
         profile.section("Final norm and vocabulary head", || {
             self.head_forward(self.normalization_backend.rms(&self.norm, hidden))
         })

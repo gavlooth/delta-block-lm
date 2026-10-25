@@ -102,6 +102,9 @@ fn model_gate(c: &Config, device: &Device) -> Result<Value> {
     small.epilogue_backend = crate::config::EpilogueBackend::Native;
     small.loss_backend = crate::config::LossBackend::Tensor;
     small.update_backend = crate::config::UpdateBackend::Tensor;
+    // Component gate: other Step 7 sublayers are covered by their own gates and kron-model-check.
+    small.wavelet_layers.clear();
+    small.lngram_layers.clear();
     let cpu = Device::ndarray().autodiff();
     cpu.seed(819);
     let reference = LanguageModel::new(&small, &small.arms[0], &cpu)?;

@@ -27,6 +27,10 @@ pub fn validate(c: &Config) -> Result<()> {
         ),
         "autotune requires merged input projections so every executed GEMM is covered by preflight"
     );
+    ensure!(
+        !c.ohc_streams && c.wavelet_layers.is_empty() && c.lngram_layers.is_empty(),
+        "autotune preflight does not yet probe the oHC, wavelet or Lngram matrix multiplies"
+    );
     Ok(())
 }
 

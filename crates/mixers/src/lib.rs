@@ -18,19 +18,20 @@ pub mod convolution;
 pub mod gdn2_reference;
 pub use convolution::ConvolutionBackend;
 mod hola;
+pub mod lngram;
 pub mod normalization;
+pub mod ohc;
 pub mod profile;
 mod projections;
-pub mod ohc;
 pub use normalization::NormalizationBackend;
 pub mod reference;
 pub mod wavelet;
-pub use wavelet::{WaveletBackend, WaveletDyn};
 pub use checks::{NumericalReport, numerical_checks};
 pub use projections::{
     ProjectionBackend, benchmark as projection_benchmark,
     numerical_checks as projection_numerical_checks,
 };
+pub use wavelet::{WaveletBackend, WaveletDyn};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
