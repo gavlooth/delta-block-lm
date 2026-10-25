@@ -70,3 +70,15 @@ mod epilogue;
 mod epilogue_ops;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 pub use epilogue_ops::{silu_analytic, silu_vjp};
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod ohc;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod ohc_ops;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+pub use ohc_ops::ohc_write;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod ohc_read;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod ohc_read_ops;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+pub use ohc_read_ops::{ohc_gate_norm, ohc_weighted_read, ohc_quaternion};

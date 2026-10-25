@@ -69,6 +69,7 @@ impl Arm {
             || !c.update_backend.is_tensor()
             || !c.loss_backend.is_tensor()
             || !c.epilogue_backend.is_native()
+            || !c.ohc_backend.is_tensor()
     }
 }
 
@@ -182,6 +183,11 @@ pub struct Config {
     pub update_backend: UpdateBackend,
     #[serde(skip_serializing_if = "LossBackend::is_tensor")]
     pub loss_backend: LossBackend,
+    /// Four orthogonal residual streams; omitted preserves the single-stream architecture.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub ohc_streams: bool,
+    #[serde(skip_serializing_if = "delta_mixers::ohc::OhcBackend::is_tensor")]
+    pub ohc_backend: delta_mixers::ohc::OhcBackend,
     pub context: usize,
     pub batch_size: usize,
     pub learning_rate: f64,
@@ -240,6 +246,8 @@ impl Default for Config {
             epilogue_backend: EpilogueBackend::Native,
             update_backend: UpdateBackend::Tensor,
             loss_backend: LossBackend::Tensor,
+            ohc_streams: false,
+            ohc_backend: delta_mixers::ohc::OhcBackend::Tensor,
             context: 128,
             batch_size: 1,
             learning_rate: 0.001,
@@ -275,6 +283,12 @@ impl Config {
         Ok(c)
     }
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.ohc_backend.is_tensor()
+                || (self.ohc_streams && matches!(self.backend.as_str(), "vulkan" | "cuda") && !self.fusion),
+            "fused oHC requires ohc_streams and an explicit non-fusion GPU backend"
+        );
+        ensure!(!self.ohc_backend.fused_read() || self.d_model <= 1024, "fused oHC read supports d_model <= 1024");
         ensure!(
             matches!(self.task.as_str(), "recall" | "lm"),
             "task must be recall or lm"
@@ -518,6 +532,25 @@ mod tests {
         );
     }
     #[test]
+    fn ohc_is_explicit_and_changes_architecture_identity() {
+        let mut c = Config::default();
+        let identity = c.pilot_fingerprint().unwrap();
+        c.ohc_streams = true;
+        c.validate().unwrap();
+        assert_ne!(identity, c.pilot_fingerprint().unwrap());
+        c.ohc_backend = delta_mixers::ohc::OhcBackend::FusedGpu;
+        assert!(c.validate().is_err());
+        c.backend = "vulkan".into();
+        c.validate().unwrap();
+        c.ohc_streams = false;
+        assert!(c.validate().is_err());
+        c.ohc_streams = true;
+        c.ohc_backend = delta_mixers::ohc::OhcBackend::FusedReadWrite;
+        c.validate().unwrap();
+        c.d_model = 1025;
+        assert!(c.validate().is_err());
+    }
+    #[test]
     fn legacy_selector_defaults_without_changing_serialized_identity() {
         let config = Config::default();
         let legacy = serde_json::to_value(&config).unwrap();
@@ -531,6 +564,8 @@ mod tests {
         assert!(legacy.get("head_backend").is_none());
         assert!(legacy.get("update_backend").is_none());
         assert!(legacy.get("loss_backend").is_none());
+        assert!(legacy.get("ohc_streams").is_none());
+        assert!(legacy.get("ohc_backend").is_none());
         assert!(legacy.get("soft_selection_backend").is_none());
         let decoded: Config = serde_json::from_value(legacy.clone()).unwrap();
         assert_eq!(decoded.scan_backend, ScanBackend::TensorSolver);
@@ -547,6 +582,8 @@ mod tests {
         assert_eq!(decoded.update_backend, UpdateBackend::Tensor);
         assert_eq!(decoded.loss_backend, LossBackend::Tensor);
         assert_eq!(decoded.soft_selection_backend, SoftSelectionBackend::Cpu);
+        assert!(!decoded.ohc_streams);
+        assert_eq!(decoded.ohc_backend, delta_mixers::ohc::OhcBackend::Tensor);
         assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
     }
     #[test]

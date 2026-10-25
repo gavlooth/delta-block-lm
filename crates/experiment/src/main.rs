@@ -13,6 +13,7 @@ mod io_benchmark;
 mod kron_benchmark;
 mod lm_retrieval;
 mod model;
+mod ohc;
 mod profile;
 mod runtime;
 mod scan_benchmark;
@@ -36,7 +37,7 @@ fn execute() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     ensure!(
         args.len() >= 2,
-        "usage: delta-experiment <reference|convolution-reference|normalization-reference|epilogue-reference|epilogue-benchmark|kron-reference|gdn-reference|gdn-directional-diagnostic|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|optimization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|gdn-benchmark|kron-model-benchmark|hola-benchmark|io-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256|fused_gdn2 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
+        "usage: delta-experiment <reference|ohc-reference|ohc-benchmark|ohc-learning-smoke|convolution-reference|normalization-reference|epilogue-reference|epilogue-benchmark|kron-reference|gdn-reference|gdn-directional-diagnostic|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|optimization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|gdn-benchmark|kron-model-benchmark|hola-benchmark|io-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256|fused_gdn2 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
     );
     let command = &args[0];
     let c = Config::load(Path::new(&args[1]))?;
@@ -181,6 +182,7 @@ fn execute() -> Result<()> {
                 | "soft-step"
                 | "optimization-benchmark"
                 | "io-benchmark"
+                | "ohc-benchmark"
         ) || benchmark_warmups.is_none(),
         "--warmups is only valid for Kron benchmarks/profile; hola-benchmark uses two warmups per mode"
     );
@@ -206,6 +208,7 @@ fn execute() -> Result<()> {
                 | "soft-step"
                 | "optimization-benchmark"
                 | "io-benchmark"
+                | "ohc-benchmark"
         ) || benchmark_trials.is_none(),
         "--trials is only valid for a benchmark command"
     );
@@ -224,6 +227,10 @@ fn execute() -> Result<()> {
                 | "update-loss-benchmark"
                 | "update-loss-reference"
                 | "gdn-directional-diagnostic"
+                | "ohc-reference"
+                | "ohc-benchmark"
+                | "ohc-learning-smoke"
+                | "ohc-attribution"
         ) || (arm_name.is_none()
             && (resume.is_none() || command == "update-loss-reference")
             && seed == c.seed),
@@ -310,6 +317,14 @@ fn execute() -> Result<()> {
         }
     }
     let mut result = match command.as_str() {
+        "ohc-reference" => {
+            let report = ohc::reference(&c, &device);
+            json!({"schema":1,"command":command,"passed":report.is_ok(),"config":c,"device":runtime::identity(&device),
+                "numerical_report":report.as_ref().ok(),"error":report.as_ref().err().map(|e|format!("{e:#}"))})
+        }
+        "ohc-benchmark" => ohc::benchmark(&c, &device, benchmark_warmups.unwrap_or(2), benchmark_trials.unwrap_or(11))?,
+        "ohc-learning-smoke" => ohc::learning_smoke(&c, &device)?,
+        "ohc-attribution" => ohc::attribution(&c, &device)?,
         "io-benchmark" => io_benchmark::run(
             &c,
             &c.arms[0],
@@ -580,6 +595,7 @@ fn execute() -> Result<()> {
                 | "io-benchmark"
                 | "gdn-benchmark"
                 | "gdn-directional-diagnostic"
+                | "ohc-benchmark"
         ) || result["completed"] == true,
         "profile/benchmark failed or hit its deadline; separate partial report retained"
     );
@@ -598,6 +614,8 @@ fn execute() -> Result<()> {
                 | "gemm-micro"
                 | "update-loss-reference"
                 | "soft-reference"
+                | "ohc-reference"
+                | "ohc-learning-smoke"
         ) || result["passed"] == true,
         "numerical/checkpoint diagnostic/certification failed; separate report retained"
     );

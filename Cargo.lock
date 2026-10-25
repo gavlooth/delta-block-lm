@@ -2268,6 +2268,7 @@ dependencies = [
  "burn",
  "delta-kernels",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -21,6 +21,7 @@ mod hola;
 pub mod normalization;
 pub mod profile;
 mod projections;
+pub mod ohc;
 pub use normalization::NormalizationBackend;
 pub mod reference;
 pub use checks::{NumericalReport, numerical_checks};
