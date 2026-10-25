@@ -339,10 +339,15 @@ impl Enumeration {
     }
 }
 
-fn finite_differences(circuit: &Circuit, evidence: &[Option<usize>], clean: &[usize]) -> Result<Value> {
+fn finite_differences(circuit: &Circuit, evidence: &[Option<usize>], targets: &[bool], clean: &[usize]) -> Result<Value> {
     let prepared = circuit.prepare()?;
-    let complete = clean.iter().copied().map(Some).collect::<Vec<_>>();
-    let positive = prepared.query(&complete)?;
+    ensure!(targets.len() == evidence.len() && clean.len() == evidence.len(), "event fixture shape mismatch");
+    let mut numerator = evidence.to_vec();
+    for i in 0..targets.len() {
+        ensure!(!targets[i] || evidence[i].is_none(), "event fixture target overlaps evidence");
+        if targets[i] { numerator[i] = Some(clean[i]); }
+    }
+    let positive = prepared.query(&numerator)?;
     let negative = prepared.query(evidence)?;
     let derivative = prepared.derivative(&positive,&negative,circuit.group);
     let expected = [&derivative.logits,&derivative.gates,&derivative.pi,&derivative.a,&derivative.root];
@@ -354,8 +359,8 @@ fn finite_differences(circuit: &Circuit, evidence: &[Option<usize>], clean: &[us
             let mut plus = circuit.clone(); plus.field(field)[coordinate] += step;
             let mut minus = circuit.clone(); minus.field(field)[coordinate] -= step;
             let plus = plus.prepare()?; let minus = minus.prepare()?;
-            actual.push(((plus.query(&complete)?.log_z-plus.query(evidence)?.log_z)
-                -(minus.query(&complete)?.log_z-minus.query(evidence)?.log_z))/(2.0*step));
+            actual.push(((plus.query(&numerator)?.log_z-plus.query(evidence)?.log_z)
+                -(minus.query(&numerator)?.log_z-minus.query(evidence)?.log_z))/(2.0*step));
         }
         let mut errors = Errors::default();
         errors.add(&actual,expected[field],2e-7,2e-6,name)?;
@@ -365,7 +370,7 @@ fn finite_differences(circuit: &Circuit, evidence: &[Option<usize>], clean: &[us
     for values in [&flow.pi_plus,&flow.pi_minus,&flow.a_plus,&flow.a_minus,&flow.root_plus,&flow.root_minus] {
         ensure!(values.iter().all(|x|x.is_finite() && *x >= 0.0), "negative or invalid separated flow");
     }
-    Ok(json!({"objective":"full conditional joint log likelihood","difference_step":1e-5,"coordinate_convention":"independent log entries with each row normalization differentiated","quantities":reports}))
+    Ok(json!({"objective":"joint event log likelihood","targets":targets,"difference_step":1e-5,"coordinate_convention":"independent log entries with each row normalization differentiated","quantities":reports}))
 }
 
 fn enumeration_checks() -> Result<Value> {
@@ -417,22 +422,33 @@ fn enumeration_checks() -> Result<Value> {
             evidence_queries += 1;
         }
         let clean = (0..l).map(|i|(i+1)%v).collect::<Vec<_>>();
-        let evidence = clean.iter().enumerate().map(|(i,&x)|if i%2 == 1 {Some(x)} else {None}).collect::<Vec<_>>();
-        let complete = clean.iter().copied().map(Some).collect::<Vec<_>>();
-        let flow = prepared.flows(&prepared.query(&complete)?,&prepared.query(&evidence)?);
-        let enumerated_flow = prepared.flows(&enumerated.query(&complete)?,&enumerated.query(&evidence)?);
+        let evidence = clean.iter().enumerate().map(|(i,&x)|if i%3 == 1 {Some(x)} else {None}).collect::<Vec<_>>();
+        let targets = (0..l).map(|i|i%3 == 0 && evidence[i].is_none()).collect::<Vec<_>>();
+        let mut numerator = evidence.clone();
+        for i in 0..l {if targets[i] {numerator[i] = Some(clean[i]);}}
+        let positive = prepared.query(&numerator)?;
+        let negative = prepared.query(&evidence)?;
+        let flow = prepared.flows(&positive,&negative);
+        let enumerated_flow = prepared.flows(&enumerated.query(&numerator)?,&enumerated.query(&evidence)?);
         let mut separate_flows = Errors::default();
         for (actual,expected) in [
             (&flow.pi_plus,&enumerated_flow.pi_plus),(&flow.pi_minus,&enumerated_flow.pi_minus),
             (&flow.a_plus,&enumerated_flow.a_plus),(&flow.a_minus,&enumerated_flow.a_minus),
             (&flow.root_plus,&enumerated_flow.root_plus),(&flow.root_minus,&enumerated_flow.root_minus),
-        ] {separate_flows.strict(actual,expected,"enumerated separate nonnegative flows")?;}
-        reports.push(json!({"states":k,"vocabulary":v,"length":l,"group_size":group,
+        ] {separate_flows.strict(actual,expected,"enumerated event separate nonnegative flows")?;}
+        let conditional_targets = evidence.iter().map(Option::is_none).collect::<Vec<_>>();
+        let mut conditional_numerator = evidence.clone();
+        for i in 0..l {if conditional_targets[i] {conditional_numerator[i] = Some(clean[i]);}}
+        let old_conditional = prepared.query(&clean.iter().copied().map(Some).collect::<Vec<_>>())?.log_z - negative.log_z;
+        let special_case = prepared.query(&conditional_numerator)?.log_z - negative.log_z;
+        ensure!((old_conditional-special_case).abs() <= 1e-12, "conditional NLL target-all-unresolved special case differs");
+        reports.push(json!({"states":k,"vocabulary":v,"length":l,
             "enumerated_joint_assignments":enumerated.assignments.len(),"evidence_queries":evidence_queries,
             "partition":partition.report(),"evidence_log_mass":masses.report(),"state_posterior":states.report(),
             "edge_posterior":edges.report(),"token_marginals":tokens.report(),"emission_counts":counts.report(),
-            "conditional_joint":conditional.report(),"dependence":deltas.report(),"separate_flows":separate_flows.report(),
-            "full_finite_differences":finite_differences(&circuit,&evidence,&clean)?}));
+            "conditional_joint":conditional.report(),"dependence":deltas.report(),"event_separate_flows":separate_flows.report(),
+            "event_targets":targets,"conditional_all_unresolved_special_case":true,
+            "full_finite_differences":finite_differences(&circuit,&evidence,&targets,&clean)?}));
     }
     Ok(json!({"passed":true,"f64_tolerance":{"absolute":2e-10,"relative":2e-9},"cases":reports}))
 }
@@ -446,6 +462,7 @@ fn tensor_case(device: &Device, states: usize, vocab: usize, lengths: &[usize], 
     let mut gates = Vec::new();
     let mut clean = vec![v+199;n*l];
     let mut observed = vec![false;n*l];
+    let mut targets = vec![false;n*l];
     let mut expected_z = vec![0.0;n];
     let mut expected_state = vec![0.0;n*l*k];
     let mut expected_edge = vec![0.0;n*l*k*k];
@@ -472,16 +489,20 @@ fn tensor_case(device: &Device, states: usize, vocab: usize, lengths: &[usize], 
         gates.extend_from_slice(&circuit.gates);
         if length == 0 { proposals.push(Vec::new()); expected_scores.push(Vec::new()); continue; }
         logits[row*l*v..row*l*v+length*v].copy_from_slice(&circuit.logits);
-        let target = (0..length).map(|i|(i*37+row*11+3)%v).collect::<Vec<_>>();
-        let evidence = target.iter().enumerate().map(|(i,&x)| {
+        let values = (0..length).map(|i|(i*37+row*11+3)%v).collect::<Vec<_>>();
+        let evidence = values.iter().enumerate().map(|(i,&x)| {
             let fixed = if row == 2 {true} else {i%3 == 1};
             clean[row*l+i] = x;
             observed[row*l+i] = fixed;
+            targets[row*l+i] = i%3 == 0 && !fixed;
             if fixed {Some(x)} else {None}
+        }).collect::<Vec<_>>();
+        let numerator = evidence.iter().enumerate().map(|(i,value)| {
+            if targets[row*l+i] {Some(values[i])} else {*value}
         }).collect::<Vec<_>>();
         let prepared = circuit.prepare()?;
         let negative = prepared.query(&evidence)?;
-        let positive = prepared.query(&target.iter().copied().map(Some).collect::<Vec<_>>())?;
+        let positive = prepared.query(&numerator)?;
         expected_z[row] = negative.log_z;
         expected_state[row*l*k..row*l*k+length*k].copy_from_slice(&negative.state);
         expected_token[row*l*v..row*l*v+length*v].copy_from_slice(&negative.token);
@@ -492,7 +513,7 @@ fn tensor_case(device: &Device, states: usize, vocab: usize, lengths: &[usize], 
         let proposal = (0..length).map(|i|evidence[i].unwrap_or((i+row+1)%v)).collect::<Vec<_>>();
         expected_scores.push(prepared.query_scores(&evidence,&proposal)?);
         proposals.push(proposal);
-        if evidence.iter().all(Option::is_some) {continue;}
+        if !targets[row*l..row*l+length].iter().any(|&x|x) {continue;}
         active_blocks += 1;
         expected_loss += (negative.log_z-positive.log_z)/denominator;
         let derivative = prepared.derivative(&positive,&negative,group);
@@ -522,6 +543,7 @@ fn tensor_case(device: &Device, states: usize, vocab: usize, lengths: &[usize], 
     let prepared = PreparedCircuit::prepare_with_execution(pi.clone(),a.clone(),root.clone(),potentials.clone(),gate.clone(),lengths.to_vec(),group,execution)?;
     let values = int_tensor(&clean,[n,l],&device);
     let fixed = bool_tensor(&observed,[n,l],&device);
+    let target_mask = bool_tensor(&targets,[n,l],&device);
     let query = prepared.query(values.clone(),fixed.clone())?;
     let mut forward = Vec::new();
     for (name,actual,expected) in [
@@ -534,8 +556,29 @@ fn tensor_case(device: &Device, states: usize, vocab: usize, lengths: &[usize], 
         let mut errors = Errors::default(); errors.tensor(&actual,&expected,name)?;
         forward.push(json!({"quantity":name,"errors":errors.report()}));
     }
-    let loss = prepared.conditional_nll(values.clone(),fixed.clone(),denominator)?;
-    let mut loss_errors = Errors::default(); loss_errors.tensor(&tensor_values(loss.loss.clone()),&[expected_loss],"conditional NLL")?;
+    let loss = prepared.event_nll(values.clone(),fixed.clone(),target_mask,denominator)?;
+    let conditional = prepared.conditional_nll(values.clone(),fixed.clone(),denominator)?;
+    let mut target_all = vec![false;n*l];
+    for row in 0..n {for i in 0..lengths[row] {target_all[row*l+i] = !observed[row*l+i];}}
+    let target_all = bool_tensor(&target_all,[n,l],&device);
+    let all_unresolved = prepared.event_nll(values.clone(),fixed.clone(),target_all,denominator)?;
+    let mut special_case_errors = Errors::default();
+    special_case_errors.tensor(&tensor_values(conditional.loss),&tensor_values(all_unresolved.loss),"conditional target-all-unresolved event loss")?;
+    ensure!(conditional.flows.active_blocks == all_unresolved.flows.active_blocks, "conditional target-all-unresolved active rows differ");
+    for (actual,expected) in [
+        (conditional.flows.emission_positive,all_unresolved.flows.emission_positive),
+        (conditional.flows.emission_negative,all_unresolved.flows.emission_negative),
+        (conditional.flows.transition_positive,all_unresolved.flows.transition_positive),
+        (conditional.flows.transition_negative,all_unresolved.flows.transition_negative),
+        (conditional.flows.root_positive.reshape([1,-1]),all_unresolved.flows.root_positive.reshape([1,-1])),
+        (conditional.flows.root_negative.reshape([1,-1]),all_unresolved.flows.root_negative.reshape([1,-1])),
+        (conditional.flows.emission_reach.reshape([1,-1]),all_unresolved.flows.emission_reach.reshape([1,-1])),
+        (conditional.flows.transition_reach.reshape([1,-1]),all_unresolved.flows.transition_reach.reshape([1,-1])),
+        (conditional.flows.root_reach.reshape([1,-1]),all_unresolved.flows.root_reach.reshape([1,-1])),
+    ] {
+        special_case_errors.tensor(&tensor_values(actual),&tensor_values(expected),"conditional target-all-unresolved flows")?;
+    }
+    let mut loss_errors = Errors::default(); loss_errors.tensor(&tensor_values(loss.loss.clone()),&[expected_loss],"event NLL")?;
     let gradients = loss.loss.backward();
     let mut derivatives = Vec::new();
     for (name,actual,expected) in [
@@ -571,7 +614,8 @@ fn tensor_case(device: &Device, states: usize, vocab: usize, lengths: &[usize], 
     ensure!(scores.len() == expected_scores.len(), "dependence score row count differs");
     Ok(json!({"states":k,"vocabulary":v,"lengths":lengths,"group_size":group,"execution":format!("{execution:?}"),
         "dirty_padding":true,"noncontiguous_token_potentials":true,
-        "active_blocks":active_blocks,"forward":forward,"conditional_nll":loss_errors.report(),
+        "active_blocks":active_blocks,"forward":forward,"event_nll":loss_errors.report(),
+        "conditional_all_unresolved_special_case":special_case_errors.report(),
         "full_nll_vjp":derivatives,"separate_flows":flows,"dependence":score_errors.report()}))
 }
 

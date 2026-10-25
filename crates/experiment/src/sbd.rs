@@ -9,10 +9,10 @@ fn fixture(input: Vec<i32>) -> Example {
     let n = input.len();
     Example { input, target: vec![0;n], weight: vec![1.0;n], groups: vec![None;n] }
 }
-fn prefix_batch(prefix: &[i32], device: &Device) -> Batch {
+pub(super) fn prefix_batch(prefix: &[i32], device: &Device) -> Batch {
     Batch::new(&[fixture(prefix.to_vec())], device)
 }
-fn state(c: &Config, observed: Vec<Option<usize>>, device: &Device) -> Result<SoftState> {
+pub(super) fn state(c: &Config, observed: Vec<Option<usize>>, device: &Device) -> Result<SoftState> {
     let s = c.sbd.as_ref().context("SBD config is required")?;
     let n = observed.len();
     SoftState::new(c.vocab(), s.candidate_width, observed, vec![true;n], device, c.soft_selection_backend)
@@ -29,6 +29,9 @@ pub fn block_forward(model: &LanguageModel, prefix: &[i32], soft: &SoftState, ha
         return model.forward_output_profiled(&prefix_batch(prefix, device),&mut delta_mixers::profile::Unprofiled)
             .slice_positions(p-1,1);
     }
+    if model.cocommit_marker.is_some() {
+        return crate::cocommit::reconstruct_output(model,prefix,soft,hard,None,device);
+    }
     let mut input = prefix.to_vec();
     input.resize(p+n,0);
     let mut batch = prefix_batch(&input, device);
@@ -39,7 +42,7 @@ pub fn block_forward(model: &LanguageModel, prefix: &[i32], soft: &SoftState, ha
     model.forward_noisy(Tensor::cat(vec![clean,noisy],1), &batch, p)
         .slice_positions(p,n)
 }
-fn prepare_distribution(model: &LanguageModel, output: DenoisingOutput, soft: &SoftState, temperature: f64) -> Result<(PreparedCircuit,Tensor<2,Bool>)> {
+pub(super) fn prepare_distribution(model: &LanguageModel, output: DenoisingOutput, soft: &SoftState, temperature: f64) -> Result<(PreparedCircuit,Tensor<2,Bool>)> {
     let [rows,width,_] = output.logits.dims();
     ensure!(soft.active.len() == rows*width && soft.observed.len() == rows*width,"circuit feedback shape differs from output");
     let mut lengths = Vec::with_capacity(rows);
@@ -87,7 +90,7 @@ pub struct SbdTrainingResult {
     pub circuit_flows: Option<CircuitFlows>,
 }
 impl SbdTrainingResult {
-    fn add_circuit_loss(&mut self, loss: crate::codpula::CircuitLoss) {
+    pub(super) fn add_circuit_loss(&mut self, loss: crate::codpula::CircuitLoss) {
         self.loss = self.loss.clone() + loss.loss;
         if let Some(flows) = &mut self.circuit_flows {
             flows.add(loss.flows);
@@ -121,7 +124,7 @@ pub fn sample_training_blocks(c: &Config, rows: &[Example], seed: u64) -> Result
     }
     Ok(blocks)
 }
-fn masked_training_loss(logits: Tensor<3>, block: &TrainingBlock, row: &Example, row_count: usize, vocab: usize, device: &Device) -> Tensor<1> {
+pub(super) fn masked_training_loss(logits: Tensor<3>, block: &TrainingBlock, row: &Example, row_count: usize, vocab: usize, device: &Device) -> Tensor<1> {
     let n = block.masked.len();
     let targets = Tensor::<2,Int>::from_data(TensorData::new(row.target[block.start..block.start+n].to_vec(),[n,1]),device);
     let weights = Tensor::<2>::from_data(TensorData::new((0..n)
@@ -230,6 +233,9 @@ pub fn training_loss(model: &LanguageModel, c: &Config, rows: &[Example], batch:
 }
 pub fn training_loss_profiled<P: delta_mixers::profile::Sections>(model: &LanguageModel, c: &Config, rows: &[Example], batch: &Batch, seed: u64, profile: &mut P) -> Result<SbdTrainingResult> {
     let s = c.sbd.as_ref().context("SBD config is required")?;
+    if s.cocommit.is_some() {
+        return crate::cocommit::training_loss_profiled(model,c,rows,batch,seed,profile);
+    }
     if s.joint_output == SbdJointOutput::Codpula {
         ensure!(rows.iter().all(|row|row.weight.iter().all(|&weight|weight == 1.0)),
             "Codpula joint event loss requires unit valid target weights");
@@ -253,6 +259,9 @@ pub fn training_loss_profiled<P: delta_mixers::profile::Sections>(model: &Langua
 
 pub fn evaluate(model: &LanguageModel, c: &Config, examples: &[Example], device: &Device) -> Result<Value> {
     let s = c.sbd.as_ref().context("SBD config is required")?;
+    if s.cocommit.is_some() {
+        return crate::cocommit::evaluate(model,c,examples,device);
+    }
     if s.joint_output == SbdJointOutput::Codpula {
         ensure!(examples.iter().all(|row|row.weight.iter().all(|&weight|weight == 1.0)),
             "Codpula joint event evaluation requires unit valid target weights");
@@ -384,13 +393,30 @@ pub fn generate(model: &LanguageModel, c: &Config, prompt: &[i32], device: &Devi
     let mut passes = 0;
     let mut generated = Vec::new();
     let mut blocks = 0;
+    let mut coordinated_passes = 0usize;
+    let mut coordinated_blocks = 0usize;
     let mut proposal_rng = Rng(c.seed);
     while generated.len() < s.generate_tokens {
         let n = s.block_lengths[blocks%s.block_lengths.len()].min(s.generate_tokens-generated.len());
         let mut soft = state(c,vec![None;n],device)?;
         let mut final_values = vec![None;n];
         let mut block_passes = 0;
+        let coordination_cache = if s.cocommit.is_some() && n>1 {
+            coordinated_blocks+=1;
+            Some(crate::cocommit::prepare_clean_cache(&model,&clean.tokens,device))
+        } else {None};
         while final_values.iter().any(Option::is_none) {
+            if s.cocommit.is_some() && n>1 {
+                passes+=1;
+                block_passes+=1;
+                coordinated_passes+=1;
+                let seed = if model.codpula.is_some() {proposal_rng.next()} else {0};
+                let assignment = crate::cocommit::assign(&model,c,coordination_cache.as_ref().unwrap(),&soft,block_passes,seed,device)?;
+                advance_generation_state(c,&mut soft,&assignment.proposals,&assignment.commits,
+                    assignment.feedback,assignment.feedback_temperature,device)?;
+                final_values=soft.observed.clone();
+                continue;
+            }
             let output = block_forward(&model,&clean.tokens,&soft,s.feedback == SbdFeedback::HardMask,device);
             passes += 1;
             block_passes += 1;
@@ -443,6 +469,7 @@ pub fn generate(model: &LanguageModel, c: &Config, prompt: &[i32], device: &Devi
                 feedback_logits.reshape([n,c.vocab()]),feedback_temperature,device)?;
             final_values = soft.observed.clone();
         }
+        drop(coordination_cache);
         let finalized: Vec<i32> = final_values.into_iter().map(|v| v.unwrap() as i32).collect();
         clean.replay(&model,&finalized,device);
         generated.extend_from_slice(&finalized);
@@ -450,7 +477,17 @@ pub fn generate(model: &LanguageModel, c: &Config, prompt: &[i32], device: &Devi
     }
     runtime::sync(device)?;
     let seconds = clock.elapsed().as_secs_f64();
-    Ok(json!({"tokens":generated,"text":String::from_utf8_lossy(&generated.iter().map(|&x| x as u8).collect::<Vec<_>>()),"finalized_tokens":generated.len(),"finalized_tokens_per_second":generated.len() as f64/seconds,"seconds":seconds,"denoising_passes":passes,"blocks":blocks,"causally_replayed_tokens":clean.replayed,"includes_replay":true,"prefill_included":false,"replay_implementation":"full clean-prefix reconstruction once per finalized block; no incremental optimization","commit_rule":if s.commitment == SbdCommitment::Dependence {"dependence"} else if s.entropy_threshold.is_some() {"sbd_entropy_eq8"} else {"fixed_count"},"joint_output":s.joint_output,"joint_execution":s.joint_execution,"proposal_seed":c.seed,"potential_temperature":c.soft_temperature,"dependence_threshold":s.dependence_threshold,"maximum_passes_per_block":"actual block length"}))
+    let mut report = json!({"tokens":generated,"text":String::from_utf8_lossy(&generated.iter().map(|&x| x as u8).collect::<Vec<_>>()),"finalized_tokens":generated.len(),"finalized_tokens_per_second":generated.len() as f64/seconds,"seconds":seconds,"denoising_passes":passes,"blocks":blocks,"causally_replayed_tokens":clean.replayed,"includes_replay":true,"prefill_included":false,"replay_implementation":"full clean-prefix reconstruction once per finalized block; no incremental optimization","commit_rule":if s.commitment == SbdCommitment::Dependence {"dependence"} else if s.entropy_threshold.is_some() {"sbd_entropy_eq8"} else {"fixed_count"},"joint_output":s.joint_output,"joint_execution":s.joint_execution,"proposal_seed":c.seed,"potential_temperature":c.soft_temperature,"dependence_threshold":s.dependence_threshold,"maximum_passes_per_block":"actual block length"});
+    if let Some(options) = &s.cocommit {
+        report["cocommit"] = json!({"config":options,"shared_noisy_prefix_calls":coordinated_passes,
+            "unmarked_tail_calls":coordinated_passes,"marked_tail_calls":coordinated_passes,
+            "clean_prefix_cache_preparations":coordinated_blocks,
+            "clean_prefix_cache_reuses":coordinated_passes.saturating_sub(coordinated_blocks),
+            "circuit_preparations":if model.codpula.is_some() {2*coordinated_passes}else{0},
+            "circuit_proposals":if model.codpula.is_some() {2*coordinated_passes}else{0},
+            "clean_replays":blocks,"cost_note":"seconds include both tails, all circuit queries, host selection, feedback and replay"});
+    }
+    Ok(report)
 }
 
 fn validate_checkpoint_identity(c: &Config, arm: &Arm, seed: u64, saved: &crate::train::State) -> Result<()> {

@@ -66,6 +66,7 @@ pub fn noisy_hola_read(
 
 /// Differentiable clean tensors prepared once per layer/sequence. Snapshot work
 /// scans disjoint segments with carried state, never all prefixes per block.
+#[derive(Clone)]
 pub struct MixerCache {
     raw: [Tensor<3>;3],
     cache_k: Tensor<4>,
@@ -87,11 +88,13 @@ fn convolve(m: &Mixer, raw: Tensor<3>, weight: Tensor<2>) -> Tensor<4> {
 }
 
 /// Clean histories and recurrence snapshots with the noisy block as batch axis.
+#[derive(Clone)]
 pub struct BatchedMixerCache {
     raw: [Tensor<3>;3],
     state: Tensor<4>,
     reads: Option<BatchedReadCache>,
 }
+#[derive(Clone)]
 struct BatchedReadCache {
     keys: Tensor<4>,
     values: Tensor<4>,
@@ -388,9 +391,39 @@ impl Mixer {
         self.project_output(mixed.reshape([b,n,self.heads*self.value_dim]))*valid.unsqueeze_dim::<3>(2)
     }
 }
+impl BatchedMixerCache {
+    pub fn duplicate_rows(&self) -> Self {
+        let duplicate = |x: &Tensor<4>| Tensor::cat(vec![x.clone(),x.clone()],0);
+        let reads = self.reads.as_ref().map(|reads| BatchedReadCache {
+            keys: duplicate(&reads.keys),
+            values: duplicate(&reads.values),
+            positions: Tensor::cat(vec![reads.positions.clone(),reads.positions.clone()],0),
+            visible: reads.visible.as_ref().map(|x| Tensor::cat(vec![x.clone(),x.clone()],0)),
+            summaries: reads.summaries.as_ref().map(|x| duplicate(x)),
+            starts: Tensor::cat(vec![reads.starts.clone(),reads.starts.clone()],0),
+            max_start: reads.max_start,
+            own: reads.own,
+        });
+        Self {
+            raw: self.raw.each_ref().map(|x| Tensor::cat(vec![x.clone(),x.clone()],0)),
+            state: duplicate(&self.state),
+            reads,
+        }
+    }
+}
+impl Mixer {
+    pub fn has_prefix_retrieval(&self) -> bool { self.prefix_retrieval.is_some() }
+}
 
+#[derive(Clone)]
 pub struct WaveletCache { approximations: Vec<Tensor<3>> }
+#[derive(Clone)]
 pub struct BatchedWaveletCache { histories: Vec<Tensor<3>> }
+impl BatchedWaveletCache {
+    pub fn duplicate_rows(&self) -> Self {
+        Self { histories: self.histories.iter().map(|x| Tensor::cat(vec![x.clone(),x.clone()],0)).collect() }
+    }
+}
 impl crate::WaveletDyn {
     pub fn prepare_sbd(&self, input: Tensor<3>) -> WaveletCache {
         let [b,t,_] = input.dims();

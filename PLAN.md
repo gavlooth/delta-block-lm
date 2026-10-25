@@ -122,7 +122,7 @@ First implement factorized output + CoCommit as its own comparison:
 3. Add a learned marker at those positions to the saved pre-tail states.
 4. Run the shared tail again, then write from the coordinated logits.
 
-Start with one coordination round and one tail layer on the tiny model. Train the marked branch as well as the unmarked selection branch. Compare against an extra unmarked tail pass at matched cost to separate marker benefit from extra depth. Do not feed the first tail's output into the second and call it the paper's one-round mechanism.
+Start with one coordination round and one tail layer on the tiny model. Train the marked branch as well as the unmarked selection branch. The current authorization uses a saved-input zero-marker repeat only as a correctness equivalence gate; no trained sequential-depth comparison arm or quality study is authorized. Do not feed the first tail's output into the second and call it the paper's one-round mechanism.
 
 CoCommit's evaluated coordination is for masked commit bundles under greedy decoding. It is not an exact joint distribution, an exact joint MAP solver, or a guarantee under independent temperature sampling. Marking already-visible tokens is a proposed extension, not an evaluated paper result.
 
@@ -279,13 +279,13 @@ Partially implemented: clean/masked objectives, soft feedback, frozen prefix rea
 
 - Implement the unmarked selection tail and marked assignment tail starting from the same saved pre-tail hidden states.
 - Train the marked branch; start with one tail layer and one coordination round on the tiny model.
-- Compare CoCommit alone with factorized output and an extra unmarked tail pass at matched cost.
-- Compare Codpula alone before combining it with CoCommit. In the combined path, regenerate circuit potentials/gates and dependence scores after marked coordination.
+- Check saved-h zero-marker equivalence; measure CoCommit off/on step cost and equivalent tail execution layouts only. No trained comparison arm, quality study, sweep or ablation is authorized.
+- In the combined path, regenerate circuit potentials/gates and dependence scores after marked coordination. Separate-versus-combined quality comparisons require a future explicit authorization.
 - Reset temporary recurrent-tail state from the same clean-prefix snapshot for each branch. No coordination pass commits persistent state.
 
-**Deliverable:** separate and combined results for circuit dependence modeling and hidden-state coordination.
+**Deliverable:** implemented separate/combined paths, numerical and checkpoint gates, paired execution-cost evidence and a tiny execution smoke; no quality conclusion.
 
-**Gate:** any combined gain exceeds the extra partial-pass/circuit cost. Keep greedy joint-mode coordination distinct from stochastic joint sampling.
+**Gate:** outputs, losses, full gradients, visibility and checkpoint continuation satisfy the fixed tolerances; measure complete-step cost before selecting a tail layout. Keep greedy coordination distinct from the combined stochastic joint sampler. A quality-versus-cost study is deferred, not inferred from the smoke.
 
 ### Step 11 — Test the user's energy-guided stochastic remasking
 

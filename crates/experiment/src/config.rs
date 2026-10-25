@@ -200,6 +200,34 @@ impl SbdCommitment {
 fn dependence_threshold() -> f64 { 0.05 }
 fn is_default_dependence_threshold(value: &f64) -> bool { *value == dependence_threshold() }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CocommitExecution {
+    #[default]
+    Doubled,
+    Separate,
+}
+impl CocommitExecution {
+    pub fn is_doubled(&self) -> bool { *self == Self::Doubled }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CocommitConfig {
+    pub tail_layers: usize,
+    pub rounds: usize,
+    pub training_bundle_max: usize,
+    pub visible_loss_weight: f64,
+    #[serde(skip_serializing_if = "CocommitExecution::is_doubled")]
+    pub execution: CocommitExecution,
+}
+impl Default for CocommitConfig {
+    fn default() -> Self {
+        Self { tail_layers: 1, rounds: 1, training_bundle_max: 16, visible_loss_weight: 0.2,
+            execution: CocommitExecution::Doubled }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SbdConfig {
@@ -220,6 +248,8 @@ pub struct SbdConfig {
     pub in_block_reads: delta_mixers::sbd::InBlockReads,
     #[serde(skip_serializing_if = "delta_mixers::sbd::NoisyReadBackend::is_tensor")]
     pub noisy_read_backend: delta_mixers::sbd::NoisyReadBackend,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cocommit: Option<CocommitConfig>,
     pub candidate_width: usize,
     pub commit_count: usize,
     /// None selects fixed-count commitment; Some selects paper equation 8 (nats).
@@ -235,13 +265,15 @@ impl Default for SbdConfig {
             commitment: SbdCommitment::Fixed, dependence_threshold: dependence_threshold(),
             candidate_width: 4, commit_count: 2, entropy_threshold: None, generate_tokens: 32,
             in_block_reads: delta_mixers::sbd::InBlockReads::None,
-            noisy_read_backend: delta_mixers::sbd::NoisyReadBackend::Tensor }
+            noisy_read_backend: delta_mixers::sbd::NoisyReadBackend::Tensor,
+            cocommit: None }
     }
 }
 
 // Keep the historical SBD revision; optional reads enter identity through their selectors.
 const SBD_MODEL_REVISION: &str = "sbd-recurrence-only-v1";
 const PREFIX_RETRIEVAL_REVISION: &str = "prefix-block-moba-own-v1";
+const COCOMMIT_MODEL_REVISION: &str = "cocommit-full-stream-marker-event-v1";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -466,6 +498,19 @@ impl Config {
                         && self.cache_capacity <= 64 && sbd.block_lengths.iter().all(|&n| n <= 16)),
                 "sbd.noisy_read_backend=fused_gpu requires explicit non-fusion GPU execution, key32/value64, chunk/query count <=16 and capacity <=64"
             );
+            if let Some(cocommit) = &sbd.cocommit {
+                ensure!((1..=self.layers).contains(&cocommit.tail_layers),
+                    "sbd.cocommit.tail_layers must be within 1..=layers");
+                ensure!(cocommit.rounds == 1, "sbd.cocommit currently requires rounds=1");
+                ensure!(cocommit.training_bundle_max > 0,
+                    "sbd.cocommit.training_bundle_max must be positive");
+                ensure!(cocommit.visible_loss_weight.is_finite() && cocommit.visible_loss_weight >= 0.0,
+                    "sbd.cocommit.visible_loss_weight must be finite and nonnegative");
+                ensure!(sbd.in_block_reads == delta_mixers::sbd::InBlockReads::HolaRead,
+                    "sbd.cocommit requires in_block_reads=hola_read");
+                ensure!(self.cache_capacity > 0 && self.arms.iter().all(|arm| arm.cache != "none"),
+                    "sbd.cocommit requires HOLA cache layers");
+            }
         }
         ensure!(
             self.ohc_backend.is_tensor()
@@ -684,7 +729,10 @@ impl Config {
         self.context * self.batch_size
     }
     pub fn training_fingerprint(&self, target_tokens: usize) -> Result<String> {
-        let bytes = if self.prefix_block_retrieval.is_some() {
+        let bytes = if self.sbd.as_ref().is_some_and(|s|s.cocommit.is_some()) {
+            serde_json::to_vec(&(self,target_tokens,SBD_MODEL_REVISION,
+                self.prefix_block_retrieval.as_ref().map(|_|PREFIX_RETRIEVAL_REVISION),COCOMMIT_MODEL_REVISION))?
+        } else if self.prefix_block_retrieval.is_some() {
             serde_json::to_vec(&(self,target_tokens,
                 self.sbd.as_ref().map(|_|SBD_MODEL_REVISION),PREFIX_RETRIEVAL_REVISION))?
         } else if self.sbd.is_some() {
@@ -702,6 +750,9 @@ impl Config {
         }
         if self.prefix_block_retrieval.is_some() {
             identity["prefix_block_retrieval_revision"] = PREFIX_RETRIEVAL_REVISION.into();
+        }
+        if self.sbd.as_ref().is_some_and(|s|s.cocommit.is_some()) {
+            identity["cocommit_model_revision"] = COCOMMIT_MODEL_REVISION.into();
         }
         Ok(crate::data::hash(&serde_json::to_vec(&identity)?))
     }

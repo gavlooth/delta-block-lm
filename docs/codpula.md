@@ -8,7 +8,7 @@ This document records the paper equations, the model-specific decisions in §5, 
 
 Source: Shao et al., [Learning to Couple: Context-Adaptive Joint Denoising for Diffusion Language Models, arXiv:2610.25723v1](https://arxiv.org/html/2610.25723v1), including Appendices A–G. The [abstract/version page](https://arxiv.org/abs/2610.25723) identifies the version. References such as Eq. (10) refer to that paper, not numbered equations in this document.
 
-Repository context: [PLAN.md §5.1 and Step 9](../PLAN.md), [SBD](sbd.md), and `configs/lm512-sbd.json`. Step 9 adds a joint output distribution and dependence-adaptive commitment; it does not change KronLSTM, HOLA, oHC, wavelet, Lngram, or MoBA prefix retrieval. CoCommit and remasking are later work, not part of this addition.
+Repository context: [PLAN.md §5.1 and Step 9](../PLAN.md), [SBD](sbd.md), and `configs/lm512-sbd.json`. Step 9 adds a joint output distribution and dependence-adaptive commitment; it does not change KronLSTM, HOLA, oHC, wavelet, Lngram, or MoBA prefix retrieval. The optional Step-10 [CoCommit](cocommit.md) now composes with this output: each marked tail regenerates token potentials and gates, prepares a fresh circuit, and recomputes joint proposals/dependence scores. Its marked training event fixes only selected targets, marginalizing other masks; the existing full conditional NLL is that generalized event's all-unresolved special case. Remasking remains separate work.
 
 Fixed model requirements:
 
