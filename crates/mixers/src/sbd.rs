@@ -70,6 +70,7 @@ pub struct MixerCache {
     raw: [Tensor<3>;3],
     cache_k: Tensor<4>,
     cache_v: Tensor<4>,
+    prefix_summaries: Option<Tensor<4>>,
     positions: Vec<Tensor<3>>,
     states: Vec<Tensor<4>>,
     starts: Vec<usize>,
@@ -128,7 +129,15 @@ impl Mixer {
             positions = selections.into_iter().map(|s| s.positions).collect();
             ck
         } else { rk };
-        MixerCache {raw,cache_k,cache_v:rv,positions,states,starts:starts.to_vec()}
+        let prefix_summaries = self.prefix_retrieval.and_then(|config| {
+            if config.backend.is_tensor() || t<config.block_size {return None;}
+            #[cfg(any(feature="vulkan",feature="cuda"))]
+            {Some(delta_kernels::prefix_summaries(cache_k.clone(),Tensor::ones([b,t],&device),
+                Tensor::ones([b,t],&device),config.block_size))}
+            #[cfg(not(any(feature="vulkan",feature="cuda")))]
+            {panic!("fused prefix retrieval requires a GPU feature; no CPU fallback")}
+        });
+        MixerCache {raw,cache_k,cache_v:rv,prefix_summaries,positions,states,starts:starts.to_vec()}
     }
     pub fn forward_sbd_cached(&self, input: Tensor<3>, clean: &MixerCache, block: usize, valid: Tensor<2>) -> Tensor<3> {
         self.forward_sbd_cached_profiled(input,clean,block,valid,&mut crate::profile::Unprofiled)
@@ -164,28 +173,39 @@ impl Mixer {
         let mut mixed = recurrent.output.reshape([b,n,self.heads,self.value_dim]);
         if let Some(cache) = &self.cache {
             mixed = profile.section("Noisy HOLA read", || {
-                let query = hola::normalize(self.hola_backend,self.normalization_backend,&cache.q_norm,rq).swap_dims(1,2);
-                let cut = start/self.chunk_size*self.chunk_size;
-                let mut keys = Vec::new();
-                let mut vals = Vec::new();
-                let mut visible = Vec::new();
-                if cut > 0 {
-                    let positions = clean.positions[cut/self.chunk_size-1].clone();
-                    let ids = positions.clone().clamp_min(0.0).int();
-                    keys.push(clean.cache_k.clone().swap_dims(1,2).gather(2,ids.clone().unsqueeze_dim::<4>(3).expand([b,self.heads,self.cache_capacity,self.key_dim])));
-                    vals.push(clean.cache_v.clone().swap_dims(1,2).gather(2,ids.unsqueeze_dim::<4>(3).expand([b,self.heads,self.cache_capacity,self.value_dim])));
-                    visible.push(positions.greater_equal_elem(0.0).unsqueeze_dim::<4>(2).expand([b,self.heads,n,self.cache_capacity]));
-                }
-                if cut < start {
-                    keys.push(take4(&clean.cache_k,cut,start).swap_dims(1,2));
-                    vals.push(take4(&clean.cache_v,cut,start).swap_dims(1,2));
-                    visible.push(Tensor::<4>::ones([b,self.heads,n,start-cut],&device).greater_elem(0.0));
-                }
-                let block = (self.in_block_reads == InBlockReads::HolaRead).then(|| (
-                    hola::normalize(self.hola_backend,self.normalization_backend,&cache.k_norm,rk).swap_dims(1,2),
-                    rv.swap_dims(1,2),
+                let query = hola::normalize(self.hola_backend,self.normalization_backend,&cache.q_norm,rq);
+                let active = (self.in_block_reads == InBlockReads::HolaRead).then(|| (
+                    hola::normalize(self.hola_backend,self.normalization_backend,&cache.k_norm,rk),
+                    rv,
                 ));
-                let exact = noisy_hola_read(query,keys,vals,visible,block,valid.clone(),cache.sink.val(),self.noisy_read_backend);
+                let cut = start/self.chunk_size*self.chunk_size;
+                let exact = if let Some(config) = self.prefix_retrieval {
+                    let positions = if cut > 0 { clean.positions[cut/self.chunk_size-1].clone() }
+                        else { Tensor::full([b,self.heads,self.cache_capacity],-1.0,&device) };
+                    let t = clean.cache_k.dims()[1];
+                    crate::prefix_retrieval::noisy_read(query,clean.cache_k.clone(),clean.cache_v.clone(),
+                        Tensor::ones([b,t],&device),Tensor::ones([b,t],&device),
+                        Tensor::ones([b,n],&device),valid.clone(),positions,
+                        start,self.chunk_size,cache.sink.val(),config,active,clean.prefix_summaries.clone())
+                } else {
+                    let mut keys = Vec::new();
+                    let mut vals = Vec::new();
+                    let mut visible = Vec::new();
+                    if cut > 0 {
+                        let positions = clean.positions[cut/self.chunk_size-1].clone();
+                        let ids = positions.clone().clamp_min(0.0).int();
+                        keys.push(clean.cache_k.clone().swap_dims(1,2).gather(2,ids.clone().unsqueeze_dim::<4>(3).expand([b,self.heads,self.cache_capacity,self.key_dim])));
+                        vals.push(clean.cache_v.clone().swap_dims(1,2).gather(2,ids.unsqueeze_dim::<4>(3).expand([b,self.heads,self.cache_capacity,self.value_dim])));
+                        visible.push(positions.greater_equal_elem(0.0).unsqueeze_dim::<4>(2).expand([b,self.heads,n,self.cache_capacity]));
+                    }
+                    if cut < start {
+                        keys.push(take4(&clean.cache_k,cut,start).swap_dims(1,2));
+                        vals.push(take4(&clean.cache_v,cut,start).swap_dims(1,2));
+                        visible.push(Tensor::<4>::ones([b,self.heads,n,start-cut],&device).greater_elem(0.0));
+                    }
+                    let active = active.map(|(k,v)| (k.swap_dims(1,2),v.swap_dims(1,2)));
+                    noisy_hola_read(query.swap_dims(1,2),keys,vals,visible,active,valid.clone(),cache.sink.val(),self.noisy_read_backend)
+                };
                 mixed + exact*sigmoid(cache.gate.val()).reshape([1,1,self.heads,1])
             });
         }

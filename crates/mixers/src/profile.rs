@@ -26,6 +26,10 @@ pub trait Sections {
     ) -> Option<Vec<burn::prelude::Tensor<3, burn::prelude::Int>>> {
         None
     }
+    fn prefix_visibility(&mut self, _visible: Option<&burn::prelude::Tensor<4, burn::prelude::Bool>>) {}
+    fn replayed_prefix_visibility(&self) -> Option<Vec<Option<burn::prelude::Tensor<4, burn::prelude::Bool>>>> {
+        None
+    }
 
     fn block(&mut self, _index: Option<usize>) {}
 

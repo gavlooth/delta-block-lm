@@ -16,6 +16,7 @@ mod lngram;
 mod model;
 mod ohc;
 mod profile;
+mod prefix_retrieval;
 mod runtime;
 mod scan_benchmark;
 mod sbd;
@@ -43,7 +44,7 @@ fn execute() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     ensure!(
         args.len() >= 2,
-        "usage: delta-experiment <sbd-reference|sbd-diagnostic|sbd-benchmark|sbd-train|sbd-generate|sbd-evaluate|reference|lngram-reference|lngram-benchmark|lngram-attribution|lngram-smoke|wavelet-reference|wavelet-benchmark|wavelet-smoke|ohc-reference|ohc-benchmark|ohc-learning-smoke|convolution-reference|normalization-reference|epilogue-reference|epilogue-benchmark|kron-reference|gdn-reference|gdn-directional-diagnostic|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|optimization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|gdn-benchmark|kron-model-benchmark|hola-benchmark|io-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256|fused_gdn2 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
+        "usage: delta-experiment <prefix-retrieval-reference|prefix-retrieval-benchmark|prefix-retrieval-sbd-diagnostic|prefix-retrieval-sbd-benchmark|sbd-reference|sbd-diagnostic|sbd-benchmark|sbd-train|sbd-generate|sbd-evaluate|reference|lngram-reference|lngram-benchmark|lngram-attribution|lngram-smoke|wavelet-reference|wavelet-benchmark|wavelet-smoke|ohc-reference|ohc-benchmark|ohc-learning-smoke|convolution-reference|normalization-reference|epilogue-reference|epilogue-benchmark|kron-reference|gdn-reference|gdn-directional-diagnostic|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|optimization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|gdn-benchmark|kron-model-benchmark|hola-benchmark|io-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256|fused_gdn2 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
     );
     let command = &args[0];
     let c = Config::load(Path::new(&args[1]))?;
@@ -193,6 +194,8 @@ fn execute() -> Result<()> {
                 | "lngram-benchmark"
                 | "lngram-attribution"
                 | "sbd-benchmark"
+                | "prefix-retrieval-benchmark"
+                | "prefix-retrieval-sbd-benchmark"
         ) || benchmark_warmups.is_none(),
         "--warmups is only valid for Kron benchmarks/profile; hola-benchmark uses two warmups per mode"
     );
@@ -223,6 +226,8 @@ fn execute() -> Result<()> {
                 | "lngram-benchmark"
                 | "lngram-attribution"
                 | "sbd-benchmark"
+                | "prefix-retrieval-benchmark"
+                | "prefix-retrieval-sbd-benchmark"
         ) || benchmark_trials.is_none(),
         "--trials is only valid for a benchmark command"
     );
@@ -433,6 +438,17 @@ fn execute() -> Result<()> {
             benchmark_trials.unwrap_or(5),
         )?,
         "gdn-directional-diagnostic" => kron_benchmark::directional_diagnostic(&c, &device)?,
+        "prefix-retrieval-benchmark" => prefix_retrieval::benchmark(&c,&device,
+            benchmark_warmups.unwrap_or(2),benchmark_trials.unwrap_or(11))?,
+        "prefix-retrieval-sbd-diagnostic" => prefix_retrieval::sbd_diagnostic(&c,&device)?,
+        "prefix-retrieval-sbd-benchmark" => prefix_retrieval::sbd_benchmark(&c,&device,
+            benchmark_warmups.unwrap_or(2),benchmark_trials.unwrap_or(11))?,
+        "prefix-retrieval-reference" => {
+            let report = delta_mixers::prefix_checks::reference(&device);
+            json!({"schema":1,"command":command,"passed":report.is_ok(),"config":c,
+                "device":runtime::identity(&device),"absolute_tolerance":2e-5,"relative_tolerance":3e-4,
+                "semantics":"moba_own_block_and_topk_earlier_blocks","numerical_report":report.as_ref().ok(),"error":report.as_ref().err()})
+        }
         "hola-reference" => {
             let report = if let Some(selected) = reference_hola_backend {
                 delta_mixers::checks::hola_numerical_checks_selected(&device, selected)
@@ -654,6 +670,9 @@ fn execute() -> Result<()> {
                 | "lngram-attribution"
                 | "sbd-benchmark"
                 | "sbd-diagnostic"
+                | "prefix-retrieval-benchmark"
+                | "prefix-retrieval-sbd-diagnostic"
+                | "prefix-retrieval-sbd-benchmark"
         ) || result["completed"] == true,
         "profile/benchmark failed or hit its deadline; separate partial report retained"
     );
@@ -666,6 +685,7 @@ fn execute() -> Result<()> {
                 | "kron-reference"
                 | "gdn-reference"
                 | "hola-reference"
+                | "prefix-retrieval-reference"
                 | "kron-model-check"
                 | "normalization-reference"
                 | "epilogue-reference"

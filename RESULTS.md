@@ -1680,3 +1680,114 @@ Pilot cost accounting uses the full four-layer width-256 Step-7 model with B1/T3
 For `none - hola_read(tensor)`, the paired median was +0.84 ms, 95% paired bootstrap interval [-30.90, +26.10] ms; `hola_read` was faster in 6/11 pairs. This cost difference is not distinguishable from noise. For `tensor - fused` with `hola_read` in both paths, the paired median saving was 32.20 ms [16.49, 47.96], faster in 11/11 pairs. Absolute medians are not compared across sessions. Pool samples include all three resident model/optimizer trajectories and allocator reuse, not exact live bytes or physical-device peak. Launch counts are issued CubeCL kernels, not submissions/workgroups. Evidence: `artifacts/inblock/pilot/sbd-benchmark.json`.
 
 Earlier training/generation numbers in [docs/sbd.md](docs/sbd.md) describe the removed separate dense-attention implementation only. No new training study, quality comparison, candidate sweep or Step-7 quality-ablation implementation was performed.
+
+## Step 8: optional prefix block retrieval
+
+`prefix_block_retrieval` implements MoBA coverage in selected HOLA layers:
+the causal own block is always included, in addition to top-k completed
+same-document earlier blocks. Original K/V share the existing softmax with
+cache/chunk entries and sink; cached and current-chunk duplicates are omitted.
+Selection is detached. Omission preserves historical serialization and
+initialization; enabled identities include `prefix-block-moba-own-v1`.
+The explicit fixture is `configs/lm512-step8-retrieval.json`; other
+configurations do not enable retrieval.
+
+Cached training and prefix reconstruction compose retrieval with
+`sbd.in_block_reads: "hola_read"` through the same noisy-read helper. Its
+active tuple contains HOLA-normalized noisy K and raw convolved V in
+`[batch,length,head,width]` layout. All segments and the sink share one
+softmax, using `prefix_block_retrieval_backend` on selected layers and
+`sbd.noisy_read_backend` elsewhere. Both selectors are enabled in the
+explicit retrieval config; no extra attention operator or fallback is used.
+
+The parent CPU/GPU tensor and indexed CubeCL implementations have an
+independent scalar f64 selection/read/VJP gate, including active K/V.
+Semantics, memory formulas, reproduction and measurement evidence are in
+[prefix-block-retrieval.md](docs/optimization/prefix-block-retrieval.md).
+These measurements establish correctness and execution costs, not quality.
+
+Parent MoBA gates passed 10 CPU and 20 Vulkan scalar-f64 cases, configured
+model forward/gradient/AdamW checks, CPU/Vulkan SBD snapshots, all six
+historical checkpoint arms and 68 workspace tests (one GPU-sharing test ignored).
+At B8/T512 clean AdamW steps, medians were off 1863.765 ms, tensor 2234.488 ms
+and fused 2015.634 ms. Fused saved paired 211.244 ms [197.175,218.854] against
+tensor (11/11), but retrieval cost paired 139.102 ms versus off.
+The T2048 isolated fused forward/VJP medians were 18.417/271.405 ms versus
+1713.428/2901.180 ms tensor. Full-SBD B1/T512 off/on medians were
+44258.335/43128.916 ms, paired saving 1869.235 ms [1129.419,2438.515] (10/11);
+that includes replacing legacy frozen-read tensor assembly with fused
+execution, not a quality result or a measurement of both selectors together.
+
+### Joint-selector integration acceptance
+
+The merged implementation supplies the active segment in both cached training
+and prefix reconstruction. Retrieval-selected layers use the indexed retrieval
+read; remaining layers keep the standalone noisy HOLA read. Both semantic
+selectors retain their enabled identities, and omitted selectors retain
+historical serialization/fingerprints. No optimization or math change was
+introduced in this integration.
+
+All ten executable acceptance commands exited 0. Workspace tests passed
+**47 experiment + 7 kernel + 16 mixer tests**, with one GPU-sharing test ignored.
+The GPU build completed in 8.84 seconds wall time (8.58 seconds compiling).
+All new equivalence comparisons kept `2e-5 + 3e-4*abs(reference)`.
+
+| Integrated gate | Maximum absolute error |
+| --- | ---: |
+| SBD without retrieval, Vulkan/CPU logits | 2.757e-7 |
+| SBD without retrieval, all-parameter gradients | 1.400e-8 |
+| SBD retrieval fixture, Vulkan/CPU logits, all 12 cases | 3.502e-7 |
+| SBD retrieval fixture, all-parameter gradients, all cases | 2.282e-8 |
+| Retrieval plus active reads, Vulkan/CPU logits, four combined cases | 2.980e-7 |
+| Retrieval plus active reads, all-parameter gradients | 2.154e-8 |
+| Cached/reconstructed logits, CPU, across both fixtures | 1.491e-7 |
+| Cached/reconstructed gradients, CPU | 1.130e-8 |
+| Cached/reconstructed logits, Vulkan | 0 |
+| Cached/reconstructed gradients, Vulkan | 1.397e-9 |
+| Noisy-HOLA f64 forward / full VJP | 3.566e-8 / 1.427e-7 |
+| Noisy-HOLA oracle central finite differences | 9.415e-11 |
+| Prefix f64 forward / full VJP, CPU | 2.417e-8 / 7.047e-7 |
+| Prefix f64 forward / full VJP, Vulkan tensor/fused | 2.745e-8 / 2.097e-6 |
+| Step-7 configured model logits / gradients / AdamW parameters | 5.052e-6 / 2.265e-6 / 2.119e-5 |
+| Retrieval clean configured model logits / gradients / AdamW parameters | 5.737e-6 / 1.342e-6 / 6.546e-6 |
+| Historical checkpoint roundtrip and optimizer-continuation logits | 0 |
+
+The largest reported SBD elementwise tolerance ratio was **0.01365**;
+the noisy-read f64 oracle ratio was **0.003271**. Prefix f64 checks passed
+10 CPU and 20 Vulkan cases, including four/eight active K/V cases.
+Both SBD fixtures passed 12 CPU and 12 Vulkan model cases, including
+leakage, padding, clean snapshot/replay, observed-token communication and
+cached/reconstructed checks. The combined Vulkan cases changed other positions'
+logits by at least 0.1374 when an observed block token changed.
+
+Both configured clean model checks passed four T128/T512, HOLA off/on cases.
+Their existing directional finite-difference checks also passed unchanged:
+maximum discrepancies 6.885e-5 (Step 7) and 4.130e-4 (retrieval), under their
+separate pre-existing `0.003 + 0.03*abs(reference)` limit. The Step-7 AdamW
+maximum above exceeds the absolute component alone but passed the unchanged
+per-element relative criterion. Historical `kronlstm-hola`, seed 1,
+checkpoint 13 passed its stricter `1e-5 + 1e-4*abs(reference)` comparisons;
+weights and optimizer semantic state matched exactly after continuation.
+
+Reproduction configs, exact timeout/lock-wrapped command arrays and numerical
+summaries are in `artifacts/integration-step8/{commands,summary}.json`.
+`sbd-{cpu,vulkan}.json` derives from `configs/lm512-sbd.json`;
+`retrieval-{cpu,vulkan}.json` derives from `configs/lm512-step8-retrieval.json`.
+Vulkan copies change only the artifact directory; CPU copies additionally select
+the tensor CPU execution paths. `step7-clean.json` changes only the artifact
+directory from `artifacts/integration/step7/step7-b1.json`;
+`retrieval-clean.json` omits SBD from the retrieval config. Each runs
+`kron-model-check --model-scope configured`. The historical check uses the
+original resolved config and resume path, with diagnostic output isolated here.
+
+The execution-only context-32, batch-1 retrieval smoke completed exactly
+**two steps / 64 tokens**. Its generated model/optimizer payloads and the
+historical diagnostic's scratch checkpoint payloads were deleted; final reports
+and smoke state/metrics remain. No training study, ablation or sweep was run.
+The conflict-marker scan returned no matches.
+
+An initial test invocation omitted `CARGO_TARGET_DIR`; it was cancelled and
+its newly created local target removed. All passing builds/tests used the
+required shared target. Existing Burn ndarray deprecation warnings remain;
+there were no acceptance failures.
+

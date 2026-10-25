@@ -88,9 +88,22 @@ impl LanguageModel {
                     delta_mixers::WaveletDyn::new(c.d_model, 4, 8, c.wavelet_backend, device)
                 }),
                 norm: norm(),
-                mixer: arm.mixer_config(c)?.init(device).with_sbd_reads(
-                    c.sbd.as_ref().map_or(delta_mixers::sbd::InBlockReads::None,|s| s.in_block_reads),
-                    c.sbd.as_ref().map_or(delta_mixers::sbd::NoisyReadBackend::Tensor,|s| s.noisy_read_backend)),
+                mixer: {
+                    let mut mixer = arm.mixer_config(c)?.init(device).with_sbd_reads(
+                        c.sbd.as_ref().map_or(delta_mixers::sbd::InBlockReads::None, |s| s.in_block_reads),
+                        c.sbd.as_ref().map_or(delta_mixers::sbd::NoisyReadBackend::Tensor, |s| s.noisy_read_backend),
+                    );
+                    if let Some(retrieval) = &c.prefix_block_retrieval {
+                        if retrieval.layers.contains(&index) {
+                            mixer.set_prefix_retrieval(delta_mixers::prefix_retrieval::PrefixReadConfig {
+                                block_size: retrieval.block_size,
+                                blocks_per_query: retrieval.blocks_per_query,
+                                backend: c.prefix_block_retrieval_backend,
+                            });
+                        }
+                    }
+                    mixer
+                },
                 ff_norm: norm(),
                 up: linear(c.d_model, 2 * c.d_model),
                 down: linear(2 * c.d_model, c.d_model),

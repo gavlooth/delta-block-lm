@@ -170,7 +170,7 @@ pub(crate) fn read_detailed(
     sink: Tensor<1>,
 ) -> CacheRead {
     read_impl::<false>(
-        q, k, v, scores, valid, documents, capacity, chunk, policy, sink, None,
+        q, k, v, scores, valid, documents, capacity, chunk, policy, sink, None, None, None,
     )
     .0
 }
@@ -180,6 +180,7 @@ pub struct CacheSelection {
     pub chunk_start: usize,
     pub kept_slots: Tensor<3, Int>,
     pub positions: Tensor<3>,
+    pub prefix_visible: Option<Tensor<4, Bool>>,
 }
 
 /// Exact production tensor selection, returning every chunk's kept slots. With `replay`,
@@ -199,7 +200,7 @@ pub(crate) fn read_with_selection(
     replay: Option<&[Tensor<3, Int>]>,
 ) -> (CacheRead, Vec<CacheSelection>) {
     read_impl::<true>(
-        q, k, v, scores, valid, documents, capacity, chunk, policy, sink, replay,
+        q, k, v, scores, valid, documents, capacity, chunk, policy, sink, replay, None, None,
     )
 }
 
@@ -215,6 +216,8 @@ fn read_impl<const TRACE: bool>(
     policy: CachePolicy,
     sink: Tensor<1>,
     replay: Option<&[Tensor<3, Int>]>,
+    retrieval: Option<crate::prefix_retrieval::PrefixReadConfig>,
+    prefix_replay: Option<&[Option<Tensor<4, Bool>>]>,
 ) -> (CacheRead, Vec<CacheSelection>) {
     assert!(capacity > 0 && chunk > 0 && policy != CachePolicy::None);
     let [b, t, h, dk] = q.dims();
@@ -260,6 +263,7 @@ fn read_impl<const TRACE: bool>(
             .repeat_dim(0, b)
             .repeat_dim(1, h)
             .mask_fill(local_valid.clone().lower_elem(0.5), -1.0);
+        let retrieval_positions = cp.clone();
         let keys = Tensor::cat(vec![ck, take(&k)], 2);
         let values = Tensor::cat(vec![cv, take(&v)], 2);
         let positions = Tensor::cat(vec![cp, local_pos.clone()], 2);
@@ -279,8 +283,27 @@ fn read_impl<const TRACE: bool>(
                     .unsqueeze_dim::<4>(2)
                     .equal(local_doc.clone().unsqueeze_dim::<4>(3)),
             );
-        let logits = (take(&q).matmul(keys.clone().swap_dims(2, 3)) / (dk as f64).sqrt())
+        let mut prefix_visible = None;
+        let mut logits = (take(&q).matmul(keys.clone().swap_dims(2, 3)) / (dk as f64).sqrt())
             .mask_fill(visible.bool_not(), -1.0e30);
+        let mut read_values = values.clone();
+        if let Some(config) = retrieval {
+            let prefix = first;
+            if prefix > 0 {
+                let visible = match prefix_replay {
+                    Some(replay) => replay[chunk_index].clone().expect("missing replayed prefix visibility"),
+                    None => crate::prefix_retrieval::visibility(take(&q),&k,&valid,&documents,
+                        documents.clone().slice([0..b,first..first+n]),retrieval_positions,first,config),
+                };
+                if TRACE { prefix_visible = Some(visible.clone()); }
+                let prefix_keys = k.clone().slice([0..b,0..prefix,0..h,0..dk]).swap_dims(1,2);
+                let extra = (take(&q).matmul(prefix_keys.swap_dims(2,3))/(dk as f64).sqrt())
+                    .mask_fill(visible.bool_not(),-1.0e30);
+                logits = Tensor::cat(vec![logits,extra],3);
+                read_values = Tensor::cat(vec![read_values,v.clone().slice([0..b,0..prefix,0..h,0..dv]).swap_dims(1,2)],2);
+                work += b*h*n*prefix;
+            }
+        }
         let sink_logits = sink
             .clone()
             .reshape([1, h, 1, 1])
@@ -288,7 +311,7 @@ fn read_impl<const TRACE: bool>(
             .repeat_dim(2, n);
         let probabilities = softmax(Tensor::cat(vec![logits, sink_logits], 3), 3);
         let with_sink = Tensor::cat(
-            vec![values.clone(), Tensor::zeros([b, h, 1, dv], &device)],
+            vec![read_values, Tensor::zeros([b, h, 1, dv], &device)],
             2,
         );
         output.push(
@@ -346,6 +369,7 @@ fn read_impl<const TRACE: bool>(
                 chunk_start: first,
                 kept_slots: index_kept,
                 positions: cp.clone(),
+                prefix_visible,
             });
         }
     }
@@ -357,6 +381,55 @@ fn read_impl<const TRACE: bool>(
         },
         selections,
     )
+}
+
+pub(crate) fn read_prefix_with_selection(
+    q: Tensor<4>, k: Tensor<4>, v: Tensor<4>, scores: Tensor<4>, valid: Tensor<2>, documents: Tensor<2>,
+    capacity: usize, chunk: usize, policy: CachePolicy, sink: Tensor<1>,
+    config: crate::prefix_retrieval::PrefixReadConfig, replay: Option<&[Tensor<3, Int>]>,
+    prefix_replay: Option<&[Option<Tensor<4,Bool>>]>,
+) -> (CacheRead, Vec<CacheSelection>) {
+    assert!(config.backend.is_tensor(), "selection replay uses the tensor reference");
+    read_impl::<true>(q,k,v,scores,valid,documents,capacity,chunk,policy,sink,replay,Some(config),prefix_replay)
+}
+
+/// Retrieval is opt-in; the ordinary HOLA reader above is unchanged.
+pub(crate) fn read_prefix(
+    q: Tensor<4>, k: Tensor<4>, v: Tensor<4>, scores: Tensor<4>,
+    valid: Tensor<2>, documents: Tensor<2>, capacity: usize, chunk: usize,
+    policy: CachePolicy, sink: Tensor<1>, start: Option<usize>,
+    config: crate::prefix_retrieval::PrefixReadConfig, in_block_reads: crate::sbd::InBlockReads,
+) -> Tensor<4> {
+    let [b,t,h,_] = q.dims();
+    let take = |x: &Tensor<4>, a: usize, z: usize| {
+        x.clone().slice([0..b,a..z,0..h,0..x.dims()[3]])
+    };
+    if let Some(start) = start {
+        let cut = start/chunk*chunk;
+        let clean = read_prefix(take(&q,0,start),take(&k,0,start),take(&v,0,start),
+            take(&scores,0,start),valid.clone().slice([0..b,0..start]),
+            documents.clone().slice([0..b,0..start]),capacity,chunk,policy,sink.clone(),None,config,in_block_reads);
+        let positions = if cut > 0 {
+            read_detailed(take(&q,0,cut),take(&k,0,cut),take(&v,0,cut),
+                take(&scores,0,cut),valid.clone().slice([0..b,0..cut]),
+                documents.clone().slice([0..b,0..cut]),capacity,chunk,policy,sink.clone()).final_positions
+        } else { Tensor::full([b,h,capacity],-1.0,&q.device()) };
+        let block = (in_block_reads == crate::sbd::InBlockReads::HolaRead)
+            .then(|| (take(&k,start,t),take(&v,start,t)));
+        let active = crate::prefix_retrieval::noisy_read(take(&q,start,t),k,v,valid.clone(),
+            documents.clone(),documents.slice([0..b,start..t]),valid.slice([0..b,start..t]),
+            positions,start,chunk,sink,config,block,None);
+        return Tensor::cat(vec![clean,active],1);
+    }
+    if !config.backend.is_tensor() {
+        crate::chunk::assert_fused_device(&q.device());
+        #[cfg(any(feature="vulkan",feature="cuda"))]
+        return delta_kernels::prefix_hola_read(q,k,v,scores,valid,documents,sink,
+            capacity,chunk,policy == CachePolicy::Recency,config.block_size,config.blocks_per_query);
+        #[cfg(not(any(feature="vulkan",feature="cuda")))]
+        panic!("fused prefix retrieval requires a GPU feature; no CPU fallback");
+    }
+    read_impl::<false>(q,k,v,scores,valid,documents,capacity,chunk,policy,sink,None,Some(config),None).0.output
 }
 
 /// Read the exact cache at `start`: completed chunks' selected slots plus the

@@ -579,7 +579,7 @@ fn sink_backward_kernel(auxiliary: &View<f32>, sink_gradient: &mut View<f32>) {
     }
 }
 
-fn checked_elements(dims: &[usize]) -> usize {
+pub(crate) fn checked_elements(dims: &[usize]) -> usize {
     let elements = dims
         .iter()
         .try_fold(1usize, |count, &dim| count.checked_mul(dim))
@@ -616,7 +616,7 @@ fn checked_span(dims: &[usize], strides: &[usize], backing_elements: u64) {
     );
 }
 
-fn assert_u32_tensor(tensor: &CubeTensor) {
+pub(crate) fn assert_u32_tensor(tensor: &CubeTensor) {
     checked_span(
         tensor.meta.shape().as_slice(),
         tensor.meta.strides(),
@@ -638,6 +638,29 @@ fn count(reference: &CubeTensor, groups: usize) -> CubeCount {
     let y = groups.div_ceil(x);
     assert!(y <= max_y as usize, "HOLA exceeds device workgroup limits");
     CubeCount::Static(x as u32, y as u32, 1)
+}
+
+pub(crate) fn run_schedule(
+    scores: CubeTensor, valid: CubeTensor, documents: CubeTensor,
+    capacity: usize, chunk: usize, recency: bool,
+) -> CubeTensor {
+    let [batch,time,heads,width] = scores.shape().dims::<4>();
+    assert!(batch>0 && time>0 && heads>0 && width==1 && time<=1<<24);
+    assert!((1..=64).contains(&capacity) && (1..=16).contains(&chunk));
+    assert_eq!(valid.shape().dims::<2>(),[batch,time]);
+    assert_eq!(documents.shape().dims::<2>(),[batch,time]);
+    for x in [&scores,&valid,&documents] {
+        assert_eq!(x.dtype,DType::F32);
+        assert_eq!(x.device,scores.device);
+        assert_u32_tensor(x);
+    }
+    let schedule = empty(&scores,[batch,heads,time.div_ceil(chunk)+1,capacity]);
+    let expiry = empty(&scores,[batch,time,heads]);
+    selection_kernel::launch(&scores.client,count(&scores,batch*heads),
+        CubeDim::new_1d((capacity+chunk).next_power_of_two().max(V) as u32),
+        scores.clone().into_tensor_arg(),valid.into_tensor_arg(),documents.into_tensor_arg(),
+        schedule.clone().into_tensor_arg(),expiry.into_tensor_arg(),capacity,chunk,recency);
+    schedule
 }
 
 pub(crate) fn run_read(

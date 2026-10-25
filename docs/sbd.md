@@ -10,6 +10,16 @@ With `sbd` absent, the architecture, config serialization, random initialization
 
 Enabled-SBD training and pilot fingerprints retain the semantic revision introduced after dense attention removal. Selecting `hola_read` additionally changes the serialized model identity; omitted/explicit `none` keeps the previous SBD identity. Old dense-SBD checkpoints remain incompatible. Configurations without `sbd` retain their hashes.
 
+The optional model selector `prefix_block_retrieval` extends HOLA's single
+softmax with the always-visible own-block clean prefix plus top-k completed
+same-document earlier blocks; `configs/lm512-step8-retrieval.json` enables it
+alongside `sbd.in_block_reads: "hola_read"`.
+All noisy queries use own block `floor(start/B)`, including positions across
+a B boundary; cached/unfinished-chunk duplicates are excluded. The
+descriptions below omit the extra retrieved/own-block clean segment. See
+[prefix block retrieval](optimization/prefix-block-retrieval.md) for exact
+semantics, execution selectors, independent numerical checks and costs.
+
 For each training sequence, choose one entry of `sbd.block_lengths` uniformly, then partition its target positions with that length, including a short final block. A singleton entry is a fixed-length condition. The variable condition can use `[1,4,8,16]` or the paper's `[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]`. Draw one sequence-level mask probability uniformly in (0,1), and independent Bernoulli masks. Unmasked targets inside the active block are explicit observed evidence, including targets to the right of a masked position. No other future targets are visible.
 
 The objective is clean causal mean NLL plus the sum of masked block NLLs divided by the number of clean targets. This is equation 14's sum objective with a common token normalization, not an independently mask-normalized auxiliary loss. All-observed draws contribute zero masked loss. A detached first noisy pass supplies top-k candidate IDs, original probability weights and retained mass. The second pass uses Step 3's weighted embedding plus the mask embedding, with visibility `1 / soft_steps`. Selection is discrete; the second pass's embedding values remain differentiable. The mask is a separate trainable vector. Teacher probabilities are detached deliberately, rather than training through a proposal-generation graph. Hard-mask training skips this teacher pass.
@@ -23,6 +33,8 @@ A target block starting at target index `s` sees exactly `example.input[..s+1]`:
 Each mixer computes its clean-prefix recurrence and uses that final state as the initial state of every noisy query's **independent, temporary one-step recurrence**. Temporary states are discarded.
 
 For `hola_read`, each head reads `[selected HOLA slots after completed chunks | clean unfinished chunk cut..start | active noisy block]` and the existing learned sink in **one softmax**, with the existing `1/sqrt(key_dim)` scale and sigmoid HOLA gate. Active keys use HOLA's key RMS normalization on the noisy convolved raw K; values use noisy convolved raw V, as clean cache values do. Every valid query sees every valid block key, including itself and keys to its right. Padded keys are excluded and padded queries return zero read output. The temporary block K/V never enters cache selection or the clean path. With `none`, the final segment is absent. Starts inside a computational chunk retain every unfinished clean key without ranking or truncation.
+
+On retrieval-selected layers the read is `[cache | clean unfinished chunk | retrieved/own-block clean keys | active noisy block]` plus sink, still with exactly one softmax. Both cached training and prefix reconstruction pass the active K/V in `[batch,length,head,width]` layout to the retrieval helper; clean candidates never include noisy K/V. `prefix_block_retrieval_backend` selects the combined read on those layers, while `sbd.noisy_read_backend` continues to select the ordinary noisy HOLA read on other layers. Unsupported execution is rejected explicitly.
 
 Wavelet taps crossing the start use clean-prefix activations and taps within the block use noisy activations. Lngram suffix codes and left-only smoothing use the same rule. Both remain left-to-right inside the block; they do not supply a bidirectional attention path. oHC stream initialization/read/write/readout is per token, including the mask/candidate inputs. No noisy stream state persists between passes. Every example is one document, with BOS/reset at its start. Training blocks cannot cross examples. Padding freezes recurrence and is excluded from HOLA reads, convolution and Step-7 history.
 
@@ -42,7 +54,7 @@ Only after the entire block is finalized does the clean-prefix object append it 
 
 Clean preparation is O(T), plus one state-extraction scan segment per block per layer. Prefix-reconstruction inference is O(prefix length) per denoising pass and per completed-block replay. The active HOLA segment adds O(B H L² (K+V)) read work per pass; this is quadratic only in the active block length, not the prefix length.
 
-`sbd.noisy_read_backend` defaults to `"tensor"`; `"fused_gpu"` explicitly selects the CubeCL noisy-read kernel with analytic query/K/V/sink derivatives. The sigmoid gate remains the existing tensor operation. Cache gathers and segment concatenation still use the tensor graph. The kernel supports f32 K32/V64, at most 16 noisy queries and 127 assembled keys, on explicit non-fusion GPU execution; unsupported shapes are rejected without a CPU alternative. This execution choice adds no model parameter.
+`sbd.noisy_read_backend` defaults to `"tensor"`; `"fused_gpu"` explicitly selects the CubeCL noisy-read kernel on layers without retrieval, with analytic query/K/V/sink derivatives. The sigmoid gate remains the existing tensor operation. Cache gathers and segment concatenation still use the tensor graph. The kernel supports f32 K32/V64, at most 16 noisy queries and 127 assembled keys, on explicit non-fusion GPU execution; unsupported shapes are rejected without a CPU alternative. Retrieval-selected layers instead use `prefix_block_retrieval_backend` for the combined read, including active K/V. These execution choices add no model parameter.
 
 Paired complete-step cost tables, launch counts and sampled memory are recorded in [RESULTS.md](../RESULTS.md#step-8-recurrent-block-denoising-through-hola). The complete-step benchmark is `sbd-benchmark CONFIG --warmups 2 --trials 11`. It measures the real SBD loss/backward/checks/clipping/AdamW path, not clean-only training, and performs no evaluation or checkpoint writes.
 

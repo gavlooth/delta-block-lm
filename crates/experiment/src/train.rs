@@ -74,7 +74,21 @@ fn attention_work(c: &Config, arm: &Arm) -> Result<Value> {
     work.sink_pairs *= c.layers;
     work.selection_rank_pairs *= c.layers;
     work.selection_sort_elements *= c.layers;
-    Ok(serde_json::to_value(work)?)
+    let mut value=serde_json::to_value(work)?;
+    if let Some(retrieval)=&c.prefix_block_retrieval {
+        let layers=(0..c.layers).filter(|layer|retrieval.layers.contains(layer)).count();
+        let tensor_pairs=(0..c.context).step_by(c.chunk_size).map(|first|
+            c.batch_size*c.heads*c.chunk_size.min(c.context-first)
+                *first).sum::<usize>()*layers;
+        let own=(retrieval.block_size-c.chunk_size).min(c.context.saturating_sub(1)/c.chunk_size*c.chunk_size);
+        let slots=retrieval.blocks_per_query.min(c.context.saturating_sub(1)/retrieval.block_size)*retrieval.block_size+own;
+        value["prefix_retrieval"]=json!({
+            "selected_layers":layers,"tensor_appended_prefix_pairs":tensor_pairs,
+            "fused_appended_position_slots":layers*c.batch_size*c.context*c.heads*slots,
+            "full_prefix_kv_value_bytes":layers*c.batch_size*c.context*c.heads*(c.key_dim+c.value_dim)*4,
+            "scope":"clean forward, including masked/unfilled read slots; K/V value footprint can share already retained projections"});
+    }
+    Ok(value)
 }
 
 pub fn evaluate(
