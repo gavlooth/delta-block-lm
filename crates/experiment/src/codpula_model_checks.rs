@@ -550,6 +550,11 @@ fn complete_step(model: LanguageModel, cfg: &Config, optimizer: &mut ModuleOptim
     ensure!(flow.active_blocks > 0,"complete-step fixture has no active blocks");
     let gradients = model::checked_gradients(&model,result.loss)?;
     let gradient_values = snapshot(&model,Some(&gradients))?;
+    let gradient_sha256 = snapshot_hash(&gradient_values)?;
+    let clipping_norms = gradient_values.iter().map(|(name, values)| {
+        let norm = values.values.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>().sqrt();
+        (name.clone(),json!({"f64_norm":norm,"clipping_active":norm>f64::from(cfg.gradient_clip)}))
+    }).collect::<BTreeMap<_,_>>();
     let updated = train::optimizer_step(cfg,model,optimizer,gradients,result.circuit_flows)?;
     let after = snapshot(&updated,None)?;
     let changed = |neural: bool| before.iter().filter(|(_,v)|v.trainable == neural).any(|(name,value)|value.values.iter().zip(&after[name].values).any(|(a,b)|a.to_bits()!=b.to_bits()));
@@ -557,7 +562,7 @@ fn complete_step(model: LanguageModel, cfg: &Config, optimizer: &mut ModuleOptim
     ensure!(before.iter().filter(|(name,_)|name.ends_with("log_emission") || name.ends_with("log_transition") || name.ends_with("log_root")).any(|(name,value)|value.values.iter().zip(&after[name].values).any(|(a,b)|a.to_bits()!=b.to_bits())), "complete step did not update circuit probability rows");
     let circuit_report = circuit_state(&updated)?;
     ensure!(circuit_report["update_step"].as_i64() == Some(i64::from(previous_circuit_step)+1),"complete step did not advance circuit momentum time exactly once");
-    let report = json!({"passed":true,"loss":loss,"mask_seed":seed,"neural_gradient_tensors":gradient_values.len(),"neural_parameters_changed":changed(true),"circuit_parameters_changed":true,"flows":flow_report,"state":circuit_report});
+    let report = json!({"passed":true,"loss":loss,"mask_seed":seed,"neural_gradient_tensors":gradient_values.len(),"gradient_sha256":gradient_sha256,"gradient_norms":clipping_norms,"neural_parameters_changed":changed(true),"circuit_parameters_changed":true,"flows":flow_report,"state":circuit_report});
     Ok((updated,report))
 }
 fn checkpoint_continuation(model: &LanguageModel, cfg: &Config, device: &Device) -> Result<Value> {
@@ -571,8 +576,7 @@ fn checkpoint_continuation(model: &LanguageModel, cfg: &Config, device: &Device)
     let mut optimizer = train::optimizer(cfg);
     let (trained,first) = complete_step(model.clone(),cfg,&mut optimizer,&examples,seed,device)?;
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../artifacts/codpula")
-        .join(format!("model-check-{}",cfg.backend)).join(format!("{}-{stamp}",std::process::id()));
+    let directory = cfg.artifact_dir.join("model-check").join(format!("{}-{stamp}",std::process::id()));
     let path = directory.join("checkpoint-1");
     let state = train::State { schema:1,config_sha256:cfg.training_fingerprint(cfg.resolved_tokens()?)?,data:json!({"fixture_sha256":data::fixture_hash(&examples)}),arm:cfg.arms[0].name.clone(),seed:cfg.seed,step:1,tokens:22,training_seconds:0.0,initial_evaluation:Value::Null };
     train::checkpoint(cfg,&path,&trained,&optimizer,&state)?;
@@ -596,6 +600,11 @@ fn checkpoint_continuation(model: &LanguageModel, cfg: &Config, device: &Device)
         let selected_seed = training_seed(cfg,&next_examples)?;
         let (next,actual) = complete_step(uninterrupted,cfg,&mut optimizer,&next_examples,selected_seed,device)?;
         let (loaded_next,loaded_step) = complete_step(continued,cfg,&mut restored_optimizer,&next_examples,selected_seed,device)?;
+        runtime::write_json(&cfg.artifact_dir.join("continuation-diagnostic.json"),&json!({
+            "continuation_step":index+2,"uninterrupted":actual,"restored":loaded_step,
+            "raw_gradients_bit_identical":actual["gradient_sha256"]==loaded_step["gradient_sha256"]}))?;
+        ensure!(actual["gradient_sha256"]==loaded_step["gradient_sha256"],
+            "checkpoint continuation raw gradients differ before optimizer");
         let parameters = compare_snapshots(&snapshot(&loaded_next,None)?,&snapshot(&next,None)?,true)?;
         ensure!(actual["loss"] == loaded_step["loss"],"checkpoint continuation loss differs");
         ensure!(circuit_state(&loaded_next)? == circuit_state(&next)?,"checkpoint continuation circuit time differs");
@@ -857,6 +866,7 @@ fn maximum_errors(value: &Value, absolute: &mut f64, ratio: &mut f64) {
 /// Called by the ordinary experiment CLI; no second integration-test executable.
 pub fn run(c: &Config, device: &Device) -> Result<Value> {
     ensure!(matches!(c.backend.as_str(),"cpu"|"vulkan"),"Codpula model checks support CPU or Vulkan");
+    let clipping = crate::update::clipping_checks(device)?;
     let device = device.clone().autodiff();
     let cpu = Device::ndarray().autodiff();
     let identity = selector_identity(c,&device)?;
@@ -894,10 +904,24 @@ pub fn run(c: &Config, device: &Device) -> Result<Value> {
         }
     }
     let historical = historical_checkpoint_compatibility(&device)?;
-    let mut report = json!({"passed":true,"command":"codpula-model-reference","device":runtime::identity(&device),"precision":"float32","seed":72,"absolute_tolerance":2e-5,"relative_tolerance":3e-4,"selector_and_initialization":identity,"cases":cases,"checkpoint_continuation":continuation.context("missing checkpoint continuation case")?,"historical_checkpoint_compatibility":historical,"old_sbd_leakage_checks":"unchanged; this module adds Codpula checks"});
+    let mut report = json!({"passed":true,"command":"codpula-model-reference","device":runtime::identity(&device),"precision":"float32","seed":72,"absolute_tolerance":2e-5,"relative_tolerance":3e-4,"clipping":clipping,"selector_and_initialization":identity,"cases":cases,"checkpoint_continuation":continuation.context("missing checkpoint continuation case")?,"historical_checkpoint_compatibility":historical,"old_sbd_leakage_checks":"unchanged; this module adds Codpula checks"});
     let (mut absolute,mut ratio) = (0.0,0.0);
     maximum_errors(&report,&mut absolute,&mut ratio);
     report["max_abs"] = json!(absolute);
     report["maximum_tolerance_ratio"] = json!(ratio);
     Ok(report)
+}
+
+/// Narrow strict continuation regression, without rerunning the architecture matrix.
+pub fn continuation_reference(c: &Config, device: &Device) -> Result<Value> {
+    let clipping = crate::update::clipping_checks(device)?;
+    let cpu = Device::ndarray().autodiff();
+    let target = device.clone().autodiff();
+    let (mut cfg,arm) = fixture_config(c,"kronlstm",false);
+    cpu.seed(cfg.seed);
+    let mut reference = LanguageModel::new(&cfg,&arm,&cpu)?;
+    probe_gates(&mut reference,&cpu);
+    let mut model = reference.fork(&target);
+    requested_backends(&mut model,&mut cfg,c);
+    Ok(json!({"passed":true,"clipping":clipping,"continuation":checkpoint_continuation(&model,&cfg,&target)?}))
 }
