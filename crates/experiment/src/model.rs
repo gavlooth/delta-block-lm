@@ -1,10 +1,10 @@
 use crate::{
-    config::{Arm, Config, HeadBackend, LossBackend, UpdateBackend},
+    config::{Arm, CocommitConfig, Config, HeadBackend, LossBackend, UpdateBackend},
     data::Batch,
 };
 use anyhow::{Result, ensure};
 use burn::{
-    module::{Initializer, ModuleVisitor, Param},
+    module::{Initializer, ModuleVisitor, Param, ParamId},
     nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig},
     optim::GradientsParams,
     prelude::*,
@@ -18,6 +18,18 @@ use delta_mixers::{
     },
     profile::{Sections, Unprofiled},
 };
+
+#[derive(Clone, Debug)]
+pub(crate) enum NoisyRepresentation {
+    Hidden(Tensor<3>),
+    Streams(Tensor<4>),
+}
+#[derive(Clone, Debug)]
+pub(crate) struct NoisyPrefix {
+    pub representation: NoisyRepresentation,
+    pub valid: Tensor<2>,
+    pub unresolved: Tensor<2>,
+}
 
 #[derive(Module, Debug)]
 pub struct Block {
@@ -59,6 +71,7 @@ impl DenoisingOutput {
 pub struct LanguageModel {
     pub(super) embedding: Embedding,
     pub(super) sbd_mask: Option<Param<Tensor<1>>>,
+    pub(super) cocommit_marker: Option<Param<Tensor<2>>>,
     pub(super) blocks: Vec<Block>,
     pub(super) norm: RmsNorm,
     pub(super) head: Linear,
@@ -67,6 +80,8 @@ pub struct LanguageModel {
     pub(super) codpula: Option<crate::codpula::Codpula>,
     #[module(skip)]
     pub(super) ohc_backend: OhcBackend,
+    #[module(skip)]
+    pub(super) cocommit_config: Option<CocommitConfig>,
     #[module(skip)]
     pub(super) normalization_backend: delta_mixers::NormalizationBackend,
     #[module(skip)]
@@ -135,6 +150,7 @@ impl LanguageModel {
         }
         let model = Self {
             sbd_mask: c.sbd.as_ref().map(|_| init.init([c.d_model], device)),
+            cocommit_marker: None,
             embedding: EmbeddingConfig::new(c.vocab(), c.d_model)
                 .with_initializer(init.clone())
                 .init(device),
@@ -145,6 +161,7 @@ impl LanguageModel {
             ohc_readout: None,
             codpula: None,
             ohc_backend: c.ohc_backend,
+            cocommit_config: c.sbd.as_ref().and_then(|sbd| sbd.cocommit.clone()),
             normalization_backend: c.normalization_backend,
             head_backend: c.head_backend,
             epilogue_backend: c.epilogue_backend,
@@ -165,7 +182,23 @@ impl LanguageModel {
                     .with_execution(sbd.joint_execution)),
             };
         }
+        if model.cocommit_config.is_some() {
+            let streams = if c.ohc_streams { 4 } else { 1 };
+            let marker=Tensor::zeros([streams,c.d_model],device);
+            let marker=if device.is_autodiff() {marker.require_grad()} else {marker};
+            model.cocommit_marker=Some(Param::initialized(ParamId::new(),marker));
+        }
         Ok(model)
+    }
+    /// Realize lazy initializers in visit order for matched-parameter diagnostics.
+    pub(super) fn materialize_parameters(&self) {
+        struct Materialize;
+        impl burn::module::ModuleVisitor for Materialize {
+            fn visit_float<const D:usize>(&mut self,value:&Param<Tensor<D>>) {
+                std::hint::black_box(value.val());
+            }
+        }
+        self.visit(&mut Materialize);
     }
     /// Attach only the added architecture, keeping all ordinary parameters shared with a clone.
     pub(super) fn with_ohc(mut self, width: usize, device: &Device) -> Self {

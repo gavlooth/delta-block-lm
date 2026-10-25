@@ -25,6 +25,127 @@ pub(crate) struct CacheRead {
     pub attention_pairs: usize,
 }
 
+/// Discrete cache positions before the first chunk and after every chunk,
+/// including a partial tail: [batch,head,ceil(time/chunk)+1,capacity].
+/// This path performs selection only; it never constructs attention or Q/K/V.
+pub(crate) fn schedule_selected(
+    backend: HolaBackend,
+    scores: Tensor<4>,
+    valid: Tensor<2>,
+    documents: Tensor<2>,
+    capacity: usize,
+    chunk: usize,
+    policy: CachePolicy,
+) -> Tensor<4> {
+    assert!(capacity > 0 && chunk > 0 && policy != CachePolicy::None);
+    match backend {
+        HolaBackend::Tensor => schedule_tensor(scores, valid, documents, capacity, chunk, policy),
+        HolaBackend::FusedGpu | HolaBackend::FusedGpuPairs | HolaBackend::FusedGpuPairsNorms => {
+            crate::chunk::assert_fused_device(&scores.device());
+            #[cfg(any(feature = "vulkan", feature = "cuda"))]
+            {
+                delta_kernels::hola_schedule(
+                    scores, valid, documents, capacity, chunk, policy == CachePolicy::Recency,
+                )
+            }
+            #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
+            {
+                let _ = (scores, valid, documents);
+                unreachable!("fused HOLA requires the vulkan or cuda feature; no CPU fallback")
+            }
+        }
+    }
+}
+
+fn schedule_tensor(
+    scores: Tensor<4>,
+    valid: Tensor<2>,
+    documents: Tensor<2>,
+    capacity: usize,
+    chunk: usize,
+    policy: CachePolicy,
+) -> Tensor<4> {
+    let [b, t, h, width] = scores.dims();
+    assert!(b > 0 && t > 0 && h > 0 && width == 1);
+    assert_eq!(valid.dims(), [b, t]);
+    assert_eq!(documents.dims(), [b, t]);
+    let device = scores.device();
+    let scores = scores.detach();
+    let valid = valid.detach();
+    let documents = documents.detach();
+    let mut cs = Tensor::full([b, h, capacity], -1.0e30, &device);
+    let mut cp = Tensor::full([b, h, capacity], -1.0, &device);
+    let mut cd = Tensor::full([b, h, capacity], -1.0, &device);
+    let mut snapshots = Vec::with_capacity(t.div_ceil(chunk) + 1);
+    snapshots.push(cp.clone().unsqueeze_dim::<4>(2));
+    for first in (0..t).step_by(chunk) {
+        let n = chunk.min(t - first);
+        let local_valid = valid.clone().slice([0..b, first..first + n])
+            .reshape([b, 1, n]).repeat_dim(1, h);
+        let local_doc = documents.clone().slice([0..b, first..first + n])
+            .reshape([b, 1, n]).repeat_dim(1, h);
+        let local_pos = Tensor::<1, Int>::arange(first as i64..(first + n) as i64, &device)
+            .float().reshape([1, 1, n]).repeat_dim(0, b).repeat_dim(1, h)
+            .mask_fill(local_valid.lower_elem(0.5), -1.0);
+        let local_scores = if policy == CachePolicy::Recency {
+            local_pos.clone()
+        } else {
+            scores.clone().slice([0..b, first..first + n, 0..h, 0..1])
+                .swap_dims(1, 2).reshape([b, h, n])
+        };
+        let last_doc = local_doc.clone().slice([0..b, 0..h, n - 1..n]);
+        (cs, cp, cd, _) = select_cache(
+            Tensor::cat(vec![cs, local_scores], 2),
+            Tensor::cat(vec![cp, local_pos], 2),
+            Tensor::cat(vec![cd, local_doc], 2),
+            last_doc,
+            capacity,
+            None,
+        );
+        snapshots.push(cp.clone().unsqueeze_dim::<4>(2));
+    }
+    Tensor::cat(snapshots, 2)
+}
+
+/// Shared exact tensor membership for attention reads and position-only schedules.
+/// Replayed slots bypass ranking but retain the same eligibility masking.
+fn select_cache(
+    all_scores: Tensor<3>,
+    positions: Tensor<3>,
+    docs: Tensor<3>,
+    last_doc: Tensor<3>,
+    capacity: usize,
+    replay: Option<&Tensor<3, Int>>,
+) -> (Tensor<3>, Tensor<3>, Tensor<3>, Tensor<3, Int>) {
+    let [b, h, total] = positions.dims();
+    let eligible = positions.clone().greater_equal_elem(0.0)
+        .bool_and(docs.clone().equal(last_doc));
+    let ranked = all_scores.mask_fill(eligible.clone().bool_not(), -1.0e30).detach();
+    let index = match replay {
+        Some(index) => index.clone(),
+        None => {
+            // Exact lexicographic rank: larger score first, then earlier position.
+            // This is the original tensor reference, independent of top-k tie order.
+            let better = ranked.clone().unsqueeze_dim::<4>(2)
+                .greater(ranked.clone().unsqueeze_dim::<4>(3));
+            let equal = ranked.clone().unsqueeze_dim::<4>(2)
+                .equal(ranked.clone().unsqueeze_dim::<4>(3));
+            let earlier = positions.clone().unsqueeze_dim::<4>(2)
+                .lower(positions.clone().unsqueeze_dim::<4>(3));
+            let rank = better.bool_or(equal.bool_and(earlier)).int().sum_dim(3)
+                .reshape([b, h, total]);
+            rank.argsort(2).slice([0..b, 0..h, 0..capacity])
+        }
+    };
+    (
+        ranked.gather(2, index.clone()),
+        positions.gather(2, index.clone())
+            .mask_fill(eligible.gather(2, index.clone()).bool_not(), -1.0),
+        docs.gather(2, index.clone()),
+        index,
+    )
+}
+
 /// Explicit opt-in dispatch. The tensor implementation below remains the
 /// differentiable reference and the default until paired GPU measurements.
 pub(crate) fn read_selected(
@@ -240,7 +361,6 @@ fn read_impl<const TRACE: bool>(
     }
     for (chunk_index, first) in (0..t).step_by(chunk).enumerate() {
         let n = chunk.min(t - first);
-        let total = capacity + n;
         let take = |x: &Tensor<4>| {
             let width = x.dims()[3];
             x.clone()
@@ -324,44 +444,17 @@ fn read_impl<const TRACE: bool>(
         } else {
             take(&scores).reshape([b, h, n]).detach()
         };
-        let all_scores = Tensor::cat(vec![cs, local_scores], 2);
         let last_doc = local_doc.slice([0..b, 0..h, n - 1..n]);
-        let eligible = positions
-            .clone()
-            .greater_equal_elem(0.0)
-            .bool_and(docs.clone().equal(last_doc));
-        let ranked = all_scores
-            .mask_fill(eligible.clone().bool_not(), -1.0e30)
-            .detach();
-        // Stable exact lexicographic rank: larger score first, then earlier position.
-        // Capacity+chunk is small; this avoids backend-dependent top-k tie order.
-        let better = ranked
-            .clone()
-            .unsqueeze_dim::<4>(2)
-            .greater(ranked.clone().unsqueeze_dim::<4>(3));
-        let equal = ranked
-            .clone()
-            .unsqueeze_dim::<4>(2)
-            .equal(ranked.clone().unsqueeze_dim::<4>(3));
-        let earlier = positions
-            .clone()
-            .unsqueeze_dim::<4>(2)
-            .lower(positions.clone().unsqueeze_dim::<4>(3));
-        let rank = better
-            .bool_or(equal.bool_and(earlier))
-            .int()
-            .sum_dim(3)
-            .reshape([b, h, total]);
-        let index = match replay {
-            Some(replay) => replay[chunk_index].clone(),
-            None => rank.argsort(2).slice([0..b, 0..h, 0..capacity]),
-        };
+        let index;
+        (cs, cp, cd, index) = select_cache(
+            Tensor::cat(vec![cs, local_scores], 2),
+            positions,
+            docs,
+            last_doc,
+            capacity,
+            replay.map(|slots| &slots[chunk_index]),
+        );
         let index_kept = index.clone();
-        cs = ranked.gather(2, index.clone());
-        cp = positions
-            .gather(2, index.clone())
-            .mask_fill(eligible.gather(2, index.clone()).bool_not(), -1.0);
-        cd = docs.gather(2, index.clone());
         ck = keys.gather(2, index.clone().unsqueeze_dim::<4>(3).repeat_dim(3, dk));
         cv = values.gather(2, index.unsqueeze_dim::<4>(3).repeat_dim(3, dv));
         if TRACE {

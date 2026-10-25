@@ -14,18 +14,24 @@ impl Runner {
         self.step_profiled(c,corpus,device,&mut delta_mixers::profile::Unprofiled)
     }
     fn step_profiled<P:delta_mixers::profile::Sections>(&mut self,c:&Config,corpus:Option<&Corpus>,device:&Device,profile:&mut P) -> Result<f64> {
+        let fixture=self.step;
+        self.step_fixture_profiled(c,corpus,device,fixture,profile)
+    }
+    fn step_fixed(&mut self,c:&Config,corpus:Option<&Corpus>,device:&Device)->Result<f64>{
+        self.step_fixture_profiled(c,corpus,device,0,&mut delta_mixers::profile::Unprofiled)
+    }
+    fn step_fixture_profiled<P:delta_mixers::profile::Sections>(&mut self,c:&Config,corpus:Option<&Corpus>,device:&Device,fixture:usize,profile:&mut P)->Result<f64>{
         runtime::sync(device)?;
         let clock=Instant::now();
-        let rows=data::examples(c,corpus,c.seed,self.step*c.batch_size,c.batch_size,"train")?;
+        let rows=data::examples(c,corpus,c.seed,fixture*c.batch_size,c.batch_size,"train")?;
         let batch=Batch::new(&rows,device);
         let model=self.model.take().unwrap();
-        let result=crate::sbd::training_loss_profiled(&model,c,&rows,&batch,c.seed.wrapping_add(self.step as u64),profile)?;
-        let loss=result.loss;
+        let result=crate::sbd_step::backward_profiled(&model,c,&rows,&batch,c.seed.wrapping_add(fixture as u64),profile)?;
         self.sample(device);
-        model::scalar(loss.clone())?;
-        let gradients=model::checked_gradients(&model,loss)?;
+        let gradients=result.gradients;
+        let circuit_flows=result.circuit_flows;
         self.sample(device);
-        self.model=Some(train::optimizer_step(c,model,&mut self.optim,gradients,result.circuit_flows)?);
+        self.model=Some(train::optimizer_step(c,model,&mut self.optim,gradients,circuit_flows)?);
         runtime::sync(device)?;
         self.sample(device);
         self.step+=1;
@@ -108,6 +114,7 @@ impl delta_mixers::profile::Sections for ReadTiming<'_> {
     }
 }
 
+
 /// One warm step and one observed complete step per mode; no evaluation/checkpoint.
 pub fn diagnostic(c:&Config,device:&Device) -> Result<Value> {
     ensure!(c.sbd.is_some() && c.arms.len()==1 && c.arms[0].cache!="none","SBD diagnostic requires one HOLA arm");
@@ -134,7 +141,9 @@ pub fn diagnostic(c:&Config,device:&Device) -> Result<Value> {
         let dispatches=launches(|| {milliseconds=runner.step_profiled(&config,corpus.as_ref(),&target,&mut timing)?;Ok(())})?;
         ensure!(timing.error.is_none(),"noisy-read diagnostic synchronization failed: {:?}",timing.error);
         ensure!(timing.calls%c.layers==0,"noisy HOLA call count must cover every layer");
-        rows.push(json!({"selection":(["none_tensor","hola_read_tensor","hola_read_fused_gpu"][mode]),"warm_step_ms":warm_ms,"complete_step_ms":milliseconds,"noisy_block_evaluations":timing.calls/c.layers,"noisy_hola_layer_reads":timing.calls,"noisy_hola_forward_ms":timing.milliseconds,"noisy_hola_forward_percent_of_observed_step":100.0*timing.milliseconds/milliseconds,"launches":dispatches,"sampled_peak_pool_reserved_bytes":runner.peak}));
+        let rows_per_pass=config.sbd.as_ref().and_then(|s|s.rows_per_pass).unwrap_or(config.batch_size).min(config.batch_size);
+        let backward_passes=config.batch_size.div_ceil(rows_per_pass);
+        rows.push(json!({"selection":(["none_tensor","hola_read_tensor","hola_read_fused_gpu"][mode]),"warm_step_ms":warm_ms,"complete_step_ms":milliseconds,"backward_passes":backward_passes,"rows_per_pass":rows_per_pass,"noisy_block_evaluations":timing.calls/c.layers,"noisy_hola_layer_reads":timing.calls,"noisy_hola_forward_ms":timing.milliseconds,"noisy_hola_forward_percent_of_observed_step":100.0*timing.milliseconds/milliseconds,"launches":dispatches,"sampled_peak_pool_reserved_bytes":runner.peak}));
         runtime::write_json(&path,&json!({"completed":false,"config":c,"steps":rows}))?;
     }
     Ok(json!({"completed":true,"config":c,"device":runtime::identity(device),"steps":rows,"warmups_per_mode":1,"measured_steps_per_mode":1,"precision":"float32","method":"complete SBD loss/backward/checks/clipping/AdamW after one warm step per mode; synchronization only before/after each noisy HOLA forward section to expose its time; section includes query/key norms, cache gathers, segment assembly, one softmax/value read and existing sigmoid gate; clean preparation, other noisy work and backward remain outside that section","share_limitation":"forward-section time divided by the observed complete-step time, not full forward/backward HOLA cost or additive GPU utilization; inserted synchronization changes overlap, so this diagnostic is not the ordinary paired-step adoption measurement","count_method":"all layers have HOLA; noisy block evaluation count equals noisy HOLA section calls divided by layers, including detached teacher and differentiable denoising passes; all-observed and length-one blocks do not call the denoiser","memory_note":"pool reservation sampled after forward/backward/update; allocator reuse and resident model/optimizer values are included; not exact live bytes or physical-device peak"}))
@@ -184,10 +193,23 @@ pub fn batching_diagnostic(c:&Config,device:&Device) -> Result<Value> {
     let base=LanguageModel::new(c,&c.arms[0],&target)?;
     let corpus=train::loaded_corpus(c)?;
     let mut runner=Runner{model:Some(base),optim:train::optimizer(c),step:0,peak:None};
-    let warm_ms=runner.step(c,corpus.as_ref(),&target)?;
+    let fixed=c.sbd.as_ref().unwrap().cocommit.is_some();
+    let warmups=if fixed {2}else{1};
+    let mut warm=Vec::with_capacity(warmups);
+    for _ in 0..warmups {
+        warm.push(if fixed {runner.step_fixed(c,corpus.as_ref(),&target)?}else{runner.step(c,corpus.as_ref(),&target)?});
+    }
     let mut milliseconds=0.0;
-    let dispatches=launches(||{milliseconds=runner.step(c,corpus.as_ref(),&target)?;Ok(())})?;
-    Ok(json!({"completed":true,"config":c,"device":runtime::identity(device),"selection":"batched","warm_step_ms":warm_ms,"complete_step_ms":milliseconds,"launches":dispatches,"sampled_peak_pool_reserved_bytes":runner.peak,"warmups":1,"measured_steps":1,"precision":"float32","method":"one warm and one complete batched SBD training step, including uploads, detached teacher, second noisy pass, backward, checks, clipping and AdamW","memory_note":"pool reservation sampled after forward/backward/update, not peak live activation bytes"}))
+    let dispatches=launches(||{milliseconds=if fixed {runner.step_fixed(c,corpus.as_ref(),&target)?}else{runner.step(c,corpus.as_ref(),&target)?};Ok(())})?;
+    let rows_per_pass=c.sbd.as_ref().and_then(|s|s.rows_per_pass).unwrap_or(c.batch_size).min(c.batch_size);
+    let passes=c.batch_size.div_ceil(rows_per_pass);
+    let mut report=json!({"completed":true,"config":c,"device":runtime::identity(device),"selection":"batched","warm_step_ms":warm[warmups-1],"complete_step_ms":milliseconds,"launches":dispatches,"sampled_peak_pool_reserved_bytes":runner.peak,"warmups":warmups,"measured_steps":1,"backward_passes":passes,"rows_per_pass":rows_per_pass,"precision":"float32","method":"one warm and one complete batched SBD training step, including uploads, detached teacher, second noisy pass, backward, checks, clipping and AdamW","memory_note":"pool reservation sampled after forward/backward/update, not exact peak live allocation bytes"});
+    if fixed {
+        report["method"]="two warmups on one fixed fixture, then one observed complete CoCommit step including both tails, queries, flows, backward, checks, clipping, AdamW and circuit update".into();
+        report["warm_step_samples_ms"]=json!(warm);
+        report["fixture"]=json!({"example_index":0,"mask_seed":c.seed});
+    }
+    Ok(report)
 }
 
 fn codpula_isolated(c:&Config,device:&Device,warmups:usize,trials:usize) -> Result<Value> {
@@ -362,4 +384,138 @@ fn codpula_contextual(c:&Config,device:&Device,warmups:usize,trials:usize) -> Re
         "logical_extra_forward_mac_per_noisy_pass":(c.batch_size*c.context/8)*c.d_model*(3*96-64)});
     runtime::write_json(&path,&report)?;
     Ok(report)
+}
+
+/// Costs only: disabled coordination and two equivalent marked-tail layouts.
+pub fn cocommit(c: &Config, device: &Device, warmups: usize, trials: usize) -> Result<Value> {
+    use crate::config::CocommitExecution;
+    ensure!(warmups>=2 && trials>=11,"CoCommit timing requires >=2 warmups and >=11 interleaved pairs");
+    ensure!(c.batch_size==1 && c.context==512,"CoCommit paired timing requires B1/T512");
+    ensure!(c.arms.len()==1 && c.sbd.as_ref().is_some_and(|s|s.cocommit.is_some()),"CoCommit timing requires one configured arm");
+    let first_tail=c.layers-c.sbd.as_ref().unwrap().cocommit.as_ref().unwrap().tail_layers;
+    ensure!(c.prefix_block_retrieval.as_ref().is_none_or(|retrieval|
+        retrieval.layers.iter().all(|&layer|layer<first_tail)),
+        "CoCommit layout benchmark explicitly compares Doubled and requires no retrieval in the marked tail; use Separate with the complete-step diagnostic for tail retrieval");
+    let target=device.clone().autodiff();
+    let corpus=train::loaded_corpus(c)?;
+    let mut configs=[c.clone(),c.clone(),c.clone()];
+    configs[0].sbd.as_mut().unwrap().cocommit=None;
+    configs[1].sbd.as_mut().unwrap().cocommit.as_mut().unwrap().execution=CocommitExecution::Separate;
+    configs[2].sbd.as_mut().unwrap().cocommit.as_mut().unwrap().execution=CocommitExecution::Doubled;
+    target.seed(c.seed);
+    let base=LanguageModel::new(&configs[2],&c.arms[0],&target)?;
+    base.materialize_parameters();
+    let mut runners=Vec::with_capacity(3);
+    for config in &configs {
+        config.validate()?;
+        let mut model=base.clone().fork(&target);
+        model.cocommit_config=config.sbd.as_ref().unwrap().cocommit.clone();
+        if model.cocommit_config.is_none(){model.cocommit_marker=None;}
+        runners.push(Runner {model:Some(model),optim:train::optimizer(config),step:0,peak:None});
+    }
+    drop(base);
+    let path=c.artifact_dir.join("cocommit-benchmark.json");
+    let started=Instant::now();
+    let mut samples:[Vec<f64>;3]=std::array::from_fn(|_|Vec::new());
+    for iteration in 0..warmups+trials {
+        for mode in if iteration%2==0 {[0,1,2]} else {[2,1,0]} {
+            runtime::write_json(&path,&json!({"completed":false,"config":c,"warmups":warmups,"trials":trials,"iteration":iteration,"next_mode":mode,"samples_ms":samples}))?;
+            ensure!(started.elapsed().as_secs_f64()<c.max_seconds,"CoCommit timing reached max_seconds; partial report retained");
+            let milliseconds=runners[mode].step_fixed(&configs[mode],corpus.as_ref(),&target)?;
+            if iteration>=warmups {samples[mode].push(milliseconds);}
+        }
+    }
+    let mut steps=Vec::with_capacity(3);
+    for mode in 0..3 {
+        let dispatches=launches(|| {runners[mode].step_fixed(&configs[mode],corpus.as_ref(),&target)?;Ok(())})?;
+        steps.push(json!({"selection":(["off","separate","doubled"][mode]),"median_ms":median(&samples[mode]),"samples_ms":samples[mode],
+            "launches":dispatches,"sampled_peak_pool_reserved_bytes":runners[mode].peak}));
+    }
+    let layouts=paired(&samples[1],&samples[2]);
+    let doubled=layouts["bootstrap_95_percent_ms"][0].as_f64().unwrap()>0.0;
+    let selected=if doubled {2}else{1};
+    let isolated=cocommit_tail_isolated(c,device,warmups,trials)?;
+    let mut membership=delta_mixers::checks::membership_schedule_benchmark(device,warmups,trials).map_err(anyhow::Error::msg)?;
+    let legacy=membership["legacy_full_read_ms"].as_array().unwrap().iter().map(|x|x.as_f64().unwrap()).collect::<Vec<_>>();
+    let position_only=membership["position_only_ms"].as_array().unwrap().iter().map(|x|x.as_f64().unwrap()).collect::<Vec<_>>();
+    membership["paired_saving_ms"]=paired(&legacy,&position_only);
+    Ok(json!({"completed":true,"config":c,"device":runtime::identity(device),"precision":"float32","warmups":warmups,"trials":trials,
+        "steps":steps,"separate_minus_doubled":layouts,"selected_execution":if doubled {"doubled"}else{"separate"},
+        "off_minus_selected":paired(&samples[0],&samples[selected]),
+        "isolated_tail_pair":isolated,
+        "isolated_membership_schedule":membership,
+        "method":"complete-step costs only; two warmups then 11+ interleaved forward/reverse mode rounds; one fixed row/mask/bundle fixture in all rounds so all timed shapes are warmed; ordinary initial parameter values shared by cloning/forking one materialized model; independent advancing AdamW trajectories; no evaluation/checkpoints/quality comparison; off has the historical objective, on both approved branches; equivalent layouts share the objective",
+        "fixture":{"example_index":0,"mask_seed":c.seed,"bundle_seed":c.seed^0x434f434f4d4d4954u64},
+        "adoption_rule":"select doubled only if the paired 95% saving interval excludes zero; otherwise keep shared-cache separate execution",
+        "memory_note":"sampled pool reservation includes all three live runners, not exact peak live activation bytes"}))
+}
+
+fn cocommit_tail_isolated(c:&Config,device:&Device,warmups:usize,trials:usize)->Result<Value> {
+    use crate::{config::{CocommitExecution,SbdFeedback},sbd_training::CleanInputs,soft::SoftState};
+    let target=device.clone().autodiff();
+    let mut configurations=[c.clone(),c.clone()];
+    configurations[0].sbd.as_mut().unwrap().cocommit.as_mut().unwrap().execution=CocommitExecution::Separate;
+    configurations[1].sbd.as_mut().unwrap().cocommit.as_mut().unwrap().execution=CocommitExecution::Doubled;
+    target.seed(c.seed);
+    let base=LanguageModel::new(&configurations[0],&c.arms[0],&target)?;
+    base.materialize_parameters();
+    let mut models=Vec::with_capacity(2);
+    for config in &configurations {
+        let mut model=base.clone().fork(&target);
+        model.cocommit_config=config.sbd.as_ref().unwrap().cocommit.clone();
+        models.push(model);
+    }
+    drop(base);
+    let corpus=train::loaded_corpus(c)?;
+    let rows=data::examples(c,corpus.as_ref(),c.seed,0,c.batch_size,"train")?;
+    let blocks=crate::sbd::sample_training_blocks(c,&rows,c.seed)?;
+    let bundles=crate::cocommit::sample_bundles(&blocks,c.sbd.as_ref().unwrap().cocommit.as_ref().unwrap().training_bundle_max,c.seed);
+    let selected=blocks.iter().zip(&bundles).filter(|(block,_)|block.masked.len()>1).collect::<Vec<_>>();
+    ensure!(!selected.is_empty(),"isolated CoCommit tail requires a multi-token block");
+    let width=*c.sbd.as_ref().unwrap().block_lengths.iter().max().unwrap();
+    let count=selected.len();
+    let mut observed=Vec::with_capacity(count*width);
+    let mut active=Vec::with_capacity(count*width);
+    let mut marks=Vec::with_capacity(count*width);
+    let mut starts=Vec::with_capacity(count);
+    for (block,bundle) in selected {
+        starts.push((block.row,block.start+1));
+        for j in 0..width {
+            let real=j<block.masked.len();
+            active.push(real);
+            observed.push(if real && !block.masked[j] {Some(rows[block.row].target[block.start+j] as usize)}else{None});
+            marks.push(if real && bundle[j] {1.0f32}else{0.0});
+        }
+    }
+    let frozen=models[0].valid();
+    let mut trace=CleanInputs::default();
+    let _=frozen.forward_profiled(&Batch::new(&rows,&target),&mut trace);
+    let cache=frozen.training_cache_batched(&trace,&starts);
+    let soft=SoftState::new(c.vocab(),c.sbd.as_ref().unwrap().candidate_width,observed,active,&target,c.soft_selection_backend)?;
+    let prefix=frozen.cached_blocks_prefix_profiled(&cache,&soft,c.sbd.as_ref().unwrap().feedback==SbdFeedback::HardMask,&mut delta_mixers::profile::Unprofiled);
+    let marks=Tensor::<2>::from_data(TensorData::new(marks,[count,width]),&target);
+    let run=|model:&LanguageModel|->Result<(f64,f64)> {
+        runtime::sync(&target)?;
+        let start=Instant::now();
+        let (a,b)=model.cached_blocks_pair_profiled(&cache,prefix.clone(),marks.clone(),&mut delta_mixers::profile::Unprofiled);
+        runtime::sync(&target)?;
+        let forward=start.elapsed().as_secs_f64()*1000.0;
+        std::hint::black_box((a.logits.mean()+b.logits.mean()).backward());
+        runtime::sync(&target)?;
+        Ok((forward,start.elapsed().as_secs_f64()*1000.0))
+    };
+    let mut forward:[Vec<f64>;2]=std::array::from_fn(|_|Vec::new());
+    let mut total:[Vec<f64>;2]=std::array::from_fn(|_|Vec::new());
+    for iteration in 0..warmups+trials {
+        for mode in if iteration%2==0 {[0,1]}else{[1,0]} {
+            let (f,t)=run(&models[mode])?;
+            if iteration>=warmups {forward[mode].push(f);total[mode].push(t);}
+        }
+    }
+    Ok(json!({"shape":{"chains":count,"length":width,"d_model":c.d_model,"streams":if c.ohc_streams {4}else{1}},
+        "warmups":warmups,"trials":trials,
+        "separate":{"forward_median_ms":median(&forward[0]),"forward_backward_median_ms":median(&total[0]),"forward_samples_ms":forward[0],"forward_backward_samples_ms":total[0]},
+        "doubled":{"forward_median_ms":median(&forward[1]),"forward_backward_median_ms":median(&total[1]),"forward_samples_ms":forward[1],"forward_backward_samples_ms":total[1]},
+        "forward_separate_minus_doubled":paired(&forward[0],&forward[1]),"forward_backward_separate_minus_doubled":paired(&total[0],&total[1]),
+        "scope":"resident clean caches and saved noisy prefix prepared using frozen model; initialized soft block inputs; both tail/readout/head branches and mean-logit VJP; no clean/shared-prefix backward, teacher, circuit, optimizer or uploads in measured section; no parameter updates"}))
 }

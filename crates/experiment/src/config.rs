@@ -202,6 +202,34 @@ impl SbdCommitment {
 fn dependence_threshold() -> f64 { 0.05 }
 fn is_default_dependence_threshold(value: &f64) -> bool { *value == dependence_threshold() }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CocommitExecution {
+    Doubled,
+    #[default]
+    Separate,
+}
+impl CocommitExecution {
+    pub fn is_separate(&self) -> bool { *self == Self::Separate }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CocommitConfig {
+    pub tail_layers: usize,
+    pub rounds: usize,
+    pub training_bundle_max: usize,
+    pub visible_loss_weight: f64,
+    #[serde(skip_serializing_if = "CocommitExecution::is_separate")]
+    pub execution: CocommitExecution,
+}
+impl Default for CocommitConfig {
+    fn default() -> Self {
+        Self { tail_layers: 1, rounds: 1, training_bundle_max: 16, visible_loss_weight: 0.2,
+            execution: CocommitExecution::Separate }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SbdConfig {
@@ -222,6 +250,11 @@ pub struct SbdConfig {
     pub in_block_reads: delta_mixers::sbd::InBlockReads,
     #[serde(skip_serializing_if = "delta_mixers::sbd::NoisyReadBackend::is_tensor")]
     pub noisy_read_backend: delta_mixers::sbd::NoisyReadBackend,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cocommit: Option<CocommitConfig>,
+    /// Optional exact row chunk size for SBD backward accumulation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows_per_pass: Option<usize>,
     pub candidate_width: usize,
     pub commit_count: usize,
     /// None selects fixed-count commitment; Some selects paper equation 8 (nats).
@@ -242,6 +275,7 @@ impl Default for SbdConfig {
             candidate_width: 4, commit_count: 2, entropy_threshold: None, generate_tokens: 32,
             in_block_reads: delta_mixers::sbd::InBlockReads::None,
             noisy_read_backend: delta_mixers::sbd::NoisyReadBackend::Tensor,
+            cocommit: None, rows_per_pass: None,
             refinement: None, training_mode: crate::tct::TrainingMode::Sbd }
     }
 }
@@ -249,6 +283,8 @@ impl Default for SbdConfig {
 // Keep the historical SBD revision; optional reads enter identity through their selectors.
 const SBD_MODEL_REVISION: &str = "sbd-recurrence-only-v1";
 const PREFIX_RETRIEVAL_REVISION: &str = "prefix-block-moba-own-v1";
+const COCOMMIT_MODEL_REVISION: &str = "cocommit-full-stream-marker-event-v1";
+const COORDINATED_PROVISIONAL_REVISION: &str = "cocommit-coherent-b-permanent-O-provisional-R-v1";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -457,6 +493,8 @@ impl Config {
             "fused prefix retrieval requires selected layers, K32/V64 and non-fusion Vulkan");
         if let Some(sbd) = &self.sbd {
             ensure!(self.task == "lm", "SBD requires byte language modeling");
+            ensure!(sbd.rows_per_pass.is_none_or(|rows| rows > 0),
+                "sbd.rows_per_pass must be positive when specified");
             ensure!(!self.autotune, "SBD variable-shape matmuls are not covered by the autotune preflight");
             ensure!(!sbd.block_lengths.is_empty() && sbd.block_lengths.iter().all(|&n| n > 0),
                 "SBD block lengths must be positive");
@@ -497,6 +535,24 @@ impl Config {
                         && self.cache_capacity <= 64 && sbd.block_lengths.iter().all(|&n| n <= 16)),
                 "sbd.noisy_read_backend=fused_gpu requires explicit non-fusion GPU execution, key32/value64, chunk/query count <=16 and capacity <=64"
             );
+            if let Some(cocommit) = &sbd.cocommit {
+                ensure!((1..=self.layers).contains(&cocommit.tail_layers),
+                    "sbd.cocommit.tail_layers must be within 1..=layers");
+                ensure!(cocommit.rounds == 1, "sbd.cocommit currently requires rounds=1");
+                ensure!(cocommit.training_bundle_max > 0,
+                    "sbd.cocommit.training_bundle_max must be positive");
+                ensure!(cocommit.visible_loss_weight.is_finite() && cocommit.visible_loss_weight >= 0.0,
+                    "sbd.cocommit.visible_loss_weight must be finite and nonnegative");
+                ensure!(sbd.in_block_reads == delta_mixers::sbd::InBlockReads::HolaRead,
+                    "sbd.cocommit requires in_block_reads=hola_read");
+                ensure!(self.cache_capacity > 0 && self.arms.iter().all(|arm| arm.cache != "none"),
+                    "sbd.cocommit requires HOLA cache layers");
+                let first_tail = self.layers - cocommit.tail_layers;
+                ensure!(cocommit.execution != CocommitExecution::Doubled
+                    || self.prefix_block_retrieval.as_ref().is_none_or(|retrieval|
+                        retrieval.layers.iter().all(|&layer| layer < first_tail)),
+                    "sbd.cocommit.execution=doubled does not support prefix retrieval in the marked tail; select separate explicitly");
+            }
         }
         ensure!(
             self.ohc_backend.is_tensor()
@@ -714,8 +770,20 @@ impl Config {
     pub fn tokens_per_step(&self) -> usize {
         self.context * self.batch_size
     }
+    pub fn coordination_contract_revision(&self) -> Option<&'static str> {
+        self.sbd.as_ref().filter(|s| s.cocommit.is_some()
+            && (s.refinement.is_some() || !s.training_mode.is_sbd()))
+            .map(|_| COORDINATED_PROVISIONAL_REVISION)
+    }
     pub fn training_fingerprint(&self, target_tokens: usize) -> Result<String> {
-        let bytes = if self.prefix_block_retrieval.is_some() {
+        let bytes = if let Some(revision) = self.coordination_contract_revision() {
+            serde_json::to_vec(&(self,target_tokens,SBD_MODEL_REVISION,
+                self.prefix_block_retrieval.as_ref().map(|_|PREFIX_RETRIEVAL_REVISION),
+                COCOMMIT_MODEL_REVISION,revision))?
+        } else if self.sbd.as_ref().is_some_and(|s|s.cocommit.is_some()) {
+            serde_json::to_vec(&(self,target_tokens,SBD_MODEL_REVISION,
+                self.prefix_block_retrieval.as_ref().map(|_|PREFIX_RETRIEVAL_REVISION),COCOMMIT_MODEL_REVISION))?
+        } else if self.prefix_block_retrieval.is_some() {
             serde_json::to_vec(&(self,target_tokens,
                 self.sbd.as_ref().map(|_|SBD_MODEL_REVISION),PREFIX_RETRIEVAL_REVISION))?
         } else if self.sbd.is_some() {
@@ -733,6 +801,12 @@ impl Config {
         }
         if self.prefix_block_retrieval.is_some() {
             identity["prefix_block_retrieval_revision"] = PREFIX_RETRIEVAL_REVISION.into();
+        }
+        if self.sbd.as_ref().is_some_and(|s|s.cocommit.is_some()) {
+            identity["cocommit_model_revision"] = COCOMMIT_MODEL_REVISION.into();
+        }
+        if let Some(revision) = self.coordination_contract_revision() {
+            identity["coordinated_provisional_revision"] = revision.into();
         }
         Ok(crate::data::hash(&serde_json::to_vec(&identity)?))
     }
@@ -1325,5 +1399,64 @@ mod tests {
         c.validate().unwrap();
         c.fusion = true;
         assert!(c.validate().is_err());
+    }
+    #[test]
+    fn coordinated_provisional_identity_is_explicit_and_standalone_stays_historical() {
+        let mut c = Config {task:"lm".into(),sbd:Some(SbdConfig {
+            joint_output:SbdJointOutput::CodpulaContextual,
+            block_execution:SbdBlockExecution::Batched,
+            in_block_reads:delta_mixers::sbd::InBlockReads::HolaRead,
+            cocommit:Some(CocommitConfig::default()),
+            ..SbdConfig::default()
+        }),arms:vec![Arm {name:"kronlstm-hola".into(),mixer:"kronlstm".into(),cache:"surprise".into()}],..Config::default()};
+        c.validate().unwrap();
+        let tokens = 2048;
+        let standalone = crate::data::hash(&serde_json::to_vec(&(
+            &c,tokens,SBD_MODEL_REVISION,Option::<&str>::None,COCOMMIT_MODEL_REVISION,
+        )).unwrap());
+        assert_eq!(c.coordination_contract_revision(),None);
+        assert_eq!(c.training_fingerprint(tokens).unwrap(),standalone);
+        c.sbd.as_mut().unwrap().refinement =
+            Some(serde_json::from_value(serde_json::json!({"policy":"uniform"})).unwrap());
+        c.validate().unwrap();
+        assert_eq!(c.coordination_contract_revision(),Some(COORDINATED_PROVISIONAL_REVISION));
+        let combined = crate::data::hash(&serde_json::to_vec(&(
+            &c,tokens,SBD_MODEL_REVISION,Option::<&str>::None,
+            COCOMMIT_MODEL_REVISION,COORDINATED_PROVISIONAL_REVISION,
+        )).unwrap());
+        assert_eq!(c.training_fingerprint(tokens).unwrap(),combined);
+        let refinement_identity = c.pilot_fingerprint().unwrap();
+        c.sbd.as_mut().unwrap().refinement = None;
+        c.sbd.as_mut().unwrap().training_mode = crate::tct::TrainingMode::Tct;
+        c.sbd.as_mut().unwrap().rows_per_pass = Some(4);
+        c.tct = Some(crate::tct::TctConfig {rows_per_pass:4});
+        c.validate().unwrap();
+        assert_eq!(c.coordination_contract_revision(),Some(COORDINATED_PROVISIONAL_REVISION));
+        assert_ne!(c.pilot_fingerprint().unwrap(),refinement_identity);
+        c.sbd.as_mut().unwrap().cocommit = None;
+        assert_eq!(c.coordination_contract_revision(),None);
+        let historical_tct = crate::data::hash(&serde_json::to_vec(&(&c,tokens,SBD_MODEL_REVISION)).unwrap());
+        assert_eq!(c.training_fingerprint(tokens).unwrap(),historical_tct);
+    }
+    #[test]
+    fn doubled_marked_tail_rejects_retrieval_instead_of_switching_execution() {
+        let mut c = Config {task:"lm".into(),layers:4,
+            arms:vec![Arm {name:"kronlstm-hola".into(),mixer:"kronlstm".into(),cache:"surprise".into()}],
+            sbd:Some(SbdConfig {
+                joint_output:SbdJointOutput::CodpulaContextual,
+                block_execution:SbdBlockExecution::Batched,
+                in_block_reads:delta_mixers::sbd::InBlockReads::HolaRead,
+                cocommit:Some(CocommitConfig::default()),
+                ..SbdConfig::default()
+            }),
+            prefix_block_retrieval:Some(delta_mixers::prefix_retrieval::PrefixBlockRetrieval {
+                layers:vec![3],block_size:64,blocks_per_query:2,
+            }),..Config::default()};
+        c.validate().unwrap();
+        c.sbd.as_mut().unwrap().cocommit.as_mut().unwrap().execution=CocommitExecution::Doubled;
+        let error=c.validate().unwrap_err().to_string();
+        assert!(error.contains("doubled") && error.contains("retrieval"),"{error}");
+        c.prefix_block_retrieval.as_mut().unwrap().layers=vec![0];
+        c.validate().unwrap();
     }
 }

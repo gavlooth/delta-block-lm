@@ -173,11 +173,111 @@ fn token_uniforms(state: &Episode, keys: &[u64], seed: u64, call: usize, device:
     Tensor::from_data(TensorData::new(values,[state.lengths.len(),width,2]),device)
 }
 
+fn select_branch_output(a: crate::model::DenoisingOutput, b: crate::model::DenoisingOutput,
+    use_b: &[bool], device: &Device) -> crate::model::DenoisingOutput {
+    let [rows,width,vocab] = a.logits.dims();
+    let depth = a.features.dims()[2];
+    let selected = Tensor::<2,Bool>::from_data(TensorData::new(use_b.to_vec(),[rows,1]),device)
+        .expand([rows,width]);
+    let logits = a.logits.mask_where(selected.clone().unsqueeze_dim::<3>(2).expand([rows,width,vocab]),b.logits);
+    let features = a.features.mask_where(selected.unsqueeze_dim::<3>(2).expand([rows,width,depth]),b.features);
+    crate::model::DenoisingOutput {logits,features}
+}
+/// A's preparation masks only O; standard decisions query temporary O+R, endpoint/correction O.
+fn announcement_marks(model: &LanguageModel, c: &Config, a: crate::model::DenoisingOutput,
+    state: &Episode, eligible: &[bool], carry_reveals: bool, keys: &[u64], seed: u64, call: usize,
+    device: &Device, work: &mut crate::cocommit::CoordinationWork) -> Result<Vec<bool>> {
+    let rows=state.lengths.len();
+    let width=state.width();
+    let s=c.sbd.as_ref().unwrap();
+    let (logs,scores)=if model.codpula.is_some() {
+        let (circuit,tokens,observed)=crate::sbd::prepare_circuit(model,a,&state.soft,c.soft_temperature)?;
+        let (tokens,observed)=if carry_reveals {
+            (Tensor::<2,Int>::from_data(TensorData::new(state.values.iter().map(|&value|value as i32).collect::<Vec<_>>(),[rows,width]),device),
+                Tensor::<2,Bool>::from_data(TensorData::new(state.soft.observed.iter().zip(&state.revealed)
+                    .map(|(o,&r)|o.is_some() || r).collect::<Vec<_>>(),[rows,width]),device))
+        } else {(tokens,observed)};
+        work.circuit_preparations+=1;
+        work.message_passes+=1;
+        work.evidence_queries+=1;
+        work.circuit_query_dispatched_rows+=rows;
+        work.circuit_query_used_rows+=rows;
+        let logs=circuit.marginals(tokens.clone(),observed.clone())?.log();
+        let scores=if s.commitment==crate::config::SbdCommitment::Dependence {
+            let proposals=circuit.sample_with_uniforms(tokens.clone(),observed.clone(),
+                token_uniforms(state,keys,seed,call,device))?;
+            work.ffbs_passes+=1;
+            work.ffbs_dispatched_rows+=rows;
+            work.ffbs_used_rows+=rows;
+            work.message_passes+=3; // FFBS messages plus both dependence traversals.
+            work.evidence_queries+=2;
+            work.circuit_query_dispatched_rows+=2*rows;
+            work.circuit_query_used_rows+=2*rows;
+            Some(circuit.dependence_scores(tokens,observed,&proposals)?)
+        } else {None};
+        (host(logs)?,scores)
+    } else {(host(log_softmax(a.logits/c.soft_temperature,2))?,None)};
+    let mut marks=vec![false;rows*width];
+    for row in 0..rows {
+        let positions=(0..state.lengths[row]).filter(|&i|eligible[row*width+i]).collect::<Vec<_>>();
+        let chosen=if let Some(scores)=&scores {
+            ensure!(positions.iter().all(|&i|scores[row][i].is_finite()),
+                "CoCommit dependence requires finite supported scores");
+            crate::sbd::dependence_commits(&positions,&scores[row],s.dependence_threshold,false)
+        } else {
+            let mut order=positions.into_iter().map(|i| {
+                let logs=&logs[(row*width+i)*c.vocab()..(row*width+i+1)*c.vocab()];
+                let entropy=logs.iter().filter(|log|log.is_finite()).map(|&log|-(log as f64).exp()*log as f64).sum::<f64>();
+                (i,entropy)
+            }).collect::<Vec<_>>();
+            order.sort_by(|a,b|a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+            let take=if order.is_empty() {0} else if let Some(gamma)=s.entropy_threshold {
+                let mut take=1;
+                let mut sum=0.0;
+                while take<order.len() && sum+order[take-1].1<=gamma {sum+=order[take-1].1;take+=1;}
+                take
+            } else {s.commit_count.min(order.len())};
+            order[..take].iter().map(|&(i,_)|i).collect()
+        };
+        for i in chosen {marks[row*width+i]=true;}
+    }
+    Ok(marks)
+}
+
+fn coordinated_output(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache,
+    input: &SoftState, state: &Episode, eligible: &[bool], carry_reveals: bool, keys: &[u64], seed: u64,
+    call: usize, device: &Device) -> Result<(crate::model::DenoisingOutput,Vec<bool>,crate::cocommit::CoordinationWork)> {
+    let rows=state.lengths.len();
+    let width=state.width();
+    let prefix=model.cached_blocks_prefix_profiled(cache,input,false,&mut delta_mixers::profile::Unprofiled);
+    let a=model.cached_blocks_tail_profiled(cache,prefix.clone(),None,&mut delta_mixers::profile::Unprofiled).detach();
+    let mut work=crate::cocommit::CoordinationWork {logical_blocks:rows,prefix_batches:1,prefix_rows:rows,
+        a_tail_dispatches:1,a_tail_rows:rows,a_tail_used_rows:rows,head_dispatches:1,head_rows:rows,
+        head_used_rows:rows,..crate::cocommit::CoordinationWork::default()};
+    let marks=announcement_marks(model,c,a.clone(),state,eligible,carry_reveals,keys,seed,call,device,&mut work)?;
+    let used=marks.chunks_exact(width).map(|marks|marks.iter().any(|&mark|mark)).collect::<Vec<_>>();
+    let used_count=used.iter().filter(|&&used|used).count();
+    work.empty_announcement_rows=rows-used_count;
+    if used_count==0 {return Ok((a,marks,work));}
+    let b=model.cached_blocks_tail_profiled(cache,prefix,
+        Some(Tensor::from_data(TensorData::new(marks.iter().map(|&mark|if mark {1.0f32}else{0.0}).collect::<Vec<_>>(),[rows,width]),device)),
+        &mut delta_mixers::profile::Unprofiled).detach();
+    work.b_tail_dispatches=1;
+    work.b_tail_rows=rows;
+    work.b_tail_used_rows=used_count;
+    work.head_dispatches+=1;
+    work.head_rows+=rows;
+    work.head_used_rows+=used_count;
+    work.b_circuit_used_rows=if model.codpula.is_some(){used_count}else{0};
+    Ok((select_branch_output(a,b,&used,device),marks,work))
+}
+
 struct Prediction {
     hidden: Tensor<3>,
     logs: Tensor<2>,
     input_visibility: Tensor<2>,
     input_revealed: Vec<bool>,
+    work: crate::cocommit::CoordinationWork,
 }
 fn predict(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, state: &mut Episode,
     keys: &[u64], seed: u64, call: usize, device: &Device) -> Result<Prediction> {
@@ -186,12 +286,29 @@ fn predict(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, stat
     let view = provisional_input(&state.soft,&state.values,&state.revealed,device)?;
     let visibility = view.visibility.clone();
     let revealed = state.revealed.clone();
-    let output = model.cached_blocks(cache,&view,false).detach();
-    let hidden = output.features.clone();
     let rows = state.lengths.len();
     let width = state.width();
     let correction = c.sbd.as_ref().unwrap().training_mode == crate::tct::TrainingMode::Tct;
+    let marked = model.cocommit_config.is_some();
+    let (output,marks,mut work)=if marked {
+        let eligible=state.soft.active.iter().zip(&state.soft.observed).zip(&revealed)
+            .map(|((&active,observed),&reveal)|active && observed.is_none() && (correction || !reveal)).collect::<Vec<_>>();
+        coordinated_output(model,c,cache,&view,state,&eligible,!correction,keys,seed,call,device)?
+    } else {(model.cached_blocks(cache,&view,false).detach(),Vec::new(),crate::cocommit::CoordinationWork::default())};
+    let used_b_count=marks.chunks_exact(width).filter(|marks|marks.iter().any(|&mark|mark)).count();
+    let hidden=output.features.clone();
     let logs = if model.codpula.is_some() {
+        if marked {
+            work.circuit_preparations += 1;
+            work.message_passes += 2;
+            work.evidence_queries += 1;
+            work.ffbs_passes += 1;
+            work.circuit_query_dispatched_rows += rows;
+            work.circuit_query_used_rows += rows;
+            work.b_circuit_used_rows = used_b_count;
+            work.ffbs_dispatched_rows += rows;
+            work.ffbs_used_rows += rows;
+        }
         let (circuit,tokens,fixed) = crate::sbd::prepare_circuit(model,output,&state.soft,c.soft_temperature)?;
         let proposal_tokens = Tensor::<2,Int>::from_data(TensorData::new(
             state.values.iter().map(|&v|v as i32).collect::<Vec<_>>(),[rows,width]),device);
@@ -216,7 +333,7 @@ fn predict(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, stat
     state.soft.update(logs.clone().detach(),c.soft_eta,1.0,c.soft_steps,c.sbd.as_ref().unwrap().candidate_width)?;
     state.previous_candidates = Some(previous);
     state.validate(c.vocab())?;
-    Ok(Prediction {hidden,logs,input_visibility:visibility,input_revealed:revealed})
+    Ok(Prediction {hidden,logs,input_visibility:visibility,input_revealed:revealed,work})
 }
 
 fn features(model: &LanguageModel, c: &Config, state: &Episode, output: &Prediction,
@@ -286,7 +403,7 @@ fn energy_terms(energy: &MaskEnergy, input: Tensor<3>, state: &Episode, policy: 
     Ok((packed,pairs))
 }
 
-struct EpisodeResult { state: Episode, calls: usize, row_calls: Vec<usize> }
+struct EpisodeResult { state: Episode, calls: usize, row_calls: Vec<usize>, work: crate::cocommit::CoordinationWork }
 fn episode(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, mut state: Episode,
     keys: &[u64], seed: u64, energy: Option<&MaskEnergy>, adaptive: bool, device: &Device) -> Result<EpisodeResult> {
     let policy = settings(c)?.policy;
@@ -294,7 +411,8 @@ fn episode(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, mut 
     let free = (0..rows).map(|row|state.eligible(row).len()).collect::<Vec<_>>();
     let levels = free.iter().copied().max().unwrap_or(0);
     let mut calls = 0;
-    let mut row_calls = vec![0;rows];
+    let mut work = crate::cocommit::CoordinationWork::default();
+    let mut row_calls=vec![0;rows];
     for level in (0..levels).rev() {
         let mut previous: Vec<Option<Vec<usize>>> = vec![None;rows];
         let mut repeats = vec![0;rows];
@@ -304,6 +422,7 @@ fn episode(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, mut 
             let before = state.clone();
             let decision_index = (levels-1-level)*CALLS_PER_LEVEL+inner;
             let output = predict(model,c,cache,&mut state,keys,seed,decision_index,device)?;
+            work.add(output.work);
             let cardinalities = (0..rows).map(|row|level.min(free[row])).collect::<Vec<_>>();
             let noise = (0..rows).map(|row|level as f32/free[row].max(1) as f32).collect::<Vec<_>>();
             let terms = if policy == MaskPolicy::Uniform || cardinalities.iter().all(|&r|r==0) {None} else {
@@ -328,7 +447,7 @@ fn episode(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, mut 
             calls += 1;
         }
     }
-    Ok(EpisodeResult {state,calls,row_calls})
+    Ok(EpisodeResult {state,calls,row_calls,work})
 }
 fn restore_row(state: &mut Episode, before: &Episode, row: usize, device: &Device) -> Result<()> {
     let width = state.width();
@@ -392,7 +511,8 @@ pub fn generate(model: &LanguageModel, c: &Config, prompt: &[i32], device: &Devi
     let mut blocks = 0;
     let mut calls = 0;
     let mut row_calls = 0;
-    let mut clean_cache = None;
+    let mut coordination = crate::cocommit::CoordinationWork::default();
+    let mut clean_cache=None;
     runtime::sync(device)?;
     let clock = Instant::now();
     while generated.len()<s.generate_tokens {
@@ -408,13 +528,15 @@ pub fn generate(model: &LanguageModel, c: &Config, prompt: &[i32], device: &Devi
             if clean_cache.is_none() {clean_cache=Some(prefix_cache(&model,&[prefix.clone()],device)?);}
             let state = Episode::new(c,vec![n],n,vec![None;n],device)?;
             let result = episode(&model,c,clean_cache.as_ref().unwrap(),state,&[blocks as u64],c.seed,energy.as_ref(),true,device)?;
+            coordination.add(result.work);
             calls += result.calls;
             row_calls += result.row_calls[0];
             result.state.values.into_iter().map(|v|v as i32).collect()
         };
         prefix.extend_from_slice(&values);
         generated.extend_from_slice(&values);
-        // One clean replay, after the entire episode; no noisy state enters this snapshot.
+        coordination.final_replay_dispatches += 1;
+        coordination.final_replay_rows += 1;
         blocks += 1;
         let remaining=s.generate_tokens-generated.len();
         let next_length=s.block_lengths[blocks%s.block_lengths.len()].min(remaining);
@@ -429,13 +551,15 @@ pub fn generate(model: &LanguageModel, c: &Config, prompt: &[i32], device: &Devi
     let seconds = clock.elapsed().as_secs_f64();
     Ok(json!({"tokens":generated,"text":String::from_utf8_lossy(&generated.iter().map(|&v|v as u8).collect::<Vec<_>>()),
         "seconds":seconds,"finalized_tokens":generated.len(),"finalized_tokens_per_second":generated.len() as f64/seconds,
+        "coordination_work":coordination,
         "denoising_passes":calls,"active_row_calls":row_calls,"blocks":blocks,"causally_replayed_tokens":generated.len(),
         "includes_replay":true,"prefill_included":true,"commit_rule":"delay_until_episode_end","policy":settings(c)?.policy,
         "levels":"K=eligible_count","calls_per_level_max":CALLS_PER_LEVEL,"patience":PATIENCE,
         "token_operator":if s.training_mode == crate::tct::TrainingMode::Tct {"correction_all_free"}else if model.codpula.is_some(){"indexed_seeded_ffbs_standard_carry"}else{"factorized_argmax_standard_carry"},
         "feedback":"retained_topk_masked_visibility_1_over_soft_steps","feature_definition":FEATURE_VERSION,"rng":RANDOM_VERSION,
         "proposal_evidence":if s.training_mode == crate::tct::TrainingMode::Tct {"permanent_O_only"}else{"permanent_O_plus_provisional_reveals"},"feedback_and_feature_evidence":"permanent_O_only",
-        "marginal_queries_per_joint_call":1,"ffbs_queries_per_joint_call":1,
+        "marginal_queries_per_joint_call":if model.cocommit_config.is_some(){None}else{Some(1usize)},
+        "ffbs_queries_per_joint_call":if model.cocommit_config.is_some(){None}else{Some(1usize)},
         "proposal_seed":c.seed,"potential_temperature":c.soft_temperature,"quality_evaluation":false}))
 }
 
@@ -498,30 +622,54 @@ fn intervention_pair(eligible: &[usize], r: usize, logs: &[f32], values: &[usize
 }
 
 fn endpoint_losses(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, state: &Episode,
-    targets: Vec<i32>, device: &Device) -> Result<Vec<f32>> {
+    targets: Vec<i32>, keys: &[u64], seed: u64, call: usize, device: &Device) -> Result<(Vec<f32>,crate::cocommit::CoordinationWork)> {
     let rows = state.lengths.len();
     let width = state.width();
     ensure!(targets.len() == rows*width,"endpoint target layout differs");
     for (i,value) in state.soft.observed.iter().enumerate() {
         ensure!(value.is_none_or(|value|value == targets[i] as usize),"endpoint target disagrees with permanent evidence");
     }
-    // This readout uses retained soft candidates, not hard provisional reveals or clean targets.
-    let output = model.cached_blocks(cache,&state.soft,false).detach();
+    // Endpoint scoring intentionally uses the retained soft state, never hard provisional inputs.
     let targets = Tensor::<2,Int>::from_data(TensorData::new(targets,[rows,width]),device);
     let denominators = Tensor::<1>::from_data(TensorData::new((0..rows).map(|row|state.eligible(row).len().max(1) as f32).collect::<Vec<_>>(),[rows]),device);
-    let loss = if model.codpula.is_some() {
-        let (circuit,_,observed) = crate::sbd::prepare_circuit(model,output,&state.soft,c.soft_temperature)?;
-        let full = Tensor::<2,Bool>::from_data(TensorData::new(state.soft.active.clone(),[rows,width]),device);
-        (circuit.log_partition(targets.clone(),observed)?-circuit.log_partition(targets,full)?)/denominators
+    let mut work=crate::cocommit::CoordinationWork::default();
+    let loss = if model.cocommit_config.is_some() {
+        let eligible = state.soft.active.iter().zip(&state.soft.observed)
+            .map(|(&active,observed)| active && observed.is_none()).collect::<Vec<_>>();
+        let (output,_marks,coordination)=coordinated_output(model,c,cache,&state.soft,state,&eligible,false,
+            keys,seed ^ 0x454e44504f494e54,call,device)?;
+        work=coordination;
+        if model.codpula.is_some() {
+            work.circuit_preparations+=1;
+            work.evidence_queries+=2;
+            work.message_passes+=2;
+            work.circuit_query_dispatched_rows+=2*rows;
+            work.circuit_query_used_rows+=2*rows;
+            let (circuit,_,observed) = crate::sbd::prepare_circuit(model,output,&state.soft,c.soft_temperature)?;
+            let full = Tensor::<2,Bool>::from_data(TensorData::new(state.soft.active.clone(),[rows,width]),device);
+            (circuit.log_partition(targets.clone(),observed)?-circuit.log_partition(targets,full)?)/denominators
+        } else {
+            let eligible = Tensor::<2>::from_data(TensorData::new(eligible.iter().map(|&free|if free {1.0f32}else{0.0}).collect::<Vec<_>>(),[rows,width]),device);
+            let logits = output.logits;
+            -(log_softmax(logits/c.soft_temperature,2).reshape([rows*width,c.vocab()])
+                .gather(1,targets.reshape([rows*width,1])).reshape([rows,width])*eligible).sum_dim(1).reshape([rows])/denominators
+        }
     } else {
-        let eligible = Tensor::<2>::from_data(TensorData::new(state.soft.active.iter().zip(&state.soft.observed)
-            .map(|(&active,value)|if active && value.is_none(){1.0f32}else{0.0}).collect::<Vec<_>>(),[rows,width]),device);
-        -(log_softmax(output.logits/c.soft_temperature,2).reshape([rows*width,c.vocab()])
-            .gather(1,targets.reshape([rows*width,1])).reshape([rows,width])*eligible).sum_dim(1).reshape([rows])/denominators
+        let output = model.cached_blocks(cache,&state.soft,false).detach();
+        if model.codpula.is_some() {
+            let (circuit,_,observed) = crate::sbd::prepare_circuit(model,output,&state.soft,c.soft_temperature)?;
+            let full = Tensor::<2,Bool>::from_data(TensorData::new(state.soft.active.clone(),[rows,width]),device);
+            (circuit.log_partition(targets.clone(),observed)?-circuit.log_partition(targets,full)?)/denominators
+        } else {
+            let eligible = Tensor::<2>::from_data(TensorData::new(state.soft.active.iter().zip(&state.soft.observed)
+                .map(|(&active,value)|if active && value.is_none(){1.0f32}else{0.0}).collect::<Vec<_>>(),[rows,width]),device);
+            -(log_softmax(output.logits/c.soft_temperature,2).reshape([rows*width,c.vocab()])
+                .gather(1,targets.reshape([rows*width,1])).reshape([rows,width])*eligible).sum_dim(1).reshape([rows])/denominators
+        }
     };
     let values = host(loss)?;
     ensure!(values.iter().all(|value|value.is_finite()),"trajectory endpoint has nonfinite target-conditional NLL");
-    Ok(values)
+    Ok((values,work))
 }
 
 #[derive(Clone)]
@@ -563,6 +711,9 @@ pub fn collect(model: &LanguageModel, c: &Config, rows: &[Example], checkpoint_i
     let mut branch_calls = 0usize;
     let mut endpoint_calls = 0usize;
     let mut device_dispatch_calls = 0usize;
+    let mut source_work = crate::cocommit::CoordinationWork::default();
+    let mut branch_work = crate::cocommit::CoordinationWork::default();
+    let mut endpoint_work = crate::cocommit::CoordinationWork::default();
     let mut eligible_pairs = 0usize;
     let mut swap_pairs = 0usize;
     let mut uniform_pairs = 0usize;
@@ -576,6 +727,7 @@ pub fn collect(model: &LanguageModel, c: &Config, rows: &[Example], checkpoint_i
         let mut decision = None;
         for call in 0..=decision_call {
             let output = predict(&model,c,&cache,&mut state,&keys,c.seed,call,device)?;
+            source_work.add(output.work);
             source_calls += count;
             device_dispatch_calls += 1;
             if call == decision_call { decision=Some(output); break; }
@@ -624,6 +776,7 @@ pub fn collect(model: &LanguageModel, c: &Config, rows: &[Example], checkpoint_i
         for step in 0..refinement.horizon {
             let call = decision_call+1+step;
             let output = predict(&model,c,&branch_cache,&mut branches,&branch_keys,c.seed,call,device)?;
+            branch_work.add(output.work);
             branch_calls += branch_rows.len();
             device_dispatch_calls += 1;
             let continuation_r = length.saturating_sub(1+call/CALLS_PER_LEVEL);
@@ -637,7 +790,9 @@ pub fn collect(model: &LanguageModel, c: &Config, rows: &[Example], checkpoint_i
             let block = &blocks[row];
             rows[block.row].target[block.start..block.start+length].iter().copied()
         }).collect::<Vec<_>>();
-        let losses = endpoint_losses(&model,c,&branch_cache,&branches,targets,device)?;
+        let (losses,scoring_work) = endpoint_losses(&model,c,&branch_cache,&branches,targets,&branch_keys,
+            c.seed,decision_call+refinement.horizon+1,device)?;
+        endpoint_work.add(scoring_work);
         endpoint_calls += branch_rows.len();
         device_dispatch_calls += 1;
         for row in 0..count {
@@ -673,6 +828,10 @@ pub fn collect(model: &LanguageModel, c: &Config, rows: &[Example], checkpoint_i
     ensure!(branch_calls==refinement.states*refinement.pairs_per_state*2*refinement.horizon
         && endpoint_calls==refinement.states*refinement.pairs_per_state*2,
         "paired trajectories did not receive their identical complete horizon and scoring calls");
+    let logical_batch_reads=device_dispatch_calls;
+    if model.cocommit_config.is_some() {
+        device_dispatch_calls=source_work.head_dispatches+branch_work.head_dispatches+endpoint_work.head_dispatches;
+    }
     let metadata = json!({"feature_definition":FEATURE_VERSION,"feature_width":2*c.d_model+12,"seed":c.seed,"rng":RANDOM_VERSION,
         "temperature":c.soft_temperature,"soft_eta":c.soft_eta,"soft_steps":c.soft_steps,"candidate_width":c.sbd.as_ref().unwrap().candidate_width,
         "source_model_identity":model_identity(&model)?,"collection_mask_policy":"uniform",
@@ -680,6 +839,8 @@ pub fn collect(model: &LanguageModel, c: &Config, rows: &[Example], checkpoint_i
         "proposal_evidence":if c.sbd.as_ref().unwrap().training_mode == crate::tct::TrainingMode::Tct {"permanent_O_only"}else{"permanent_O_plus_provisional_reveals"},"feature_and_feedback_evidence":"permanent_O_only",
         "source_split":"train","source_calls":source_calls,"branch_calls":branch_calls,"endpoint_calls":endpoint_calls,
         "device_noisy_dispatches":device_dispatch_calls,"horizon":refinement.horizon,"pairs_per_state":refinement.pairs_per_state,
+        "coordination_work":{"source":source_work,"branch":branch_work,"endpoint":endpoint_work},
+        "logical_noisy_batch_reads":logical_batch_reads,"dispatch_unit":"batched tail/head API execution, not kernel launches",
         "proposal_weighted_swap_pairs":swap_pairs,"independent_uniform_pairs":uniform_pairs,"records":records});
     let dataset = Dataset {schema:1,feature_width:2*c.d_model+12,checkpoint_identity:checkpoint_identity.into(),states:dataset_states,metadata};
     if let Some(parent) = refinement.data_path.parent().filter(|path|!path.as_os_str().is_empty()) {std::fs::create_dir_all(parent)?;}
@@ -691,6 +852,8 @@ pub fn collect(model: &LanguageModel, c: &Config, rows: &[Example], checkpoint_i
         "eligible_pairs":eligible_pairs,"horizon":refinement.horizon,"source_calls":source_calls,"branch_calls":branch_calls,
         "collection_mask_policy":"uniform","feature_definition":FEATURE_VERSION,
         "endpoint_calls":endpoint_calls,"total_noisy_row_calls":source_calls+branch_calls+endpoint_calls,"device_noisy_dispatches":device_dispatch_calls,
+        "coordination_work":{"source":source_work,"branch":branch_work,"endpoint":endpoint_work},
+        "logical_noisy_batch_reads":logical_batch_reads,"dispatch_unit":"batched tail/head API execution, not kernel launches",
         "proposal_weighted_swap_pairs":swap_pairs,"independent_uniform_pairs":uniform_pairs,"paired_calls_exactly_equal":true,
         "checkpoint_identity":checkpoint_identity,"seconds":clock.elapsed().as_secs_f64(),"quality_evaluation":false}))
 }
@@ -716,9 +879,12 @@ fn checkpoint_training_identity(c: &Config, path: &Path, saved: &crate::train::S
     if fingerprint==saved.config_sha256 {return Ok((fingerprint,None));}
     let (source,metrics_path,target_tokens) = recorded_source_config(path,saved)?;
     let source_fingerprint=saved.config_sha256.clone();
-    ensure!(source.sbd.as_ref().is_some_and(|s|s.refinement.is_none()),"recorded training source unexpectedly contains decoder refinement");
+    // Decoder/rank-fit controls are runtime-only. Restore their exact recorded
+    // value, including an explicitly trained combined profile, for comparison.
+    requested.sbd.as_mut().unwrap().refinement =
+        source.sbd.as_ref().context("recorded remasking source requires SBD")?.refinement.clone();
     // Output location and output-token count do not change the frozen denoiser.
-    // Every other requested field must still reproduce the exact recorded training fingerprint.
+    // Every model/training field must reproduce the verified source fingerprint.
     requested.artifact_dir = source.artifact_dir.clone();
     requested.sbd.as_mut().unwrap().generate_tokens = source.sbd.as_ref().unwrap().generate_tokens;
     ensure!(requested.training_fingerprint(target_tokens)?==source_fingerprint,
@@ -784,6 +950,7 @@ pub fn benchmark(c: &Config, arm: &Arm, seed: u64, device: &Device, warmups: usi
     let mut replay_seconds = Vec::with_capacity(trials);
     let mut dispatches = Vec::with_capacity(trials);
     let mut active_calls = Vec::with_capacity(trials);
+    let mut coordination_samples=Vec::with_capacity(trials);
     for iteration in 0..warmups+trials {
         runtime::sync(device)?;
         let clock = Instant::now();
@@ -805,11 +972,16 @@ pub fn benchmark(c: &Config, arm: &Arm, seed: u64, device: &Device, warmups: usi
             replay_seconds.push(elapsed-refinement_elapsed);
             dispatches.push(result.calls);
             active_calls.push(result.row_calls);
+            let mut work=result.work;
+            work.final_replay_dispatches=1;
+            work.final_replay_rows=c.batch_size;
+            coordination_samples.push(work);
         }
     }
     Ok(json!({"shape":{"batch":c.batch_size,"clean_prefix":prefix_length,"episode_length":length,"depth":c.d_model},
         "seconds":seconds,"refinement_seconds":refinement_seconds,"clean_replay_seconds":replay_seconds,
         "noisy_dispatches":dispatches,"active_row_calls":active_calls,"rectangular_row_calls":dispatches.iter().map(|&n|n*c.batch_size).collect::<Vec<_>>(),
+        "coordination_work":coordination_samples,"noisy_dispatches_unit":"logical episode reads; use coordination_work for physical A/B execution",
         "warmups":warmups,"trials":trials,"prefill_seconds":prefill_seconds,"prefill_in_timed_episode":false,"clean_replay_in_timed_episode":true,
         "clean_replay_processed_positions_per_row":prefix_length+length,
         "prefill_processed_positions_per_row":prefix_length+1,"prefill_extra_position":"snapshot API dummy after the immutable prefix, never used as evidence",
@@ -917,6 +1089,8 @@ pub fn numerical_checks(c: &Config, device: &Device) -> Result<Value> {
     let mut check = c.clone();
     if check.sbd.is_none() {check.sbd=Some(Default::default());}
     check.sbd.as_mut().unwrap().refinement=Some(RefinementConfig::default());
+    // Preserve the standalone proofs, then exercise composition independently below.
+    check.sbd.as_mut().unwrap().cocommit=None;
     device.seed(check.seed);
     let model = LanguageModel::new(&check,arm,device)?.valid();
     let width = 4;
@@ -983,7 +1157,7 @@ pub fn numerical_checks(c: &Config, device: &Device) -> Result<Value> {
     let independent = intervention_pair(&eligible,1,&candidate_logs[..width*check.vocab()],&state.values[..width],check.vocab(),false,&mut independent_rng)?;
     ensure!(swap.0!=swap.1 && independent.0!=independent.1,"collection accepted duplicate branch sets");
     let targets = vec![1,2,3,0,4,5,0,0];
-    let actual_losses = endpoint_losses(&model,&check,&cache,&state,targets.clone(),device)?;
+    let (actual_losses,_) = endpoint_losses(&model,&check,&cache,&state,targets.clone(),&keys,check.seed,7,device)?;
     let endpoint = model.cached_blocks(&cache,&state.soft,false).detach();
     let reference_losses = if model.codpula.is_some() {
         let (circuit,_,_) = crate::sbd::prepare_circuit(&model,endpoint,&state.soft,check.soft_temperature)?;
@@ -1007,9 +1181,244 @@ pub fn numerical_checks(c: &Config, device: &Device) -> Result<Value> {
         .slice_positions(prefix.len()-1,1).logits)?;
     ensure!(actual_l1.iter().zip(expected_l1).all(|(a,b)|a.to_bits()==b.to_bits()),"L1 remasking bypass differs from causal prediction");
     let fixed_state = Episode::new(&check,vec![2],2,vec![Some(1),Some(2)],device)?;
-    let fixed_cache = prefix_cache(&model,&[prefix],device)?;
+    let fixed_cache = prefix_cache(&model,&[prefix.clone()],device)?;
     let fixed_result = episode(&model,&check,&fixed_cache,fixed_state,&[0],check.seed,None,true,device)?;
     ensure!(fixed_result.calls==0 && fixed_result.state.values==vec![1,2],"all-observed episode performed refinement");
+    let mut co_check = check.clone();
+    let co_options=co_check.sbd.as_mut().unwrap();
+    co_options.cocommit=Some(crate::config::CocommitConfig::default());
+    co_options.commitment=crate::config::SbdCommitment::Fixed;
+    co_options.commit_count=1;
+    co_options.entropy_threshold=None;
+    co_options.training_mode=crate::tct::TrainingMode::Sbd;
+    co_options.in_block_reads=delta_mixers::sbd::InBlockReads::HolaRead;
+    co_options.joint_output=crate::config::SbdJointOutput::CodpulaContextual;
+    co_check.tct=None;
+    co_check.validate()?;
+    let mut co_arm=arm.clone();
+    co_arm.cache="surprise".into();
+    let mut co_model=LanguageModel::new(&co_check,&co_arm,device)?.valid();
+    let states=crate::codpula::STATES;
+    let vocab=crate::codpula::VOCAB;
+    let emission=(0..states).flat_map(|state|(0..vocab)
+        .map(move |token|if token%states==state {4.0f32}else{0.0})).collect::<Vec<_>>();
+    let transition=(0..states).flat_map(|source|(0..states)
+        .map(move |destination|if source==destination {6.0f32}else{0.0})).collect::<Vec<_>>();
+    co_model.codpula.as_mut().context("contextual CoCommit fixture requires its joint head")?.probability=
+        crate::codpula::CircuitState::from_logs(
+            Tensor::from_data(TensorData::new(emission,[states,vocab]),device),
+            Tensor::from_data(TensorData::new(transition,[states,states]),device),
+            Tensor::zeros([states],device));
+    // Exercise communication, not the initialization's nearly closed HOLA gate.
+    // These changes condition only this numerical fixture; production parameters
+    // and the independent standalone checks above remain unchanged.
+    #[derive(Default)]
+    struct CommunicationParameters {path:Vec<String>,gates:Vec<u64>,outputs:Vec<u64>}
+    impl ModuleVisitor for CommunicationParameters {
+        fn enter_module(&mut self,name:&str,_:&str) {self.path.push(name.to_owned());}
+        fn exit_module(&mut self,_:&str,_:&str) {self.path.pop();}
+        fn visit_float<const D:usize>(&mut self,param:&Param<Tensor<D>>) {
+            let name=self.path.join(".");
+            if name=="cache.gate" || name.ends_with(".cache.gate") {self.gates.push(param.id.val());}
+            if name=="output.weight" || name.ends_with(".output.weight") {self.outputs.push(param.id.val());}
+        }
+    }
+    impl burn::module::ModuleMapper for CommunicationParameters {
+        fn map_float<const D:usize>(&mut self,param:Param<Tensor<D>>) -> Param<Tensor<D>> {
+            let value=param.val();
+            if self.gates.contains(&param.id.val()) {
+                Param::from_tensor(Tensor::full(value.dims(),4.0,&value.device()))
+            } else if self.outputs.contains(&param.id.val()) {
+                Param::from_tensor(value*4.0)
+            } else {param}
+        }
+    }
+    let tail_start=co_model.blocks.len()-co_check.sbd.as_ref().unwrap().cocommit.as_ref().unwrap().tail_layers;
+    for block in &mut co_model.blocks[tail_start..] {
+        let mut parameters=CommunicationParameters::default();
+        block.mixer.visit(&mut parameters);
+        ensure!(!parameters.gates.is_empty() && !parameters.outputs.is_empty(),
+            "CoCommit communication fixture requires an active HOLA gate and output projection");
+        block.mixer=block.mixer.clone().map(&mut parameters);
+    }
+    co_model.head.weight=Param::from_tensor(co_model.head.weight.val()*4.0);
+    let marker_shape=co_model.cocommit_marker.as_ref().unwrap().val().dims();
+    let marker_values=(0..marker_shape[0]).flat_map(|stream|(0..marker_shape[1])
+        .map(move |channel|(((channel*7+stream*11)%19) as f32-9.0)*(1.0+stream as f32)*0.75)).collect::<Vec<_>>();
+    co_model.cocommit_marker=Some(Param::from_tensor(Tensor::from_data(TensorData::new(marker_values,marker_shape),device)));
+    let co_cache=prefix_cache(&co_model,&[prefix.clone(),prefix.clone()],device)?;
+    let mut co_state=Episode::new(&co_check,vec![3,4],4,
+        vec![Some(1),Some(2),Some(3),None,Some(4),None,None,None],device)?;
+    let r_value=co_check.vocab()-1;
+    co_state.values[5]=r_value;
+    co_state.revealed[5]=true;
+    let co_input_state=co_state.clone();
+    let co_before=host(co_model.forward_output_profiled(&Batch::new(&[prefix_fixture(prefix.clone())],device),
+        &mut delta_mixers::profile::Unprofiled).logits)?;
+    let co_view=provisional_input(&co_state.soft,&co_state.values,&co_state.revealed,device)?;
+    let co_prefix=co_model.cached_blocks_prefix_profiled(&co_cache,&co_view,false,&mut delta_mixers::profile::Unprofiled);
+    let manual_a=co_model.cached_blocks_tail_profiled(&co_cache,co_prefix.clone(),None,&mut delta_mixers::profile::Unprofiled).detach();
+    let a_decision_logs=if co_model.codpula.is_some() {
+        let (circuit,_,_)=crate::sbd::prepare_circuit(&co_model,manual_a.clone(),&co_state.soft,co_check.soft_temperature)?;
+        let tokens=Tensor::<2,Int>::from_data(TensorData::new(co_state.values.iter().map(|&v|v as i32).collect::<Vec<_>>(),[2,4]),device);
+        let fixed=Tensor::<2,Bool>::from_data(TensorData::new(co_state.soft.observed.iter().zip(&co_state.revealed)
+            .map(|(o,&r)|o.is_some() || r).collect::<Vec<_>>(),[2,4]),device);
+        host(circuit.marginals(tokens,fixed)?.log())?
+    } else {host(log_softmax(manual_a.logits.clone()/co_check.soft_temperature,2))?};
+    let entropy=|position:usize| a_decision_logs[position*co_check.vocab()..(position+1)*co_check.vocab()]
+        .iter().filter(|log|log.is_finite()).map(|&log|-(log as f64).exp()*log as f64).sum::<f64>();
+    let marked_position=if entropy(6)<=entropy(7) {6}else{7};
+    let outside_position=if marked_position==6 {7}else{6};
+    let mut co_marks=vec![false;8];
+    co_marks[marked_position]=true;
+    let manual_b=co_model.cached_blocks_tail_profiled(&co_cache,co_prefix,
+        Some(Tensor::from_data(TensorData::new(co_marks.iter().map(|&mark|if mark {1.0f32}else{0.0}).collect::<Vec<_>>(),[2,4]),device)),
+        &mut delta_mixers::profile::Unprofiled).detach();
+    let co_prediction=predict(&co_model,&co_check,&co_cache,&mut co_state,&[91,92],co_check.seed,3,device)?;
+    let co_hidden=host(co_prediction.hidden.clone())?;
+    let a_hidden=host(manual_a.features.clone())?;
+    let b_hidden=host(manual_b.features.clone())?;
+    let d=co_check.d_model;
+    crate::sbd::compare(&co_hidden[..4*d],&a_hidden[..4*d].iter().map(|&value|value as f64).collect::<Vec<_>>())?;
+    crate::sbd::compare(&co_hidden[4*d..8*d],&b_hidden[4*d..8*d].iter().map(|&value|value as f64).collect::<Vec<_>>())?;
+    ensure!(co_state.values[5]==r_value && co_state.soft.observed==co_input_state.soft.observed,
+        "standard CoCommit changed O or carried R");
+    ensure!(co_prediction.work.b_tail_rows==2 && co_prediction.work.b_tail_used_rows==1
+        && co_prediction.work.b_tail_dispatches==1 && co_prediction.work.prefix_batches==1,
+        "mixed empty/nonempty announcement dispatch accounting differs");
+    ensure!(co_state.soft.observed[4]==Some(4) && co_state.revealed[5]
+        && !co_marks[4] && !co_marks[5] && co_marks.iter().filter(|&&mark|mark).count()==1,
+        "CoCommit O/R/announcement sets were not separated");
+    let paired_co_state=repeat_state(&co_check,&co_state,&[1,1],device)?;
+    let paired_co_uniforms=host(token_uniforms(&paired_co_state,&[99,99],co_check.seed,7,device))?;
+    ensure!(paired_co_uniforms[..8]==paired_co_uniforms[8..],
+        "paired CoCommit keys did not share indexed proposal draws");
+    let selected_b_manual=if co_model.codpula.is_some() {
+        let (circuit,tokens,fixed)=crate::sbd::prepare_circuit(&co_model,manual_b,&co_state.soft,co_check.soft_temperature)?;
+        let proposal_tokens=Tensor::<2,Int>::from_data(TensorData::new(co_input_state.values.iter().map(|&v|v as i32).collect::<Vec<_>>(),[2,4]),device);
+        let proposal_fixed=Tensor::<2,Bool>::from_data(TensorData::new(co_input_state.soft.observed.iter().zip(&co_input_state.revealed)
+            .map(|(o,&r)|o.is_some() || r).collect::<Vec<_>>(),[2,4]),device);
+        let proposal=circuit.sample_with_uniforms(proposal_tokens,proposal_fixed,token_uniforms(&co_input_state,&[91,92],co_check.seed,3,device))?;
+        ensure!(co_state.values[4..8]==proposal[1],"selected row did not use one coherent B joint proposal");
+        circuit.marginals(tokens,fixed)?.reshape([8,co_check.vocab()]).log()
+    } else {log_softmax(manual_b.logits/co_check.soft_temperature,2).reshape([8,co_check.vocab()])};
+    let selected_a_manual=if co_model.codpula.is_some() {
+        let (circuit,tokens,fixed)=crate::sbd::prepare_circuit(&co_model,manual_a,&co_state.soft,co_check.soft_temperature)?;
+        circuit.marginals(tokens,fixed)?.reshape([8,co_check.vocab()]).log()
+    } else {log_softmax(manual_a.logits/co_check.soft_temperature,2).reshape([8,co_check.vocab()])};
+    let predicted_logs=host(co_prediction.logs.clone())?;
+    let a_logs=host(selected_a_manual)?;
+    let b_logs=host(selected_b_manual)?;
+    let observable_difference=|position:usize| (position*co_check.vocab()..(position+1)*co_check.vocab()).any(|i| {
+        let a=a_logs[i].exp();
+        let b=b_logs[i].exp();
+        (a-b).abs()>2e-5+3e-4*b.abs()
+    });
+    ensure!(observable_difference(marked_position),"nonzero announcement marker did not observably change B distribution");
+    ensure!(observable_difference(outside_position),"fixture cannot reject per-token A/B splicing outside S");
+    crate::sbd::compare(&predicted_logs[..4*co_check.vocab()].iter().map(|value|value.exp()).collect::<Vec<_>>(),
+        &a_logs[..4*co_check.vocab()].iter().map(|&value|(value as f64).exp()).collect::<Vec<_>>())?;
+    crate::sbd::compare(&predicted_logs[4*co_check.vocab()..].iter().map(|value|value.exp()).collect::<Vec<_>>(),
+        &b_logs[4*co_check.vocab()..].iter().map(|&value|(value as f64).exp()).collect::<Vec<_>>())?;
+    let mut manual_selected_logs = a_logs[..4*co_check.vocab()].to_vec();
+    manual_selected_logs.extend_from_slice(&b_logs[4*co_check.vocab()..]);
+    let mut manual_selected_hidden = a_hidden[..4*d].to_vec();
+    manual_selected_hidden.extend_from_slice(&b_hidden[4*d..8*d]);
+    let manual_prediction = Prediction {
+        hidden:Tensor::from_data(TensorData::new(manual_selected_hidden,[2,4,d]),device),
+        logs:Tensor::from_data(TensorData::new(manual_selected_logs,[8,co_check.vocab()]),device),
+        input_visibility:co_view.visibility.clone(),input_revealed:co_state.revealed.clone(),
+        work:crate::cocommit::CoordinationWork::default(),
+    };
+    let actual_energy_features = host(features(&co_model,&co_check,&co_state,&co_prediction,&[1,1],&[0.5,0.5],device)?)?;
+    let manual_energy_features = host(features(&co_model,&co_check,&co_state,&manual_prediction,&[1,1],&[0.5,0.5],device)?)?;
+    crate::sbd::compare(&actual_energy_features,&manual_energy_features.iter().map(|&value|value as f64).collect::<Vec<_>>())?;
+    let candidate_ids_before_endpoint = crate::soft::ids_host(co_state.soft.candidates.ids.clone());
+    let endpoint_gold=vec![1,2,3,0,4,5,6,7];
+    let endpoint_gold_alternative=vec![1,2,3,0,4,8,9,10];
+    let endpoint_prefix=co_model.cached_blocks_prefix_profiled(&co_cache,&co_state.soft,false,&mut delta_mixers::profile::Unprofiled);
+    let endpoint_unmarked=co_model.cached_blocks_tail_profiled(&co_cache,endpoint_prefix.clone(),None,&mut delta_mixers::profile::Unprofiled).detach();
+    let endpoint_selection_logs=if co_model.codpula.is_some() {
+        let (circuit,tokens,observed)=crate::sbd::prepare_circuit(&co_model,endpoint_unmarked,&co_state.soft,co_check.soft_temperature)?;
+        host(circuit.marginals(tokens,observed)?.log())?
+    } else {host(log_softmax(endpoint_unmarked.logits/co_check.soft_temperature,2))?};
+    let endpoint_entropy=|position:usize| endpoint_selection_logs[position*co_check.vocab()..(position+1)*co_check.vocab()]
+        .iter().filter(|log|log.is_finite()).map(|&log|-(log as f64).exp()*log as f64).sum::<f64>();
+    let endpoint_mark=(5..8).min_by(|&a,&b|endpoint_entropy(a).total_cmp(&endpoint_entropy(b)).then(a.cmp(&b))).unwrap();
+    let mut endpoint_marks=vec![0.0f32;8];
+    endpoint_marks[endpoint_mark]=1.0;
+    let endpoint_marked=co_model.cached_blocks_tail_profiled(&co_cache,endpoint_prefix,
+        Some(Tensor::from_data(TensorData::new(endpoint_marks,[2,4]),device)),&mut delta_mixers::profile::Unprofiled).detach();
+    let manual_endpoint_losses=if co_model.codpula.is_some() {
+        let (circuit,_,observed)=crate::sbd::prepare_circuit(&co_model,endpoint_marked,&co_state.soft,co_check.soft_temperature)?;
+        let targets=Tensor::<2,Int>::from_data(TensorData::new(endpoint_gold.clone(),[2,4]),device);
+        let full=Tensor::<2,Bool>::from_data(TensorData::new(co_state.soft.active.clone(),[2,4]),device);
+        host((circuit.log_partition(targets.clone(),observed)?-circuit.log_partition(targets,full)?)
+            /Tensor::<1>::from_data(TensorData::new(vec![1.0f32,3.0],[2]),device))?
+    } else {
+        let logs=host(log_softmax(endpoint_marked.logits/co_check.soft_temperature,2))?;
+        vec![0.0,-(5..8).map(|i|logs[i*co_check.vocab()+endpoint_gold[i] as usize]).sum::<f32>()/3.0]
+    };
+    let (endpoint_a,endpoint_work_a)=endpoint_losses(&co_model,&co_check,&co_cache,&co_state,endpoint_gold,&[91,92],co_check.seed,8,device)?;
+    let (endpoint_b,endpoint_work_b)=endpoint_losses(&co_model,&co_check,&co_cache,&co_state,endpoint_gold_alternative,&[91,92],co_check.seed,8,device)?;
+    crate::sbd::compare(&endpoint_a,&manual_endpoint_losses.iter().map(|&loss|loss as f64).collect::<Vec<_>>())?;
+    ensure!(endpoint_work_a.b_tail_used_rows==1 && endpoint_work_a.b_tail_rows==2
+        && endpoint_work_a.ffbs_passes==endpoint_work_b.ffbs_passes,
+        "endpoint gold values changed coordination work or batch membership");
+    ensure!(endpoint_a.iter().chain(&endpoint_b).all(|value|value.is_finite())
+        && crate::soft::ids_host(co_state.soft.candidates.ids.clone())==candidate_ids_before_endpoint,
+        "endpoint gold scoring entered retained-soft inputs or mutated candidates");
+    let mut correction_check=co_check.clone();
+    correction_check.sbd.as_mut().unwrap().training_mode=crate::tct::TrainingMode::Tct;
+    let mut correction_state=Episode::new(&correction_check,vec![3,4],4,
+        vec![Some(1),Some(2),Some(3),None,Some(4),None,Some(5),Some(6)],device)?;
+    correction_state.values[5]=r_value;
+    correction_state.revealed[5]=true;
+    let correction_before=correction_state.clone();
+    let correction_view=provisional_input(&correction_state.soft,&correction_state.values,&correction_state.revealed,device)?;
+    let correction_prefix=co_model.cached_blocks_prefix_profiled(&co_cache,&correction_view,false,&mut delta_mixers::profile::Unprofiled);
+    let mut correction_marks=vec![0.0f32;8];
+    correction_marks[5]=1.0; // The only free slot is R: correction must announce it.
+    let correction_b=co_model.cached_blocks_tail_profiled(&co_cache,correction_prefix,
+        Some(Tensor::from_data(TensorData::new(correction_marks,[2,4]),device)),&mut delta_mixers::profile::Unprofiled).detach();
+    let correction_prediction=predict(&co_model,&correction_check,&co_cache,&mut correction_state,&[101,102],co_check.seed,11,device)?;
+    if co_model.codpula.is_some() {
+        let (circuit,tokens,observed)=crate::sbd::prepare_circuit(&co_model,correction_b,&correction_before.soft,co_check.soft_temperature)?;
+        let proposal=circuit.sample_with_uniforms(tokens,observed,
+            token_uniforms(&correction_before,&[101,102],co_check.seed,11,device))?;
+        ensure!(correction_state.values[4..8]==proposal[1],
+            "correction CoCommit used R as evidence or spliced A/B proposals");
+    } else {
+        let best=crate::soft::ids_host(correction_b.logits.reshape([8,co_check.vocab()]).argmax(1));
+        ensure!(correction_state.values[5]==best[5] as usize,
+            "factorized correction did not revise R from B");
+    }
+    ensure!(correction_prediction.work.b_tail_used_rows==1
+        && correction_state.soft.observed==correction_before.soft.observed,
+        "correction announcement omitted R or changed permanent O");
+    let all_observed = Episode::new(&co_check,vec![3,3],4,
+        vec![Some(1),Some(2),Some(3),None,Some(4),Some(5),Some(6),None],device)?;
+    let all_observed_prediction = predict(&co_model,&co_check,&co_cache,&mut all_observed.clone(),&[93,94],co_check.seed,5,device)?;
+    ensure!(all_observed_prediction.work.b_tail_dispatches==0
+        && all_observed_prediction.work.paired_tail_dispatches==0,
+        "all-empty CoCommit announcement performed marked B work");
+    ensure!(host(co_model.forward_output_profiled(&Batch::new(&[prefix_fixture(prefix.clone())],device),
+        &mut delta_mixers::profile::Unprofiled).logits)?==co_before,
+        "CoCommit prediction or endpoint scoring mutated the clean prefix");
+    let coordinated_report=json!({"coherent_B_vs_manual":true,"O_R_S_separated":true,
+        "mixed_empty_nonempty_dispatch_rows":co_prediction.work.b_tail_rows,
+        "mixed_empty_nonempty_used_rows":co_prediction.work.b_tail_used_rows,
+        "empty_S_skipped_B":true,"endpoint_retained_soft_gold_only":true,"prefix_immutable":true,
+        "o_only_B_energy_marginals":true,
+        "nonzero_channel_stream_marker":true,"observable_B_difference_on_S_and_outside_S":true,
+        "communication_fixture":{"in_block_reads":"hola_read","cache":"surprise","tail_cache_gate_logit":4.0,
+            "tail_output_projection_scale":4.0,"head_projection_scale":4.0},
+        "joint_fixture":{"selector":"codpula_contextual","vocab":vocab,"states":states,
+            "diagonal_transition_logit":6.0,"matching_emission_logit":4.0,"other_logits":0.0,
+            "normalized_strictly_positive_rows":true,"root":"uniform"},
+        "proper_subset_announcement_size":1,"correction_announces_and_resamples_R":true,
+        "endpoint_manual_retained_soft_NLL":true,
+        "proposal_R_carried":true,"common_indexed_keys":true});
     let mut schedule_cases = Vec::new();
     for n in 1..=16 {
         let counts=(0..n).rev().map(|level|n-((n-level)*n)/n).collect::<Vec<_>>();
@@ -1017,6 +1426,7 @@ pub fn numerical_checks(c: &Config, device: &Device) -> Result<Value> {
         schedule_cases.push(json!({"eligible":n,"r":counts,"maximum_calls":n*CALLS_PER_LEVEL}));
     }
     Ok(json!({"first_call_features":first_report,"previous_call_features":second_report,"endpoint_conditional_nll":endpoint_report,
+        "coordination":coordinated_report,
         "feature_definition":FEATURE_VERSION,"feature_width":2*check.d_model+12,"immutable_O":true,"immutable_prefix":true,
         "candidates_retained":true,"right_padding_ignored":true,"invalid_sets_rejected":true,"paired_indexed_uniforms":true,
         "independent_row_rng":true,"weighted_swap_and_independent_distinct":true,"l1_exact_causal_bypass":true,

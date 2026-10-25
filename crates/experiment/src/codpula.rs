@@ -453,6 +453,17 @@ impl PreparedCircuit {
         prepared.contextual_log_root = Some(log_softmax(prepared.log_root.clone().reshape([1, states]) + root_gates, 1));
         Ok(prepared)
     }
+    /// Freeze query-only branches without copying tensors or retaining decision graphs.
+    pub fn detached(mut self) -> Self {
+        self.log_emission = self.log_emission.detach();
+        self.log_transition = self.log_transition.detach();
+        self.log_root = self.log_root.detach();
+        self.contextual_log_root = self.contextual_log_root.map(|root| root.detach());
+        self.logits = self.logits.detach();
+        self.leaf_normalizers = self.leaf_normalizers.detach();
+        self.valid = self.valid.detach();
+        self
+    }
     /// Actual roots used by every evidence query and unconditional traversal.
     pub fn root_rows(&self) -> Tensor<2> {
         self.contextual_log_root.clone().unwrap_or_else(|| {
@@ -634,19 +645,23 @@ impl PreparedCircuit {
         #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
         { anyhow::bail!("fused circuit execution requires a GPU feature") }
     }
-    /// Conditional block losses sum and use the caller's existing clean-target denominator.
-    pub fn conditional_nll(&self, clean: Tensor<2, Int>, observed: Tensor<2, Bool>, denominator: f64) -> Result<CircuitLoss> {
+    /// Joint event loss for target positions conditioned on the existing observations.
+    /// Target positions not selected by this mask remain marginalized.
+    pub fn event_nll(&self, clean: Tensor<2, Int>, observed: Tensor<2, Bool>, targets: Tensor<2, Bool>, denominator: f64) -> Result<CircuitLoss> {
         ensure!(denominator.is_finite() && denominator > 0.0, "invalid joint loss denominator");
         let (rows, width, states, vocab) = self.shape();
-        ensure!(observed.dims() == [rows, width], "invalid observed mask shape");
-        let plus = self.statistics(clean.clone(), self.valid.clone().greater_elem(0.0))?;
+        ensure!(observed.dims() == [rows, width] && targets.dims() == [rows, width], "invalid event mask shape");
+        let valid = self.valid.clone().greater_elem(0.0);
+        let observed = observed.bool_and(valid.clone());
+        let targets = targets.bool_and(valid.clone());
+        ensure!(!observed.clone().bool_and(targets.clone()).any().into_scalar::<bool>(), "event targets overlap observations");
+        let numerator_fixed = observed.clone().bool_or(targets.clone());
+        let plus = self.statistics(clean.clone(), numerator_fixed.clone())?;
         let minus = self.statistics(clean.clone(), observed.clone())?;
-        let active = observed.clone().bool_not().bool_and(self.valid.clone().greater_elem(0.0))
-            .float().sum_dim(1).greater_elem(0.0).float().reshape([rows]);
+        let active = targets.float().sum_dim(1).greater_elem(0.0).float().reshape([rows]);
         let active_blocks = active.clone().sum().into_scalar::<f32>() as usize;
         let loss = (minus.log_z.clone() - plus.log_z.clone()).mask_fill(active.clone().equal_elem(0.0), 0.0).sum() / denominator;
         let clean_ids = clean.mask_fill(self.valid.clone().equal_elem(0.0), 0);
-        let observed = observed.bool_and(self.valid.clone().greater_elem(0.0));
         let gamma_plus = plus.state.detach();
         let gamma_minus = minus.state.detach();
         let a = self.log_transition.clone().detach().exp();
@@ -658,9 +673,13 @@ impl PreparedCircuit {
                 let gp = gamma_plus.clone().narrow(1, i, 1).reshape([rows, states, 1]);
                 let gm = gamma_minus.clone().narrow(1, i, 1).reshape([rows, states, 1]);
                 let leaf = self.leaf(i).detach();
-                let point = Tensor::<2>::zeros([rows, vocab], &self.logits.device()).scatter(1, clean_ids.clone().narrow(1, i, 1), Tensor::ones([rows, 1], &self.logits.device()), burn::tensor::IndexingUpdateOp::Add).reshape([rows, 1, vocab]);
-                let minus_leaf = leaf.clone().mask_where(observed.clone().narrow(1, i, 1).reshape([rows, 1, 1]).expand([rows, states, vocab]), point.clone().expand([rows, states, vocab]));
-                positive = positive + ((gp.clone() * point + gm.clone() * leaf.clone()) * active_emission.clone()).sum_dim(0).reshape([states, vocab]);
+                let point = Tensor::<2>::zeros([rows, vocab], &self.logits.device())
+                    .scatter(1, clean_ids.clone().narrow(1, i, 1), Tensor::ones([rows, 1], &self.logits.device()), burn::tensor::IndexingUpdateOp::Add)
+                    .reshape([rows, 1, vocab]);
+                let fixed_point = point.clone().expand([rows, states, vocab]);
+                let plus_leaf = leaf.clone().mask_where(numerator_fixed.clone().narrow(1, i, 1).reshape([rows, 1, 1]).expand([rows, states, vocab]), fixed_point.clone());
+                let minus_leaf = leaf.clone().mask_where(observed.clone().narrow(1, i, 1).reshape([rows, 1, 1]).expand([rows, states, vocab]), fixed_point);
+                positive = positive + ((gp.clone() * plus_leaf + gm.clone() * leaf.clone()) * active_emission.clone()).sum_dim(0).reshape([states, vocab]);
                 negative = negative + ((gm * minus_leaf + gp * leaf) * active_emission.clone()).sum_dim(0).reshape([states, vocab]);
             }
             (positive, negative)
@@ -672,8 +691,8 @@ impl PreparedCircuit {
                     gamma * active.clone().reshape([rows, 1, 1]), clean_ids.clone().float(), fixed, self.valid.clone(),
                 );
                 let unresolved = Tensor::zeros([rows, width], &self.logits.device());
-                (counts(gamma_plus.clone(), self.valid.clone()) + counts(gamma_minus.clone(), unresolved.clone()),
-                 counts(gamma_minus.clone(), observed.clone().float()) + counts(gamma_plus.clone(), unresolved))
+                (counts(gamma_plus.clone(), numerator_fixed.float()) + counts(gamma_minus.clone(), unresolved.clone()),
+                 counts(gamma_minus.clone(), observed.float()) + counts(gamma_plus.clone(), unresolved))
             }
             #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
             { anyhow::bail!("fused circuit execution requires a GPU feature") }
@@ -700,6 +719,11 @@ impl PreparedCircuit {
             root_reach: Tensor::from_data([active_blocks as f32], &self.logits.device()), active_blocks,
         };
         Ok(CircuitLoss { loss, flows })
+    }
+    /// Conditional block loss targets every valid position not already observed.
+    pub fn conditional_nll(&self, clean: Tensor<2, Int>, observed: Tensor<2, Bool>, denominator: f64) -> Result<CircuitLoss> {
+        let targets = self.valid.clone().greater_elem(0.0).bool_and(observed.clone().bool_not());
+        self.event_nll(clean, observed, targets, denominator)
     }
     /// Forward-filter/backward-sampling draws a joint latent path before emissions.
     pub fn sample(&self, values: Tensor<2, Int>, fixed: Tensor<2, Bool>, seed: u64) -> Result<Vec<Vec<usize>>> {

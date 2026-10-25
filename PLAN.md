@@ -1,6 +1,6 @@
 # Architecture implementation and optimization plan
 
-Status: Steps 1–7 implemented and exercised on CPU and local Intel Vulkan; Step 8 is partially implemented, with sparse/within-block attention undecided pending explicit user selection. The added dense active-block attention has been removed; HOLA's pre-existing attention is unchanged. Measured results and checkpoint-load correction are in [RESULTS.md](RESULTS.md). Prior Step-8 checks and short training smokes describe the historical dense-attention implementation, not the current architecture or a quality/speedup conclusion. Steps 9–12 are not implemented.
+Status: Steps 1–11 have separate implemented/correctness-gated profiles on CPU and local Intel Vulkan; their contextual/coordination/refinement composition is the isolated integration in §9, not yet a main cutover. Current Step8 uses the explicitly selected HOLA in-block read and optional prefix retrieval; earlier removed dense-attention measurements remain historical only. The Step7 quality ablation is cancelled, not pending. Step12 has not started and is not authorized by this integration. Measured results are in [RESULTS.md](RESULTS.md).
 
 **Scope override — explicit user instruction:** implement and optimize the given architecture. Its components are requirements, not candidates that must win architecture-selection experiments. Correctness checks and focused runtime/memory measurements may verify an implementation optimization. Do not launch quality ablations, architecture comparisons, candidate sweeps, alternative-mechanism studies or research training runs unless the user explicitly requests them. This overrides experimental comparisons, sweeps and quality-adoption gates elsewhere in this document; those passages are historical proposals, not executable tasks. Steps 9–12 are implementation/optimization work only where they implement the specified architecture, not authorization to add alternatives.
 
@@ -122,7 +122,7 @@ First implement factorized output + CoCommit as its own comparison:
 3. Add a learned marker at those positions to the saved pre-tail states.
 4. Run the shared tail again, then write from the coordinated logits.
 
-Start with one coordination round and one tail layer on the tiny model. Train the marked branch as well as the unmarked selection branch. Compare against an extra unmarked tail pass at matched cost to separate marker benefit from extra depth. Do not feed the first tail's output into the second and call it the paper's one-round mechanism.
+Start with one coordination round and one tail layer on the tiny model. Train the marked branch as well as the unmarked selection branch. The current authorization uses a saved-input zero-marker repeat only as a correctness equivalence gate; no trained sequential-depth comparison arm or quality study is authorized. Do not feed the first tail's output into the second and call it the paper's one-round mechanism.
 
 CoCommit's evaluated coordination is for masked commit bundles under greedy decoding. It is not an exact joint distribution, an exact joint MAP solver, or a guarantee under independent temperature sampling. Marking already-visible tokens is a proposed extension, not an evaluated paper result.
 
@@ -163,7 +163,7 @@ R²D's convergence results do not transfer automatically to state-dependent mask
 
 ## 7. Step-by-step execution checklist
 
-Steps 1–7 are implemented and exercised as small pilots. Numerical, soft-feedback, build and checkpoint-continuation checks passed; three-seed recall and tiny-LM experiments were run and independently reevaluated from validated checkpoints. Recall remains near guessing, so its historical architecture-selection gate is not met and no retrieval winner is asserted. Tiny-LM learning is demonstrated at a deliberately short budget, not at production scale. Step 7 added causal oHC, wavelet and three Lngram injections with verified gradients and optimized kernels; quality benefit remains unestablished, and the cancelled quality ablation must not be resumed. Step 8 retains clean causal plus masked-block training, soft feedback, frozen prefix reads and clean replay, but is partial: the added dense active-block attention is removed and sparse/within-block attention awaits explicit user selection. Its prior visibility checks and fixed/variable-length training smokes are historical evidence for the removed dense-attention implementation, not verification of the current architecture. Steps 9–12 remain pending. The scope override above remains in force. See [RESULTS.md](RESULTS.md) and [docs/sbd.md](docs/sbd.md).
+Historical earlier pilot stage: Steps1–7 numerical, soft-feedback, build and checkpoint-continuation checks passed; three-seed recall/tiny-LM experiments were independently reevaluated from validated checkpoints. Recall stayed near guessing and tiny-LM learning used a deliberately short budget, so neither establishes a quality winner. The Step7 quality ablation is cancelled and must not resume. The earlier partial-Step8/dense-attention status is superseded by the explicitly selected HOLA in-block read, optional prefix retrieval and separate Step9–11 implementations documented below. Removed dense-attention visibility/training results remain historical only. Current combined acceptance is §9; Step12 is not started or authorized. The scope override remains in force. See [RESULTS.md](RESULTS.md) and [docs/sbd.md](docs/sbd.md).
 
 ### Step 1 — Create the small active Burn workspace
 
@@ -279,15 +279,23 @@ Partially implemented: clean/masked objectives, soft feedback, frozen prefix rea
 
 ### Step 10 — Add CoCommit, then test the combination
 
+**Implementation, numerical gates and execution-cost measurement complete (2026-10-25).** The authorized scope is correctness, off/on cost accounting, equivalent layouts and a tiny execution smoke, not a quality study.
+
+- One complete final block, one round, full saved oHC streams and independent marker entries are integrated with hard/soft feedback, factorized/Codpula output, reconstruction, batching, evaluation and generation. Marked potentials/gates create a new circuit; no temporary tail writes persistent state.
+- Independent f64 marker/temporary-Kron and circuit-event references, CPU/Vulkan logits/loss/every-gradient, padding/leakage, real prefix219 tail MoBA, and historical/enabled production checkpoint gates pass unchanged `2e-5 + 3e-4*abs(ref)`. Enabled restart includes clipping/AdamW/marker moments and one circuit update.
+- B1/T512 medians off/separate/doubled1286.855/1408.335/1393.231ms. Selected separate overhead116.839ms[89.963,121.664]; doubled saving24.124ms[-23.326,49.555] is not established for the complete step.
+- Position-only membership reuses existing fused selection and passes90 exact oracle/old-read cases; isolated paired saving98.227ms[91.325,104.213]. Frozen teachers avoid unused autodiff graphs. Explicit `sbd.rows_per_pass:4` preserves all B8/T512 work/RNG/bundles with two backward groups and one optimizer/circuit update; full/chunk all-gradient/all-flow gates pass. Selected B8 diagnostic6893.824ms,49928 launches,3,951,724,736 sampled pool bytes; original OOMs retained.
+- `docs/cocommit.md` records all adopted decisions and the evidence-selected layout override. Remasking/TCT combined dispatch and provisional-evidence semantics are owned by parent integration, using the independent saved-prefix/tail/output API.
+
 - Implement the unmarked selection tail and marked assignment tail starting from the same saved pre-tail hidden states.
 - Train the marked branch; start with one tail layer and one coordination round on the tiny model.
-- Compare CoCommit alone with factorized output and an extra unmarked tail pass at matched cost.
-- Compare Codpula alone before combining it with CoCommit. In the combined path, regenerate circuit potentials/gates and dependence scores after marked coordination.
+- Check saved-h zero-marker equivalence; measure CoCommit off/on step cost and equivalent tail execution layouts only. No trained comparison arm, quality study, sweep or ablation is authorized.
+- In the combined path, regenerate circuit potentials/gates and dependence scores after marked coordination. Separate-versus-combined quality comparisons require a future explicit authorization.
 - Reset temporary recurrent-tail state from the same clean-prefix snapshot for each branch. No coordination pass commits persistent state.
 
-**Deliverable:** separate and combined results for circuit dependence modeling and hidden-state coordination.
+**Deliverable:** implemented separate/combined paths, numerical and checkpoint gates, paired execution-cost evidence and a tiny execution smoke; no quality conclusion.
 
-**Gate:** any combined gain exceeds the extra partial-pass/circuit cost. Keep greedy joint-mode coordination distinct from stochastic joint sampling.
+**Gate:** outputs, losses, full gradients, visibility and checkpoint continuation satisfy the fixed tolerances; measure complete-step cost before selecting a tail layout. Keep greedy coordination distinct from the combined stochastic joint sampler. A quality-versus-cost study is deferred, not inferred from the smoke.
 
 ### Step 11 — Implement the user's energy-guided stochastic remasking
 
@@ -303,17 +311,13 @@ Implemented2026-10-25; exact design, director decisions and evidence: [docs/rema
 
 **Deliverable/gate, as explicitly decided:** implemented commands/configs, numerical and exact-law gates, tiny context32 smokes for generation/collection/fitting/guided generation/TCT, execution measurements and documentation. No quality study, ablation, sweep, calibration grid or quality/cost curves were authorized or run.
 
-### Step 12 — Scale only supported choices and test remaining mechanisms
+### Step 12 — Not started; outside this integration
 
-- Increase context, model width/depth, block length and memory/circuit capacities one axis at a time.
-- Test learned/adaptive block boundaries against the measured variable-length baseline; account for selector training and inference cost.
-- If the leading mixers have complementary failures, test layer-interleaved GDN-2/KronLSTM. Do not assume mixing them is better.
-- Test preconditioning/exact-flow parameterizations, GSA-2, independent erase addresses or another sparse mechanism only against an identified failure/cost.
-- Arrange a Spark GPU window before CUDA runs; do not interfere with predecessor production training.
-
-**Deliverable:** a measured scaled configuration, plus rejected alternatives and reasons.
-
-**Gate:** gains persist at realistic sequence lengths and batch sizes without exceeding memory/build limits. No full factorial sweep and no large run before the local pilot answers the cheaper questions.
+No scaling study, adaptive boundaries, mixer alternatives, new parameterization
+or sparse mechanism is authorized here. Earlier Step12 experimental proposals
+are not pending execution tasks. Any such work requires a separate explicit
+user request; the current deliverable composes the given architecture through
+Step11 with correctness and execution-cost checks only.
 
 ## 8. Measurement and correctness requirements
 

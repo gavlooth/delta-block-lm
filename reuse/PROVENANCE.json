@@ -115,5 +115,38 @@
       "lines": ["33-79", "103-132"],
       "reason": "Relation argmax and posterior calibration would replace approved exact joint sampling and pre-potential temperature; all-zero posterior handling also lacks an explicit validity check"
     }
+  ],
+  "within_repository_integrations": [
+    {
+      "integrated_on": "2026-10-25",
+      "component": "Contextual Codpula, CoCommit and stochastic refinement/TCT",
+      "source_commits": [
+        {"commit": "a0c173c5", "used": "Explicit contextual root, ordered summary, approved initialization and independent circuit references"},
+        {"commit": "3c20ffc2", "used": "Saved-prefix A/B tails, marked event loss, position-only HOLA schedules, no-grad teacher and exact SBD row accumulation"},
+        {"commit": "b9e589b5", "used": "Stochastic mask-set laws, real outcome-ranked fitting, provisional refinement and persistent-chain TCT"},
+        {"commit": "093d0085", "used": "Docs-only independent precision diagnosis and preserved negative stress evidence, not a production correction"},
+        {"commit": "64590d18", "used": "Deterministic native clipping prerequisite without optimizer formula/state changes"},
+        {"commit": "e50cc523", "used": "Independent deterministic Tensor Lngram duplicate-index gradient accumulation prerequisite"}
+      ],
+      "destinations": [
+        "crates/experiment/src/cocommit.rs",
+        "crates/experiment/src/remask.rs",
+        "crates/experiment/src/tct.rs",
+        "crates/experiment/src/codpula_reference.rs",
+        "crates/experiment/src/cocommit_checks.rs",
+        "crates/experiment/src/config.rs"
+      ],
+      "changes": [
+        "Compose the existing batched saved-prefix/A/B primitives without absorbing writes or per-row neural/circuit graphs",
+        "Keep permanent O, provisional R and temporary announcements S distinct; use one coherent B distribution, or A for empty-S rows",
+        "Score retained-soft paired endpoints through the coordinated model; gold enters only the conditional-NLL scorer",
+        "Combine all-free TCT A correction and B marked-subset event statistics before one optimizer/circuit update",
+        "Retain full-batch RNG/normalization and separate SBD versus persistent-chain TCT row accumulators",
+        "Use an explicit combination-specific identity revision while preserving historical standalone/omitted selectors"
+      ],
+      "external_code_copied": false,
+      "scope": "Composition of the given architecture only; no new mechanism, quality study, ablation, sweep or resumed Step7 quality experiment",
+      "evidence": "artifacts/integrated11/"
+    }
   ]
 }

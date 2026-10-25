@@ -66,12 +66,13 @@ pub fn noisy_hola_read(
 
 /// Differentiable clean tensors prepared once per layer/sequence. Snapshot work
 /// scans disjoint segments with carried state, never all prefixes per block.
+#[derive(Clone)]
 pub struct MixerCache {
     raw: [Tensor<3>;3],
     cache_k: Tensor<4>,
     cache_v: Tensor<4>,
     prefix_summaries: Option<Tensor<4>>,
-    positions: Vec<Tensor<3>>,
+    schedule: Option<Tensor<4>>,
     states: Vec<Tensor<4>>,
     starts: Vec<usize>,
 }
@@ -87,11 +88,13 @@ fn convolve(m: &Mixer, raw: Tensor<3>, weight: Tensor<2>) -> Tensor<4> {
 }
 
 /// Clean histories and recurrence snapshots with the noisy block as batch axis.
+#[derive(Clone)]
 pub struct BatchedMixerCache {
     raw: [Tensor<3>;3],
     state: Tensor<4>,
     reads: Option<BatchedReadCache>,
 }
+#[derive(Clone)]
 struct BatchedReadCache {
     keys: Tensor<4>,
     values: Tensor<4>,
@@ -134,7 +137,7 @@ impl Mixer {
         let rq = convolve(self,raw[0].clone(),self.q_conv.val());
         let rk = convolve(self,raw[1].clone(),self.k_conv.val());
         let rv = convolve(self,raw[2].clone(),self.v_conv.val());
-        let q = self.normalization_backend.l2(rq.clone());
+        let q = self.normalization_backend.l2(rq);
         let k = self.normalization_backend.l2(rk.clone());
         let v = if self.kind == MixerKind::KronLstm {self.normalization_backend.l2(rv.clone())} else {rv.clone()};
         let alpha = self.normalization_backend.decay(self.decay.forward(input.clone()).reshape([b,t,self.heads,self.key_dim]),self.decay_bias.val(),self.decay_scale.val());
@@ -159,14 +162,12 @@ impl Mixer {
             if states.len() < starts.len() { states.push(current.clone()); }
         }
         let scores = Tensor::cat(scores,1);
-        let mut positions = Vec::new();
+        let mut schedule = None;
         let cache_k = if let Some(cache) = &self.cache {
-            let cq = hola::normalize(self.hola_backend,self.normalization_backend,&cache.q_norm,rq);
             let ck = hola::normalize(self.hola_backend,self.normalization_backend,&cache.k_norm,rk);
-            let (_, selections) = hola::read_with_selection(cq,ck.clone(),rv.clone(),scores,
+            schedule = Some(hola::schedule_selected(self.hola_backend,scores,
                 Tensor::ones([b,t],&device),Tensor::ones([b,t],&device),
-                self.cache_capacity,self.chunk_size,self.cache_policy,cache.sink.val(),None);
-            positions = selections.into_iter().map(|s| s.positions).collect();
+                self.cache_capacity,self.chunk_size,self.cache_policy));
             ck
         } else { rk };
         let prefix_summaries = self.prefix_retrieval.and_then(|config| {
@@ -177,7 +178,7 @@ impl Mixer {
             #[cfg(not(any(feature="vulkan",feature="cuda")))]
             {panic!("fused prefix retrieval requires a GPU feature; no CPU fallback")}
         });
-        MixerCache {raw,cache_k,cache_v:rv,prefix_summaries,positions,states,starts:starts.to_vec()}
+        MixerCache {raw,cache_k,cache_v:rv,prefix_summaries,schedule,states,starts:starts.to_vec()}
     }
     pub fn prepare_sbd_batched(&self, input: Tensor<3>, blocks: &[(usize,usize)]) -> BatchedMixerCache {
         let [rows,time,_] = input.dims();
@@ -196,13 +197,15 @@ impl Mixer {
         let state = Tensor::cat(clean.states,0).select(0,state_ids);
         let reads = self.cache.as_ref().map(|_| {
             let row_ids = block_rows(blocks,&device);
-            let mut snapshots = Vec::with_capacity(clean.positions.len()+1);
-            snapshots.push(Tensor::full([rows,self.heads,self.cache_capacity],-1.0,&device));
-            snapshots.extend(clean.positions);
+            let schedule = clean.schedule.expect("HOLA cache requires a membership schedule");
+            let snapshots = schedule.dims()[2];
             let snapshot_ids = Tensor::<1,Int>::from_data(burn::tensor::TensorData::new(
                 blocks.iter().map(|&(row,start)| (start/self.chunk_size*rows+row) as i64)
                     .collect::<Vec<_>>(),[b]),&device);
-            let positions = Tensor::cat(snapshots,0).select(0,snapshot_ids);
+            // Snapshot-major rows preserve mixed block starts without gathering KV
+            // until the selected original positions are known.
+            let positions = schedule.permute([2,0,1,3])
+                .reshape([snapshots*rows,self.heads,self.cache_capacity]).select(0,snapshot_ids);
             let starts = block_starts(blocks,&device);
             let max_start = blocks.iter().map(|&(_,start)| start).max().unwrap();
             let own = self.prefix_retrieval.map_or(0,|config| blocks.iter()
@@ -348,9 +351,11 @@ impl Mixer {
                     rv,
                 ));
                 let cut = start/self.chunk_size*self.chunk_size;
+                let boundary = start/self.chunk_size;
+                let positions = clean.schedule.as_ref().expect("HOLA cache requires a membership schedule")
+                    .clone().slice([0..b,0..self.heads,boundary..boundary+1,0..self.cache_capacity])
+                    .reshape([b,self.heads,self.cache_capacity]);
                 let exact = if let Some(config) = self.prefix_retrieval {
-                    let positions = if cut > 0 { clean.positions[cut/self.chunk_size-1].clone() }
-                        else { Tensor::full([b,self.heads,self.cache_capacity],-1.0,&device) };
                     let t = clean.cache_k.dims()[1];
                     crate::prefix_retrieval::noisy_read(query,clean.cache_k.clone(),clean.cache_v.clone(),
                         Tensor::ones([b,t],&device),Tensor::ones([b,t],&device),
@@ -361,7 +366,6 @@ impl Mixer {
                     let mut vals = Vec::new();
                     let mut visible = Vec::new();
                     if cut > 0 {
-                        let positions = clean.positions[cut/self.chunk_size-1].clone();
                         let ids = positions.clone().clamp_min(0.0).int();
                         keys.push(clean.cache_k.clone().swap_dims(1,2).gather(2,ids.clone().unsqueeze_dim::<4>(3).expand([b,self.heads,self.cache_capacity,self.key_dim])));
                         vals.push(clean.cache_v.clone().swap_dims(1,2).gather(2,ids.unsqueeze_dim::<4>(3).expand([b,self.heads,self.cache_capacity,self.value_dim])));
@@ -388,9 +392,63 @@ impl Mixer {
         self.project_output(mixed.reshape([b,n,self.heads*self.value_dim]))*valid.unsqueeze_dim::<3>(2)
     }
 }
+impl MixerCache {
+    pub fn detached(&self)->Self {
+        Self {raw:self.raw.each_ref().map(|x|x.clone().detach()),
+            cache_k:self.cache_k.clone().detach(),cache_v:self.cache_v.clone().detach(),
+            prefix_summaries:self.prefix_summaries.as_ref().map(|x|x.clone().detach()),
+            schedule:self.schedule.clone(),states:self.states.iter().map(|x|x.clone().detach()).collect(),starts:self.starts.clone()}
+    }
+}
+impl BatchedMixerCache {
+    pub fn detached(&self)->Self {
+        Self {raw:self.raw.each_ref().map(|x|x.clone().detach()),state:self.state.clone().detach(),
+            reads:self.reads.as_ref().map(|x|BatchedReadCache{
+                keys:x.keys.clone().detach(),values:x.values.clone().detach(),positions:x.positions.clone(),
+                visible:x.visible.clone(),summaries:x.summaries.as_ref().map(|x|x.clone().detach()),
+                starts:x.starts.clone(),max_start:x.max_start,own:x.own,
+            })}
+    }
+    pub fn duplicate_rows(&self) -> Self {
+        let duplicate = |x: &Tensor<4>| Tensor::cat(vec![x.clone(),x.clone()],0);
+        let reads = self.reads.as_ref().map(|reads| BatchedReadCache {
+            keys: duplicate(&reads.keys),
+            values: duplicate(&reads.values),
+            positions: Tensor::cat(vec![reads.positions.clone(),reads.positions.clone()],0),
+            visible: reads.visible.as_ref().map(|x| Tensor::cat(vec![x.clone(),x.clone()],0)),
+            summaries: reads.summaries.as_ref().map(|x| duplicate(x)),
+            starts: Tensor::cat(vec![reads.starts.clone(),reads.starts.clone()],0),
+            max_start: reads.max_start,
+            own: reads.own,
+        });
+        Self {
+            raw: self.raw.each_ref().map(|x| Tensor::cat(vec![x.clone(),x.clone()],0)),
+            state: duplicate(&self.state),
+            reads,
+        }
+    }
+}
+impl Mixer {
+    pub fn has_prefix_retrieval(&self) -> bool { self.prefix_retrieval.is_some() }
+}
 
+#[derive(Clone)]
 pub struct WaveletCache { approximations: Vec<Tensor<3>> }
+#[derive(Clone)]
 pub struct BatchedWaveletCache { histories: Vec<Tensor<3>> }
+impl WaveletCache {
+    pub fn detached(&self)->Self {
+        Self {approximations:self.approximations.iter().map(|x|x.clone().detach()).collect()}
+    }
+}
+impl BatchedWaveletCache {
+    pub fn detached(&self)->Self {
+        Self {histories:self.histories.iter().map(|x|x.clone().detach()).collect()}
+    }
+    pub fn duplicate_rows(&self) -> Self {
+        Self { histories: self.histories.iter().map(|x| Tensor::cat(vec![x.clone(),x.clone()],0)).collect() }
+    }
+}
 impl crate::WaveletDyn {
     pub fn prepare_sbd(&self, input: Tensor<3>) -> WaveletCache {
         let [b,t,_] = input.dims();

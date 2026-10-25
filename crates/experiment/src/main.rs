@@ -5,6 +5,8 @@ mod config;
 mod codpula;
 mod codpula_reference;
 mod codpula_model_checks;
+mod cocommit;
+mod cocommit_checks;
 mod data;
 mod diagnostics;
 mod epilogues;
@@ -26,6 +28,7 @@ mod prefix_retrieval;
 mod runtime;
 mod scan_benchmark;
 mod sbd;
+mod sbd_step;
 mod sbd_training;
 mod sbd_read_reference;
 mod sbd_benchmark;
@@ -51,7 +54,7 @@ fn execute() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     ensure!(
         args.len() >= 2,
-        "usage: delta-experiment <remask-reference|remask-generate|remask-collect|energy-fit|remask-benchmark|tct-reference|tct-train|tct-benchmark|codpula-reference|codpula-model-reference|codpula-benchmark|codpula-diagnostic|prefix-retrieval-reference|prefix-retrieval-benchmark|prefix-retrieval-sbd-diagnostic|prefix-retrieval-sbd-benchmark|sbd-reference|sbd-batching-reference|sbd-batching-benchmark|sbd-batching-diagnostic|sbd-diagnostic|sbd-benchmark|sbd-train|sbd-generate|sbd-evaluate|reference|lngram-reference|lngram-benchmark|lngram-attribution|lngram-smoke|wavelet-reference|wavelet-benchmark|wavelet-smoke|ohc-reference|ohc-benchmark|ohc-learning-smoke|convolution-reference|normalization-reference|epilogue-reference|epilogue-benchmark|kron-reference|gdn-reference|gdn-directional-diagnostic|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|optimization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|gdn-benchmark|kron-model-benchmark|hola-benchmark|io-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256|fused_gdn2 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
+        "usage: delta-experiment <cocommit-reference|cocommit-benchmark|cocommit-diagnostic|remask-reference|remask-generate|remask-collect|energy-fit|remask-benchmark|tct-reference|tct-train|tct-benchmark|codpula-reference|codpula-model-reference|codpula-benchmark|codpula-diagnostic|prefix-retrieval-reference|prefix-retrieval-benchmark|prefix-retrieval-sbd-diagnostic|prefix-retrieval-sbd-benchmark|sbd-reference|sbd-batching-reference|sbd-batching-benchmark|sbd-batching-diagnostic|sbd-diagnostic|sbd-benchmark|sbd-train|sbd-generate|sbd-evaluate|reference|lngram-reference|lngram-benchmark|lngram-attribution|lngram-smoke|wavelet-reference|wavelet-benchmark|wavelet-smoke|ohc-reference|ohc-benchmark|ohc-learning-smoke|convolution-reference|normalization-reference|epilogue-reference|epilogue-benchmark|kron-reference|gdn-reference|gdn-directional-diagnostic|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|optimization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|gdn-benchmark|kron-model-benchmark|hola-benchmark|io-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256|fused_gdn2 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
     );
     let command = &args[0];
     let c = Config::load(Path::new(&args[1]))?;
@@ -204,6 +207,7 @@ fn execute() -> Result<()> {
                 | "sbd-batching-benchmark"
                 | "codpula-benchmark"
                 | "remask-benchmark"
+                | "cocommit-benchmark"
                 | "prefix-retrieval-benchmark"
                 | "prefix-retrieval-sbd-benchmark"
         ) || benchmark_warmups.is_none(),
@@ -239,6 +243,7 @@ fn execute() -> Result<()> {
                 | "sbd-batching-benchmark"
                 | "remask-benchmark"
                 | "codpula-benchmark"
+                | "cocommit-benchmark"
                 | "prefix-retrieval-benchmark"
                 | "prefix-retrieval-sbd-benchmark"
         ) || benchmark_trials.is_none(),
@@ -370,6 +375,9 @@ fn execute() -> Result<()> {
         },
         "tct-benchmark" => tct::benchmark(&c,&c.arms[0],seed,&device)?,
         "remask-benchmark" => remask::benchmark(&c,&c.arms[0],seed,&device,benchmark_warmups.unwrap_or(2),benchmark_trials.unwrap_or(11))?,
+        "cocommit-reference" => cocommit_checks::run(&c,&device)?,
+        "cocommit-benchmark" => sbd_benchmark::cocommit(&c,&device,benchmark_warmups.unwrap_or(2),benchmark_trials.unwrap_or(11))?,
+        "cocommit-diagnostic" => sbd_benchmark::batching_diagnostic(&c,&device)?,
         "codpula-reference" => codpula_reference::numerical_checks(&device)?,
         "codpula-model-reference" => codpula_model_checks::run(&c,&device)?,
         "codpula-continuation-reference" => codpula_model_checks::continuation_reference(&c,&device)?,
@@ -720,6 +728,8 @@ fn execute() -> Result<()> {
                 | "sbd-batching-diagnostic"
                 | "codpula-benchmark"
                 | "codpula-diagnostic"
+                | "cocommit-benchmark"
+                | "cocommit-diagnostic"
                 | "prefix-retrieval-benchmark"
                 | "prefix-retrieval-sbd-diagnostic"
                 | "prefix-retrieval-sbd-benchmark"
@@ -735,6 +745,7 @@ fn execute() -> Result<()> {
                 | "sbd-batching-reference"
                 | "codpula-reference"
                 | "codpula-model-reference"
+                | "cocommit-reference"
                 | "kron-reference"
                 | "gdn-reference"
                 | "hola-reference"

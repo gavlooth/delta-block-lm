@@ -342,15 +342,15 @@ pub fn run(
             "train",
         )?;
         let batch = Batch::new(&rows, &train_device);
-        let (loss, circuit_flows) = if c.sbd.is_some() {
-            let result = crate::sbd::training_loss(&model,c,&rows,&batch,seed.wrapping_add(step as u64))?;
-            (result.loss, result.circuit_flows)
+        let (value, grads, circuit_flows, passes, rows_per_pass) = if c.sbd.is_some() {
+            let result = crate::sbd_step::backward(&model, c, &rows, &batch, seed.wrapping_add(step as u64))?;
+            (result.loss, result.gradients, result.circuit_flows, result.passes, result.rows_per_pass)
         } else {
-            (model.loss(model.forward(&batch), &batch), None)
+            let loss = model.loss(model.forward(&batch), &batch);
+            let value = model::scalar(loss.clone())?;
+            let grads = model::checked_gradients(&model, loss)?;
+            (value, grads, None, 1, rows.len())
         };
-        peak(&mut peak_reserved, device);
-        let value = model::scalar(loss.clone())?;
-        let grads = model::checked_gradients(&model, loss)?;
         peak(&mut peak_reserved, device);
         model = optimizer_step(c, model, &mut optim, grads, circuit_flows)?;
         runtime::sync(device)?;
@@ -359,11 +359,9 @@ pub fn run(
         tokens += quantum;
         last_loss = Some(value);
         use std::io::Write;
-        writeln!(
-            log,
-            "{}",
-            json!({"step":step,"tokens":tokens,"loss":value,"elapsed_seconds":started.elapsed().as_secs_f64()})
-        )?;
+        writeln!(log, "{}", json!({"step":step,"tokens":tokens,"loss":value,
+            "elapsed_seconds":started.elapsed().as_secs_f64(),"backward_passes":passes,
+            "rows_per_pass":rows_per_pass}))?;
         if step % c.checkpoint_every == 0 {
             let state = State {
                 schema: 1,
@@ -475,11 +473,13 @@ pub fn pilot(c: &Config, device: &Device) -> Result<Value> {
         let rows = data::examples(c, corpus.as_ref(), c.seed, 0, c.batch_size, "train")?;
         let batch = Batch::new(&rows,&train_device);
         let first = Instant::now();
-        let (loss, circuit_flows) = if c.sbd.is_some() {
-            let result = crate::sbd::training_loss(&model,c,&rows,&batch,c.seed)?;
-            (result.loss, result.circuit_flows)
-        } else {(model.loss(model.forward(&batch),&batch), None)};
-        let grads = model::checked_gradients(&model, loss)?;
+        let (grads, circuit_flows, mut passes, mut rows_per_pass) = if c.sbd.is_some() {
+            let result = crate::sbd_step::backward(&model, c, &rows, &batch, c.seed)?;
+            (result.gradients, result.circuit_flows, result.passes, result.rows_per_pass)
+        } else {
+            let loss = model.loss(model.forward(&batch), &batch);
+            (model::checked_gradients(&model, loss)?, None, 1, rows.len())
+        };
         model = optimizer_step(c, model, &mut optim, grads, circuit_flows)?;
         runtime::sync(device)?;
         let first_use = first.elapsed().as_secs_f64();
@@ -497,11 +497,17 @@ pub fn pilot(c: &Config, device: &Device) -> Result<Value> {
                 "train",
             )?;
             let batch = Batch::new(&rows, &train_device);
-            let (loss, circuit_flows) = if c.sbd.is_some() {
-                let result = crate::sbd::training_loss(&model,c,&rows,&batch,c.seed.wrapping_add(steps as u64 + 1))?;
-                (result.loss, result.circuit_flows)
-            } else {(model.loss(model.forward(&batch),&batch), None)};
-            let grads = model::checked_gradients(&model, loss)?;
+            let (grads, circuit_flows, step_passes, step_rows_per_pass) = if c.sbd.is_some() {
+                let result = crate::sbd_step::backward(
+                    &model, c, &rows, &batch, c.seed.wrapping_add(steps as u64 + 1),
+                )?;
+                (result.gradients, result.circuit_flows, result.passes, result.rows_per_pass)
+            } else {
+                let loss = model.loss(model.forward(&batch), &batch);
+                (model::checked_gradients(&model, loss)?, None, 1, rows.len())
+            };
+            passes = step_passes;
+            rows_per_pass = step_rows_per_pass;
             model = optimizer_step(c, model, &mut optim, grads, circuit_flows)?;
             runtime::sync(device)?;
             steps += 1;
@@ -513,7 +519,7 @@ pub fn pilot(c: &Config, device: &Device) -> Result<Value> {
             "invalid pilot throughput"
         );
         slowest = slowest.min(throughput);
-        arms.push(json!({"arm":arm,"training_algorithm":arm.training_algorithm(c),"custom_gpu_kernel_proof":arm.uses_custom_gpu(c),"hola_work_per_model_forward":attention_work(c,arm)?,"first_use_forward_backward_step_seconds":first_use,"warm_steps":steps,"warm_seconds":seconds,"tokens_per_second":throughput}));
+        arms.push(json!({"arm":arm,"training_algorithm":arm.training_algorithm(c),"custom_gpu_kernel_proof":arm.uses_custom_gpu(c),"hola_work_per_model_forward":attention_work(c,arm)?,"first_use_forward_backward_step_seconds":first_use,"warm_steps":steps,"warm_seconds":seconds,"tokens_per_second":throughput,"backward_passes":passes,"rows_per_pass":rows_per_pass}));
         drop(model);
         device.memory_cleanup();
     }

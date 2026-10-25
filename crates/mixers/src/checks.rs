@@ -16,7 +16,7 @@ pub use kron::{
 mod hola;
 pub use hola::{
     HolaBenchmark, HolaCheck, hola_numerical_checks, hola_numerical_checks_selected,
-    hola_paired_benchmark,
+    hola_paired_benchmark, membership_schedule_checks, membership_schedule_benchmark,
 };
 
 #[derive(Debug, Serialize)]
