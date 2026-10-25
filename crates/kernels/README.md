@@ -190,7 +190,7 @@ Public runtime-dispatch `Tensor<D>` functions:
 |---|---|---|
 | `codpula_leaf_normalizers` | logits `[C,L,V]`, log_pi `[K,V]`, valid `[C,L]` | log local normalizers `[C,L,K]` |
 | `codpula_leaf_backward` | same inputs, normalizers, upstream `[C,L,K]` | derivatives `[C,L,V]`, `[K,V]` |
-| `codpula_log_partition` | log evidence `[C,L,K]`, log transition `[C,K,K]`, log root `[K]`, valid `[C,L]` | logZ `[C]` |
+| `codpula_log_partition` | log evidence `[C,L,K]`, log transition `[C,K,K]`, shared log root `[K]` or flattened contextual log roots `[C*K]`, valid `[C,L]` | logZ `[C]` |
 | `codpula_chain_statistics` | same chain inputs | detached logZ, gamma `[C,L,K]`, summed_xi `[C,K,K]` |
 | `codpula_chain_backward` | gamma, summed_xi, upstream `[C]` | log-evidence, log-transition, log-root derivatives |
 | `codpula_token_marginals` | logits, log_pi, normalizers, gamma, tokens `[C,L]`, observed `[C,L]`, valid | detached `[C,L,V]` |
@@ -206,9 +206,13 @@ mass before using a conditional readout. The caller also supplies normalized
 log rows, constructs normalized fixed-token evidence, applies any temperature
 to neural potentials, and masks observed-token-potential derivatives as required.
 
-The analytic first-order logZ derivative is gamma for log evidence, the sum of
-posterior edge occurrences for each chain's shared log transition, and the sum
-of initial posterior occurrences across chains for the shared log root.
+The analytic first-order logZ derivative is gamma for log evidence and the sum
+of posterior edge occurrences for each chain's shared log transition. For a
+shared `[K]` root, its derivative sums initial posterior occurrences across
+chains; for flattened contextual roots `[C*K]`, autodiff retains each chain's
+initial posterior separately. The direct `codpula_chain_backward` helper keeps
+its original shared-root derivative contract. This shape handling uses the
+same kernels, not a new execution selector or a different distribution.
 Leaf-normalizer derivatives include both neural logits and shared log_pi, summed
 across tied occurrences. These derivatives are with respect to the supplied
 log weights; row normalization and grouped gates remain differentiable caller

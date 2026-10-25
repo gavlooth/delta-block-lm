@@ -88,6 +88,8 @@ pub struct PreparedCircuit {
     pub log_emission: Tensor<2>,
     pub log_transition: Tensor<3>,
     pub log_root: Tensor<1>,
+    /// Normalized per-block roots for the contextual profile; legacy roots stay shared.
+    pub contextual_log_root: Option<Tensor<2>>,
     pub logits: Tensor<3>,
     pub leaf_normalizers: Tensor<3>,
     pub lengths: Vec<usize>,
@@ -218,6 +220,46 @@ impl Codpula {
             execution: CodpulaExecution::Tensor,
         }
     }
+    /// Contextual b4 transitions and roots share one zero-initialized neural head.
+    pub fn new_contextual(d_model: usize, seed: u64, device: &Device) -> Self {
+        let mut random = Generator(seed);
+        let mut row = |rows: usize, columns: usize, half_width: f64| {
+            let data = (0..rows * columns).map(|_| ((random.next() - 0.5) * (2.0 * half_width)) as f32).collect::<Vec<_>>();
+            log_softmax(Tensor::from_data(TensorData::new(data, [rows, columns]), device), 1)
+        };
+        let log_emission = row(STATES, VOCAB, 0.25);
+        let log_transition = row(STATES, STATES, 0.1);
+        let log_root = row(1, STATES, 0.01).reshape([STATES]);
+        Self {
+            gate_head: LinearConfig::new(3 * d_model, 64 + STATES).with_bias(true).with_initializer(Initializer::Zeros).init(device),
+            probability: CircuitState::from_logs(log_emission, log_transition, log_root),
+            execution: CodpulaExecution::Tensor,
+        }
+    }
+    pub fn is_contextual(&self) -> bool { self.gate_head.weight.val().dims()[1] == 64 + STATES }
+    /// Concatenate valid mean, first valid feature, and last valid feature.
+    /// Lengths describe prefix-valid rows; entirely inactive rows yield all zeros.
+    pub fn context_summary(&self, features: Tensor<3>, lengths: &[usize]) -> Result<Tensor<2>> {
+        let [rows, width, depth] = features.dims();
+        ensure!(rows > 0 && rows == lengths.len() && width > 0 && lengths.iter().all(|&n| n <= width), "invalid context pooling lengths");
+        let valid = valid_tensor(lengths, width, &features.device());
+        let features = features.mask_fill(valid.clone().equal_elem(0.0).reshape([rows, width, 1]).expand([rows, width, depth]), 0.0);
+        finite(&features, "valid context features")?;
+        let counts = valid.sum_dim(1).clamp_min(1.0);
+        let mean = features.clone().sum_dim(1).reshape([rows, depth]) / counts;
+        let first = features.clone().narrow(1, 0, 1).reshape([rows, depth]);
+        let last_ids = Tensor::<2, Int>::from_data(TensorData::new(
+            lengths.iter().map(|&length| length.saturating_sub(1) as i32).collect::<Vec<_>>(), [rows, 1]), &features.device())
+            .reshape([rows, 1, 1]).expand([rows, 1, depth]);
+        let last = features.gather(1, last_ids).reshape([rows, depth]);
+        Ok(Tensor::cat(vec![mean, first, last], 1))
+    }
+    pub fn contextual_gates(&self, features: Tensor<3>, lengths: &[usize]) -> Result<(Tensor<3>, Tensor<2>)> {
+        ensure!(self.is_contextual(), "contextual gates require the contextual profile");
+        let rows = features.dims()[0];
+        let gates = self.gate_head.forward(self.context_summary(features, lengths)?);
+        Ok((gates.clone().narrow(1, 0, 64).reshape([rows, 8, 8]), gates.narrow(1, 64, STATES)))
+    }
     pub fn with_execution(mut self, execution: CodpulaExecution) -> Self {
         self.execution = execution;
         self
@@ -226,6 +268,7 @@ impl Codpula {
     /// Reapply after loading if a recorder or model mapper activates float parameters.
     pub fn freeze_state(&mut self) { self.probability.freeze_rows(); }
     pub fn gates(&self, features: Tensor<3>, lengths: &[usize]) -> Result<Tensor<3>> {
+        if self.is_contextual() { return Ok(self.contextual_gates(features, lengths)?.0); }
         let [rows, width, depth] = features.dims();
         ensure!(rows == lengths.len() && width > 0 && lengths.iter().all(|&n| n <= width), "invalid gate pooling lengths");
         let valid = valid_tensor(lengths, width, &features.device());
@@ -241,11 +284,19 @@ impl Codpula {
         ensure!(vocab == VOCAB && observed.dims() == [rows, width] && features.dims()[..2] == [rows, width], "invalid circuit neural output shape");
         // Only the token-potential path is detached. Observed features still train gates and backbone.
         let logits = logits.clone().mask_where(observed.reshape([rows, width, 1]).expand([rows, width, vocab]), logits.detach()) / temperature;
-        let gates = self.gates(features, lengths)?;
-        PreparedCircuit::prepare_with_execution(
-            self.probability.log_emission.val(), self.probability.log_transition.val(), self.probability.log_root.val(),
-            logits, gates, lengths.to_vec(), GROUP_WIDTH, self.execution,
-        )
+        if self.is_contextual() {
+            let (gates, root_gates) = self.contextual_gates(features, lengths)?;
+            PreparedCircuit::prepare_contextual_with_execution(
+                self.probability.log_emission.val(), self.probability.log_transition.val(), self.probability.log_root.val(),
+                logits, gates, root_gates, lengths.to_vec(), GROUP_WIDTH, self.execution,
+            )
+        } else {
+            let gates = self.gates(features, lengths)?;
+            PreparedCircuit::prepare_with_execution(
+                self.probability.log_emission.val(), self.probability.log_transition.val(), self.probability.log_root.val(),
+                logits, gates, lengths.to_vec(), GROUP_WIDTH, self.execution,
+            )
+        }
     }
     pub fn update(&mut self, flows: CircuitFlows) -> Result<()> { self.probability.update(flows) }
 }
@@ -385,7 +436,36 @@ impl PreparedCircuit {
             { anyhow::bail!("fused circuit execution requires a GPU feature") }
         };
         finite(&leaf_normalizers, "leaf normalizers")?;
-        Ok(Self { log_emission, log_transition, log_root, logits, leaf_normalizers, lengths, valid, execution })
+        Ok(Self { log_emission, log_transition, log_root, contextual_log_root: None, logits, leaf_normalizers, lengths, valid, execution })
+    }
+    /// Generic tensor-reference API with per-block log-root modulation.
+    pub fn prepare_contextual(log_emission: Tensor<2>, log_transition: Tensor<2>, log_root: Tensor<1>, logits: Tensor<3>, gates: Tensor<3>, root_gates: Tensor<2>, lengths: Vec<usize>, group: usize) -> Result<Self> {
+        Self::prepare_contextual_with_execution(log_emission, log_transition, log_root, logits, gates, root_gates, lengths, group, CodpulaExecution::Tensor)
+    }
+    fn prepare_contextual_with_execution(log_emission: Tensor<2>, log_transition: Tensor<2>, log_root: Tensor<1>, logits: Tensor<3>, gates: Tensor<3>, root_gates: Tensor<2>, lengths: Vec<usize>, group: usize, execution: CodpulaExecution) -> Result<Self> {
+        let [rows, _, _] = logits.dims();
+        let states = log_root.dims()[0];
+        ensure!(root_gates.dims() == [rows, states], "invalid circuit root gate dimensions");
+        let mut prepared = Self::prepare_with_execution(log_emission, log_transition, log_root, logits, gates, lengths, group, execution)?;
+        let inactive = prepared.valid.clone().sum_dim(1).equal_elem(0.0).expand([rows, states]);
+        let root_gates = root_gates.mask_fill(inactive, 0.0);
+        finite(&root_gates, "root gates")?;
+        prepared.contextual_log_root = Some(log_softmax(prepared.log_root.clone().reshape([1, states]) + root_gates, 1));
+        Ok(prepared)
+    }
+    /// Actual roots used by every evidence query and unconditional traversal.
+    pub fn root_rows(&self) -> Tensor<2> {
+        self.contextual_log_root.clone().unwrap_or_else(|| {
+            let (rows, _, states, _) = self.shape();
+            self.log_root.clone().reshape([1, states]).expand([rows, states])
+        })
+    }
+    #[cfg(any(feature = "vulkan", feature = "cuda"))]
+    fn kernel_root(&self) -> Tensor<1> {
+        match &self.contextual_log_root {
+            Some(root) => root.clone().flatten(0, 1),
+            None => self.log_root.clone(),
+        }
     }
     fn shape(&self) -> (usize, usize, usize, usize) {
         let [rows, width, vocab] = self.logits.dims();
@@ -419,7 +499,7 @@ impl PreparedCircuit {
         let (_, _, evidence) = self.evidence(values, fixed)?;
         let mut forward = Vec::with_capacity(width);
         let mut incoming = Vec::with_capacity(width);
-        let mut previous = self.log_root.clone().reshape([1, states]).expand([rows, states]);
+        let mut previous = self.root_rows();
         for i in 0..width {
             let before = if i == 0 { previous.clone() } else {
                 lse(previous.clone().reshape([rows, states, 1]) + self.log_transition.clone(), 1).reshape([rows, states])
@@ -434,7 +514,7 @@ impl PreparedCircuit {
             lse(previous, 1).reshape([rows])
         } else {
             #[cfg(any(feature = "vulkan", feature = "cuda"))]
-            { delta_kernels::codpula_log_partition(Tensor::cat(evidence.iter().map(|x| x.clone().reshape([rows, 1, states])).collect(), 1), self.log_transition.clone(), self.log_root.clone(), self.valid.clone()) }
+            { delta_kernels::codpula_log_partition(Tensor::cat(evidence.iter().map(|x| x.clone().reshape([rows, 1, states])).collect(), 1), self.log_transition.clone(), self.kernel_root(), self.valid.clone()) }
             #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
             { anyhow::bail!("fused circuit execution requires a GPU feature") }
         };
@@ -479,10 +559,10 @@ impl PreparedCircuit {
         {
             let (_, _, evidence) = self.evidence(values, fixed)?;
             let evidence = Tensor::cat(evidence.into_iter().map(|x| x.reshape([rows, 1, states])).collect(), 1);
-            let log_z = delta_kernels::codpula_log_partition(evidence.clone(), self.log_transition.clone(), self.log_root.clone(), self.valid.clone());
+            let log_z = delta_kernels::codpula_log_partition(evidence.clone(), self.log_transition.clone(), self.kernel_root(), self.valid.clone());
             let log_z = log_z.mask_fill(self.valid.clone().sum_dim(1).equal_elem(0.0).reshape([rows]), 0.0);
             finite(&log_z, "evidence mass")?;
-            let (_, state, summed_edge) = delta_kernels::codpula_chain_statistics(evidence.detach(), self.log_transition.clone().detach(), self.log_root.clone().detach(), self.valid.clone());
+            let (_, state, summed_edge) = delta_kernels::codpula_chain_statistics(evidence.detach(), self.log_transition.clone().detach(), self.kernel_root().detach(), self.valid.clone());
             Ok(Statistics { log_z, state, summed_edge })
         }
         #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
@@ -492,7 +572,7 @@ impl PreparedCircuit {
         let (rows, width, states, _) = self.shape();
         let (_, _, evidence) = self.evidence(values, fixed)?;
         let result = if self.execution.is_tensor() {
-            let mut previous = self.log_root.clone().reshape([1, states]).expand([rows, states]);
+            let mut previous = self.root_rows();
             for i in 0..width {
                 let incoming = if i == 0 { previous.clone() } else {
                     lse(previous.clone().reshape([rows, states, 1]) + self.log_transition.clone(), 1).reshape([rows, states])
@@ -504,7 +584,7 @@ impl PreparedCircuit {
             lse(previous, 1).reshape([rows])
         } else {
             #[cfg(any(feature = "vulkan", feature = "cuda"))]
-            { delta_kernels::codpula_log_partition(Tensor::cat(evidence.into_iter().map(|x| x.reshape([rows, 1, states])).collect(), 1), self.log_transition.clone(), self.log_root.clone(), self.valid.clone()) }
+            { delta_kernels::codpula_log_partition(Tensor::cat(evidence.into_iter().map(|x| x.reshape([rows, 1, states])).collect(), 1), self.log_transition.clone(), self.kernel_root(), self.valid.clone()) }
             #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
             { anyhow::bail!("fused circuit execution requires a GPU feature") }
         };
@@ -602,7 +682,10 @@ impl PreparedCircuit {
         let xi_minus = minus.summed_edge;
         let transition_positive = ((xi_plus.clone() + xi_minus.clone().sum_dim(2) * a.clone()) * active_emission.clone()).sum_dim(0).reshape([states, states]);
         let transition_negative = ((xi_minus + xi_plus.sum_dim(2) * a) * active_emission.clone()).sum_dim(0).reshape([states, states]);
-        let rho = self.log_root.clone().detach().exp().reshape([1, states]);
+        let rho = match &self.contextual_log_root {
+            Some(root) => root.clone().detach().exp(),
+            None => self.log_root.clone().detach().exp().reshape([1, states]),
+        };
         let root_positive = ((gamma_plus.narrow(1, 0, 1).reshape([rows, states]) + rho.clone()) * active.clone().reshape([rows, 1])).sum_dim(0).reshape([states]);
         let root_negative = ((gamma_minus.narrow(1, 0, 1).reshape([rows, states]) + rho) * active.clone().reshape([rows, 1])).sum_dim(0).reshape([states]);
         // Traversal is unconditional under each block's current, modulated transition.
@@ -712,5 +795,60 @@ impl PreparedCircuit {
             }
         }
         Ok(scores)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contextual_summary_ignores_padding_and_keeps_endpoint_gradients() {
+        let device = Device::ndarray().autodiff();
+        let module = Codpula::new_contextual(2, 7, &device);
+        let features = Tensor::<3>::from_data(TensorData::new(vec![
+            2.0, 4.0, 6.0, 8.0, f32::NAN, f32::NAN,
+            f32::NAN, f32::NAN, f32::NAN, f32::NAN, f32::NAN, f32::NAN,
+            10.0, 12.0, f32::NAN, f32::NAN, f32::NAN, f32::NAN,
+        ], [3, 3, 2]), &device).require_grad();
+        let summary = module.context_summary(features.clone(), &[2, 0, 1]).unwrap();
+        assert_eq!(tensor_values(summary.clone()).unwrap(), vec![
+            4.0, 6.0, 2.0, 4.0, 6.0, 8.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            10.0, 12.0, 10.0, 12.0, 10.0, 12.0,
+        ]);
+        let grads = summary.sum().backward();
+        assert_eq!(tensor_values(features.grad(&grads).unwrap()).unwrap(), vec![
+            1.5, 1.5, 1.5, 1.5, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            3.0, 3.0, 0.0, 0.0, 0.0, 0.0,
+        ]);
+    }
+
+    #[test]
+    fn contextual_roots_change_marginals_and_receive_only_active_gradients() {
+        let device = Device::ndarray().autodiff();
+        let root_gates = Tensor::<2>::from_data([[3.0f32.ln(), 0.0], [f32::NAN, f32::NAN]], &device).require_grad();
+        let prepared = PreparedCircuit::prepare_contextual(
+            Tensor::<2>::from_data([[0.8f32.ln(), 0.2f32.ln()], [0.2f32.ln(), 0.8f32.ln()]], &device),
+            Tensor::<2>::from_data([[0.7f32.ln(), 0.3f32.ln()], [0.4f32.ln(), 0.6f32.ln()]], &device),
+            Tensor::<1>::from_data([0.5f32.ln(), 0.5f32.ln()], &device),
+            Tensor::zeros([2, 2, 2], &device),
+            Tensor::<3>::from_data(TensorData::new(vec![0.0, 0.0, 0.0, 0.0, f32::NAN, f32::NAN, f32::NAN, f32::NAN], [2, 2, 2]), &device),
+            root_gates.clone(), vec![2, 0], 1,
+        ).unwrap();
+        let values = Tensor::<2, Int>::from_data([[0, 0], [99, 99]], &device);
+        let unknown = Tensor::<2, Bool>::from_data([[false, false], [false, false]], &device);
+        let marginal = tensor_values(prepared.marginals(values.clone(), unknown).unwrap()).unwrap();
+        assert!((marginal[0] - 0.65).abs() < 2e-6);
+        assert!((marginal[1] - 0.35).abs() < 2e-6);
+        assert_eq!(&marginal[4..], &[0.0; 4]);
+        let fixed = Tensor::<2, Bool>::from_data([[true, false], [true, true]], &device);
+        let log_z = prepared.log_partition(values, fixed).unwrap();
+        let grads = log_z.sum().backward();
+        let gradient = tensor_values(root_gates.grad(&grads).unwrap()).unwrap();
+        assert!((gradient[0] - (0.6 / 0.65 - 0.75)).abs() < 2e-6);
+        assert!((gradient[1] + (0.6 / 0.65 - 0.75)).abs() < 2e-6);
+        assert_eq!(&gradient[2..], &[0.0, 0.0]);
     }
 }

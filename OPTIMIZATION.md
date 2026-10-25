@@ -67,3 +67,20 @@ Outside the resident step:
 - [x] Larger training batch sizes at current K32/V64/chunk16/context512: B1/4/8/16/32 measured, largest tested B32 fits; full steps, component attribution and memory in Batch scaling.
 - [ ] Larger key/value widths and contexts beyond the current K32/V64/chunk16 pilot limits: custom kernels are specialized to K32/V64; storage scaling recorded in `precision-and-shapes.md`; no wider-state kernels or measurements yet.
 - [x] Re-profile after the batch-8 round: combined paired benchmark and per-increment sessions recorded; next bottleneck attribution should use `backward-profile` on `configs/lm512-optimized.json`.
+
+## Explicit contextual Codpula profile
+
+- [x] Approved routing/initialization revision: ordered valid mean/first/last,
+  one 768→96 zero head and normalized contextual root; fourteen other decisions
+  and old selectors/fingerprints remain. CPU/Vulkan tensor/fused, independent
+  f64/full-VJP/flow and strict full-optimizer restart gates pass unchanged
+  tolerances. Separate deterministic Tensor Lngram raw-gradient fix `e50cc523`
+  resolves the exposed duplicate-index atomic sum without changing clipping
+  `64590d18` or the adopted fused Lngram backend.
+- [x] Required cost accounting only: B1/T512 old/contextual medians
+  1713.161/1691.060 ms; contextual-minus-old paired median -42.608 ms,
+  95% interval [-138.390,15.668], so no resolved difference. Full B8/T512
+  diagnostic 8714.077 ms, 30,818 launches and 8,826,780,928-byte sampled pool;
+  no subdivision. Original Codpula figures above remain historical, not the
+  revision's measured cost. See `RESULTS.md`, `docs/codpula.md` and
+  `artifacts/codpula-context/`. No quality study or architecture sweep.

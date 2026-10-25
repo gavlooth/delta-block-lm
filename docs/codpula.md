@@ -4,7 +4,7 @@
 
 This document records the paper equations, the model-specific decisions in §5, and the implementation and measurement evidence below. The earlier specification-only pass made no code changes; the implementation pass uses the explicitly recorded decisions rather than silently choosing alternatives.
 
-**Implemented 2026-10-25.** The fixed model, full-vocabulary inference, dual-flow updates, seeded joint proposals and dependence commitments are integrated. CPU and Vulkan numerical/model gates pass at the unchanged tolerance. The tensor circuit remains the selected execution: fused kernels are correct and faster in isolation, but their complete-step confidence interval includes zero (§10).
+**Original implementation 2026-10-25.** The `codpula` profile, full-vocabulary inference, dual-flow updates, seeded joint proposals and dependence commitments are integrated. Its historical CPU/Vulkan and cost results are in §10. The explicitly selected `codpula_contextual` revision changes only decisions 3, 4 and 6 below; it does not reinterpret old selectors or checkpoints.
 
 Source: Shao et al., [Learning to Couple: Context-Adaptive Joint Denoising for Diffusion Language Models, arXiv:2610.25723v1](https://arxiv.org/html/2610.25723v1), including Appendices A–G. The [abstract/version page](https://arxiv.org/abs/2610.25723) identifies the version. References such as Eq. (10) refer to that paper, not numbered equations in this document.
 
@@ -34,7 +34,7 @@ q(x_{1:L},z_{1:L};\theta,\omega)
 q(x)=\sum_{z_{1:L}}q(x,z).
 \]
 
-Here `r` is an initial-state categorical row, `A` is a row-stochastic transition matrix, and each `g[i,s]` is a categorical emission. The base transition and emission tables are shared across positions and lengths. One context gate grid is shared across all edges of each block, so its modulated transition is also identical across those edges; the learned initial row has no neural modulation. These are the model-specific decisions in §5, rather than details uniquely specified by the paper's grouping equation. The circuit can be written recursively as a sum over the next state followed by the product of the current emission and remaining suffix distribution, directly supplying the smooth/decomposable structure.
+Here `r` is an initial-state categorical row, `A` is a row-stochastic transition matrix, and each `g[i,s]` is a categorical emission. The base transition and emission tables are shared across positions and lengths. One context gate grid is shared across all edges of each block, so its modulated transition is also identical across those edges. The original `codpula` root has no neural modulation; `codpula_contextual` uses the locally normalized contextual root below. These are the model-specific decisions in §5, rather than details uniquely specified by the paper's grouping equation. The circuit can be written recursively as a sum over the next state followed by the product of the current emission and remaining suffix distribution, directly supplying the smooth/decomposable structure.
 
 The model parameters are split into neural parameters `varphi` and intrinsic probabilistic parameters `omega`. Neural outputs `theta = f_varphi(x_t)` contain token potentials and coupling gates (paper §3, Eq. (4)). Within a denoising pass, all these outputs are held fixed while candidate completions are summed, queried, or sampled. Re-evaluating the backbone for different queried assignments would define different distributions and invalidate the conditional calculations.
 
@@ -81,6 +81,8 @@ A_{\theta,i}(s,t)=
 \]
 
 The `i` index is omitted here because one gate matrix is shared within the block. Zero log-gates recover the base transition. One scalar for the entire matrix (`b=32`) cancels in row normalization and cannot change coupling. A source-row-only scalar likewise cancels: effective gates must distinguish destination groups within a row. The paper's 1,024-state “Both” configuration uses a `32 x 32` gate grid, hence `b=32`; copying that group width to our 32-state matrix would remove modulation. This implementation instead uses `b=4`, an `8 x 8` grid.
+
+The contextual profile forms `c = concat(valid_mean(H), first_valid(H), last_valid(H))` from the same final-normalized features, including observed positions but excluding padding. One zero-initialized biased `3D -> 96` linear head emits the 64 transition log-gates above and 32 root log-gates `u`. The prepared initial row is `log r_theta = log_softmax(log r + u)`. All evidence queries, latent sampling, marginals, cavity scores and unconditional reaches use that same fixed row. Empty rows have zero summaries and no learning contribution; actual `L=1` still uses the exact causal bypass.
 
 ### 1.4 Visible-evidence normalizer
 
@@ -332,41 +334,45 @@ Valid joint targets must have unit weights; unsupported nonunit weights produce 
 
 ## 5. Decisions
 
-**Decided 2026-10-25 in the user's absence; closest to the paper / cheapest; reversible.** These decisions replace the earlier open alternatives. All use K=32, L<=16 and all 257 output symbols.
+**Re-evaluated and explicitly approved 2026-10-25 for highest expected useful gain per cost, not “closest to paper / cheapest.”** All profiles retain K32, L<=16 and V257. The original `codpula` profile remains exactly as implemented, including initialization and head shapes. Only `joint_output: "codpula_contextual"` selects the three changes below. Expected quality/trainability gains are assumptions, not measured results; no architecture-selection study was run.
 
-1. **Token head:** reuse the existing clean vocabulary projection, with no new token head. Reason: matches the paper's backbone-logit potentials without another projection.
+Costs below use D256/B8/T512/L8 (4096 positions, at most 512 active chains); MAC counts are forward work per noisy pass, not latency predictions.
 
-2. **Emission sharing:** one shared `[32,257]` base emission table across positions and lengths. Reason: a homogeneous HMM is the cheapest shared model.
+1. **Token head — retain:** reuse the clean vocabulary projection. A separate noisy head could reduce task interference but adds about 66k parameters and 269.5M MAC/pass (`O(NDV)`). Shared byte semantics and a context-specific circuit make routing improvements more targeted than another full projection.
 
-3. **Initial state:** one learned positive 32-entry row, shared across lengths, with no neural modulation; differentiate its row normalization consistently with decision 12. Reason: retains a learned start distribution without another neural output.
+2. **Emission sharing — retain:** one `[32,257]` table across positions/lengths. Untied leaves genuinely permit slot-specific state meanings and leave leading `O(NKV)` work unchanged; 16 tables add about 1.41MiB including two flow histories. Shared token roles pool training signal across arbitrary block offsets/lengths instead of fragmenting it. Position-specific potentials already provide unary variation. Later untying grows persistent state as `O(LKV)`, with more flow/checkpoint cases.
 
-4. **Gate head:** masked mean of all valid final-normalized block states, including observed positions and excluding padding, followed by one biased linear head with no nonlinearity; share its grid across all edges. Reason: the cheapest context-dependent block router.
+3. **Initial state — change only for contextual:** keep the learned positive shared base row, but use `r_theta=softmax(log r+u(c))`. A length-specific root is a weaker alternative because it cannot select regimes from prefix/content. The 768-to-32 part costs 24,608 parameters and 12.58M MAC/pass, plus 64KiB prepared roots. Expected gain: direct context selection at position one, before transition gates can act. This extends the existing HMM root parameterization; it does not alter local normalization or Eq. (9).
 
-5. **Gate grouping:** `b=4`, an `8x8` grid of 64 log-gates. Reason: meaningful grouped coupling with a small head at K=32.
+4. **Gate head — change only for contextual:** use ordered `[valid mean, first valid, last valid]`, followed by one zero-initialized biased `768 -> 96` linear head; retain one shared transition grid across edges. Compared with the old mean-to-64 part, the transition portion adds 32,768 weights and 16.78M MAC/pass. The summary adds about 1MiB storage/pass. A nonlinear pooled head cannot recover information lost by averaging; attention pooling adds learned selection; per-edge gates offer more capacity but at L8 multiply transition storage from 2 to 14MiB and sacrifice homogeneous block coupling. Ordered summaries expose boundary context directly while preserving mean information, with `O((N/L)D)` head work.
 
-6. **Initialization:** near-uniform positive base rows with small seeded random perturbations; gate-head weights and bias start at zero. Reason: breaks latent symmetry while initially retaining the base transitions.
+5. **Gate grouping — retain b=4:** an `8x8` grid has 56 effective degrees of freedom after row normalization. b=2 offers 240 and b=1 offers 992, at 33.55M/134.22M MAC/pass with the old pool versus 8.39M for b=4; ordered summaries triple these projection counts. Finer groups are affordable but less targeted than fixing the routing input. Retain the full learned base transition matrix and improve its context signal first. b=32 cancels and is not useful modulation.
 
-7. **Noisy objective:** sum conditional joint NLLs over blocks and divide by the existing clean target count `B*T`; no inverse-mask weight or length multiplier. Reason: keeps the existing SBD reduction and follows the paper's SDAR choice.
+6. **Initialization — change only for contextual:** seed-local emission logits uniform in `[-0.25,0.25)`, transition logits in `[-0.1,0.1)`, root logits in the existing `[-0.01,0.01)`, then row log-softmax. The combined head remains zero. Moderate state contrast avoids starting extremely close to indistinguishable leaves/uniform transitions, with no recurring cost. These ranges are engineering assumptions, not calibrated optima. Strongly sticky transitions or token-cluster leaves impose unnecessary semantic priors. Original `codpula` keeps every old random draw and range.
 
-8. **Target weights:** require unit weights on valid joint targets and reject others clearly; padding is structurally absent. Reason: avoids inventing a fractional joint-event objective.
+7. **Noisy objective — retain:** sum conditional joint NLL and divide by `B*T`, without inverse-mask or length weights. Inverse-mask weighting and per-block averaging change training emphasis/variance, not merely speed or correctness. The existing clean/noisy reduction is a fixed project requirement.
 
-9. **Singletons:** keep the exact existing causal L=1 bypass unchanged. Reason: preserves the established next-token identity.
+8. **Target weights — retain:** require unit valid-target weights; reject unsupported weights clearly. Fractional token weights do not uniquely define a normalized joint event. Powered factors/composite likelihood would be a new objective despite cheap arithmetic.
 
-10. **Feedback temperature:** apply the existing soft-temperature value to neural potentials before the teacher circuit; feed joint marginals into `SoftState` with its temperature set to one. Reason: follows paper §5 without a second sharpening operation.
+9. **Singletons — retain:** exact causal `L=1` bypass. A generic singleton HMM adds `O(KV)` work and a latent-mixture calibration change; it does not preserve the required next-token identity.
 
-11. **Neural optimization:** jointly train backbone, shared head and gate head with the unchanged existing AdamW settings; update circuit rows every step. Mask token-potential derivatives at observed positions as in Appendix A.1, while backbone/gate gradients through observed features flow normally. Reason: follows the paper's joint schedule and observed-potential masking without adapters or another optimizer.
+10. **Feedback temperature — retain:** temperature on neural potentials before teacher inference, then `SoftState` temperature one. Post-hoc marginal/joint tempering or double sharpening changes the paper-defined distribution, even when inexpensive.
 
-12. **Circuit statistics:** use the explicit normalized nonnegative split in §3.3, sum tied-occurrence flows, and compute Anemone traversal scales from summed occurrence reach probabilities, averaged over the same active block contexts as the flows. The initial row uses the normalized-row split. Reason: gives exact local-normalizer derivatives and a defined shared-row update.
+11. **Neural optimization — retain:** joint existing AdamW for backbone/shared projection/context head, separate circuit update each step; mask observed token-potential derivatives, not observed-feature gradients through transition/root gates. Differential rates or staged fitting could improve conditioning but add schedules/state semantics. Better initialization is the more targeted first response to weak latent signals. All statistics come from the same pre-update model.
 
-13. **Circuit optimizer:** separately average positive and negative flows over active blocks; maintain separate exponential averages with momentum 0.9 and standard bias correction; use constant alpha 0.05 and update every step. Reason: uses the paper's SDAR/block-diffusion step size with an explicit momentum recurrence.
+12. **Circuit statistics — retain:** explicit normalized nonnegative split in §3.3, tied occurrence sums and context-modulated unconditional reaches averaged over the same active blocks. The contextual root uses its own normalized-row split: `F_root+ = gamma_1+ + r_theta`, `F_root- = gamma_1- + r_theta`, summed across active blocks; root reach is one per active block. Raw-edge root flows, removing common positive mass or taking signed-gradient parts can share the signed derivative but change finite Eq. (9) steps. Do not substitute them.
 
-14. **Proposals:** exact conditional joint sampling by seeded forward-filter/backward-sampling. Reason: follows paper §5 rather than substituting marginal greedy decisions.
+13. **Circuit optimizer — retain:** separate active-block-averaged positive/negative EMAs, momentum 0.9, standard bias correction, alpha 0.05, every active step. Current reaches and current base weights enter Eq. (9); histories retain raw flows. Smoothing reaches, smoothing scaled flows, signed momentum or alpha schedules are different recurrences. Possible staleness/scale variation is a trainability tradeoff, not an established bug. Memory remains 111,360 f32 bytes for base rows plus histories; update work is `O(KV+K^2)`.
 
-15. **Scored positions:** score every remaining unresolved position. Reason: L<=16 makes extra candidate ranking unnecessary.
+14. **Proposals — retain:** exact seeded conditional joint FFBS. Independent marginal greedy loses coupling; sequential conditional greedy is order-dependent; latent Viterbi is not token-sequence MAP. FFBS uses `O(LK^2+LKV)` work and `O(LK)` messages; host transfers can dominate small-block latency.
 
-16. **Commitment:** use the same temperature and full support for proposals and scores, threshold `tau=0.05`, Algorithm 3 with `M=L` passes and last-pass full completion, and existing ascending-position then token-ID ties. Reason: reuses the prepared circuit and the paper's reported `0.05` deferral traces (Appendix C, Figures 12–13). Section 5 and Algorithm 3 specify only `tau>0`; the paper does not give a universal numeric default or identify one threshold for all main-table operating points. The cited traces, not evidence-temperature sweeps, are the numeric source.
+15. **Scored positions — retain:** all remaining unresolved positions. With cavity reuse, all scores need two forward/backward traversals rather than one full traversal per candidate. A confidence shortlist adds policy/ranking and changes the dependency question while saving little fixed work at L<=16.
 
-17. **Probability arithmetic:** store normalized base rows in log form and compute Eq. (9) and row normalization in log space; fail clearly on invalid evidence. Reason: preserves positive mathematical support without an arbitrary probability floor.
+16. **Commitment — retain:** matched full support/temperature, strict `delta<0.05`, minimum-score progress fallback, `M=L`, final completion and existing deterministic ties. Larger thresholds/shorter caps could save backbone passes but commit more sensitive proposals. The threshold corresponds to about a 5.13% multiplicative probability change in the queried comparison, not a quality guarantee. Its source is the paper's Appendix C deferral traces, not a universal numeric default; no threshold sweep is authorized.
+
+17. **Arithmetic — retain:** positive normalized base rows stored in log form, log-space Eq. (9)/normalization, clear invalid-evidence errors. Mathematically equivalent scaled messages may improve execution later; floors/mixed-precision underflow must not silently redefine support. Persistent log rows are small; vocabulary-state temporaries dominate memory/work.
+
+Together the contextual changes add 57,376 neural parameters: 73,824 versus 16,448. Estimated extra persistent parameter/Adam f32 storage is 688,512 bytes (918,016 including one gradient copy); extra forward head work is 29.36M MAC/pass at B8/T512/L8. This is capacity/cost reasoning, not measured quality or integrated speed. The other fourteen decisions remain unchanged rather than being re-optimized around the revision.
 
 ## 6. Compute and memory estimate
 
@@ -542,9 +548,11 @@ The initial locally written commitment helper also needed a correction: its last
 
 The prepared block distribution exposes conditional joint log likelihood, token marginals, evidence-query log masses, seeded joint proposals and cavity dependence scores. Training returns the neural loss and separate nonnegative circuit statistics; the shared training-step helper applies AdamW and the circuit update from the same pre-update outputs. Generation uses detached prepared values.
 
-Cached, per-block, batched, reconstruction, evaluation and generation callers use the selected output distribution. Omitted or explicit `joint_output: "factorized"` retains historical serialization and initialization. `joint_output: "codpula"` changes model identity; `joint_execution` selects mathematically equivalent tensor or fused circuit execution, and `commitment: "dependence"` selects the adaptive decoder. The independent factorized model is used only for cost accounting in this pass; no quality studies, ablations or sweeps are included.
+Cached, per-block, batched, reconstruction, evaluation and generation callers use the selected output distribution. Omitted or explicit `joint_output: "factorized"` retains historical serialization and initialization. `joint_output: "codpula"` retains its original model identity and exact head/row initialization; `joint_output: "codpula_contextual"` selects the revised profile and a distinct model/training identity. `joint_execution` selects mathematically equivalent execution, and `commitment: "dependence"` selects the adaptive decoder. No quality studies, ablations or sweeps are included.
 
 ## 10. Observed implementation evidence
+
+Sections 10.1–10.3 report the original `codpula` profile, not the revised contextual initialization/head. They remain historical evidence and must not be read as measurements of the revision. Section 10.4 is the shared clipping prerequisite.
 
 ### 10.1 Implementation and correctness
 
@@ -616,3 +624,124 @@ The user's exact historical causal `checkpoint-check` command against `artifacts
 
 Source evidence: `burn-optim-0.22.1/src/grad_clipping/base.rs:70–93`; `burn-cubecl-0.22.1/src/kernel/reduce/base.rs:120–160,435–449,635–641`; `cubek-reduce-0.3.1/src/routines/shared_sum.rs:202–205` and `components/global/unit.rs:178–185`. This is an execution correctness repair, not a change to the Codpula probabilistic model.
 
+### 10.5 Separate Tensor Lngram accumulation prerequisite
+
+The first retained full-model Vulkan run failed **before optimizer work** at the
+exact L1 common-gradient comparison:
+`blocks.0.lngram.tables.0.weight: values are not bit-identical`.
+The singleton path still executes the same clean forward/loss and clean-logit
+slices, with no noisy/circuit evaluation; the joint path adds only zero-valued
+head terms for gradient completeness. The exposed difference was in raw
+gradients, not updated weights.
+
+Burn Gather backward calls floating scatter Add; CubeCL 0.22.1 selects
+duplicate-index float atomics on Vulkan. The independently committed
+`e50cc523` correction keeps native gather forward and gives each Tensor table
+gradient cell one owner with ascending-position accumulation. It does not
+change `64590d18`, CPU/FlatSelect/FusedGpu, selectors, singleton identity or
+restart equality. No baseline rerun or fixture-backend switch was used to hide
+the failure. Contiguous/noncontiguous duplicate fixtures have 1,059 duplicate
+hits each and 32 bit-identical raw-gradient repeats; Vulkan max error is
+`1.862645149230957e-6`, tolerance ratio `0.00330107578025247`. The full original
+and contextual model gates then pass, including exact L1 common gradients and
+optimizer continuation. Details: [Lngram correction](optimization/lngram.md),
+`artifacts/codpula-context/lngram-accumulation-investigation.json`,
+`lookup-{cpu,vulkan}/lngram-reference.json` and preserved command logs.
+
+### 10.6 Explicit contextual profile: acceptance and execution costs
+
+The revised profile is selected only by `sbd.joint_output: "codpula_contextual"`.
+The original constructor, 256-to-64 head, probability initialization, omitted
+factorized behavior and fingerprints remain intact. The new constructor uses
+the exact approved 768-to-96 head, ordered valid summaries, contextual root and
+seed-local emission/transition ranges in §5. There are no independent
+pool/group/init selectors. Existing fused chain/root-VJP kernels accept shared
+`[K]` or flattened per-block `[C*K]` roots; their mathematical operations are
+unchanged, with no new execution selection.
+
+Independent scalar-f64/brute-force checks cover contextual evidence masses,
+conditional joints, marginals, FFBS, cavities, root/base-row/potential/gate
+VJPs, normalized nonnegative flows, tied reaches and Eq. (9) from pre-update
+parameters. Actual D256 summary/head fixtures cover every head VJP coordinate,
+observed features, padding/NaNs, empty rows and singleton endpoint overlap.
+
+| Gate | Max absolute error | Max ratio to unchanged tolerance |
+| --- | ---: | ---: |
+| Contextual component, CPU f32 versus independent reference | 5.167103e-6 | 0.147606 |
+| Contextual component, Vulkan f32 versus independent reference | 1.202851e-5 | 0.157887 |
+| Complete model, CPU | 1.907349e-6 | 0.095364 |
+| Complete model, Vulkan tensor | 2.384186e-6 | 0.047431 |
+| Complete model, Vulkan fused circuit | 2.384186e-6 | 0.047431 |
+
+All use `2e-5 + 3e-4*abs(ref)`. The original four model cases remain and one
+contextual KronLSTM case includes HOLA/oHC/wavelet/Lngram/retrieval. Cached,
+per-block/batched/reconstructed, evidence/leakage/temperature, detached teacher,
+student/observed-feature gradients, exact singleton and fixed-uniform rollout
+checks pass. Both old and contextual full AdamW/circuit checkpoints restore
+exactly and continue two further optimizer steps with bit-identical parameters,
+rows/EMAs and logical optimizer state. The pinned historical causal identity
+remains `c7eca1dace65f65fea8db186a6c0cc5427a320f4bf89f76a4ea0482c86dc42ca`.
+Workspace tests pass **57 experiment + 7 kernel + 16 mixer tests**; one existing
+GPU-sharing test remains explicitly ignored.
+
+Costs were recorded on Intel Arc MTL/Mesa 26.2.4, Vulkan f32, D256/four layers,
+T512/L8, no autotune or Burn fusion, tensor circuit and the configured fixed
+backbone components. At B1, two warmups precede **11 interleaved pairs**, with
+alternating order, common backbone/head, identical examples/mask draws, and
+independent optimizer trajectories. Full steps include uploads, clean pass,
+detached teacher, student joint loss, backward/checks, clipping, AdamW and
+dual-flow update. Build/startup and designated warmups are excluded; later
+shape-specific JIT is not separately removed.
+
+| B1/T512 full optimizer step | Median ms | Launches |
+| --- | ---: | ---: |
+| Original `codpula` | 1713.161 | 27,842 |
+| Explicit `codpula_contextual` | 1691.060 | 27,915 |
+
+Paired **contextual minus original** median is **-42.608 ms**, 95% paired
+bootstrap interval **[-138.390,15.668] ms**. The interval crosses zero: this does
+not establish a speedup or a resolved overhead. It is cost accounting for an
+already approved architecture, not a quality comparison or selection study.
+Sampled pool reservation is about **1,689,192,384 bytes with both runners
+resident**; it is not incremental or per-profile live peak memory.
+
+One full B8/T512 contextual diagnostic, without row subdivision or workload
+shrinking, takes **8714.077 ms**, with **30,818 launches** and **8,826,780,928
+bytes** sampled pool reservation after one warm step. Historical B8 numbers
+are unpaired and cannot establish its incremental latency/memory. Logical
+extra parameter/Adam storage is 688,512 f32 bytes, 918,016 including one gradient
+copy; extra head forward work is 3.670M MAC/pass at B1 or 29.360M at B8. Exact
+live activation peak remains unavailable.
+
+The only training execution smoke is **B1/context32/seed1, 96 bytes/three
+optimizer steps** with the D256/four-layer profile. It saves checkpoint-3;
+separate CLI load/evaluation and generation succeed, finalizing and causally
+replaying eight tokens in one dependence pass. These are execution checks,
+not quality evidence. No study, ablation, sweep, calibration grid or additional
+training was performed.
+
+Evidence is under `artifacts/codpula-context/`: `cpu/`, `vulkan/`,
+`vulkan-fused/`, `b1/codpula-benchmark.json`, `b8/codpula-diagnostic.json`,
+`smoke/` and `commands/` (including resolved failures and process exit records).
+The tracked configuration is `configs/lm512-codpula-contextual.json`; existing
+configs remain unchanged.
+
+Commands (run through `scripts/locked-gpu.ts` with shared GPU/build locks;
+the executable is a workspace-private copy of the Vulkan build):
+
+```sh
+cargo build -p delta-experiment --features vulkan
+cargo test --workspace --features delta-experiment/vulkan
+.cache/delta-experiment codpula-reference artifacts/codpula-context/cpu/config.json
+.cache/delta-experiment codpula-reference artifacts/codpula-context/vulkan/config.json
+.cache/delta-experiment codpula-model-reference artifacts/codpula-context/cpu/config.json
+.cache/delta-experiment codpula-model-reference artifacts/codpula-context/vulkan/config.json
+.cache/delta-experiment codpula-model-reference artifacts/codpula-context/vulkan-fused/config.json
+.cache/delta-experiment lngram-reference artifacts/codpula-context/lookup-cpu/config.json
+.cache/delta-experiment lngram-reference artifacts/codpula-context/lookup-vulkan/config.json
+.cache/delta-experiment codpula-benchmark artifacts/codpula-context/b1/config.json --warmups 2 --trials 11
+.cache/delta-experiment codpula-diagnostic artifacts/codpula-context/b8/config.json
+.cache/delta-experiment sbd-train artifacts/codpula-context/smoke/config.json
+.cache/delta-experiment sbd-evaluate artifacts/codpula-context/smoke/config.json --resume artifacts/codpula-context/smoke/kronlstm-hola-seed1/checkpoint-3
+.cache/delta-experiment sbd-generate artifacts/codpula-context/smoke/config.json --resume artifacts/codpula-context/smoke/kronlstm-hola-seed1/checkpoint-3
+```

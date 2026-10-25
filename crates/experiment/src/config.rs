@@ -183,9 +183,11 @@ pub enum SbdJointOutput {
     #[default]
     Factorized,
     Codpula,
+    CodpulaContextual,
 }
 impl SbdJointOutput {
     pub fn is_factorized(&self) -> bool { *self == Self::Factorized }
+    pub fn is_codpula(&self) -> bool { matches!(self, Self::Codpula | Self::CodpulaContextual) }
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -451,12 +453,12 @@ impl Config {
                 "SBD entropy threshold must be finite and nonnegative");
             ensure!(sbd.dependence_threshold.is_finite() && sbd.dependence_threshold > 0.0,
                 "SBD dependence threshold must be finite and positive");
-            ensure!(sbd.commitment != SbdCommitment::Dependence || sbd.joint_output == SbdJointOutput::Codpula,
-                "dependence commitment requires sbd.joint_output=codpula");
-            ensure!(sbd.joint_output != SbdJointOutput::Codpula || sbd.block_lengths.iter().all(|&n| n <= 16),
+            ensure!(sbd.commitment != SbdCommitment::Dependence || sbd.joint_output.is_codpula(),
+                "dependence commitment requires a Codpula joint output");
+            ensure!(!sbd.joint_output.is_codpula() || sbd.block_lengths.iter().all(|&n| n <= 16),
                 "Codpula block lengths must be at most 16");
             ensure!(sbd.joint_execution.is_tensor()
-                || (sbd.joint_output == SbdJointOutput::Codpula
+                || (sbd.joint_output.is_codpula()
                     && matches!(self.backend.as_str(),"vulkan" | "cuda") && !self.fusion),
                 "sbd.joint_execution=fused_gpu requires Codpula and explicit non-fusion GPU execution");
             ensure!(
@@ -1228,5 +1230,39 @@ mod tests {
             invalid["sbd"][field] = "automatic".into();
             assert!(serde_json::from_value::<Config>(invalid).is_err());
         }
+    }
+    #[test]
+    fn contextual_codpula_has_separate_identity_and_shared_joint_constraints() {
+        let mut c = Config {task:"lm".into(),sbd:Some(SbdConfig::default()),..Config::default()};
+        let factorized_training = c.training_fingerprint(c.train_tokens).unwrap();
+        let factorized_pilot = c.pilot_fingerprint().unwrap();
+        c.sbd.as_mut().unwrap().joint_output = SbdJointOutput::Codpula;
+        let legacy_training = c.training_fingerprint(c.train_tokens).unwrap();
+        let legacy_pilot = c.pilot_fingerprint().unwrap();
+        c.sbd.as_mut().unwrap().joint_output = SbdJointOutput::CodpulaContextual;
+        c.sbd.as_mut().unwrap().commitment = SbdCommitment::Dependence;
+        c.sbd.as_mut().unwrap().block_lengths = vec![1, 4, 16];
+        c.validate().unwrap();
+        let encoded = serde_json::to_value(&c).unwrap();
+        assert_eq!(encoded["sbd"]["joint_output"], "codpula_contextual");
+        let restored: Config = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), encoded);
+        assert_ne!(c.training_fingerprint(c.train_tokens).unwrap(), factorized_training);
+        assert_ne!(c.training_fingerprint(c.train_tokens).unwrap(), legacy_training);
+        assert_ne!(c.pilot_fingerprint().unwrap(), factorized_pilot);
+        assert_ne!(c.pilot_fingerprint().unwrap(), legacy_pilot);
+        c.sbd.as_mut().unwrap().commitment = SbdCommitment::Fixed;
+        c.sbd.as_mut().unwrap().block_lengths = SbdConfig::default().block_lengths;
+        assert_ne!(c.training_fingerprint(c.train_tokens).unwrap(), legacy_training);
+        assert_ne!(c.pilot_fingerprint().unwrap(), legacy_pilot);
+        c.sbd.as_mut().unwrap().block_lengths = vec![17];
+        assert!(c.validate().is_err());
+        c.sbd.as_mut().unwrap().block_lengths = vec![1, 4, 16];
+        c.sbd.as_mut().unwrap().joint_execution = crate::codpula::CodpulaExecution::FusedGpu;
+        assert!(c.validate().is_err());
+        c.backend = "vulkan".into();
+        c.validate().unwrap();
+        c.fusion = true;
+        assert!(c.validate().is_err());
     }
 }

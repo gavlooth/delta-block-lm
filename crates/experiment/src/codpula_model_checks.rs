@@ -1,8 +1,8 @@
-//! Small, independently runnable SBD/Codpula model acceptance checks.
-//! This module writes only tiny continuation checkpoints below artifacts/codpula.
+//! CPU/Vulkan acceptance checks for legacy and contextual SBD/Codpula consumers.
+//! Both profiles cover strict optimizer continuation using tiny artifacts/codpula checkpoints.
 use crate::{
     checkpoint,
-    codpula::{CircuitFlows, CodpulaExecution, STATES, VOCAB},
+    codpula::{CircuitFlows, CircuitState, Codpula, CodpulaExecution, GROUP_WIDTH, PreparedCircuit, STATES, VOCAB},
     config::{Arm, Config, SbdBlockExecution, SbdCommitment, SbdConfig, SbdFeedback, SbdJointOutput},
     data::{self, Batch, Example},
     kron_benchmark::values,
@@ -75,7 +75,7 @@ impl ModuleVisitor for Parameters<'_> {
         if self.snapshot.insert(name.clone(), value).is_some() { self.errors.push(format!("duplicate parameter path {name}")); }
     }
 }
-fn snapshot(model: &LanguageModel, gradients: Option<&GradientsParams>) -> Result<Snapshot> {
+fn snapshot(model: &impl Module, gradients: Option<&GradientsParams>) -> Result<Snapshot> {
     let mut visitor = Parameters { path: Vec::new(), gradients, snapshot: BTreeMap::new(), errors: Vec::new() };
     model.visit(&mut visitor);
     ensure!(visitor.errors.is_empty(), "{}", visitor.errors.join("; "));
@@ -209,13 +209,45 @@ fn probe_gates(model: &mut LanguageModel, device: &Device) {
     let shape = head.weight.val().dims();
     head.weight = head.weight.clone().map(|_| Tensor::from_data(TensorData::new(
         (0..shape[0] * shape[1]).map(|i| ((i * 17 % 29) as f32 - 14.0) * 0.005).collect::<Vec<_>>(), shape), device).require_grad());
+    let outputs = shape[1];
     head.bias = head.bias.take().map(|bias| bias.map(|_| Tensor::from_data(TensorData::new(
-        (0..64).map(|i| (i as f32 - 31.5) * 0.003).collect::<Vec<_>>(), [64]), device).require_grad()));
+        (0..outputs).map(|i| (i as f32 - (outputs - 1) as f32 * 0.5) * 0.003).collect::<Vec<_>>(), [outputs]), device).require_grad()));
 }
 fn active_values(tensor: Tensor<3>, lengths: &[usize]) -> Vec<f32> {
     let [_, width, depth] = tensor.dims();
     let raw = values(tensor);
     lengths.iter().enumerate().flat_map(|(row, &length)| raw[row * width * depth..(row * width + length) * depth].iter().copied()).collect()
+}
+
+// Keep the historical draw order, f32 conversion and double row normalization explicit.
+// This reference does not call either profile constructor.
+fn initial_probability(seed: u64, emission_radius: f64, transition_radius: f64, device: &Device) -> CircuitState {
+    let mut state = seed;
+    let mut row = |rows: usize, columns: usize, radius: f64| {
+        let data = (0..rows * columns).map(|_| {
+            state = state.wrapping_add(0x9e3779b97f4a7c15);
+            let mut bits = state;
+            bits = (bits ^ (bits >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            bits = (bits ^ (bits >> 27)).wrapping_mul(0x94d049bb133111eb);
+            bits ^= bits >> 31;
+            let uniform = ((bits >> 11) as f64 + 0.5) / 9007199254740992.0;
+            ((uniform - 0.5) * (2.0 * radius)) as f32
+        }).collect::<Vec<_>>();
+        burn::tensor::activation::log_softmax(Tensor::from_data(TensorData::new(data, [rows, columns]), device), 1)
+    };
+    let emission = row(STATES, VOCAB, emission_radius);
+    let transition = row(STATES, STATES, transition_radius);
+    let root = row(1, STATES, 0.01).reshape([STATES]);
+    CircuitState::from_logs(emission, transition, root)
+}
+fn initial_head(circuit: &Codpula, inputs: usize, outputs: usize) -> Result<Value> {
+    ensure!(circuit.gate_head.weight.val().dims() == [inputs, outputs], "initial gate weight shape differs");
+    let bias = circuit.gate_head.bias.as_ref().context("initial gate bias")?;
+    ensure!(bias.val().dims() == [outputs], "initial gate bias shape differs");
+    ensure!(values(circuit.gate_head.weight.val()).iter().chain(values(bias.val()).iter()).all(|&x| x == 0.0), "gate head is not initialized to zero");
+    let parameters = snapshot(circuit, None)?;
+    ensure!(parameters.values().filter(|value| value.trainable).count() == 2, "profile has more than one trainable linear head");
+    Ok(json!({"passed":true,"weight_shape":[inputs,outputs],"bias_shape":[outputs],"head_exact_zero":true,"trainable_tensors":2}))
 }
 
 fn selector_identity(c: &Config, device: &Device) -> Result<Value> {
@@ -243,12 +275,44 @@ fn selector_identity(c: &Config, device: &Device) -> Result<Value> {
     let joint_values = snapshot(&joint, None)?;
     let common_initial = compare_snapshots(&common(&joint_values), &baseline, true)?;
     let circuit = joint.codpula.as_ref().unwrap();
-    ensure!(values(circuit.gate_head.weight.val()).iter().chain(values(circuit.gate_head.bias.as_ref().unwrap().val()).iter()).all(|&x| x == 0.0), "gate head is not initialized to zero");
+    let legacy_head = initial_head(circuit, cfg.d_model, 64)?;
+    let legacy_probability = compare_snapshots(&snapshot(&circuit.probability,None)?, &snapshot(&initial_probability(cfg.seed,0.01,0.01,device),None)?, true)?;
+    let legacy_encoded = serde_json::to_value(&cfg)?;
+    ensure!(legacy_encoded["sbd"]["joint_output"] == "codpula", "legacy selector serialization changed");
+    let legacy_roundtrip: Config = serde_json::from_value(legacy_encoded)?;
+    ensure!(cfg.training_fingerprint(24)? == legacy_roundtrip.training_fingerprint(24)? && cfg.pilot_fingerprint()? == legacy_roundtrip.pilot_fingerprint()?, "legacy selector roundtrip changes hashes");
     ensure!(cfg.training_fingerprint(24)? != omitted.training_fingerprint(24)? && cfg.pilot_fingerprint()? != omitted.pilot_fingerprint()?, "Codpula does not change config identity");
+    let legacy_training = cfg.training_fingerprint(24)?;
+    let legacy_pilot = cfg.pilot_fingerprint()?;
+    cfg.sbd.as_mut().unwrap().joint_output = SbdJointOutput::CodpulaContextual;
+    let contextual_encoded = serde_json::to_value(&cfg)?;
+    ensure!(contextual_encoded["sbd"]["joint_output"] == "codpula_contextual", "contextual selector serialization differs");
+    let contextual_roundtrip: Config = serde_json::from_value(contextual_encoded)?;
+    ensure!(cfg.training_fingerprint(24)? == contextual_roundtrip.training_fingerprint(24)? && cfg.pilot_fingerprint()? == contextual_roundtrip.pilot_fingerprint()?, "contextual selector roundtrip changes hashes");
+    let contextual_training = cfg.training_fingerprint(24)?;
+    let contextual_pilot = cfg.pilot_fingerprint()?;
+    ensure!(contextual_training != legacy_training && contextual_training != omitted.training_fingerprint(24)?
+        && contextual_pilot != legacy_pilot && contextual_pilot != omitted.pilot_fingerprint()?, "contextual profile does not have distinct identity");
+    device.seed(cfg.seed);
+    let contextual = LanguageModel::new(&cfg, &arm, device)?;
+    let contextual_common = compare_snapshots(&common(&snapshot(&contextual,None)?), &baseline, true)?;
+    let contextual_circuit = contextual.codpula.as_ref().context("contextual model has no circuit")?;
+    let contextual_head = initial_head(contextual_circuit,3 * cfg.d_model,96)?;
+    let contextual_probability = compare_snapshots(&snapshot(&contextual_circuit.probability,None)?, &snapshot(&initial_probability(cfg.seed,0.25,0.1,device),None)?, true)?;
+    let shared_root = identical(&values(contextual_circuit.probability.log_root.val()),&values(circuit.probability.log_root.val()),"contextual root initialization differs from legacy")?;
+    ensure!(values(contextual_circuit.probability.log_emission.val()) != values(circuit.probability.log_emission.val())
+        && values(contextual_circuit.probability.log_transition.val()) != values(circuit.probability.log_transition.val()), "contextual probability initialization still uses legacy ranges");
+    let full_width_legacy = initial_head(&Codpula::new(256,cfg.seed,device),256,64)?;
+    let full_width_contextual = initial_head(&Codpula::new_contextual(256,cfg.seed,device),768,96)?;
     let batch = Batch::new(&rows(1, 9), device);
     let clean = identical(&values(joint.forward(&batch)), &values(old_model.forward(&batch)), "Codpula changed clean logits")?;
     let clean_loss = identical(&values(joint.loss(joint.forward(&batch), &batch)), &values(old_model.loss(old_model.forward(&batch), &batch)), "Codpula changed clean loss")?;
-    Ok(json!({"passed":true,"omitted_and_explicit_serialization_identical":true,"training_sha256":omitted.training_fingerprint(24)?,"pilot_sha256":omitted.pilot_fingerprint()?,"initial_parameter_sha256":snapshot_hash(&baseline)?,"explicit_initial_parameters":initial,"codpula_common_initial_parameters":common_initial,"clean_logits":clean,"clean_loss":clean_loss,"gate_initialization_zero":true}))
+    let contextual_clean = identical(&values(contextual.forward(&batch)), &values(old_model.forward(&batch)), "contextual Codpula changed clean logits")?;
+    let contextual_clean_loss = identical(&values(contextual.loss(contextual.forward(&batch), &batch)), &values(old_model.loss(old_model.forward(&batch), &batch)), "contextual Codpula changed clean loss")?;
+    Ok(json!({"passed":true,"omitted_and_explicit_serialization_identical":true,"training_sha256":omitted.training_fingerprint(24)?,"pilot_sha256":omitted.pilot_fingerprint()?,"initial_parameter_sha256":snapshot_hash(&baseline)?,"explicit_initial_parameters":initial,"codpula_common_initial_parameters":common_initial,"clean_logits":clean,"clean_loss":clean_loss,"gate_initialization_zero":true,
+        "legacy":{"training_sha256":legacy_training,"pilot_sha256":legacy_pilot,"head":legacy_head,"historical_probability_initialization":legacy_probability,"d_model_256_head":full_width_legacy},
+        "contextual":{"training_sha256":cfg.training_fingerprint(24)?,"pilot_sha256":cfg.pilot_fingerprint()?,"common_initial_parameters":contextual_common,"head":contextual_head,"probability_initialization":contextual_probability,"root_matches_legacy":shared_root,"d_model_256_head":full_width_contextual,"clean_logits":contextual_clean,"clean_loss":contextual_clean_loss},
+        "profile_identities_distinct":true}))
 }
 
 struct Readout {
@@ -443,7 +507,7 @@ fn teacher_and_student(model: &LanguageModel, cfg: &Config, device: &Device) -> 
     let maximum = nonzero_finite(&student_gradient, "student token-potential gradient")?;
     ensure!(student_gradient[VOCAB..2 * VOCAB].iter().all(|&x| x == 0.0), "observed token potentials have a gradient");
     let features_gradient = values(student_feature_probe.grad(&gradients).context("student gate-feature gradient")?);
-    let observed_features_max = nonzero_finite(&features_gradient[cfg.d_model..2 * cfg.d_model], "observed student features through mean-pooled gates")?;
+    let observed_features_max = nonzero_finite(&features_gradient[cfg.d_model..2 * cfg.d_model], "observed student features through context gates")?;
     let table = model.embedding.weight.val().detach().require_grad();
     let mask = model.sbd_mask.as_ref().unwrap().val().detach().require_grad();
     let expected = state.embeddings(table.clone(), mask.clone(), false);
@@ -464,6 +528,97 @@ fn teacher_and_student(model: &LanguageModel, cfg: &Config, device: &Device) -> 
         identical(&values(value.clone()),before,&format!("teacher/student changed clean {kind} snapshot"))?;
     }
     Ok(json!({"passed":true,"same_clean_training_cache_for_teacher_and_student":true,"clean_snapshot_sources_bit_identical":true,"training_objective":"final student conditional NLL only; no teacher or per-round averaged loss","teacher_logits_and_features_gradients_absent":true,"teacher_potential_temperature_then_feedback_temperature_one":temperature_report,"feedback_visibility":visibility_report,"student_logit_gradient_max_abs":maximum,"observed_logit_gradient_zero":true,"observed_gate_feature_gradient_max_abs":observed_features_max,"selected_embedding_gradient_max_abs":selected_max}))
+}
+
+fn contextual_heads(model: &LanguageModel, cfg: &Config, device: &Device) -> Result<Value> {
+    let circuit = model.codpula.as_ref().context("contextual head circuit")?;
+    let lengths = vec![4,2,0];
+    let (count,width,depth) = (3,6,cfg.d_model);
+    let observed_values = vec![true,false,true,true,false,false,true,false,false,false,false,false,false,false,false,false,false,false];
+    let observed = Tensor::<2,Bool>::from_data(TensorData::new(observed_values.clone(),[count,width]),device);
+    let targets = Tensor::<2,Int>::from_data([[11,65,83,121,0,0],[47,91,0,0,0,0],[0,0,0,0,0,0]],device);
+    let logits = Tensor::from_data(TensorData::new((0..count*width*VOCAB).map(|index|
+        ((index*19%97) as f32-48.0)*0.017).collect::<Vec<_>>(),[count,width,VOCAB]),device).require_grad();
+    let features = Tensor::from_data(TensorData::new((0..count*width*depth).map(|index|
+        ((index*23%71) as f32-35.0)*0.031).collect::<Vec<_>>(),[count,width,depth]),device).require_grad();
+    let reference_logits = logits.clone().detach().require_grad();
+    let reference_features = features.clone().detach().require_grad();
+    // Independently slice only valid positions, rather than reusing context_summary.
+    let mut summaries = Vec::new();
+    for (row,&length) in lengths.iter().enumerate() {
+        summaries.push(if length == 0 {
+            Tensor::zeros([1,3*depth],device)
+        } else {
+            let valid = reference_features.clone().slice([row..row+1,0..length,0..depth]);
+            let mean = valid.sum_dim(1).reshape([1,depth]) / length as f64;
+            let first = reference_features.clone().slice([row..row+1,0..1,0..depth]).reshape([1,depth]);
+            let last = reference_features.clone().slice([row..row+1,length-1..length,0..depth]).reshape([1,depth]);
+            Tensor::cat(vec![mean,first,last],1)
+        });
+    }
+    let projected = circuit.gate_head.forward(Tensor::cat(summaries,0));
+    let gate_probe = Tensor::zeros([count,8,8],device).require_grad();
+    let root_probe = Tensor::zeros([count,STATES],device).require_grad();
+    let gates = projected.clone().slice([0..count,0..64]).reshape([count,8,8]) + gate_probe.clone();
+    let roots = projected.slice([0..count,64..96]) + root_probe.clone();
+    let temperature = 0.7;
+    let detached_observed = reference_logits.clone().mask_where(
+        observed.clone().reshape([count,width,1]).expand([count,width,VOCAB]),reference_logits.clone().detach()) / temperature;
+    let reference = PreparedCircuit::prepare_contextual(circuit.probability.log_emission.val(),
+        circuit.probability.log_transition.val(),circuit.probability.log_root.val(),detached_observed,gates,roots,lengths.clone(),GROUP_WIDTH)?;
+    let actual = circuit.prepare(logits.clone(),features.clone(),&lengths,observed.clone(),temperature)?;
+    let marginals = compare(&values(actual.marginals(targets.clone(),observed.clone())?),
+        &values(reference.marginals(targets.clone(),observed.clone())?))?;
+    let evidence = compare(&values(actual.log_partition(targets.clone(),observed.clone())?),
+        &values(reference.log_partition(targets.clone(),observed.clone())?))?;
+    let actual = actual.conditional_nll(targets.clone(),observed.clone(),6.0)?;
+    let reference = reference.conditional_nll(targets,observed,6.0)?;
+    let loss = compare(&values(actual.loss.clone()),&values(reference.loss.clone()))?;
+    let flows = compare_flows(&actual.flows,&reference.flows)?;
+    let actual_gradients = actual.loss.backward();
+    let reference_gradients = reference.loss.backward();
+    let logit_gradient = values(logits.grad(&actual_gradients).context("contextual token-potential gradient")?);
+    let feature_gradient = values(features.grad(&actual_gradients).context("contextual summary-feature gradient")?);
+    let logits_report = compare(&logit_gradient,&values(reference_logits.grad(&reference_gradients).context("reference contextual token gradient")?))?;
+    let features_report = compare(&feature_gradient,&values(reference_features.grad(&reference_gradients).context("reference contextual feature gradient")?))?;
+    let weight_gradient = values(circuit.gate_head.weight.val().grad(&actual_gradients).context("contextual head weight gradient")?);
+    let bias = circuit.gate_head.bias.as_ref().context("contextual head bias")?;
+    let bias_gradient = values(bias.val().grad(&actual_gradients).context("contextual head bias gradient")?);
+    let weights_report = compare(&weight_gradient,&values(circuit.gate_head.weight.val().grad(&reference_gradients).context("reference contextual head weight gradient")?))?;
+    let bias_report = compare(&bias_gradient,&values(bias.val().grad(&reference_gradients).context("reference contextual head bias gradient")?))?;
+    let root_gradient = values(root_probe.grad(&reference_gradients).context("contextual root-loggate gradient")?);
+    let transition_gradient = values(gate_probe.grad(&reference_gradients).context("contextual transition-loggate gradient")?);
+    let root_max = nonzero_finite(&root_gradient[..2*STATES],"active contextual root gates")?;
+    let transition_max = nonzero_finite(&transition_gradient[..2*64],"active contextual transition gates")?;
+    ensure!(root_gradient[2*STATES..].iter().chain(&transition_gradient[2*64..]).all(|&x|x == 0.0),
+        "inactive block trains context gates");
+    let root_weight_gradient = weight_gradient.chunks_exact(96).flat_map(|row|row[64..].iter().copied()).collect::<Vec<_>>();
+    let root_weights_max = nonzero_finite(&root_weight_gradient,"contextual root-head weights")?;
+    let root_bias_max = nonzero_finite(&bias_gradient[64..],"contextual root-head bias")?;
+    let mut observed_features = Vec::new();
+    for (row,&length) in lengths.iter().enumerate() {
+        for position in 0..width {
+            let index = row*width+position;
+            if position >= length {
+                ensure!(logit_gradient[index*VOCAB..(index+1)*VOCAB].iter().chain(&feature_gradient[index*depth..(index+1)*depth]).all(|&x|x == 0.0),
+                    "contextual padded token/features have a derivative");
+            } else if observed_values[index] {
+                ensure!(logit_gradient[index*VOCAB..(index+1)*VOCAB].iter().all(|&x|x == 0.0),"contextual observed output potential is not detached");
+                observed_features.push(json!({"row":row,"position":position,"maximum":nonzero_finite(&feature_gradient[index*depth..(index+1)*depth],"observed contextual feature")?}));
+            }
+        }
+    }
+    let mut summary_gradients = Vec::new();
+    for (name,index) in [("valid_mean",0),("first_valid",1),("last_valid",2)] {
+        summary_gradients.push(json!({"summary":name,"weight_gradient_max_abs":nonzero_finite(&weight_gradient[index*depth*96..(index+1)*depth*96],name)?}));
+    }
+    Ok(json!({"passed":true,"lengths":lengths,"temperature":temperature,"independent_valid_mean_first_last_reference":true,
+        "joint_marginals":marginals,"visible_log_mass":evidence,"conditional_nll":loss,"circuit_flows":flows,
+        "token_potential_gradients":logits_report,"feature_gradients":features_report,"head_weight_gradients":weights_report,"head_bias_gradients":bias_report,
+        "root_loggate_gradient_max_abs":root_max,"transition_loggate_gradient_max_abs":transition_max,
+        "root_head_weight_gradient_max_abs":root_weights_max,"root_head_bias_gradient_max_abs":root_bias_max,
+        "observed_features":observed_features,"summary_weight_gradients":summary_gradients,
+        "observed_output_potentials_detached":true,"padding_and_inactive_gate_derivatives_zero":true}))
 }
 
 fn training_seed(cfg: &Config, examples: &[Example]) -> Result<u64> {
@@ -501,7 +656,17 @@ fn training_paths(model: &LanguageModel, cfg: &Config, device: &Device) -> Resul
     singleton.sbd.as_mut().unwrap().block_lengths = vec![1];
     let result = sbd::training_loss(model, &singleton, &examples, &batch, 1)?;
     ensure!(result.circuit_flows.is_none(), "L1 bypass produces circuit updates");
-    let _ = snapshot(model,Some(&model::checked_gradients(model,result.loss)?))?;
+    let mut factorized = singleton.clone();
+    factorized.sbd.as_mut().unwrap().joint_output = SbdJointOutput::Factorized;
+    let mut causal = model.clone();
+    causal.codpula = None;
+    let baseline = sbd::training_loss(&causal,&factorized,&examples,&batch,1)?;
+    let singleton_loss = identical(&values(result.loss.clone()),&values(baseline.loss.clone()),"L1 joint/factorized loss")?;
+    let singleton_gradients = snapshot(model,Some(&model::checked_gradients(model,result.loss)?))?;
+    let singleton_common_gradients = compare_snapshots(&common(&singleton_gradients),&snapshot(&causal,Some(&model::checked_gradients(&causal,baseline.loss)?))?,true)?;
+    for (name,gradient) in &singleton_gradients {
+        if name.split('.').any(|part|part == "codpula") { ensure!(gradient.values.iter().all(|&x|x == 0.0),"L1 bypass trains context head {name}"); }
+    }
     let one_row = rows(1, 4);
     let mut all_observed_seed = None;
     for seed in 0..65_536 { if sbd::sample_training_blocks(cfg,&one_row,seed)?.is_empty() { all_observed_seed = Some(seed); break; } }
@@ -512,7 +677,7 @@ fn training_paths(model: &LanguageModel, cfg: &Config, device: &Device) -> Resul
     let clean = model.loss(model.forward(&batch),&batch);
     let clean_report = identical(&values(result.loss.clone()),&values(clean),"all-observed training loss is not causal loss")?;
     let _ = snapshot(model,Some(&model::checked_gradients(model,result.loss)?))?;
-    Ok(json!({"passed":true,"mixed_mask_seed":mixed_seed,"sampled_blocks":sbd::sample_training_blocks(cfg,&examples,mixed_seed)?.iter().map(|block|json!({"row":block.row,"start":block.start,"length":block.length,"masked":block.masked})).collect::<Vec<_>>(),"execution_paths":reports,"fractional_weight_rejection":error.to_string(),"length_one_no_circuit_update":true,"all_observed_seed":seed,"all_observed_loss":clean_report,"bypass_neural_gradients_present_and_finite":true}))
+    Ok(json!({"passed":true,"mixed_mask_seed":mixed_seed,"sampled_blocks":sbd::sample_training_blocks(cfg,&examples,mixed_seed)?.iter().map(|block|json!({"row":block.row,"start":block.start,"length":block.length,"masked":block.masked})).collect::<Vec<_>>(),"execution_paths":reports,"fractional_weight_rejection":error.to_string(),"length_one_no_circuit_update":true,"length_one_factorized_loss":singleton_loss,"length_one_factorized_common_gradients":singleton_common_gradients,"length_one_head_gradients_exact_zero":true,"all_observed_seed":seed,"all_observed_loss":clean_report,"bypass_neural_gradients_present_and_finite":true}))
 }
 
 fn circuit_state(model: &LanguageModel) -> Result<Value> {
@@ -551,6 +716,12 @@ fn complete_step(model: LanguageModel, cfg: &Config, optimizer: &mut ModuleOptim
     let gradients = model::checked_gradients(&model,result.loss)?;
     let gradient_values = snapshot(&model,Some(&gradients))?;
     let gradient_sha256 = snapshot_hash(&gradient_values)?;
+    let root_head_gradient = if cfg.sbd.as_ref().unwrap().joint_output == SbdJointOutput::CodpulaContextual {
+        let (_,weight) = gradient_values.iter().find(|(name,_)|name.ends_with("codpula.gate_head.weight")).context("complete-step contextual head gradient")?;
+        ensure!(weight.shape == [3*cfg.d_model,96], "complete-step contextual gradient shape");
+        let root = weight.values.chunks_exact(96).flat_map(|row|row[64..].iter().copied()).collect::<Vec<_>>();
+        Some(nonzero_finite(&root,"complete-step contextual root-head gradient")?)
+    } else { None };
     let clipping_norms = gradient_values.iter().map(|(name, values)| {
         let norm = values.values.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>().sqrt();
         (name.clone(),json!({"f64_norm":norm,"clipping_active":norm>f64::from(cfg.gradient_clip)}))
@@ -559,10 +730,16 @@ fn complete_step(model: LanguageModel, cfg: &Config, optimizer: &mut ModuleOptim
     let after = snapshot(&updated,None)?;
     let changed = |neural: bool| before.iter().filter(|(_,v)|v.trainable == neural).any(|(name,value)|value.values.iter().zip(&after[name].values).any(|(a,b)|a.to_bits()!=b.to_bits()));
     ensure!(changed(true),"complete step did not update any neural parameter");
+    if root_head_gradient.is_some() {
+        let (name,weight) = before.iter().find(|(name,_)|name.ends_with("codpula.gate_head.weight")).context("complete-step contextual head")?;
+        ensure!(weight.values.chunks_exact(96).zip(after[name].values.chunks_exact(96))
+            .any(|(old,new)|old[64..].iter().zip(&new[64..]).any(|(a,b)|a.to_bits()!=b.to_bits())),
+            "complete step did not update contextual root-head weights");
+    }
     ensure!(before.iter().filter(|(name,_)|name.ends_with("log_emission") || name.ends_with("log_transition") || name.ends_with("log_root")).any(|(name,value)|value.values.iter().zip(&after[name].values).any(|(a,b)|a.to_bits()!=b.to_bits())), "complete step did not update circuit probability rows");
     let circuit_report = circuit_state(&updated)?;
     ensure!(circuit_report["update_step"].as_i64() == Some(i64::from(previous_circuit_step)+1),"complete step did not advance circuit momentum time exactly once");
-    let report = json!({"passed":true,"loss":loss,"mask_seed":seed,"neural_gradient_tensors":gradient_values.len(),"gradient_sha256":gradient_sha256,"gradient_norms":clipping_norms,"neural_parameters_changed":changed(true),"circuit_parameters_changed":true,"flows":flow_report,"state":circuit_report});
+    let report = json!({"passed":true,"loss":loss,"mask_seed":seed,"neural_gradient_tensors":gradient_values.len(),"gradient_sha256":gradient_sha256,"gradient_norms":clipping_norms,"contextual_root_head_gradient_max_abs":root_head_gradient,"neural_parameters_changed":changed(true),"circuit_parameters_changed":true,"flows":flow_report,"state":circuit_report});
     Ok((updated,report))
 }
 fn checkpoint_continuation(model: &LanguageModel, cfg: &Config, device: &Device) -> Result<Value> {
@@ -872,9 +1049,18 @@ pub fn run(c: &Config, device: &Device) -> Result<Value> {
     let identity = selector_identity(c,&device)?;
     let mut cases = Vec::new();
     let mut continuation = None;
-    for mixer in ["gdn2","kronlstm"] {
-        for extended in [false,true] {
+    let mut contextual_continuation = None;
+    // Retain the historical matrix. The contextual profile fixes KronLSTM and all
+    // existing auxiliary components rather than adding another architecture sweep.
+    for (mixer,extended,joint_output) in [
+        ("gdn2",false,SbdJointOutput::Codpula),
+        ("gdn2",true,SbdJointOutput::Codpula),
+        ("kronlstm",false,SbdJointOutput::Codpula),
+        ("kronlstm",true,SbdJointOutput::Codpula),
+        ("kronlstm",true,SbdJointOutput::CodpulaContextual),
+    ] {
             let (mut cfg,arm) = fixture_config(c,mixer,extended);
+            cfg.sbd.as_mut().unwrap().joint_output = joint_output;
             cpu.seed(cfg.seed);
             let mut reference = LanguageModel::new(&cfg,&arm,&cpu)?;
             probe_gates(&mut reference,&cpu);
@@ -899,12 +1085,17 @@ pub fn run(c: &Config, device: &Device) -> Result<Value> {
             let inactive = inactive_rows(&tested,&cfg,&device).with_context(||format!("{mixer} extended={extended}: inactive rows"))?;
             let inference = evaluation_and_generation(&tested,&cfg,&device).with_context(||format!("{mixer} extended={extended}: evaluation/generation"))?;
             let rollout = scheduler_rollout(&tested,&cfg,&device).with_context(||format!("{mixer} extended={extended}: fixed-uniform rollout"))?;
-            if mixer == "kronlstm" && !extended { continuation = Some(checkpoint_continuation(&tested,&cfg,&device).context("checkpoint continuation")?); }
-            cases.push(json!({"mixer":mixer,"ohc_wavelet_lngram_and_retrieval":extended,"in_block_reads":cfg.sbd.as_ref().unwrap().in_block_reads,"joint_execution":cfg.sbd.as_ref().unwrap().joint_execution,"cpu_vs_requested_backend":backend,"output_paths":paths,"observation_and_target_locality":locality,"teacher_student_gradients":gradients,"training_paths":training,"inactive_rows":inactive,"inference":inference,"fixed_uniform_scheduler_rollout":rollout}));
-        }
+            let heads = if joint_output == SbdJointOutput::CodpulaContextual {
+                contextual_continuation = Some(checkpoint_continuation(&tested,&cfg,&device).context("contextual checkpoint continuation")?);
+                Some(json!({"cpu":contextual_heads(&reference,&cfg,&cpu)?,"requested_backend":contextual_heads(&tested,&cfg,&device)?}))
+            } else {
+                if mixer == "kronlstm" && !extended { continuation = Some(checkpoint_continuation(&tested,&cfg,&device).context("legacy checkpoint continuation")?); }
+                None
+            };
+            cases.push(json!({"mixer":mixer,"joint_output":joint_output,"ohc_wavelet_lngram_and_retrieval":extended,"in_block_reads":cfg.sbd.as_ref().unwrap().in_block_reads,"joint_execution":cfg.sbd.as_ref().unwrap().joint_execution,"cpu_vs_requested_backend":backend,"output_paths":paths,"observation_and_target_locality":locality,"teacher_student_gradients":gradients,"contextual_summary_and_root_head":heads,"training_paths":training,"inactive_rows":inactive,"inference":inference,"fixed_uniform_scheduler_rollout":rollout}));
     }
     let historical = historical_checkpoint_compatibility(&device)?;
-    let mut report = json!({"passed":true,"command":"codpula-model-reference","device":runtime::identity(&device),"precision":"float32","seed":72,"absolute_tolerance":2e-5,"relative_tolerance":3e-4,"clipping":clipping,"selector_and_initialization":identity,"cases":cases,"checkpoint_continuation":continuation.context("missing checkpoint continuation case")?,"historical_checkpoint_compatibility":historical,"old_sbd_leakage_checks":"unchanged; this module adds Codpula checks"});
+    let mut report = json!({"passed":true,"command":"codpula-model-reference","device":runtime::identity(&device),"precision":"float32","seed":72,"absolute_tolerance":2e-5,"relative_tolerance":3e-4,"clipping":clipping,"selector_and_initialization":identity,"cases":cases,"checkpoint_continuation":continuation.context("missing legacy checkpoint continuation case")?,"contextual_checkpoint_continuation":contextual_continuation.context("missing contextual checkpoint continuation case")?,"historical_checkpoint_compatibility":historical,"old_sbd_leakage_checks":"unchanged; this module adds legacy and contextual Codpula checks"});
     let (mut absolute,mut ratio) = (0.0,0.0);
     maximum_errors(&report,&mut absolute,&mut ratio);
     report["max_abs"] = json!(absolute);
@@ -912,16 +1103,21 @@ pub fn run(c: &Config, device: &Device) -> Result<Value> {
     Ok(report)
 }
 
-/// Narrow strict continuation regression, without rerunning the architecture matrix.
+/// Strict legacy and contextual continuation regressions, without the model matrix.
 pub fn continuation_reference(c: &Config, device: &Device) -> Result<Value> {
     let clipping = crate::update::clipping_checks(device)?;
     let cpu = Device::ndarray().autodiff();
     let target = device.clone().autodiff();
-    let (mut cfg,arm) = fixture_config(c,"kronlstm",false);
-    cpu.seed(cfg.seed);
-    let mut reference = LanguageModel::new(&cfg,&arm,&cpu)?;
-    probe_gates(&mut reference,&cpu);
-    let mut model = reference.fork(&target);
-    requested_backends(&mut model,&mut cfg,c);
-    Ok(json!({"passed":true,"clipping":clipping,"continuation":checkpoint_continuation(&model,&cfg,&target)?}))
+    let mut reports = Vec::new();
+    for (joint_output,extended) in [(SbdJointOutput::Codpula,false),(SbdJointOutput::CodpulaContextual,true)] {
+        let (mut cfg,arm) = fixture_config(c,"kronlstm",extended);
+        cfg.sbd.as_mut().unwrap().joint_output = joint_output;
+        cpu.seed(cfg.seed);
+        let mut reference = LanguageModel::new(&cfg,&arm,&cpu)?;
+        probe_gates(&mut reference,&cpu);
+        let mut model = reference.fork(&target);
+        requested_backends(&mut model,&mut cfg,c);
+        reports.push(checkpoint_continuation(&model,&cfg,&target)?);
+    }
+    Ok(json!({"passed":true,"clipping":clipping,"continuation":reports.remove(0),"contextual_continuation":reports.remove(0)}))
 }

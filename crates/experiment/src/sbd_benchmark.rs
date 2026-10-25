@@ -240,6 +240,9 @@ fn codpula_isolated(c:&Config,device:&Device,warmups:usize,trials:usize) -> Resu
 /// Same-model tensor/fused comparison, with the factorized cost reported separately.
 pub fn codpula(c:&Config,device:&Device,warmups:usize,trials:usize) -> Result<Value> {
     use crate::{codpula::CodpulaExecution,config::{SbdCommitment,SbdJointOutput}};
+    if c.sbd.as_ref().is_some_and(|s|s.joint_output==SbdJointOutput::CodpulaContextual) {
+        return codpula_contextual(c,device,warmups,trials);
+    }
     ensure!(warmups>=2 && trials>=11,"Codpula timing requires >=2 warmups and >=11 paired trials");
     ensure!(c.batch_size==1 && c.context==512,"Codpula paired complete-step timing requires B1/T512");
     ensure!(c.arms.len()==1 && c.sbd.as_ref().is_some_and(|s|s.joint_output==SbdJointOutput::Codpula),
@@ -298,6 +301,65 @@ pub fn codpula(c:&Config,device:&Device,warmups:usize,trials:usize) -> Result<Va
         "factorized_minus_fused":paired(&samples[0],&samples[2]),
         "method":"same-session interleaved complete steps, alternating mode order, common initial backbone and identical step-specific examples/mask draws; independent neural optimizer and circuit trajectories; includes uploads, clean and detached teacher passes, joint loss, neural backward/checks/clipping/AdamW and dual-flow circuit update; excludes cold compilation and warmups; factorized is cost accounting, not a quality comparison",
         "memory_note":"pool reservation sampled after forward/backward/update, including all three live runners; not exact peak live allocation"});
+    runtime::write_json(&path,&report)?;
+    Ok(report)
+}
+
+/// Cost accounting for the approved contextual profile, not architecture selection.
+fn codpula_contextual(c:&Config,device:&Device,warmups:usize,trials:usize) -> Result<Value> {
+    use crate::{codpula::{Codpula,CodpulaExecution},config::SbdJointOutput};
+    ensure!(warmups==2 && trials==11,"contextual cost accounting requires two warmups and eleven pairs");
+    ensure!(c.batch_size==1 && c.context==512 && c.d_model==256,"contextual paired timing requires D256/B1/T512");
+    ensure!(c.arms.len()==1 && c.sbd.as_ref().is_some_and(|s|s.block_lengths==[8]),
+        "contextual timing requires one arm and L8");
+    ensure!(matches!(c.backend.as_str(),"vulkan"|"cuda") && !c.fusion,
+        "contextual timing requires explicit non-fusion GPU execution");
+    let target=device.clone().autodiff();
+    target.seed(c.seed);
+    let base=LanguageModel::new(c,&c.arms[0],&target)?;
+    let corpus=train::loaded_corpus(c)?;
+    let mut configs=[c.clone(),c.clone()];
+    configs[0].sbd.as_mut().unwrap().joint_output=SbdJointOutput::Codpula;
+    let mut runners=Vec::with_capacity(2);
+    for (mode,config) in configs.iter_mut().enumerate() {
+        config.sbd.as_mut().unwrap().joint_execution=CodpulaExecution::Tensor;
+        config.validate()?;
+        let mut model=base.clone();
+        if mode==0 {model.codpula=Some(Codpula::new(c.d_model,c.seed,&target));}
+        runners.push(Runner{model:Some(model),optim:train::optimizer(config),step:0,peak:None});
+    }
+    let path=c.artifact_dir.join("codpula-benchmark.json");
+    let started=Instant::now();
+    let mut samples:[Vec<f64>;2]=std::array::from_fn(|_|Vec::new());
+    for iteration in 0..warmups+trials {
+        for mode in if iteration%2==0 {[0,1]}else{[1,0]} {
+            runtime::write_json(&path,&json!({"completed":false,"config":c,"warmups":warmups,"trials":trials,
+                "iteration":iteration,"next_mode":mode,"samples_ms":samples}))?;
+            ensure!(started.elapsed().as_secs_f64()<c.max_seconds,
+                "contextual timing reached max_seconds; partial report retained");
+            let milliseconds=runners[mode].step(&configs[mode],corpus.as_ref(),&target)?;
+            if iteration>=warmups {samples[mode].push(milliseconds);}
+        }
+    }
+    let mut rows=Vec::with_capacity(2);
+    for mode in 0..2 {
+        let mut instrumented_ms=0.0;
+        let dispatches=launches(|| {
+            instrumented_ms=runners[mode].step(&configs[mode],corpus.as_ref(),&target)?;
+            Ok(())
+        })?;
+        rows.push(json!({"selection":(["codpula","codpula_contextual"][mode]),
+            "median_ms":median(&samples[mode]),"samples_ms":samples[mode],"launches":dispatches,
+            "instrumented_step_ms":instrumented_ms,"sampled_peak_pool_reserved_bytes":runners[mode].peak}));
+    }
+    let report=json!({"completed":true,"config":c,"device":runtime::identity(device),"precision":"float32",
+        "warmups":warmups,"trials":trials,"steps":rows,
+        "contextual_minus_codpula":paired(&samples[1],&samples[0]),
+        "method":"same-session paired full SBD optimizer steps; alternating order; common backbone, clean vocabulary head and example/mask seeds; independent neural/circuit optimizer trajectories; includes uploads, clean pass, detached teacher, student joint loss, backward, finite checks, clipping, AdamW and dual-flow update; excludes build/startup and two designated warmups; later shape-specific JIT is not separately removed; one extra instrumented step per profile reports dispatches; costs only, not a quality comparison or architecture-selection experiment",
+        "memory_note":"sampled pool reservation includes both resident models/optimizers; not per-profile peak live allocations",
+        "logical_extra_neural_parameters":57376,
+        "logical_extra_persistent_parameter_and_adam_bytes_f32":57376*4*3,
+        "logical_extra_forward_mac_per_noisy_pass":(c.batch_size*c.context/8)*c.d_model*(3*96-64)});
     runtime::write_json(&path,&report)?;
     Ok(report)
 }

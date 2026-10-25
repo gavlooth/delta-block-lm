@@ -230,7 +230,10 @@ fn chain_kernel<F: Float>(
         u += 1;
     }
     if posterior { beta[s] = F::new(0.0f32); }
-    if s < states && length > 0 { alpha[s] = root[s * root.stride(0)] + evidence[ix3(evidence, c, 0, s)]; }
+    if s < states && length > 0 {
+        let root_row = if root.shape(0) == states { 0usize } else { c * states };
+        alpha[s] = root[(root_row + s) * root.stride(0)] + evidence[ix3(evidence, c, 0, s)];
+    }
     sync_cube();
     t = 1;
     while t < length {
@@ -341,14 +344,19 @@ fn root_backward_kernel<F: Float>(
     gamma: &View<F>, upstream: &View<F>, out: &mut View<F>, #[define(F)] _dtype: ElemType,
 ) {
     let s = UNIT_POS as usize;
+    let row = CUBE_POS as usize;
     if s < gamma.shape(2) {
-        let mut c = 0usize;
-        let mut sum = F::new(0.0f32);
-        while c < gamma.shape(0) {
-            sum += upstream[c * upstream.stride(0)] * gamma[ix3(gamma, c, 0, s)];
-            c += 1;
+        if out.shape(0) == gamma.shape(2) {
+            let mut c = 0usize;
+            let mut sum = F::new(0.0f32);
+            while c < gamma.shape(0) {
+                sum += upstream[c * upstream.stride(0)] * gamma[ix3(gamma, c, 0, s)];
+                c += 1;
+            }
+            out[s] = sum;
+        } else if row < gamma.shape(0) {
+            out[row * gamma.shape(2) + s] = upstream[row * upstream.stride(0)] * gamma[ix3(gamma, row, 0, s)];
         }
-        out[s] = sum;
     }
 }
 
@@ -478,7 +486,7 @@ pub(crate) fn chain_forward(
     let [c, l, k] = evidence.shape().dims::<3>();
     assert!((1..=16).contains(&l) && (1..=32).contains(&k), "Codpula fused chain requires L<=16 and K<=32");
     assert_eq!(transition.shape().dims::<3>(), [c, k, k]);
-    assert_eq!(root.shape().dims::<1>(), [k]);
+    assert!(root.shape().dims::<1>() == [k] || root.shape().dims::<1>() == [c * k], "Codpula roots must be shared [K] or per-row [C*K]");
     assert_eq!(valid.shape().dims::<2>(), [c, l]);
     let z = empty(&evidence, [c]);
     let gamma = if posterior { empty(&evidence, [c, l, k]) } else { evidence.clone() };
@@ -491,7 +499,7 @@ pub(crate) fn chain_forward(
     (z, gamma, edges)
 }
 
-pub(crate) fn chain_backward(gamma: CubeTensor, edges: CubeTensor, upstream: CubeTensor) -> (CubeTensor, CubeTensor, CubeTensor) {
+pub(crate) fn chain_backward(gamma: CubeTensor, edges: CubeTensor, upstream: CubeTensor, root_count: usize) -> (CubeTensor, CubeTensor, CubeTensor) {
     validate(&[&gamma, &edges, &upstream]);
     let [c, l, k] = gamma.shape().dims::<3>();
     assert!((1..=16).contains(&l) && (1..=32).contains(&k));
@@ -499,13 +507,14 @@ pub(crate) fn chain_backward(gamma: CubeTensor, edges: CubeTensor, upstream: Cub
     assert_eq!(upstream.shape().dims::<1>(), [c]);
     let de = empty(&gamma, gamma.shape());
     let da = empty(&gamma, edges.shape());
-    let dr = empty(&gamma, [k]);
+    assert!(root_count == k || root_count == c * k, "invalid Codpula root derivative shape");
+    let dr = empty(&gamma, [root_count]);
     CHAIN_BACKWARD.fetch_add(1, Ordering::Relaxed);
     let dtype = dtype_to_storage_type(gamma.dtype);
     chain_backward_kernel::launch(&gamma.client, count(&gamma, c), CubeDim::new_1d(32),
         gamma.clone().into_tensor_arg(), edges.into_tensor_arg(), upstream.clone().into_tensor_arg(),
         de.clone().into_tensor_arg(), da.clone().into_tensor_arg(), dtype);
-    root_backward_kernel::launch(&gamma.client, count(&gamma, 1), CubeDim::new_1d(32),
+    root_backward_kernel::launch(&gamma.client, count(&gamma, if root_count == k { 1 } else { c }), CubeDim::new_1d(32),
         gamma.clone().into_tensor_arg(), upstream.into_tensor_arg(), dr.clone().into_tensor_arg(), dtype);
     (de, da, dr)
 }

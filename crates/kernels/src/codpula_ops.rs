@@ -1,7 +1,7 @@
 #[cfg(feature = "fusion")]
 use burn::backend::fusion::custom::TensorSpec;
 use burn::backend::{
-    AutodiffBackend, Backend, Dispatch,
+    AutodiffBackend, Backend, Dispatch, TensorMetadata,
     autodiff::{
         Autodiff,
         checkpoint::{base::Checkpointer, strategy::CheckpointStrategy},
@@ -48,11 +48,11 @@ pub trait CodpulaOps: Backend {
         log_root: FloatTensor<Self>, valid: FloatTensor<Self>,
     ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>);
 
-    #[fusion(meta = |g: &TensorSpec, a: &TensorSpec, _upstream| {
-        (g.clone(), a.clone(), TensorSpec::new([g.shape.dims::<3>()[2]].into(), g.dtype))
+    #[fusion(meta = |g: &TensorSpec, a: &TensorSpec, _upstream, root_count: &usize| {
+        (g.clone(), a.clone(), TensorSpec::new([*root_count].into(), g.dtype))
     })]
     fn codpula_chain_backward(
-        gamma: FloatTensor<Self>, summed_xi: FloatTensor<Self>, upstream: FloatTensor<Self>,
+        gamma: FloatTensor<Self>, summed_xi: FloatTensor<Self>, upstream: FloatTensor<Self>, root_count: usize,
     ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>);
 
     #[fusion(meta = |x: &TensorSpec, pi: &TensorSpec, _normalizers, _gamma, _tokens, _observed, _valid, counts: &bool| {
@@ -91,9 +91,9 @@ impl CodpulaOps for CubeBackend {
         crate::codpula::chain_forward(log_evidence, log_transition, log_root, valid, true)
     }
     fn codpula_chain_backward(
-        gamma: FloatTensor<Self>, summed_xi: FloatTensor<Self>, upstream: FloatTensor<Self>,
+        gamma: FloatTensor<Self>, summed_xi: FloatTensor<Self>, upstream: FloatTensor<Self>, root_count: usize,
     ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
-        crate::codpula::chain_backward(gamma, summed_xi, upstream)
+        crate::codpula::chain_backward(gamma, summed_xi, upstream, root_count)
     }
     fn codpula_readout(
         logits: FloatTensor<Self>, log_pi: FloatTensor<Self>, normalizers: FloatTensor<Self>,
@@ -107,11 +107,11 @@ impl CodpulaOps for CubeBackend {
 #[derive(Debug)]
 struct ChainBackward;
 impl<B: Backend + CodpulaOps> Backward<B, 3> for ChainBackward {
-    type State = (FloatTensor<B>, FloatTensor<B>);
+    type State = (FloatTensor<B>, FloatTensor<B>, usize);
     fn backward(self, ops: Ops<Self::State, 3>, grads: &mut Gradients, _: &mut Checkpointer) {
         let upstream = grads.consume::<B>(&ops.node);
-        let (gamma, edges) = ops.state;
-        let (de, da, dr) = B::codpula_chain_backward(gamma, edges, upstream);
+        let (gamma, edges, root_count) = ops.state;
+        let (de, da, dr) = B::codpula_chain_backward(gamma, edges, upstream, root_count);
         for (node, gradient) in ops.parents.into_iter().zip([de, da, dr]) {
             if let Some(node) = node { grads.register::<B>(node.id, gradient); }
         }
@@ -160,10 +160,11 @@ impl<B: Backend + CodpulaOps, C: CheckpointStrategy> CodpulaOps for Autodiff<B, 
         let parents = [log_evidence.node(), log_transition.node(), log_root.node()];
         let (e, a, r, valid) = (log_evidence.into_primitive(), log_transition.into_primitive(),
             log_root.into_primitive(), valid.into_primitive());
+        let root_count = r.shape().num_elements();
         match ChainBackward.prepare::<C>(parents).compute_bound().stateful() {
             OpsKind::Tracked(prep) => {
                 let (z, gamma, edges) = B::codpula_chain(e, a, r, valid);
-                prep.finish((gamma, edges), z)
+                prep.finish((gamma, edges, root_count), z)
             }
             OpsKind::UnTracked(prep) => prep.finish(B::codpula_partition(e, a, r, valid)),
         }
@@ -173,20 +174,21 @@ impl<B: Backend + CodpulaOps, C: CheckpointStrategy> CodpulaOps for Autodiff<B, 
         log_root: FloatTensor<Self>, valid: FloatTensor<Self>,
     ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
         let parents = [log_evidence.node(), log_transition.node(), log_root.node()];
+        let root_count = log_root.shape().num_elements();
         let (z, gamma, edges) = B::codpula_chain(log_evidence.into_primitive(), log_transition.into_primitive(),
             log_root.into_primitive(), valid.into_primitive());
         let gamma_ad = Self::from_inner(gamma.clone());
         let edges_ad = Self::from_inner(edges.clone());
         let z = match ChainBackward.prepare::<C>(parents).compute_bound().stateful() {
-            OpsKind::Tracked(prep) => prep.finish((gamma, edges), z),
+            OpsKind::Tracked(prep) => prep.finish((gamma, edges, root_count), z),
             OpsKind::UnTracked(prep) => prep.finish(z),
         };
         (z, gamma_ad, edges_ad)
     }
     fn codpula_chain_backward(
-        gamma: FloatTensor<Self>, summed_xi: FloatTensor<Self>, upstream: FloatTensor<Self>,
+        gamma: FloatTensor<Self>, summed_xi: FloatTensor<Self>, upstream: FloatTensor<Self>, root_count: usize,
     ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
-        let (de, da, dr) = B::codpula_chain_backward(gamma.into_primitive(), summed_xi.into_primitive(), upstream.into_primitive());
+        let (de, da, dr) = B::codpula_chain_backward(gamma.into_primitive(), summed_xi.into_primitive(), upstream.into_primitive(), root_count);
         (Self::from_inner(de), Self::from_inner(da), Self::from_inner(dr))
     }
     fn codpula_readout(
@@ -218,9 +220,9 @@ pub fn codpula_leaf_backward(
     (Tensor::from_dispatch(dx), Tensor::from_dispatch(dp))
 }
 
-/// Log evidence mass for each chain. Shapes: evidence [C,L,K], transition [C,K,K], root [K], valid [C,L].
-/// The root is not modulated; transitions are shared across every active edge of a chain.
-/// VJPs cover all three log-weight tensors, including the sum over tied transition/root occurrences.
+/// Log evidence mass for each chain. Shapes: evidence [C,L,K], transition [C,K,K], valid [C,L].
+/// Roots are shared [K] or flattened per-row [C*K]; transitions are shared across each chain's edges.
+/// VJPs cover all three log-weight tensors, summing only shared root occurrences.
 /// K<=32, L<=16. Valid must be a prefix of binary ones; all-zero rows are inactive, with logZ=0.
 pub fn codpula_log_partition(
     log_evidence: Tensor<3>, log_transition: Tensor<3>, log_root: Tensor<1>, valid: Tensor<2>,
@@ -244,8 +246,9 @@ pub fn codpula_chain_statistics(
 pub fn codpula_chain_backward(
     gamma: Tensor<3>, summed_xi: Tensor<3>, upstream: Tensor<1>,
 ) -> (Tensor<3>, Tensor<3>, Tensor<1>) {
+    let root_count = gamma.dims()[2];
     let (de, da, dr) = <Dispatch as CodpulaOps>::codpula_chain_backward(gamma.into_dispatch(),
-        summed_xi.into_dispatch(), upstream.into_dispatch());
+        summed_xi.into_dispatch(), upstream.into_dispatch(), root_count);
     (Tensor::from_dispatch(de), Tensor::from_dispatch(da), Tensor::from_dispatch(dr))
 }
 

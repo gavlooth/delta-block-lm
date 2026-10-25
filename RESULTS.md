@@ -1894,6 +1894,11 @@ numerical reports remain. No training study, ablation or sweep was run.
 
 ## Step 9: Codpula joint block output
 
+This section records the original `joint_output: codpula` profile. Its numerical
+and timing results below are historical, not measurements of the explicitly
+selected `codpula_contextual` revision. The contextual profile retains the other
+fourteen decisions and has its own evidence under `artifacts/codpula-context/`.
+
 Implemented 2026-10-25 in the `codpula` workspace. The selected model is a homogeneous
 32-state HMM over actual SBD blocks of length at most 16, with full 257-symbol
 emissions, shared positive log rows, and one final-feature mean-pooled 8×8 gate
@@ -2007,3 +2012,60 @@ Evidence: `artifacts/codpula/`, particularly `cpu-tests.txt`,
 `b1/codpula-benchmark.json`, `b1/codpula-isolated.json`,
 `codpula-diagnostic.json`, `smoke/`, `adoption.json` and
 `checkpoint-cleanup.json`.
+
+## Explicit contextual Codpula revision
+
+`sbd.joint_output: "codpula_contextual"` changes only the approved initial-row
+modulation, ordered mean/first/last routing input and base emission/transition
+initialization. One zero-initialized D256 768→96 head produces 64 transition
+and 32 root log-gates. Original `codpula` and omitted factorized initialization,
+shapes, fingerprints and checkpoint behavior remain unchanged. Other fourteen
+decisions, the shared clean projection, objective and Eq. (9) remain intact.
+
+Independent contextual scalar-f64/enumeration/full-VJP/flow/update gates pass
+on CPU and Vulkan at unchanged `2e-5+3e-4*abs(ref)`: maximum contextual component
+errors are 5.167103e-6 / 1.202851e-5 (ratios 0.147606 / 0.157887).
+Complete model CPU/Vulkan tensor/Vulkan fused gates pass, including all caller
+layouts, evidence/padding/temperature/leakage, observed-feature derivatives,
+exact L1 and old/contextual full optimizer restart. Full-model max errors:
+1.907349e-6 CPU, 2.384186e-6 Vulkan; ratios 0.095364 / 0.047431. Workspace
+tests: 57 experiment + 7 kernel + 16 mixer pass; one existing GPU-sharing test
+remains ignored. Historical causal identity remains
+`c7eca1dace65f65fea8db186a6c0cc5427a320f4bf89f76a4ea0482c86dc42ca`.
+
+The initial Vulkan run exposed **raw Tensor Lngram table gradients**, not
+updated weights, differing in the retained exact L1 comparison. The clean
+graph remained identical. Gather backward selected duplicate-index float
+atomics; separate fix `e50cc523` retains native forward and gives the gradient
+unique owners with ascending-position sums. CPU/FlatSelect/FusedGpu and clipping
+`64590d18` are unchanged. Two duplicate-index layouts each pass 32 raw-gradient
+bit-identical backward repetitions (Vulkan max error 1.862645e-6, ratio
+0.003302); exact singleton/restart gates were not relaxed or switched.
+
+### Costs of the approved profile, not architecture selection
+
+Intel Arc MTL/Mesa26.2.4, Vulkan f32, D256/four layers/B1/T512/L8, no fusion or
+autotune; two warmups and 11 interleaved full SBD optimizer-step pairs:
+
+| Profile | Median ms | Launches |
+| --- | ---: | ---: |
+| Original `codpula` | 1713.161 | 27,842 |
+| Explicit `codpula_contextual` | 1691.060 | 27,915 |
+
+Paired contextual-minus-original median **-42.608 ms**, 95% interval
+**[-138.390,15.668] ms**: no resolved speedup/overhead conclusion. The process
+reserves about **1,689,192,384 bytes with both runners resident**, not per-model
+or incremental peak live memory. The full B8/T512 contextual diagnostic fits
+without subdivision: **8714.077 ms, 30,818 launches, 8,826,780,928 bytes** sampled
+pool reservation after one warm step. Historical B8 results are unpaired.
+Logical cost is +57,376 neural parameters, +688,512 persistent f32 parameter/
+Adam bytes (+918,016 with one gradient), and +29.360M forward MAC/noisy pass
+at B8 (+3.670M at B1).
+
+Only the permitted **B1/context32, 96 bytes/three steps** execution smoke was
+trained. Saved checkpoint-3 loads for separate CLI evaluation/generation;
+eight tokens finalize and causally replay in one dependence pass. No quality
+comparison, sweep, calibration grid or architecture-selection experiment was
+run. New config: `configs/lm512-codpula-contextual.json`; existing configs are
+unchanged. Exact methods, commands, resolved failures and all evidence are in
+`docs/codpula.md` §10.5–10.6 and `artifacts/codpula-context/`.

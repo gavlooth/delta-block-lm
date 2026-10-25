@@ -230,7 +230,7 @@ pub fn training_loss(model: &LanguageModel, c: &Config, rows: &[Example], batch:
 }
 pub fn training_loss_profiled<P: delta_mixers::profile::Sections>(model: &LanguageModel, c: &Config, rows: &[Example], batch: &Batch, seed: u64, profile: &mut P) -> Result<SbdTrainingResult> {
     let s = c.sbd.as_ref().context("SBD config is required")?;
-    if s.joint_output == SbdJointOutput::Codpula {
+    if s.joint_output.is_codpula() {
         ensure!(rows.iter().all(|row|row.weight.iter().all(|&weight|weight == 1.0)),
             "Codpula joint event loss requires unit valid target weights");
     }
@@ -253,7 +253,7 @@ pub fn training_loss_profiled<P: delta_mixers::profile::Sections>(model: &Langua
 
 pub fn evaluate(model: &LanguageModel, c: &Config, examples: &[Example], device: &Device) -> Result<Value> {
     let s = c.sbd.as_ref().context("SBD config is required")?;
-    if s.joint_output == SbdJointOutput::Codpula {
+    if s.joint_output.is_codpula() {
         ensure!(examples.iter().all(|row|row.weight.iter().all(|&weight|weight == 1.0)),
             "Codpula joint event evaluation requires unit valid target weights");
     }

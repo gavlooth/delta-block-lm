@@ -1,5 +1,7 @@
 //! Independent f64 circuit inference, exhaustive enumeration, and fixed-tolerance checks.
 //! This module intentionally does not reuse tensor recurrences for expected values.
+//! The contextual report also checks per-block normalized roots, tied-flow Eq9 updates,
+//! and the actual ordered mean/first/last 768-to-96 neural head, including every VJP entry.
 use anyhow::{Context, Result, bail, ensure};
 use burn::prelude::*;
 use serde_json::{Value, json};
@@ -91,6 +93,7 @@ struct Circuit {
     log_root: Vec<f64>,
     logits: Vec<f64>,
     gates: Vec<f64>,
+    root_gates: Vec<f64>,
 }
 #[derive(Clone)]
 struct Prepared {
@@ -133,13 +136,14 @@ impl Circuit {
         for row in log_pi.chunks_exact_mut(vocab) { row.copy_from_slice(&normalized(row).unwrap()); }
         for row in log_a.chunks_exact_mut(states) { row.copy_from_slice(&normalized(row).unwrap()); }
         Self { states, vocab, group, length, log_pi, log_a, log_root: normalized(&root).unwrap(),
-            logits: random(length * vocab), gates: random((states / group).pow(2)) }
+            logits: random(length * vocab), gates: random((states / group).pow(2)), root_gates: vec![0.0;states] }
     }
     fn prepare(&self) -> Result<Prepared> {
         let (k, v, l) = (self.states, self.vocab, self.length);
         ensure!(k > 0 && v > 0 && l > 0 && l <= 16 && self.group > 0 && k % self.group == 0, "invalid reference dimensions");
         ensure!(self.log_pi.len() == k*v && self.log_a.len() == k*k && self.log_root.len() == k
-            && self.logits.len() == l*v && self.gates.len() == (k/self.group).pow(2), "reference shape mismatch");
+            && self.logits.len() == l*v && self.gates.len() == (k/self.group).pow(2)
+            && self.root_gates.len() == k, "reference shape mismatch");
         let groups = k / self.group;
         let mut transition = vec![0.0; k*k];
         for s in 0..k {
@@ -154,10 +158,10 @@ impl Circuit {
             leaf[(i*k+s)*v..(i*k+s+1)*v].copy_from_slice(&normalized(&row)?);
         }}
         Ok(Prepared { states:k, vocab:v, length:l, leaf, transition,
-            root:normalized(&self.log_root)?, normalizers })
+            root:normalized(&self.log_root.iter().zip(&self.root_gates).map(|(r,u)|r+u).collect::<Vec<_>>())?, normalizers })
     }
     fn field(&mut self, field: usize) -> &mut Vec<f64> {
-        match field { 0=>&mut self.logits, 1=>&mut self.gates, 2=>&mut self.log_pi, 3=>&mut self.log_a, 4=>&mut self.log_root, _=>unreachable!() }
+        match field { 0=>&mut self.logits, 1=>&mut self.gates, 2=>&mut self.log_pi, 3=>&mut self.log_a, 4=>&mut self.log_root, 5=>&mut self.root_gates, _=>unreachable!() }
     }
 }
 impl Prepared {
@@ -368,10 +372,34 @@ fn finite_differences(circuit: &Circuit, evidence: &[Option<usize>], clean: &[us
     Ok(json!({"objective":"full conditional joint log likelihood","difference_step":1e-5,"coordinate_convention":"independent log entries with each row normalization differentiated","quantities":reports}))
 }
 
+fn contextual_root_finite_differences(circuit: &Circuit, evidence: &[Option<usize>], clean: &[usize]) -> Result<Value> {
+    let prepared = circuit.prepare()?;
+    let complete = clean.iter().copied().map(Some).collect::<Vec<_>>();
+    let expected = prepared.derivative(&prepared.query(&complete)?,&prepared.query(evidence)?,circuit.group).root;
+    let mut actual = Vec::new();
+    for coordinate in 0..circuit.states {
+        let mut plus = circuit.clone(); plus.root_gates[coordinate] += 1e-5;
+        let mut minus = circuit.clone(); minus.root_gates[coordinate] -= 1e-5;
+        let plus = plus.prepare()?; let minus = minus.prepare()?;
+        actual.push(((plus.query(&complete)?.log_z-plus.query(evidence)?.log_z)
+            -(minus.query(&complete)?.log_z-minus.query(evidence)?.log_z))/2e-5);
+    }
+    let mut errors = Errors::default();
+    errors.add(&actual,&expected,2e-7,2e-6,"contextual root log gates")?;
+    Ok(json!({"all_coordinates":true,"errors":errors.report()}))
+}
+
 fn enumeration_checks() -> Result<Value> {
+    enumeration_checks_mode(false)
+}
+
+fn enumeration_checks_mode(contextual: bool) -> Result<Value> {
     let mut reports = Vec::new();
     for (index,(k,v,l,group)) in [(2,2,1,1),(2,3,2,1),(3,2,3,1),(3,3,4,1),(2,2,4,2)].into_iter().enumerate() {
-        let circuit = Circuit::fixture(k,v,l,group,4901+index as u64);
+        let mut circuit = Circuit::fixture(k,v,l,group,4901+index as u64);
+        if contextual {
+            circuit.root_gates = (0..k).map(|s|((s*13+index*7)%23) as f64/5.0-2.1).collect();
+        }
         let prepared = circuit.prepare()?;
         let enumerated = Enumeration::new(&prepared);
         let mut partition = Errors::default();
@@ -427,23 +455,30 @@ fn enumeration_checks() -> Result<Value> {
             (&flow.a_plus,&enumerated_flow.a_plus),(&flow.a_minus,&enumerated_flow.a_minus),
             (&flow.root_plus,&enumerated_flow.root_plus),(&flow.root_minus,&enumerated_flow.root_minus),
         ] {separate_flows.strict(actual,expected,"enumerated separate nonnegative flows")?;}
-        reports.push(json!({"states":k,"vocabulary":v,"length":l,"group_size":group,
+        let mut report = json!({"states":k,"vocabulary":v,"length":l,"group_size":group,
             "enumerated_joint_assignments":enumerated.assignments.len(),"evidence_queries":evidence_queries,
             "partition":partition.report(),"evidence_log_mass":masses.report(),"state_posterior":states.report(),
             "edge_posterior":edges.report(),"token_marginals":tokens.report(),"emission_counts":counts.report(),
             "conditional_joint":conditional.report(),"dependence":deltas.report(),"separate_flows":separate_flows.report(),
-            "full_finite_differences":finite_differences(&circuit,&evidence,&clean)?}));
+            "full_finite_differences":finite_differences(&circuit,&evidence,&clean)?});
+        if contextual {report["contextual_root_finite_differences"] = contextual_root_finite_differences(&circuit,&evidence,&clean)?;}
+        reports.push(report);
     }
     Ok(json!({"passed":true,"f64_tolerance":{"absolute":2e-10,"relative":2e-9},"cases":reports}))
 }
 
 fn tensor_case(device: &Device, states: usize, vocab: usize, lengths: &[usize], group: usize, execution: crate::codpula::CodpulaExecution) -> Result<Value> {
+    tensor_case_mode(device,states,vocab,lengths,group,execution,false)
+}
+
+fn tensor_case_mode(device: &Device, states: usize, vocab: usize, lengths: &[usize], group: usize, execution: crate::codpula::CodpulaExecution, contextual: bool) -> Result<Value> {
     use crate::codpula::PreparedCircuit;
     let device = device.clone().autodiff();
     let (n,k,v,l) = (lengths.len(),states,vocab,*lengths.iter().max().unwrap());
     let base = Circuit::fixture(k,v,l,group,8903+l as u64);
     let mut logits = vec![83.0;n*l*v];
     let mut gates = Vec::new();
+    let mut root_gates = Vec::new();
     let mut clean = vec![v+199;n*l];
     let mut observed = vec![false;n*l];
     let mut expected_z = vec![0.0;n];
@@ -454,6 +489,7 @@ fn tensor_case(device: &Device, states: usize, vocab: usize, lengths: &[usize], 
     let mut expected_logits = vec![0.0;n*l*v];
     let mut expected_gates = vec![0.0;n*(k/group).pow(2)];
     let mut expected_pi = vec![0.0;k*v];
+    let mut expected_root_gates = vec![0.0;n*k];
     let mut expected_a = vec![0.0;k*k];
     let mut expected_root = vec![0.0;k];
     let mut expected_flows = Flow {pi_plus:vec![0.0;k*v],pi_minus:vec![0.0;k*v],
@@ -470,6 +506,10 @@ fn tensor_case(device: &Device, states: usize, vocab: usize, lengths: &[usize], 
         circuit.logits = (0..circuit.length*v).map(|i|(((i*31+row*17)%29) as f64/9.0-1.4) as f32 as f64).collect();
         circuit.gates = (0..(k/group).pow(2)).map(|i|(((i*13+row*7)%31) as f64/17.0-0.9) as f32 as f64).collect();
         gates.extend_from_slice(&circuit.gates);
+        if contextual {
+            circuit.root_gates = (0..k).map(|s|(((s*17+row*11)%29) as f64/7.0-1.8) as f32 as f64).collect();
+        }
+        root_gates.extend_from_slice(&circuit.root_gates);
         if length == 0 { proposals.push(Vec::new()); expected_scores.push(Vec::new()); continue; }
         logits[row*l*v..row*l*v+length*v].copy_from_slice(&circuit.logits);
         let target = (0..length).map(|i|(i*37+row*11+3)%v).collect::<Vec<_>>();
@@ -498,6 +538,7 @@ fn tensor_case(device: &Device, states: usize, vocab: usize, lengths: &[usize], 
         let derivative = prepared.derivative(&positive,&negative,group);
         for i in 0..length*v {expected_logits[row*l*v+i] = -derivative.logits[i]/denominator;}
         for (i,&x) in derivative.gates.iter().enumerate() {expected_gates[row*(k/group).pow(2)+i] = -x/denominator;}
+        for (i,&x) in derivative.root.iter().enumerate() {expected_root_gates[row*k+i] = -x/denominator;}
         for (out,gradient) in [(&mut expected_pi,&derivative.pi),(&mut expected_a,&derivative.a),(&mut expected_root,&derivative.root)] {
             for (out,&g) in out.iter_mut().zip(gradient) {*out -= g/denominator;}
         }
@@ -519,7 +560,12 @@ fn tensor_case(device: &Device, states: usize, vocab: usize, lengths: &[usize], 
     })).collect::<Vec<_>>();
     let potentials = float_tensor(&transposed_logits,[n,v,l],&device).swap_dims(1,2).require_grad();
     let gate = float_tensor(&gates,[n,k/group,k/group],&device).require_grad();
-    let prepared = PreparedCircuit::prepare_with_execution(pi.clone(),a.clone(),root.clone(),potentials.clone(),gate.clone(),lengths.to_vec(),group,execution)?;
+    let root_gate = float_tensor(&root_gates,[n,k],&device).require_grad();
+    let prepared = if contextual {
+        PreparedCircuit::prepare_contextual(pi.clone(),a.clone(),root.clone(),potentials.clone(),gate.clone(),root_gate.clone(),lengths.to_vec(),group)?
+    } else {
+        PreparedCircuit::prepare_with_execution(pi.clone(),a.clone(),root.clone(),potentials.clone(),gate.clone(),lengths.to_vec(),group,execution)?
+    };
     let values = int_tensor(&clean,[n,l],&device);
     let fixed = bool_tensor(&observed,[n,l],&device);
     let query = prepared.query(values.clone(),fixed.clone())?;
@@ -548,7 +594,15 @@ fn tensor_case(device: &Device, states: usize, vocab: usize, lengths: &[usize], 
         let mut errors = Errors::default(); errors.tensor(&actual,&expected,name)?;
         derivatives.push(json!({"quantity":name,"errors":errors.report(),"all_coordinates":true}));
     }
+    if contextual {
+        let mut errors = Errors::default();
+        errors.tensor(&tensor_values(root_gate.grad(&gradients).context("contextual root gate derivative missing")?),&expected_root_gates,"contextual root gates")?;
+        derivatives.push(json!({"quantity":"contextual_root_gates","errors":errors.report(),"all_coordinates":true}));
+    }
     ensure!(loss.flows.active_blocks == active_blocks, "active block count differs");
+    let contextual_update = if contextual {
+        Some(contextual_flow_update(&device,&base,&expected_flows,loss.flows.clone())?)
+    } else {None};
     let mut flows = Vec::new();
     for (name,actual,expected) in [
         ("emission_positive",tensor_values(loss.flows.emission_positive),expected_flows.pi_plus),
@@ -569,16 +623,23 @@ fn tensor_case(device: &Device, states: usize, vocab: usize, lengths: &[usize], 
     let mut score_errors = Errors::default();
     for (actual,expected) in scores.iter().zip(&expected_scores) {score_errors.tensor(actual,expected,"dependence score")?;}
     ensure!(scores.len() == expected_scores.len(), "dependence score row count differs");
-    Ok(json!({"states":k,"vocabulary":v,"lengths":lengths,"group_size":group,"execution":format!("{execution:?}"),
+    let mut report = json!({"states":k,"vocabulary":v,"lengths":lengths,"group_size":group,"execution":format!("{execution:?}"),
         "dirty_padding":true,"noncontiguous_token_potentials":true,
         "active_blocks":active_blocks,"forward":forward,"conditional_nll":loss_errors.report(),
-        "full_nll_vjp":derivatives,"separate_flows":flows,"dependence":score_errors.report()}))
+        "full_nll_vjp":derivatives,"separate_flows":flows,"dependence":score_errors.report()});
+    if let Some(update) = contextual_update {report["contextual_flow_eq9"] = update;}
+    Ok(report)
 }
 
 fn marginal_vjp(device: &Device, execution: crate::codpula::CodpulaExecution) -> Result<Value> {
+    marginal_vjp_mode(device,execution,false)
+}
+
+fn marginal_vjp_mode(device: &Device, execution: crate::codpula::CodpulaExecution, contextual: bool) -> Result<Value> {
     use crate::codpula::PreparedCircuit;
     let device = device.clone().autodiff();
-    let circuit = Circuit::fixture(2,3,3,1,5117);
+    let mut circuit = Circuit::fixture(2,3,3,1,5117);
+    if contextual {circuit.root_gates = vec![0.73,-0.41];}
     let evidence = vec![None,Some(2),None];
     let weights = (0..9).map(|i|((i*13%19) as f64/7.0-1.0) as f32 as f64).collect::<Vec<_>>();
     let objective = |c: &Circuit| -> Result<f64> {
@@ -590,19 +651,25 @@ fn marginal_vjp(device: &Device, execution: crate::codpula::CodpulaExecution) ->
     let root = float_tensor(&circuit.log_root,[2],&device).require_grad();
     let logits = float_tensor(&circuit.logits,[1,3,3],&device).require_grad();
     let gates = float_tensor(&circuit.gates,[1,2,2],&device).require_grad();
-    let prepared = PreparedCircuit::prepare_with_execution(pi.clone(),a.clone(),root.clone(),logits.clone(),gates.clone(),vec![3],1,execution)?;
+    let root_gates = float_tensor(&circuit.root_gates,[1,2],&device).require_grad();
+    let prepared = if contextual {
+        PreparedCircuit::prepare_contextual(pi.clone(),a.clone(),root.clone(),logits.clone(),gates.clone(),root_gates.clone(),vec![3],1)?
+    } else {
+        PreparedCircuit::prepare_with_execution(pi.clone(),a.clone(),root.clone(),logits.clone(),gates.clone(),vec![3],1,execution)?
+    };
     let query = prepared.query(int_tensor(&[0,2,0],[1,3],&device),bool_tensor(&[false,true,false],[1,3],&device))?;
     let upstream = float_tensor(&weights,[1,3,3],&device);
     let gradients = ((query.token*upstream).sum()+query.log_z.sum()*0.37).backward();
-    let actual = [
+    let mut actual = vec![
         tensor_values(logits.grad(&gradients).context("marginal logits derivative")?),
         tensor_values(gates.grad(&gradients).context("marginal gates derivative")?),
         tensor_values(pi.grad(&gradients).context("marginal emission derivative")?),
         tensor_values(a.grad(&gradients).context("marginal transition derivative")?),
         tensor_values(root.grad(&gradients).context("marginal root derivative")?),
     ];
+    if contextual {actual.push(tensor_values(root_gates.grad(&gradients).context("marginal contextual root derivative")?));}
     let mut reports = Vec::new();
-    for field in 0..5 {
+    for field in 0..actual.len() {
         let mut expected = Vec::new();
         for i in 0..actual[field].len() {
             let mut plus = circuit.clone(); plus.field(field)[i] += 1e-5;
@@ -610,7 +677,7 @@ fn marginal_vjp(device: &Device, execution: crate::codpula::CodpulaExecution) ->
             expected.push((objective(&plus)?-objective(&minus)?)/2e-5);
         }
         let mut errors = Errors::default(); errors.tensor(&actual[field],&expected,"marginal full VJP")?;
-        reports.push(json!({"input":(["token_potentials","group_gates","base_emission","base_transition","normalized_root"][field]),
+        reports.push(json!({"input":(["token_potentials","group_gates","base_emission","base_transition","normalized_root","contextual_root_gates"][field]),
             "errors":errors.report(),"all_coordinates":true}));
     }
     Ok(json!({"objective":"sum(token_marginal * signed_upstream) + 0.37*evidence_log_mass",
@@ -678,12 +745,17 @@ fn sampling_report(samples: &[Vec<usize>], probabilities: &[f64], evidence: &[Op
         "reference_binary_covariance":both-p0*p1,"counts":counts,"reference_probabilities":probabilities}))
 }
 fn sampling_checks(device: &Device) -> Result<Value> {
+    sampling_checks_mode(device,false)
+}
+
+fn sampling_checks_mode(device: &Device, contextual: bool) -> Result<Value> {
     use crate::codpula::PreparedCircuit;
     let mut circuit = Circuit::fixture(2,2,3,1,6121);
     circuit.log_pi = [0.96f64,0.04,0.04,0.96].map(f64::ln).to_vec();
     circuit.log_a = [0.97f64,0.03,0.03,0.97].map(f64::ln).to_vec();
     circuit.log_root = vec![-2.0f64.ln();2];
     circuit.logits.fill(0.0); circuit.gates.fill(0.0);
+    if contextual {circuit.root_gates = vec![-0.8,0.6];}
     let prepared = circuit.prepare()?;
     let evidence = vec![None,None,Some(1)];
     let query = prepared.query(&evidence)?;
@@ -703,16 +775,56 @@ fn sampling_checks(device: &Device) -> Result<Value> {
     let reference = sampling_report(&samples,&probabilities,&evidence,2,seed)?;
     // Identical independent rows amortize the tensor readback without changing the joint draw within a row.
     let batch = 4096;
-    let tensor = PreparedCircuit::from_log_potentials(
-        float_tensor(&circuit.log_pi,[2,2],device),float_tensor(&circuit.log_a,[2,2],device),
-        float_tensor(&circuit.log_root,[2],device),float_tensor(&circuit.logits.repeat(batch),[batch,3,2],device),
-        float_tensor(&circuit.gates.repeat(batch),[batch,2,2],device),vec![3;batch],1)?;
+    let tensor = if contextual {
+        PreparedCircuit::prepare_contextual(
+            float_tensor(&circuit.log_pi,[2,2],device),float_tensor(&circuit.log_a,[2,2],device),
+            float_tensor(&circuit.log_root,[2],device),float_tensor(&circuit.logits.repeat(batch),[batch,3,2],device),
+            float_tensor(&circuit.gates.repeat(batch),[batch,2,2],device),
+            float_tensor(&circuit.root_gates.repeat(batch),[batch,2],device),vec![3;batch],1)?
+    } else {
+        PreparedCircuit::from_log_potentials(
+            float_tensor(&circuit.log_pi,[2,2],device),float_tensor(&circuit.log_a,[2,2],device),
+            float_tensor(&circuit.log_root,[2],device),float_tensor(&circuit.logits.repeat(batch),[batch,3,2],device),
+            float_tensor(&circuit.gates.repeat(batch),[batch,2,2],device),vec![3;batch],1)?
+    };
     let values = int_tensor(&[0,0,1].repeat(batch),[batch,3],device);
     let fixed = bool_tensor(&[false,false,true].repeat(batch),[batch,3],device);
     let actual = tensor.sample(values,fixed,seed)?;
     ensure!(actual.len() == batch, "joint sampler row count differs");
     let tensor = sampling_report(&actual,&probabilities,&evidence,2,seed)?;
     Ok(json!({"categorical_rows":rows.report(),"f64_ffbs":reference,"tensor_ffbs":tensor}))
+}
+
+fn contextual_flow_update(device: &Device, base: &Circuit, reference: &Flow, flows: crate::codpula::CircuitFlows) -> Result<Value> {
+    use crate::codpula::CircuitState;
+    let (k,v) = (base.states,base.vocab);
+    let mut state = CircuitState::from_logs(float_tensor(&base.log_pi,[k,v],device),
+        float_tensor(&base.log_a,[k,k],device),float_tensor(&base.log_root,[k],device));
+    let before = [tensor_values(state.log_emission.val()),tensor_values(state.log_transition.val()),tensor_values(state.log_root.val())];
+    let plus = [&reference.pi_plus,&reference.a_plus,&reference.root_plus];
+    let minus = [&reference.pi_minus,&reference.a_minus,&reference.root_minus];
+    let reach = [&reference.pi_reach[..],&reference.a_reach[..],std::slice::from_ref(&reference.root_reach)];
+    let mut expected = Vec::new();
+    for (field,columns) in [v,k,k].into_iter().enumerate() {
+        let mut rows = Vec::new();
+        for (row,logs) in before[field].chunks_exact(columns).enumerate() {
+            let range = row*columns..(row+1)*columns;
+            let weights = logs.iter().map(|x|x.exp()).collect::<Vec<_>>();
+            let updated = row_update(&weights,&plus[field][range.clone()],&minus[field][range],reach[field][row],0.05)?;
+            ensure!(updated.iter().all(|x|x.is_finite() && *x > 0.0), "contextual Eq9 lost full support");
+            rows.extend(updated.iter().map(|x|x.ln()));
+        }
+        expected.push(rows);
+    }
+    state.update(flows)?;
+    let mut errors = Errors::default();
+    for (actual,expected) in [tensor_values(state.log_emission.val()),tensor_values(state.log_transition.val()),tensor_values(state.log_root.val())].iter().zip(&expected) {
+        errors.tensor(actual,expected,"contextual separated flows update base rows with pre-update parameters")?;
+    }
+    let mut tied = Errors::default();
+    tied.strict(&[reference.pi_reach.iter().sum::<f64>()-reference.a_reach.iter().sum::<f64>()],&[reference.root_reach],"one more tied leaf than tied edge per active block")?;
+    Ok(json!({"base_rows":errors.report(),"tied_reach":tied.report(),"alpha":0.05,
+        "first_step_bias_corrected":true,"uses_pre_update_base_parameters":true}))
 }
 
 fn row_update(weights: &[f64], positive: &[f64], negative: &[f64], reach: f64, alpha: f64) -> Result<Vec<f64>> {
@@ -1430,6 +1542,194 @@ fn support_and_dependence_regressions(device: &Device) -> Result<Value> {
         "absolute_dependence":dependence.report(),"singleton_dependence_exact_zero":true}))
 }
 
+/// Independent ordered pooling and chain derivatives for the actual D256 contextual head.
+fn contextual_neural_checks(device: &Device) -> Result<Value> {
+    use crate::codpula::{CircuitState,Codpula};
+    let device = device.clone().autodiff();
+    let (n,l,d,v,k,h) = (5,3,256,257,32,96);
+    let lengths = [3,2,2,1,0];
+    let mut module = Codpula::new_contextual(d,14891,&device);
+    let repeated = Codpula::new_contextual(d,14891,&device);
+    let legacy = Codpula::new(d,14891,&device);
+    let mut initialization = Errors::default();
+    initialization.strict(&tensor_values(module.gate_head.weight.val()),&vec![0.0;3*d*h],"contextual zero head weights")?;
+    initialization.strict(&tensor_values(module.gate_head.bias.as_ref().context("contextual bias missing")?.val()),&vec![0.0;h],"contextual zero head bias")?;
+    let mut random = 14891u64;
+    for (logs,columns,half_width) in [
+        (tensor_values(module.probability.log_emission.val()),v,0.25),
+        (tensor_values(module.probability.log_transition.val()),k,0.1),
+        (tensor_values(module.probability.log_root.val()),k,0.01),
+    ] {
+        let mut expected = Vec::with_capacity(logs.len());
+        for _ in 0..logs.len()/columns {
+            let raw = (0..columns).map(|_| {
+                random = random.wrapping_add(0x9e3779b97f4a7c15);
+                let mut bits = random;
+                bits = (bits ^ (bits >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                bits = (bits ^ (bits >> 27)).wrapping_mul(0x94d049bb133111eb);
+                bits ^= bits >> 31;
+                let uniform = ((bits >> 11) as f64+0.5)/9007199254740992.0;
+                ((uniform-0.5)*2.0*half_width) as f32 as f64
+            }).collect::<Vec<_>>();
+            expected.extend(normalized(&raw)?);
+        }
+        initialization.tensor(&logs,&expected,"independent approved contextual seeded log rows")?;
+    }
+    for (actual,expected,columns,width) in [
+        (tensor_values(module.probability.log_emission.val()),tensor_values(repeated.probability.log_emission.val()),v,0.5),
+        (tensor_values(module.probability.log_transition.val()),tensor_values(repeated.probability.log_transition.val()),k,0.2),
+        (tensor_values(module.probability.log_root.val()),tensor_values(legacy.probability.log_root.val()),k,0.02),
+    ] {
+        initialization.strict(&actual,&expected,"contextual seeded probability initialization")?;
+        for row in actual.chunks_exact(columns) {
+            let minimum = row.iter().copied().fold(f64::INFINITY,f64::min);
+            let maximum = row.iter().copied().fold(f64::NEG_INFINITY,f64::max);
+            ensure!(row.iter().all(|x|x.is_finite() && x.exp() > 0.0) && maximum-minimum <= width+1e-6,
+                "contextual initialized log row exceeds approved uniform range");
+            initialization.tensor(&[row.iter().map(|x|x.exp()).sum()],&[1.0],"contextual initialized row normalization")?;
+        }
+    }
+    let weights = (0..3*d*h).map(|i|(((i*11%29) as f64-14.0)/1100.0) as f32 as f64).collect::<Vec<_>>();
+    let bias = (0..h).map(|i|(((i*7%17) as f64-8.0)/97.0) as f32 as f64).collect::<Vec<_>>();
+    module.gate_head.weight = module.gate_head.weight.clone().map(|_|float_tensor(&weights,[3*d,h],&device).require_grad());
+    module.gate_head.bias = Some(module.gate_head.bias.take().context("contextual bias missing")?
+        .map(|_|float_tensor(&bias,[h],&device).require_grad()));
+    let base = Circuit::fixture(k,v,l,4,14923);
+    module.probability = CircuitState::from_logs(float_tensor(&base.log_pi,[k,v],&device),
+        float_tensor(&base.log_a,[k,k],&device),float_tensor(&base.log_root,[k],&device));
+    let mut features = vec![f64::NAN;n*l*d];
+    let mut potentials = vec![f64::NAN;n*l*v];
+    let mut clean = vec![999;n*l];
+    let mut observed = vec![true;n*l];
+    let mut summary = vec![0.0;n*3*d];
+    for (row,&length) in lengths.iter().enumerate() {
+        for i in 0..length {
+            for channel in 0..d {features[(row*l+i)*d+channel] = (((channel*19+i*7+row*11)%37) as f64/13.0-1.1) as f32 as f64;}
+            for x in 0..v {potentials[(row*l+i)*v+x] = (((x*7+i*3+row*17)%31) as f64/11.0-1.2) as f32 as f64;}
+            clean[row*l+i] = if row==0 && i==0 {256} else {(row*41+i*73)%v};
+            observed[row*l+i] = row==2 || i==1;
+        }
+        if length == 0 {continue;}
+        for channel in 0..d {
+            summary[row*3*d+channel] = (0..length).map(|i|features[(row*l+i)*d+channel]).sum::<f64>()/length as f64;
+            summary[row*3*d+d+channel] = features[row*l*d+channel];
+            summary[row*3*d+2*d+channel] = features[(row*l+length-1)*d+channel];
+        }
+    }
+    let head = (0..n*h).map(|index| {
+        let (row,out) = (index/h,index%h);
+        bias[out]+(0..3*d).map(|channel|summary[row*3*d+channel]*weights[channel*h+out]).sum::<f64>()
+    }).collect::<Vec<_>>();
+    let features = float_tensor(&features,[n,l,d],&device).require_grad();
+    let potential_values = potentials;
+    let potentials = float_tensor(&potential_values,[n,l,v],&device).require_grad();
+    let summary_features = features.clone().detach().require_grad();
+    let actual_summary = module.context_summary(summary_features.clone(),&lengths)?;
+    let mut pooling = Errors::default();
+    pooling.tensor(&tensor_values(actual_summary.clone()),&summary,"ordered valid mean, first, last")?;
+    let upstream = (0..n*3*d).map(|i|(((i*13%23) as f64-11.0)/19.0) as f32 as f64).collect::<Vec<_>>();
+    let gradients = (actual_summary*float_tensor(&upstream,[n,3*d],&device)).sum().backward();
+    let mut expected_summary_vjp = vec![0.0;n*l*d];
+    for (row,&length) in lengths.iter().enumerate() {for i in 0..length {for channel in 0..d {
+        expected_summary_vjp[(row*l+i)*d+channel] = upstream[row*3*d+channel]/length as f64
+            +if i==0 {upstream[row*3*d+d+channel]} else {0.0}
+            +if i+1==length {upstream[row*3*d+2*d+channel]} else {0.0};
+    }}}
+    let mut pooling_vjp = Errors::default();
+    pooling_vjp.tensor(&tensor_values(summary_features.grad(&gradients).context("contextual summary feature derivative")?),&expected_summary_vjp,"ordered summary full VJP")?;
+    let (transition_gates,root_gates) = module.contextual_gates(features.clone(),&lengths)?;
+    let mut head_outputs = Errors::default();
+    head_outputs.tensor(&tensor_values(transition_gates),&(0..n).flat_map(|row|head[row*h..row*h+64].iter().copied()).collect::<Vec<_>>(),"contextual first 64 outputs")?;
+    head_outputs.tensor(&tensor_values(root_gates),&(0..n).flat_map(|row|head[row*h+64..(row+1)*h].iter().copied()).collect::<Vec<_>>(),"contextual last 32 outputs")?;
+    let (temperature,denominator) = (0.7,8.0);
+    let mut expected_loss = 0.0;
+    let mut expected_potential = vec![0.0;n*l*v];
+    let mut expected_features = vec![0.0;n*l*d];
+    let mut expected_weights = vec![0.0;3*d*h];
+    let mut expected_bias = vec![0.0;h];
+    let mut expected_roots = Vec::new();
+    for (row,&length) in lengths.iter().enumerate() {
+        if length == 0 {
+            expected_roots.extend(normalized(&base.log_root)?);
+            continue;
+        }
+        let mut circuit = base.clone();
+        circuit.length = length;
+        circuit.logits = potential_values[row*l*v..row*l*v+length*v].iter().map(|x|x/temperature).collect();
+        circuit.gates = head[row*h..row*h+64].to_vec();
+        circuit.root_gates = head[row*h+64..(row+1)*h].to_vec();
+        let prepared = circuit.prepare()?;
+        expected_roots.extend_from_slice(&prepared.root);
+        let evidence = (0..length).map(|i|if observed[row*l+i] {Some(clean[row*l+i])} else {None}).collect::<Vec<_>>();
+        if evidence.iter().all(Option::is_some) {continue;}
+        let positive = prepared.query(&(0..length).map(|i|Some(clean[row*l+i])).collect::<Vec<_>>())?;
+        let negative = prepared.query(&evidence)?;
+        expected_loss += (negative.log_z-positive.log_z)/denominator;
+        let derivative = prepared.derivative(&positive,&negative,4);
+        for i in 0..length {for x in 0..v {
+            if !observed[row*l+i] {expected_potential[(row*l+i)*v+x] = -derivative.logits[i*v+x]/(temperature*denominator);}
+        }}
+        for out in 0..h {
+            let g = -(if out<64 {derivative.gates[out]} else {derivative.root[out-64]})/denominator;
+            expected_bias[out] += g;
+            for channel in 0..3*d {
+                expected_weights[channel*h+out] += summary[row*3*d+channel]*g;
+                for i in 0..length {
+                    let coefficient = match channel/d {0=>1.0/length as f64,1=>if i==0 {1.0} else {0.0},_=>if i+1==length {1.0} else {0.0}};
+                    expected_features[(row*l+i)*d+channel%d] += coefficient*weights[channel*h+out]*g;
+                }
+            }
+        }
+    }
+    for (name,range) in [("transition",0..64),("root",64..h)] {
+        ensure!(expected_bias[range].iter().any(|x|x.abs() > 1e-7), "contextual {name} head fixture has no derivative signal");
+    }
+    let prepared = module.prepare(potentials.clone(),features.clone(),&lengths,bool_tensor(&observed,[n,l],&device),temperature)?;
+    let mut roots = Errors::default();
+    roots.tensor(&tensor_values(prepared.root_rows()),&expected_roots,"actual contextual normalized root rows")?;
+    let result = prepared.conditional_nll(int_tensor(&clean,[n,l],&device),bool_tensor(&observed,[n,l],&device),denominator)?;
+    ensure!(result.flows.active_blocks == 3, "contextual inactive/all-observed rows contribute updates");
+    let mut loss = Errors::default();
+    loss.tensor(&tensor_values(result.loss.clone()),&[expected_loss],"actual contextual neural NLL")?;
+    let gradients = result.loss.backward();
+    let feature_gradient = tensor_values(features.grad(&gradients).context("contextual neural feature derivative")?);
+    let observed_feature_maximum = (0..n*l).filter(|&i|observed[i] && i/l!=2 && i%l<lengths[i/l])
+        .flat_map(|i|feature_gradient[i*d..(i+1)*d].iter().copied()).map(f64::abs).fold(0.0,f64::max);
+    ensure!(observed_feature_maximum > 1e-9, "contextual observed features stopped training the head");
+    let mut vjps = Vec::new();
+    for (name,actual,expected) in [
+        ("observed_detached_potentials",tensor_values(potentials.grad(&gradients).context("contextual potential derivative")?),expected_potential),
+        ("valid_features_including_observed",feature_gradient,expected_features),
+        ("contextual_head_weight",tensor_values(module.gate_head.weight.val().grad(&gradients).context("contextual head weight derivative")?),expected_weights),
+        ("contextual_head_bias",tensor_values(module.gate_head.bias.as_ref().unwrap().val().grad(&gradients).context("contextual head bias derivative")?),expected_bias),
+    ] {
+        let mut errors = Errors::default(); errors.tensor(&actual,&expected,name)?;
+        vjps.push(json!({"quantity":name,"errors":errors.report(),"all_coordinates":true}));
+    }
+    Ok(json!({"states":k,"vocabulary":v,"d_model":d,"head_shape":[3*d,h],"lengths":lengths,
+        "initialization":initialization.report(),"ordered_summary":pooling.report(),"summary_vjp":pooling_vjp.report(),
+        "head_outputs":head_outputs.report(),"normalized_root_rows":roots.report(),"conditional_nll":loss.report(),
+        "full_vjp":vjps,"observed_feature_maximum_gradient":observed_feature_maximum,
+        "dirty_padding":"NaN features and potentials, invalid ids, true observed flags",
+        "includes_all_observed_and_empty_rows":true,"includes_singleton_summary_overlap":true}))
+}
+
+fn contextual_checks(device: &Device) -> Result<Value> {
+    let execution = crate::codpula::CodpulaExecution::Tensor;
+    let mut tensor = vec![
+        tensor_case_mode(device,2,3,&[4,2,3,0],1,execution,true)?,
+        tensor_case_mode(device,4,3,&[3,2,1,0],2,execution,true)?,
+        tensor_case_mode(device,4,3,&[3,2,1,0],4,execution,true)?,
+        tensor_case_mode(device,32,257,&[3,2,1,0],4,execution,true)?,
+    ];
+    for length in 2..=16 {
+        tensor.push(tensor_case_mode(device,3,3,&[length,1,0],1,execution,true)?);
+    }
+    Ok(json!({"passed":true,"enumeration":enumeration_checks_mode(true)?,"tensor":tensor,
+        "conditional_marginal_vjp":marginal_vjp_mode(device,execution,true)?,
+        "sampling":sampling_checks_mode(device,true)?,"neural_head":contextual_neural_checks(device)?}))
+}
+
 /// Numerical acceptance checks only; this function performs no training or timing experiment.
 /// A failed quantity returns its actual/reference values, absolute error and tolerance ratio.
 pub fn numerical_checks(device: &Device) -> Result<Value> {
@@ -1454,12 +1754,27 @@ pub fn numerical_checks(device: &Device) -> Result<Value> {
     let state_update = tensor_update_checks(device).context("persistent separate-flow circuit update")?;
     let gates = gate_and_observed_gradients(device).context("valid-state gate pooling and observed derivative paths")?;
     let fused = fused_checks(device).context("real K32 V257 fused forward and full VJP")?;
+    let contextual = contextual_checks(device).context("contextual roots, ordered neural summary and full VJPs")?;
     Ok(json!({"passed":true,"device":crate::runtime::identity(device),
         "absolute_tolerance":ABSOLUTE_TOLERANCE,"relative_tolerance":RELATIVE_TOLERANCE,
         "enumeration":enumeration,"structure":structure,"tensor":tensor,
         "marginal_vjp":marginal,"sampling":sampling,"eq9":update,"state_update":state_update,
         "neural_gates":gates,"fused":fused,
+        "contextual":contextual,
         "support_and_dependence_regressions":support_regressions,
         "indexed_uniform_regressions":uniform_regressions,
         "integration_scope":"model final-RMSNorm provenance, clean singleton bypass, soft-feedback detach/embedding, decoder commitment ties and checkpoint/model optimizer integration belong to the model integration checks"}))
+}
+
+#[cfg(all(test, feature = "cpu"))]
+mod tests {
+    #[test]
+    fn contextual_scalar_enumeration_tensor_flows_and_neural_vjps() {
+        super::contextual_checks(&burn::prelude::Device::ndarray()).unwrap();
+    }
+
+    #[test]
+    fn legacy_scalar_enumeration_remains_unchanged() {
+        super::enumeration_checks().unwrap();
+    }
 }

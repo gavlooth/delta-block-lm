@@ -157,10 +157,13 @@ impl LanguageModel {
             model
         };
         if let Some(sbd) = &c.sbd {
-            if sbd.joint_output == crate::config::SbdJointOutput::Codpula {
-                model.codpula = Some(crate::codpula::Codpula::new(c.d_model,c.seed,device)
-                    .with_execution(sbd.joint_execution));
-            }
+            model.codpula = match sbd.joint_output {
+                crate::config::SbdJointOutput::Factorized => None,
+                crate::config::SbdJointOutput::Codpula => Some(crate::codpula::Codpula::new(c.d_model,c.seed,device)
+                    .with_execution(sbd.joint_execution)),
+                crate::config::SbdJointOutput::CodpulaContextual => Some(crate::codpula::Codpula::new_contextual(c.d_model,c.seed,device)
+                    .with_execution(sbd.joint_execution)),
+            };
         }
         Ok(model)
     }
