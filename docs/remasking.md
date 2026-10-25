@@ -548,3 +548,55 @@ The selected circuit execution remains tensor when omitted. `configs/lm512-tct.j
 
 Evidence: `artifacts/remasking/timing-b1/tct-benchmark.json`, `tct/tct-benchmark.json`, `tct/tct-reference.json`. The GPU/build locks were released between commands. Only the shared target directory and copied workspace executable were used. The final helper build cleaned/recompiled the three local crates; published build times are not warm per-command inference overhead. No target/profile/dependency changes were made.
 
+
+## 15. Prefix219 integration-QA investigation
+
+The unnormalized diagnostic `sum(A.logits²)+sum(B.logits²)+sum(A.features²)+sum(B.features²)` is **not** the training objective. Its original plain-SBD disagreement ratio21.071893 and CoCommit ratio11.614331 remain failures, with original bytes retained under `artifacts/cocommit/` and hashed copies in `artifacts/remasking/integration-qa/originals/`. Neither check was rerun unchanged, relabelled as passing, or assigned a looser tolerance.
+
+**Conclusion:** no incorrect retrieval operator/VJP was found. The evidence identifies cancellation and rounding amplification in this artificial f32 objective, rather than a changed cache, a changed MoBA selection, or a CoCommit-only error. Production code and accepted training gates are unchanged. This is not a claim that a complete scalar-f64 model was evaluated: independent f64 references below cover the relevant RMS, vocabulary-linear and fixed-source retrieval primitives; full-network CPUf32/Vulkanf32 comparisons are disagreement diagnostics only.
+
+### 15.1 Separate the two loss terms
+
+The same seed1/D256/four-layer initialization and prefix219/L8 geometry were used, with CPU tensor operators and the actual configured Vulkan fused operators. A/B cached reads were identical within each plain-SBD execution.
+
+| Diagnostic | Largest CPUf32/Vulkanf32 tolerance ratio | Interpretation |
+|---|---:|---|
+| Logits squared only | 25.226726 | The failure is not solely final-feature RMS cancellation |
+| Final normalized features squared only | 17.556043 | Nearly radial RMS cotangent |
+| Replay the stable scalar-f64 feature-squared cotangent at the raw final-RMS input | 0.000142909 | Removing the radial subtraction removes this component's amplification |
+| Replay scalar-f64 RMS+head logits-squared cotangent at the same input | 21.478384 | Earlier-network rounding/cancellation remains; final RMS alone is not an explanation for logits |
+| Replay one common deterministic non-radial raw-input cotangent | 5.905627 | Full-network f32 Jacobians need not agree elementwise under this artificial loss |
+
+For gamma1 and row mean square `s`, the exact feature-squared derivative is `2*epsilon*x/(s+epsilon)^2`. The independent scalar-f64 direct and projection terms have combined L2 magnitude181.043326, but their residual is only0.000090545887: worst coordinate cancellation is1,999,768×, about6.30decimal digits. CPU/Vulkan captured raw inputs differ by only3.070443e-6 relative L2. The local RMS VJPs, evaluated at each exact captured f32 input and its matched cotangent, nevertheless pass the original `2e-5+3e-4*abs(ref)` rule. Across all CPU tensor/Vulkan tensor/Vulkan fused probes, largest primitive error is1.097112e-5 and largest ratio0.088861, with zero failing elements. Relative error of a nearly zero radial residual is not substituted for the specified tolerance.
+
+### 15.2 Use the exact detached production source lists
+
+Both calls' actual original-position IDs and disabled slots were captured **after production selection**: tensor visibility/cache IDs and fused selector output IDs. No new ranking convention was written for the arithmetic reference. All32 query/head rows have identical enabled source sets across implementations, no duplicate IDs, and164–175 enabled sources including active K/V. Cache positions are identical. The earlier scalar-f64 selection-margin calculation gives a minimum boundary gap0.00240659, over25times a conservative f32 dot/summary roundoff estimate; it is supporting routing evidence, not a second VJP oracle.
+
+On these fixed lists, a separate sequential scalar-f64 implementation computes the single softmax with its sink, weighted value read and analytic q/k/v/sink/active-K/active-V derivatives. The captured query-valid output gate is included; it is a discrete mask, not an invented trainable gate.
+
+| Primitive checked at captured inputs | Largest absolute error | Largest tolerance ratio |
+|---|---:|---:|
+| CPU tensor retrieval, all outputs and six VJPs | 2.664782e-8 | 0.000924309 |
+| Actual Vulkan fused retrieval, both captured input sets | 2.664782e-8 | 0.000920052 |
+| CPU/Vulkan native vocabulary linear, output/input/weight VJPs | 2.205272e-6 | 0.015199263 |
+
+Every element passes unchanged tolerance against f64. A repeated fused retrieval backward is also bit-identical for all six VJPs; this repeat is only determinism evidence, **not** the independent numerical reference. The inspected fused query/token/active/sink derivatives have fixed output ownership rather than float `fetch_add` accumulation.
+
+### 15.3 Quantify the remaining logits cancellation
+
+Eight separate final-RMS-input row cotangents were computed from the scalar-f64 RMS+linear logits-squared formula, rounded once for the existing f32 graph, and differentiated individually. Their parameter-coordinate contributions were then summed in host f64. This tests linearity and exposes conditioning; it does not turn f32 row gradients into an independent oracle.
+
+| Parameter coordinate | Sum of absolute CPU row contributions | Absolute CPU f64 row sum | Cancellation factor | Largest individual-row CPU/Vulkan ratio | Difference between f64 sums |
+|---|---:|---:|---:|---:|---:|
+| `ohc_init.offsets[855]` | 178.828747 | 0.044420123 | 4025.85 | 0.649131 | 0.000933528 |
+| `blocks.0.ohc_lngram.mix_bias[6]` | 116.149486 | 0.062150002 | 1868.86 | 0.070737 | 0.001029491 |
+
+Each individual row passes the original comparison rule at these coordinates, yet their small residual sums fail it. The disagreements are only5.22e-6 and8.86e-6 of the respective sums of absolute contributions. Ordered host-f64 summation does not remove them: they arise before the final row sum in the differently rounded f32 graphs. This directly explains why fixing only a final host-scalar reduction or only the final RMS would not repair this stress comparison.
+
+The actual normalized CoCommit training objective remains the accepted gate: existing `artifacts/cocommit/cocommit-reference.json`, prefix219/L8, all7,083,447 neural gradient elements, max absolute1.573563e-5 and ratio0.538998135, passes unchanged tolerance. That acceptance was read, not rerun or replaced with a rescaled squared diagnostic. No mechanisms were disabled.
+
+Actual GPU Lngram execution was `fused_gpu` in all three active Lngram modules. The separate Tensor-Lngram duplicate-index fix `e50cc523` was not merged and does not explain this execution. The clipping fix `64590d18` and feature commit `b9e589b5` remain separate and unchanged.
+
+Evidence is under `artifacts/remasking/integration-qa/`: `summary.json`, `retrieval-stress-decomposition.json`, `rms-captured-inputs.json`, `row-vjp-contributions.json`, `row-vjp-f64-sums.json`, `fixed-selected-list-equality.json`, `fixed-list-prefix{,-cpu}-f64.json`, `selection-f64.json`, captured arguments/IDs in `raw/`, and hashed original failures in `originals/`. Throwaway probes and capture hooks were removed. No source regression test was added because no faulty operator was identified; existing independent primitive references and actual-objective gates remain required. No quality study, selector sweep, attention redesign or execution-layout change was performed.
+

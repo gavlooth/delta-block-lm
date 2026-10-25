@@ -2056,3 +2056,11 @@ The initial8-state collection produced only numerical ties; expanding to the alr
 
 Evidence: `artifacts/remasking/{summary,continuation-base,checkpoint-cleanup}.json`, `remask-reference.json`, `cpu/remask-reference.json`, `tct/tct-reference.json`, `historical/checkpoint-check.json`, `remask{,-timing-b1}/remask-benchmark.json`, `timing-b1/tct-benchmark.json`, `tct/tct-benchmark.json`, `smoke-trajectories-full.json`, `smoke-energy.fit.json` and `smoke-tct-final/`. Main was not moved/rebased; duplicate main specification docs remain for the director.
 
+### Prefix219 stress-gradient investigation
+
+The original plain-SBD21.071893/CoCommit11.614331 tolerance-ratio failures of the **unnormalized logits² plus normalized-features² diagnostic** remain recorded, not silently accepted. Targeted independent scalar-f64 checks find no retrieval arithmetic/VJP bug: actual detached production source lists match in all32query/head rows without duplicates; CPU tensor and Vulkan fused read/output/q/k/v/sink/active-K/active-V pass unchanged tolerance, max2.664782e-8/ratio0.000924309. The head linear passes2.205272e-6/ratio0.015199263 and matched-input RMS passes1.097112e-5/ratio0.088861.
+
+Feature-squared RMS derivatives cancel by up to1,999,768×; replacing only that endpoint cotangent with its stable f64 formula reduces its full-network disagreement ratio17.556043 to0.000142909. Logits are separately ill-conditioned: selected parameter row contributions cancel by4025.85×/1868.86×, so individual passing f32 row comparisons sum to small failing residuals even with host-f64 sums. Final RMS alone therefore does not explain the logits failure. The actual normalized prefix219/L8 training objective remains passing at max1.573563e-5/ratio0.538998135 over7,083,447gradient elements(existing CoCommit acceptance; not rerun).
+
+No production math, tolerance, selector, checkpoint or test was changed. Actual GPU Lngram paths are fused, so unrelated Tensor-only fix `e50cc523` was not merged or credited. Original failure copies/hashes, captured fixed lists, primitive references and row analysis remain in `artifacts/remasking/integration-qa/`; throwaway probes/hooks were removed. Full method and numerical limits: [docs/remasking.md §15](docs/remasking.md#15-prefix219-integration-qa-investigation).
+
