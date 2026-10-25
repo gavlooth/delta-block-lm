@@ -1,5 +1,5 @@
 //! Training snapshots from the ordinary unsegmented clean forward.
-use crate::{model::LanguageModel, soft::SoftState};
+use crate::{model::{DenoisingOutput, LanguageModel}, soft::SoftState};
 use burn::prelude::*;
 use delta_mixers::{profile::Sections, sbd::{BatchedMixerCache,BatchedWaveletCache,MixerCache,WaveletCache}};
 
@@ -84,10 +84,10 @@ impl LanguageModel {
         }).collect();
         TrainingCache {layers,starts:starts.to_vec()}
     }
-    pub fn cached_block(&self, cache: &TrainingCache, block_index: usize, soft: &SoftState, hard: bool) -> Tensor<3> {
+    pub fn cached_block(&self, cache: &TrainingCache, block_index: usize, soft: &SoftState, hard: bool) -> DenoisingOutput {
         self.cached_block_profiled(cache,block_index,soft,hard,&mut delta_mixers::profile::Unprofiled)
     }
-    pub fn cached_block_profiled<P: Sections>(&self, cache: &TrainingCache, block_index: usize, soft: &SoftState, hard: bool, profile: &mut P) -> Tensor<3> {
+    pub fn cached_block_profiled<P: Sections>(&self, cache: &TrainingCache, block_index: usize, soft: &SoftState, hard: bool, profile: &mut P) -> DenoisingOutput {
         let n = soft.observed.len();
         let start = cache.starts[block_index];
         let d = self.embedding.weight.val().dims()[1];
@@ -145,7 +145,8 @@ impl LanguageModel {
                 hidden = hidden + block.down.forward(self.epilogue_backend.silu(block.up.forward(input)));
             }
         }
-        self.head_forward(self.normalization_backend.rms(&self.norm,hidden))
+        let features = self.normalization_backend.rms(&self.norm,hidden);
+        DenoisingOutput { logits: self.head_forward(features.clone()), features }
     }
     pub fn training_cache_batched(&self, trace: &CleanInputs, blocks: &[(usize,usize)]) -> BatchedTrainingCache {
         assert!(!blocks.is_empty());
@@ -162,10 +163,10 @@ impl LanguageModel {
         BatchedTrainingCache {layers,blocks:blocks.len()}
     }
     /// The soft state is block-major, with inactive right padding in each row.
-    pub fn cached_blocks(&self, cache: &BatchedTrainingCache, soft: &SoftState, hard: bool) -> Tensor<3> {
+    pub fn cached_blocks(&self, cache: &BatchedTrainingCache, soft: &SoftState, hard: bool) -> DenoisingOutput {
         self.cached_blocks_profiled(cache,soft,hard,&mut delta_mixers::profile::Unprofiled)
     }
-    pub fn cached_blocks_profiled<P: Sections>(&self, cache: &BatchedTrainingCache, soft: &SoftState, hard: bool, profile: &mut P) -> Tensor<3> {
+    pub fn cached_blocks_profiled<P: Sections>(&self, cache: &BatchedTrainingCache, soft: &SoftState, hard: bool, profile: &mut P) -> DenoisingOutput {
         let blocks = cache.blocks;
         assert!(soft.observed.len().is_multiple_of(blocks));
         let n = soft.observed.len()/blocks;
@@ -221,6 +222,7 @@ impl LanguageModel {
                 hidden = hidden + block.down.forward(self.epilogue_backend.silu(block.up.forward(input)));
             }
         }
-        self.head_forward(self.normalization_backend.rms(&self.norm,hidden))
+        let features = self.normalization_backend.rms(&self.norm,hidden);
+        DenoisingOutput { logits: self.head_forward(features.clone()), features }
     }
 }

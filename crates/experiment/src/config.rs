@@ -86,6 +86,7 @@ impl Arm {
             || !c.wavelet_backend.is_tensor()
             || (!c.lngram_layers.is_empty()
                 && c.lngram_backend == delta_mixers::lngram::LngramBackend::FusedGpu)
+            || c.sbd.as_ref().is_some_and(|s| !s.joint_execution.is_tensor())
     }
 }
 
@@ -176,6 +177,29 @@ impl SbdBlockExecution {
         *self == Self::PerBlock
     }
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SbdJointOutput {
+    #[default]
+    Factorized,
+    Codpula,
+}
+impl SbdJointOutput {
+    pub fn is_factorized(&self) -> bool { *self == Self::Factorized }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SbdCommitment {
+    #[default]
+    Fixed,
+    Dependence,
+}
+impl SbdCommitment {
+    pub fn is_fixed(&self) -> bool { *self == Self::Fixed }
+}
+fn dependence_threshold() -> f64 { 0.05 }
+fn is_default_dependence_threshold(value: &f64) -> bool { *value == dependence_threshold() }
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SbdConfig {
@@ -183,6 +207,15 @@ pub struct SbdConfig {
     pub feedback: SbdFeedback,
     #[serde(skip_serializing_if = "SbdBlockExecution::is_per_block")]
     pub block_execution: SbdBlockExecution,
+    #[serde(skip_serializing_if = "SbdJointOutput::is_factorized")]
+    pub joint_output: SbdJointOutput,
+    #[serde(skip_serializing_if = "crate::codpula::CodpulaExecution::is_tensor")]
+    pub joint_execution: crate::codpula::CodpulaExecution,
+    #[serde(skip_serializing_if = "SbdCommitment::is_fixed")]
+    pub commitment: SbdCommitment,
+    /// Appendix C Figures 12–13 report 0.05; the paper gives no global default.
+    #[serde(skip_serializing_if = "is_default_dependence_threshold")]
+    pub dependence_threshold: f64,
     #[serde(skip_serializing_if = "delta_mixers::sbd::InBlockReads::is_none")]
     pub in_block_reads: delta_mixers::sbd::InBlockReads,
     #[serde(skip_serializing_if = "delta_mixers::sbd::NoisyReadBackend::is_tensor")]
@@ -197,6 +230,9 @@ impl Default for SbdConfig {
     fn default() -> Self {
         Self { block_lengths: vec![8], feedback: SbdFeedback::SoftFeedback,
             block_execution: SbdBlockExecution::PerBlock,
+            joint_output: SbdJointOutput::Factorized,
+            joint_execution: crate::codpula::CodpulaExecution::Tensor,
+            commitment: SbdCommitment::Fixed, dependence_threshold: dependence_threshold(),
             candidate_width: 4, commit_count: 2, entropy_threshold: None, generate_tokens: 32,
             in_block_reads: delta_mixers::sbd::InBlockReads::None,
             noisy_read_backend: delta_mixers::sbd::NoisyReadBackend::Tensor }
@@ -413,6 +449,16 @@ impl Config {
                 && sbd.commit_count > 0 && sbd.generate_tokens > 0, "invalid SBD decoding counts");
             ensure!(sbd.entropy_threshold.is_none_or(|x| x.is_finite() && x >= 0.0),
                 "SBD entropy threshold must be finite and nonnegative");
+            ensure!(sbd.dependence_threshold.is_finite() && sbd.dependence_threshold > 0.0,
+                "SBD dependence threshold must be finite and positive");
+            ensure!(sbd.commitment != SbdCommitment::Dependence || sbd.joint_output == SbdJointOutput::Codpula,
+                "dependence commitment requires sbd.joint_output=codpula");
+            ensure!(sbd.joint_output != SbdJointOutput::Codpula || sbd.block_lengths.iter().all(|&n| n <= 16),
+                "Codpula block lengths must be at most 16");
+            ensure!(sbd.joint_execution.is_tensor()
+                || (sbd.joint_output == SbdJointOutput::Codpula
+                    && matches!(self.backend.as_str(),"vulkan" | "cuda") && !self.fusion),
+                "sbd.joint_execution=fused_gpu requires Codpula and explicit non-fusion GPU execution");
             ensure!(
                 sbd.noisy_read_backend.is_tensor()
                     || (matches!(self.backend.as_str(),"vulkan" | "cuda") && !self.fusion
@@ -1131,5 +1177,56 @@ mod tests {
         assert_ne!(c.training_fingerprint(c.train_tokens).unwrap(),old_training);
         assert_ne!(c.pilot_fingerprint().unwrap(),old_pilot);
         assert!(serde_json::from_value::<Config>(serde_json::json!({"in_block_reads":"hola_read"})).is_err());
+    }
+    #[test]
+    fn joint_output_defaults_preserve_historical_sbd_identity() {
+        let mut c = Config {task:"lm".into(),sbd:Some(SbdConfig::default()),..Config::default()};
+        let omitted = serde_json::to_value(&c).unwrap();
+        for field in ["joint_output","joint_execution","commitment","dependence_threshold"] {
+            assert!(omitted["sbd"].get(field).is_none());
+        }
+        let training = c.training_fingerprint(c.train_tokens).unwrap();
+        let pilot = c.pilot_fingerprint().unwrap();
+        let mut explicit = omitted.clone();
+        explicit["sbd"]["joint_output"] = "factorized".into();
+        explicit["sbd"]["joint_execution"] = "tensor".into();
+        explicit["sbd"]["commitment"] = "fixed".into();
+        explicit["sbd"]["dependence_threshold"] = 0.05.into();
+        let explicit: Config = serde_json::from_value(explicit).unwrap();
+        assert_eq!(serde_json::to_value(&explicit).unwrap(),omitted);
+        assert_eq!(explicit.training_fingerprint(c.train_tokens).unwrap(),training);
+        assert_eq!(explicit.pilot_fingerprint().unwrap(),pilot);
+        c.sbd.as_mut().unwrap().joint_output = SbdJointOutput::Codpula;
+        c.validate().unwrap();
+        assert_ne!(c.training_fingerprint(c.train_tokens).unwrap(),training);
+        assert_ne!(c.pilot_fingerprint().unwrap(),pilot);
+        c.sbd.as_mut().unwrap().commitment = SbdCommitment::Dependence;
+        c.validate().unwrap();
+        let encoded = serde_json::to_value(&c).unwrap();
+        assert_eq!(encoded["sbd"]["joint_output"],"codpula");
+        assert_eq!(encoded["sbd"]["commitment"],"dependence");
+        assert_eq!(serde_json::to_value(serde_json::from_value::<Config>(encoded.clone()).unwrap()).unwrap(),encoded);
+        c.sbd.as_mut().unwrap().joint_output = SbdJointOutput::Factorized;
+        assert!(c.validate().is_err());
+        c.sbd.as_mut().unwrap().joint_output = SbdJointOutput::Codpula;
+        c.sbd.as_mut().unwrap().block_lengths = vec![17];
+        assert!(c.validate().is_err());
+        c.sbd.as_mut().unwrap().block_lengths = vec![1,4,16];
+        for invalid in [0.0,-0.1,f64::NAN,f64::INFINITY] {
+            c.sbd.as_mut().unwrap().dependence_threshold = invalid;
+            assert!(c.validate().is_err());
+        }
+        c.sbd.as_mut().unwrap().dependence_threshold = 0.05;
+        c.sbd.as_mut().unwrap().joint_execution = crate::codpula::CodpulaExecution::FusedGpu;
+        assert!(c.validate().is_err());
+        c.backend = "vulkan".into();
+        c.validate().unwrap();
+        c.fusion = true;
+        assert!(c.validate().is_err());
+        for field in ["joint_output","joint_execution","commitment"] {
+            let mut invalid = omitted.clone();
+            invalid["sbd"][field] = "automatic".into();
+            assert!(serde_json::from_value::<Config>(invalid).is_err());
+        }
     }
 }

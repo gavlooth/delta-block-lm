@@ -1,10 +1,10 @@
-# Steps 1–8: measured pilot results
+# Steps 1–9: implementation and measured results
 
 For the current optimized execution paths, measured speedups and known legacy GPU-solver limitation, see [Early GPU kernel optimization](#early-gpu-kernel-optimization). The current recommended batch-8 configuration and its combined measurements are in [Batch-8 component optimization round](#batch-8-component-optimization-round). Step 7 (oHC, wavelet mixer, three Lngram injections) is in [Step 7: oHC, wavelet and Lngram](#step-7-ohc-wavelet-and-lngram). The first sections retain the original pilot measurements.
 
 ## Scope and stopping point
 
-Implemented and exercised the active Burn workspace, causal GDN-2 and KronLSTM, optional HOLA/recency memory, soft top-k feedback, paired associative-recall experiments, and a tiny causal language-model comparison. The Steps 1–6 sections below predate Step 7, which is reported separately at the end. Step 8 now includes user-selected in-block reads through HOLA. Its new evidence below is numerical correctness and execution-cost measurement only; earlier dense-attention measurements remain historical. Codpula, CoCommit and energy-guided remasking remain later work.
+Implemented and exercised the active Burn workspace, causal GDN-2 and KronLSTM, optional HOLA/recency memory, soft top-k feedback, paired associative-recall experiments, and a tiny causal language-model comparison. The Steps 1–6 sections below predate Step 7, which is reported separately at the end. Step 8 includes user-selected in-block reads through HOLA. Step 9 adds Codpula joint output and dependence-adaptive commitment; this turn's evaluation scope is numerical correctness, execution cost and a tiny smoke, not a quality study. Earlier dense-attention measurements remain historical. CoCommit and energy-guided remasking remain later work.
 
 All runs used the local Intel Arc Graphics (MTL) through Vulkan, with float32 execution. No Spark or predecessor production process was used or modified.
 Run artifacts report sampled backend-reserved memory and explicit recurrent/cache/convolution storage. Exact GPU peak memory is not available here; the integrated GPU shares system memory, so reserved-pool samples must not be presented as exact physical-device peaks.
@@ -1891,3 +1891,119 @@ separately retained in `before-large-grid.json` and is not the adoption
 evidence above. Historical diagnostic model/optimizer payloads were removed;
 numerical reports remain. No training study, ablation or sweep was run.
 
+
+## Step 9: Codpula joint block output
+
+Implemented 2026-10-25 in the `codpula` workspace. The selected model is a homogeneous
+32-state HMM over actual SBD blocks of length at most 16, with full 257-symbol
+emissions, shared positive log rows, and one final-feature mean-pooled 8×8 gate
+grid (group width four) per block. The existing vocabulary projection supplies
+token potentials. Conditional joint noisy NLL is added to the unchanged clean
+loss; circuit rows use the recorded dual-flow/Anemone update, separate
+bias-corrected momentum 0.9 and constant alpha 0.05. Seeded joint FFBS proposals
+and dependence commitment use threshold 0.05, all unresolved positions, a
+minimum-score progress fallback and at most L passes.
+
+The full equations, decisions and current-source reuse audit are in
+[`docs/codpula.md`](docs/codpula.md). Omitted/explicit factorized serialization,
+fingerprints, initialization and old checkpoint behavior remain; L1 is still the
+exact clean causal bypass. `configs/lm512-codpula.json` enables Codpula with
+batched blocks and dependence commitment. Its circuit execution stays **tensor**.
+
+### Numerical and continuation acceptance
+
+The tolerance remains `2e-5 + 3e-4*abs(ref)`, unchanged.
+
+| Gate | Max absolute error | Worst tolerance ratio |
+| --- | ---: | ---: |
+| CPU circuit/f64/enumeration and VJP checks | 6.385e-6 | 0.1750 |
+| Vulkan circuit/f64 checks, tensor and fused | 1.2103e-5 | 0.1512 |
+| Fused operations/full VJPs within that report | 8.801e-7 | 0.02940 |
+| CPU complete-model matrix | 1.908e-6 | 0.09537 |
+| Fused Vulkan complete-model matrix versus CPU | 2.385e-6 | 0.04744 |
+
+Checks cover partition/evidence normalization, marginals, joint NLL and full
+VJPs, separate positive/negative flows, valid Eq. (9) updates, statistical joint
+samples plus exact indexed-uniform FFBS, cavity versus query scores, impossible
+evidence/all-zero posterior rejection, dirty padding and noncontiguous inputs.
+Model checks cover GDN-2/KronLSTM with ordinary and Step-7/retrieval features,
+all SBD paths, teacher detachment, observed-feature gradients, absorbing
+commitments and unchanged clean caches/device RNG. New checkpoint continuation
+is exact through two additional complete neural/circuit steps, including EMA,
+integer time and canonical AdamW state.
+
+The earlier valid causal checkpoint `artifacts/lm512-vulkan/kronlstm-hola-seed1/checkpoint-13`
+still loads with saved identity
+`c7eca1dace65f65fea8db186a6c0cc5427a320f4bf89f76a4ea0482c86dc42ca`.
+The obsolete dense-attention Step-8 payload remains rejected, as it was before
+this turn. Workspace tests pass **51 experiment + 7 kernel + 16 mixer tests**,
+one GPU-sharing test explicitly ignored. Unchanged SBD and block-batching
+reference matrices pass on CPU and Vulkan.
+
+A new forward-only fused-query defect was caught before acceptance: CubeCL's
+compile-time early `terminate!()` did not exclude the later posterior suffix,
+which could overwrite aliased inputs. Positive compile-time inclusion of the
+entire suffix fixes it; untracked repeated-query/model-inference regressions pass.
+
+### Paired complete-step cost, not quality
+
+Intel Arc Graphics (MTL), Mesa 26.2.4 Vulkan f32, no autotune/Burn fusion,
+B1/T512/L8, D256/four layers with oHC/wavelet/Lngram/HOLA.
+Two warmups and **11 interleaved samples per mode**, alternating order, in one
+GPU-locked session. Initial common weights and step-specific examples/masks
+match; optimizer trajectories are separate. Timings include uploads, clean and
+detached teacher passes, noisy loss, backward, checks, clipping, AdamW and the
+circuit update. They exclude evaluation, checkpoint I/O and cold compilation.
+
+| Complete optimizer step | Median ms | Launches |
+| --- | ---: | ---: |
+| Factorized cost reference | 1522.502 | 24,242 |
+| Codpula tensor, selected | 1697.014 | 27,842 |
+| Codpula fused, explicit opt-in | 1631.830 | 25,578 |
+
+Tensor Codpula adds a paired median **154.355 ms [109.492,187.927]** versus
+factorized; the median-time ratio is +11.46%. Fused adds
+**117.456 ms [57.658,149.567]**, median-time ratio +7.18%.
+
+Fused versus tensor saves a paired median **60.951 ms**, but the 95% paired
+bootstrap interval **[-23.545,84.668] ms includes zero**, with 8/11 faster.
+**Fused is not adopted by default.** The isolated circuit is genuinely faster:
+tensor/fused medians **80.350/61.654 ms**, **2716/1044 launches**, paired saving
+**20.025 ms [16.577,23.311]**, 11/11 faster. That isolated gain is not sufficient
+evidence for a complete-step adoption.
+
+Sampled pool reservation is approximately **1,697,281,920 bytes** with all three
+models/optimizers resident; it is not a per-path or exact live-memory peak.
+The selected tensor B8/T512 path's single post-warm diagnostic is
+**8000.071 ms, 30,745 launches, 8,826,550,976 bytes**. It fits without block-axis
+subdivision. The earlier factorized ~8.2 s B8 figure is unpaired historical
+context, not evidence that the added joint layer makes B8 faster.
+
+### Current predecessor salvage and tiny smoke
+
+Current predecessor inference/support/CDF/indexed-uniform, dependence
+commitment and rollout/detachment tests were salvaged and adapted, rather than
+treating the older `reuse/` copy as current. Relation fields, union alternatives,
+all-round loss averaging, destination gates and posterior-temperature decoding
+were not imported. No matching dual-flow optimizer exists there; its trainer
+uses AdamW. Exact source hashes/ranges are in `reuse/PROVENANCE.json`.
+
+Source inspection found an all-zero-row NaN in predecessor `decode.rs:56-61`:
+`-infinity-(-infinity)` during posterior normalization. That decoder was not
+ported; ours has an explicit zero-support sampling regression. The inventory
+document in the main workspace was left untouched.
+
+Only **96 bytes / three optimizer steps**, B1/context32/seed1, were trained.
+Checkpoint CLI evaluation and generation pass: clean NLL 5.447807, joint block
+NLL per target 4.463265 on one 32-token window, and eight finalized/replayed
+tokens in one dependence pass. These are smoke values, not language-quality
+evidence. Model/optimizer smoke and scratch payloads were deleted afterward;
+small JSON reports/state/hashes remain. No study, ablation, sweep or quality
+comparison was run.
+
+Evidence: `artifacts/codpula/`, particularly `cpu-tests.txt`,
+`{cpu,vulkan-fused}/codpula-model-reference.json`, `codpula-reference.json`,
+`{factorized-cpu,factorized-vulkan}/sbd-reference.json`,
+`b1/codpula-benchmark.json`, `b1/codpula-isolated.json`,
+`codpula-diagnostic.json`, `smoke/`, `adoption.json` and
+`checkpoint-cleanup.json`.

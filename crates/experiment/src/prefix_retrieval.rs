@@ -93,11 +93,13 @@ impl Runner {
         runtime::sync(device)?;let clock=Instant::now();
         let rows=data::examples(c,corpus,c.seed,self.step*c.batch_size,c.batch_size,"train")?;
         let batch=Batch::new(&rows,device);let model=self.model.take().unwrap();
-        let objective=if c.sbd.is_some() {sbd::training_loss(&model,c,&rows,&batch,c.seed+self.step as u64)?}
-            else {model.loss(model.forward(&batch),&batch)};
+        let (objective,circuit_flows)=if c.sbd.is_some() {
+            let result=sbd::training_loss(&model,c,&rows,&batch,c.seed+self.step as u64)?;
+            (result.loss,result.circuit_flows)
+        } else {(model.loss(model.forward(&batch),&batch),None)};
         model::scalar(objective.clone())?;
         let gradients:GradientsParams=model::checked_gradients(&model,objective)?;
-        self.model=Some(self.optimizer.step(c.learning_rate,model,gradients));
+        self.model=Some(train::optimizer_step(c,model,&mut self.optimizer,gradients,circuit_flows)?);
         runtime::sync(device)?;self.step+=1;
         Ok(clock.elapsed().as_secs_f64()*1000.)
     }

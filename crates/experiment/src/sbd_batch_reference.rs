@@ -175,11 +175,11 @@ fn logits_case(model: &LanguageModel, c: &Config, device: &Device) -> Result<Val
         let mut state = soft(c, visible.clone(), vec![true; n], device)?;
         let local_index = blocks[..index].iter().filter(|&&(r, _)| r == row).count();
         if feedback == SbdFeedback::SoftFeedback {
-            let teacher = model.cached_block(&caches[row], local_index, &state, false).detach();
+            let teacher = model.cached_block(&caches[row], local_index, &state, false).logits.detach();
             reference_teacher.extend(values(teacher.clone()));
             state.update(teacher.reshape([n, c.vocab()]), 1.0, c.soft_temperature, c.soft_steps, c.sbd.as_ref().unwrap().candidate_width)?;
         }
-        reference.extend(values(model.cached_block(&caches[row], local_index, &state, feedback == SbdFeedback::HardMask)));
+        reference.extend(values(model.cached_block(&caches[row], local_index, &state, feedback == SbdFeedback::HardMask).logits));
         observed.extend(visible);
         observed.extend(std::iter::repeat_n(None, width - n));
         active.extend(std::iter::repeat_n(true, n));
@@ -188,12 +188,12 @@ fn logits_case(model: &LanguageModel, c: &Config, device: &Device) -> Result<Val
     let cache = model.training_cache_batched(&trace, &blocks);
     let mut state = soft(c, observed, active, device)?;
     let teacher_report = if feedback == SbdFeedback::SoftFeedback {
-        let teacher = model.cached_blocks(&cache, &state, false).detach();
+        let teacher = model.cached_blocks(&cache, &state, false).logits.detach();
         let report = compare(&active_values(teacher.clone(), &lengths, c.vocab()), &reference_teacher).context("batched SBD detached teacher logits")?;
         state.update(teacher.reshape([blocks.len() * width, c.vocab()]), 1.0, c.soft_temperature, c.soft_steps, c.sbd.as_ref().unwrap().candidate_width)?;
         Some(report)
     } else { None };
-    let actual = model.cached_blocks(&cache, &state, feedback == SbdFeedback::HardMask);
+    let actual = model.cached_blocks(&cache, &state, feedback == SbdFeedback::HardMask).logits;
     let report = compare(&active_values(actual, &lengths, c.vocab()), &reference).context("batched SBD padded versus unpadded logits")?;
     let retrieval_candidates = c.prefix_block_retrieval.as_ref().map(|retrieval| {
         let cut = blocks[3].1 / c.chunk_size * c.chunk_size;
@@ -232,7 +232,7 @@ fn causal_objective(model: &LanguageModel, c: &Config, rows: &[Example], batch: 
         let row = &rows[block.row];
         let selected = logits.clone().slice([block.row..block.row + 1, block.start..block.start + 1, 0..c.vocab()]).reshape([1, c.vocab()]);
         let state = soft(c, vec![None], vec![true], &device)?;
-        let reconstructed = crate::sbd::block_forward(model, &row.input[..block.start + 1], &state, c.sbd.as_ref().unwrap().feedback == SbdFeedback::HardMask, &device);
+        let reconstructed = crate::sbd::block_forward(model, &row.input[..block.start + 1], &state, c.sbd.as_ref().unwrap().feedback == SbdFeedback::HardMask, &device).logits;
         let mut report = compare(&values(selected.clone()), &values(reconstructed)).context("length-one clean batch versus causal prefix logits")?;
         report["row"] = json!(block.row);
         report["start"] = json!(block.start);
@@ -249,10 +249,10 @@ fn loss_case(model: &LanguageModel, c: &Config, rows: &[Example], seed: u64, blo
     per_block.sbd.as_mut().unwrap().block_execution = SbdBlockExecution::PerBlock;
     let mut batched = per_block.clone();
     batched.sbd.as_mut().unwrap().block_execution = SbdBlockExecution::Batched;
-    let reference_loss = crate::sbd::training_loss(model, &per_block, rows, &batch, seed)?;
+    let reference_loss = crate::sbd::training_loss(model, &per_block, rows, &batch, seed)?.loss;
     let reference_value = values(reference_loss.clone());
     let reference_gradients = gradient_snapshot(model, reference_loss)?;
-    let actual_loss = crate::sbd::training_loss(model, &batched, rows, &batch, seed)?;
+    let actual_loss = crate::sbd::training_loss(model, &batched, rows, &batch, seed)?.loss;
     let actual_value = values(actual_loss.clone());
     let actual_gradients = gradient_snapshot(model, actual_loss)?;
     let loss_report = compare(&actual_value, &reference_value).context("batched SBD total training loss")?;

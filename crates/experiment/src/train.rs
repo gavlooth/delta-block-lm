@@ -45,6 +45,19 @@ pub(crate) fn optimizer(c: &Config) -> ModuleOptimizer {
         None,
     )
 }
+pub(crate) fn optimizer_step(
+    c: &Config,
+    model: LanguageModel,
+    optim: &mut ModuleOptimizer,
+    gradients: burn::optim::GradientsParams,
+    circuit_flows: Option<crate::codpula::CircuitFlows>,
+) -> Result<LanguageModel> {
+    let mut model = optim.step(c.learning_rate, model, gradients);
+    if let Some(flows) = circuit_flows {
+        model.codpula.as_mut().context("circuit statistics require Codpula output")?.update(flows)?;
+    }
+    Ok(model)
+}
 pub(crate) fn loaded_corpus(c: &Config) -> Result<Option<Corpus>> {
     if c.task == "lm" {
         Ok(Some(Corpus::load(&c.corpus_manifest)?))
@@ -302,16 +315,17 @@ pub fn run(
             "train",
         )?;
         let batch = Batch::new(&rows, &train_device);
-        let loss = if c.sbd.is_some() {
-            crate::sbd::training_loss(&model,c,&rows,&batch,seed.wrapping_add(step as u64))?
+        let (loss, circuit_flows) = if c.sbd.is_some() {
+            let result = crate::sbd::training_loss(&model,c,&rows,&batch,seed.wrapping_add(step as u64))?;
+            (result.loss, result.circuit_flows)
         } else {
-            model.loss(model.forward(&batch), &batch)
+            (model.loss(model.forward(&batch), &batch), None)
         };
         peak(&mut peak_reserved, device);
         let value = model::scalar(loss.clone())?;
         let grads = model::checked_gradients(&model, loss)?;
         peak(&mut peak_reserved, device);
-        model = optim.step(c.learning_rate, model, grads);
+        model = optimizer_step(c, model, &mut optim, grads, circuit_flows)?;
         runtime::sync(device)?;
         peak(&mut peak_reserved, device);
         step += 1;
@@ -434,11 +448,12 @@ pub fn pilot(c: &Config, device: &Device) -> Result<Value> {
         let rows = data::examples(c, corpus.as_ref(), c.seed, 0, c.batch_size, "train")?;
         let batch = Batch::new(&rows,&train_device);
         let first = Instant::now();
-        let loss = if c.sbd.is_some() {
-            crate::sbd::training_loss(&model,c,&rows,&batch,c.seed)?
-        } else {model.loss(model.forward(&batch),&batch)};
+        let (loss, circuit_flows) = if c.sbd.is_some() {
+            let result = crate::sbd::training_loss(&model,c,&rows,&batch,c.seed)?;
+            (result.loss, result.circuit_flows)
+        } else {(model.loss(model.forward(&batch),&batch), None)};
         let grads = model::checked_gradients(&model, loss)?;
-        model = optim.step(c.learning_rate, model, grads);
+        model = optimizer_step(c, model, &mut optim, grads, circuit_flows)?;
         runtime::sync(device)?;
         let first_use = first.elapsed().as_secs_f64();
         let clock = Instant::now();
@@ -455,11 +470,12 @@ pub fn pilot(c: &Config, device: &Device) -> Result<Value> {
                 "train",
             )?;
             let batch = Batch::new(&rows, &train_device);
-            let loss = if c.sbd.is_some() {
-                crate::sbd::training_loss(&model,c,&rows,&batch,c.seed.wrapping_add(steps as u64 + 1))?
-            } else {model.loss(model.forward(&batch),&batch)};
+            let (loss, circuit_flows) = if c.sbd.is_some() {
+                let result = crate::sbd::training_loss(&model,c,&rows,&batch,c.seed.wrapping_add(steps as u64 + 1))?;
+                (result.loss, result.circuit_flows)
+            } else {(model.loss(model.forward(&batch),&batch), None)};
             let grads = model::checked_gradients(&model, loss)?;
-            model = optim.step(c.learning_rate, model, grads);
+            model = optimizer_step(c, model, &mut optim, grads, circuit_flows)?;
             runtime::sync(device)?;
             steps += 1;
         }

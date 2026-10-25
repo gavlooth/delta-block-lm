@@ -106,13 +106,13 @@ Three mechanisms address related but distinct parts of the same problem. Compare
 
 ### 5.1 Codpula joint denoiser
 
-Use a small HMM compiled as a probabilistic circuit, with an initial experiment at 32 latent states and a 64-state comparison. These sizes are proposals for the small model, not the paper's 1,024-state reproduction.
+The selected implementation is a homogeneous 32-state HMM over each actual SBD block of length at most 16. Initial, transition and emission probability rows are shared across lengths/positions, stored in log form, with full 257-symbol emissions. These are small-model choices, not the paper's 1,024-state reproduction. The decisions are recorded in [docs/codpula.md](docs/codpula.md).
 
-Implement context-conditioned token potentials and group-level coupling gates, including the local emission normalizers and visible-evidence normalizer. Train under the conditional joint denoising objective. Use the paper's dual-flow multiplicative update for circuit parameters and the neural optimizer for backbone/potential/gate parameters; a different optimizer is a separately labeled experiment.
+The existing vocabulary head supplies token potentials from final-normalized noisy features. A valid-state mean pool supplies 64 biased linear log-gates, shared across edges with group width four. Local emission, transition-row and visible-evidence normalizers are included in conditional joint NLL. Circuit rows use the explicit nonnegative dual-flow split, summed occurrence reaches, separate bias-corrected momentum 0.9 and constant alpha 0.05; backbone/head/gate parameters retain existing AdamW.
 
-Compare input-only modulation against input-plus-coupling modulation. For candidate truncation, retain gold tokens during training, measure discarded mass at inference, and distinguish truncation error from circuit-inference error. Full-vocabulary enumeration is the small-vocabulary reference.
+All 257 symbols participate in circuit inference: candidate-support truncation loss is zero, while the existing width-four sparse feedback remains separate and receives detached joint marginals. The selected input-plus-coupling model, exact causal singleton bypass and old factorized default are implemented. No input-only/64-state/quality study was run in this turn.
 
-The paper's dependence-adaptive commitment computes, for proposed token i, the absolute change between its marginal log-probability and its log-probability conditioned on the other proposals. Defer dependence-sensitive proposals; include the paper's progress fallback. Reuse the same neural potentials for these conditional queries, but count the circuit work.
+Dependence commitment uses exact conditional joint proposals and absolute marginal-versus-conditional log-probability changes for all unresolved positions. It reuses one prepared circuit, evaluates leave-one-out probabilities with cavity messages, uses strict threshold 0.05, minimum-score progress fallback and at most L passes with final completion. Invalid evidence fails clearly.
 
 ### 5.2 CoCommit coordination
 
@@ -264,14 +264,16 @@ Partially implemented: clean/masked objectives, soft feedback, frozen prefix rea
 
 ### Step 9 — Add Codpula's joint output and adaptive commitment
 
-- First verify the small HMM/circuit against brute-force enumeration on tiny vocabularies: partition functions, observed evidence, conditional marginals and joint samples.
-- Start with 32 latent states and compare 64 when useful. Implement token potentials, grouped coupling modulation, all required normalizers and dual-flow circuit updates.
-- Train the joint output and compare input-only modulation with input-plus-coupling modulation. Do not decode the raw potentials as if they remained a separately trained independent head.
-- Add dependence-adaptive commitment using the paper's conditional-query scores and progress fallback. Reuse neural outputs within each step while counting circuit work.
+**Implementation, numerical gates and execution-cost measurement complete (2026-10-25).** Quality studies were explicitly excluded from this turn.
 
-**Deliverable:** a verified joint block predictor and fixed/adaptive commitment comparisons.
+- 32-state homogeneous joint output, all 257 symbols, final-normalized potentials, b=4 coupling gates, required normalizers and dual-flow circuit optimizer are integrated across cached/per-block/batched/reconstruction/evaluation/generation paths.
+- Independent f64/enumeration, full VJP/flow, joint-sampling, cavity, padding/observations/L1, CPU/Vulkan model and checkpoint/optimizer continuation gates pass at `2e-5 + 3e-4*abs(ref)`. Historical factorized identity is preserved; obsolete dense-SBD payloads stay rejected.
+- Fused leaf/chain/marginal/flow kernels with analytic VJP pass. Keep tensor circuit execution selected: B1/T512 paired fused saving 60.951 ms has 95% interval [-23.545,84.668], despite an isolated 20.025 ms [16.577,23.311] gain. Factorized/tensor/fused complete-step medians are 1522.502/1697.014/1631.830 ms.
+- Selected B8/T512 tensor diagnostic: 8000.071 ms, 30,745 launches and 8,826,550,976 bytes sampled pool reservation. Tiny context32 smoke: 96 bytes/three steps, checkpoint evaluation and eight dependence-committed/replayed tokens; disposable model/optimizer payloads removed.
 
-**Gate:** valid circuit parameters, correct conditional normalization, measured candidate-support loss and a quality/latency result against the independently trained factorized baseline.
+**Delivered:** verified joint predictor and fixed/dependence decoder support, current-predecessor salvage with provenance, exact tests and execution-cost accounting. See `docs/codpula.md`, `RESULTS.md` and `artifacts/codpula/`.
+
+**Gate result:** valid circuit rows, conditional normalization and full-support inference pass; latency is measured. The original quality/latency study against an independently trained factorized baseline, input-only comparison and 64-state study remain unevaluated by explicit user direction, not inferred from a tiny smoke.
 
 ### Step 10 — Add CoCommit, then test the combination
 

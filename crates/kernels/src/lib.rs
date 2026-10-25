@@ -112,3 +112,15 @@ mod noisy_hola;
 mod noisy_hola_ops;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 pub use noisy_hola_ops::noisy_hola_read;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod codpula;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+mod codpula_ops;
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+pub use codpula::{CodpulaKernelCounters, codpula_kernel_counters};
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+pub use codpula_ops::{
+    CodpulaOps, codpula_chain_backward, codpula_chain_statistics, codpula_emission_flows,
+    codpula_leaf_backward, codpula_leaf_normalizers, codpula_log_partition,
+    codpula_token_marginals,
+};

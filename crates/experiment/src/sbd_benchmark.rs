@@ -19,12 +19,13 @@ impl Runner {
         let rows=data::examples(c,corpus,c.seed,self.step*c.batch_size,c.batch_size,"train")?;
         let batch=Batch::new(&rows,device);
         let model=self.model.take().unwrap();
-        let loss=crate::sbd::training_loss_profiled(&model,c,&rows,&batch,c.seed.wrapping_add(self.step as u64),profile)?;
+        let result=crate::sbd::training_loss_profiled(&model,c,&rows,&batch,c.seed.wrapping_add(self.step as u64),profile)?;
+        let loss=result.loss;
         self.sample(device);
         model::scalar(loss.clone())?;
         let gradients=model::checked_gradients(&model,loss)?;
         self.sample(device);
-        self.model=Some(self.optim.step(c.learning_rate,model,gradients));
+        self.model=Some(train::optimizer_step(c,model,&mut self.optim,gradients,result.circuit_flows)?);
         runtime::sync(device)?;
         self.sample(device);
         self.step+=1;
@@ -187,4 +188,116 @@ pub fn batching_diagnostic(c:&Config,device:&Device) -> Result<Value> {
     let mut milliseconds=0.0;
     let dispatches=launches(||{milliseconds=runner.step(c,corpus.as_ref(),&target)?;Ok(())})?;
     Ok(json!({"completed":true,"config":c,"device":runtime::identity(device),"selection":"batched","warm_step_ms":warm_ms,"complete_step_ms":milliseconds,"launches":dispatches,"sampled_peak_pool_reserved_bytes":runner.peak,"warmups":1,"measured_steps":1,"precision":"float32","method":"one warm and one complete batched SBD training step, including uploads, detached teacher, second noisy pass, backward, checks, clipping and AdamW","memory_note":"pool reservation sampled after forward/backward/update, not peak live activation bytes"}))
+}
+
+fn codpula_isolated(c:&Config,device:&Device,warmups:usize,trials:usize) -> Result<Value> {
+    use crate::codpula::{Codpula,CodpulaExecution};
+    let length=8;
+    let chains=c.batch_size*c.context/length;
+    let logits=Tensor::<3>::from_data(TensorData::new((0..chains*length*257)
+        .map(|i|((i*37%101) as f32-50.0)*0.013).collect::<Vec<_>>(),[chains,length,257]),device).require_grad();
+    let features=Tensor::<3>::from_data(TensorData::new((0..chains*length*c.d_model)
+        .map(|i|((i*17%71) as f32-35.0)*0.011).collect::<Vec<_>>(),[chains,length,c.d_model]),device).require_grad();
+    let targets=Tensor::<2,Int>::from_data(TensorData::new((0..chains*length)
+        .map(|i|((i*13+7)%256) as i32).collect::<Vec<_>>(),[chains,length]),device);
+    let observed=Tensor::<2,Bool>::from_data(TensorData::new((0..chains*length)
+        .map(|i|i%3==0).collect::<Vec<_>>(),[chains,length]),device);
+    let lengths=vec![length;chains];
+    let base=Codpula::new(c.d_model,c.seed,device);
+    let mut circuits=[base.clone(),base.with_execution(CodpulaExecution::FusedGpu)];
+    let mut samples:[Vec<f64>;2]=std::array::from_fn(|_|Vec::new());
+    let run=|circuit:&mut Codpula|->Result<f64> {
+        runtime::sync(device)?;
+        let clock=Instant::now();
+        let prepared=circuit.prepare(logits.clone(),features.clone(),&lengths,observed.clone(),1.0)?;
+        let result=prepared.conditional_nll(targets.clone(),observed.clone(),(chains*length) as f64)?;
+        model::scalar(result.loss.clone())?;
+        std::hint::black_box(result.loss.backward());
+        circuit.update(result.flows)?;
+        runtime::sync(device)?;
+        Ok(clock.elapsed().as_secs_f64()*1000.0)
+    };
+    for iteration in 0..warmups+trials {
+        for mode in if iteration%2==0 {[0,1]}else{[1,0]} {
+            let milliseconds=run(&mut circuits[mode])?;
+            if iteration>=warmups {samples[mode].push(milliseconds);}
+        }
+    }
+    let mut rows=Vec::with_capacity(2);
+    for mode in 0..2 {
+        let mut milliseconds=0.0;
+        let dispatches=launches(||{milliseconds=run(&mut circuits[mode])?;Ok(())})?;
+        rows.push(json!({"execution":(["tensor","fused_gpu"][mode]),"median_ms":median(&samples[mode]),
+            "samples_ms":samples[mode],"instrumented_ms":milliseconds,"launches":dispatches}));
+    }
+    Ok(json!({"shape":{"chains":chains,"length":length,"states":32,"vocab":257,"d_model":c.d_model},
+        "warmups":warmups,"trials":trials,"results":rows,"tensor_minus_fused":paired(&samples[0],&samples[1]),
+        "scope":"resident synthetic circuit features/potentials, gate projection, local normalizers, both evidence passes, neural backward, nonnegative flows and circuit update; no backbone, token projection, uploads, neural optimizer or generation; fixed fixtures and independent identical-start circuit trajectories",
+        "logical_state_bytes":(32*257+32*32+32)*4*3,
+        "memory_note":"logical log rows plus two flow averages; no exact live-allocation measurement"}))
+}
+
+/// Same-model tensor/fused comparison, with the factorized cost reported separately.
+pub fn codpula(c:&Config,device:&Device,warmups:usize,trials:usize) -> Result<Value> {
+    use crate::{codpula::CodpulaExecution,config::{SbdCommitment,SbdJointOutput}};
+    ensure!(warmups>=2 && trials>=11,"Codpula timing requires >=2 warmups and >=11 paired trials");
+    ensure!(c.batch_size==1 && c.context==512,"Codpula paired complete-step timing requires B1/T512");
+    ensure!(c.arms.len()==1 && c.sbd.as_ref().is_some_and(|s|s.joint_output==SbdJointOutput::Codpula),
+        "Codpula timing requires one arm and Codpula output");
+    ensure!(matches!(c.backend.as_str(),"vulkan"|"cuda") && !c.fusion,"Codpula timing requires explicit non-fusion GPU execution");
+    let target=device.clone().autodiff();
+    target.seed(c.seed);
+    let base=LanguageModel::new(c,&c.arms[0],&target)?;
+    let corpus=train::loaded_corpus(c)?;
+    let isolated=codpula_isolated(c,&target,warmups,trials)?;
+    runtime::write_json(&c.artifact_dir.join("codpula-isolated.json"),&isolated)?;
+    let mut configs=[c.clone(),c.clone(),c.clone()];
+    {
+        let s=configs[0].sbd.as_mut().unwrap();
+        s.joint_output=SbdJointOutput::Factorized;
+        s.commitment=SbdCommitment::Fixed;
+        s.joint_execution=CodpulaExecution::Tensor;
+    }
+    configs[1].sbd.as_mut().unwrap().joint_execution=CodpulaExecution::Tensor;
+    configs[2].sbd.as_mut().unwrap().joint_execution=CodpulaExecution::FusedGpu;
+    let mut runners=Vec::with_capacity(3);
+    for (mode,config) in configs.iter().enumerate() {
+        config.validate()?;
+        let mut model=base.clone();
+        if mode==0 {model.codpula=None;}
+        else {
+            model.codpula=model.codpula.take().map(|circuit|
+                circuit.with_execution(if mode==1 {CodpulaExecution::Tensor}else{CodpulaExecution::FusedGpu}));
+        }
+        runners.push(Runner{model:Some(model),optim:train::optimizer(config),step:0,peak:None});
+    }
+    let path=c.artifact_dir.join("codpula-benchmark.json");
+    let started=Instant::now();
+    let mut samples:[Vec<f64>;3]=std::array::from_fn(|_|Vec::new());
+    for iteration in 0..warmups+trials {
+        for mode in if iteration%2==0 {[0,1,2]}else{[2,1,0]} {
+            runtime::write_json(&path,&json!({"completed":false,"config":c,"warmups":warmups,"trials":trials,
+                "iteration":iteration,"next_mode":mode,"samples_ms":samples}))?;
+            ensure!(started.elapsed().as_secs_f64()<c.max_seconds,"Codpula timing reached max_seconds; partial report retained");
+            let milliseconds=runners[mode].step(&configs[mode],corpus.as_ref(),&target)?;
+            if iteration>=warmups {samples[mode].push(milliseconds);}
+        }
+    }
+    let mut rows=Vec::with_capacity(3);
+    for mode in 0..3 {
+        let dispatches=launches(||{runners[mode].step(&configs[mode],corpus.as_ref(),&target)?;Ok(())})?;
+        rows.push(json!({"selection":(["factorized","codpula_tensor","codpula_fused_gpu"][mode]),
+            "median_ms":median(&samples[mode]),"samples_ms":samples[mode],"launches":dispatches,
+            "sampled_peak_pool_reserved_bytes":runners[mode].peak}));
+    }
+    let execution=paired(&samples[1],&samples[2]);
+    let report=json!({"completed":true,"config":c,"device":runtime::identity(device),"precision":"float32",
+        "warmups":warmups,"trials":trials,"isolated_circuit":isolated,"steps":rows,"execution_tensor_minus_fused":execution,
+        "fused_beyond_noise":execution["bootstrap_95_percent_ms"][0].as_f64().unwrap()>0.0,
+        "factorized_minus_tensor":paired(&samples[0],&samples[1]),
+        "factorized_minus_fused":paired(&samples[0],&samples[2]),
+        "method":"same-session interleaved complete steps, alternating mode order, common initial backbone and identical step-specific examples/mask draws; independent neural optimizer and circuit trajectories; includes uploads, clean and detached teacher passes, joint loss, neural backward/checks/clipping/AdamW and dual-flow circuit update; excludes cold compilation and warmups; factorized is cost accounting, not a quality comparison",
+        "memory_note":"pool reservation sampled after forward/backward/update, including all three live runners; not exact peak live allocation"});
+    runtime::write_json(&path,&report)?;
+    Ok(report)
 }

@@ -74,6 +74,27 @@ impl ModuleVisitor for Validate {
                 .push(format!("{name}: loaded tensor read failed: {error:?}")),
         }
     }
+    fn visit_int<const D: usize>(&mut self, param: &Param<Tensor<D, Int>>) {
+        let name = self.path.join(".");
+        let Some(expected) = self.expected.remove(&name) else {
+            self.errors.push(format!("{name}: integer parameter absent from saved record"));
+            return;
+        };
+        match param.transform_for_save().val().try_into_data() {
+            Ok(value) => {
+                let actual = TensorSignature {
+                    dtype: format!("{:?}", value.dtype()),
+                    shape: value.shape().iter().copied().collect(),
+                    param_id: Some(param.id.val()),
+                    sha256: data::hash(value.as_bytes()),
+                };
+                if actual != expected {
+                    self.errors.push(format!("{name}: loaded integer values/shape/dtype/id differ: expected {expected:?}, actual {actual:?}"));
+                }
+            }
+            Err(error) => self.errors.push(format!("{name}: loaded integer read failed: {error:?}")),
+        }
+    }
 }
 /// Keep the constructed target alive across the barrier: queued default fills must finish before
 /// their buffers can be replaced/reused by record uploads. This guard is measured on Intel Vulkan;
@@ -85,7 +106,10 @@ pub fn load_model(
 ) -> Result<LanguageModel> {
     runtime::sync(device)?;
     let path = path.as_ref();
-    let model = target.try_load_file(path)?;
+    let mut model = target.try_load_file(path)?;
+    if let Some(circuit) = &mut model.codpula {
+        circuit.freeze_state();
+    }
     runtime::sync(device)?;
     validate_model(&model, path)?;
     Ok(model)

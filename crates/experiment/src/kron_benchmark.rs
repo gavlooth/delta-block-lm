@@ -182,6 +182,9 @@ struct Parameters<'a> {
 }
 impl ModuleVisitor for Parameters<'_> {
     fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+        if self.grads.is_some() && !param.val().is_require_grad() {
+            return;
+        }
         let tensor = if let Some(grads) = self.grads {
             match grads.get::<D>(param.id) {
                 Some(g) => g,

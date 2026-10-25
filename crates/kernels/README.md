@@ -174,3 +174,78 @@ Incomplete suffixes and padding read no table row. The selector is explicitly
 GPU-only and non-fusion; CPU keeps the tensor port. Existing tables, projections
 and optimizer records are unchanged. Numerical, attribution, memory and paired
 whole-step evidence are in `../../docs/optimization/lngram.md`.
+
+## Short-chain joint inference
+
+The explicitly selected Codpula kernels require `vulkan` or `cuda`; CPU callers
+must select their tensor implementation. There is no host transfer or silent
+replacement. All inputs use the same device and float dtype, either f32 or f64.
+Device dtype support is checked before launch; no f64-to-f32 conversion is made.
+Strided inputs and 32-bit element addresses are supported. Real model dimensions
+are K=32, V=257, and 1<=L<=16; smaller K and V work for independent reference checks.
+
+Public runtime-dispatch `Tensor<D>` functions:
+
+| Function | Inputs | Result |
+|---|---|---|
+| `codpula_leaf_normalizers` | logits `[C,L,V]`, log_pi `[K,V]`, valid `[C,L]` | log local normalizers `[C,L,K]` |
+| `codpula_leaf_backward` | same inputs, normalizers, upstream `[C,L,K]` | derivatives `[C,L,V]`, `[K,V]` |
+| `codpula_log_partition` | log evidence `[C,L,K]`, log transition `[C,K,K]`, log root `[K]`, valid `[C,L]` | logZ `[C]` |
+| `codpula_chain_statistics` | same chain inputs | detached logZ, gamma `[C,L,K]`, summed_xi `[C,K,K]` |
+| `codpula_chain_backward` | gamma, summed_xi, upstream `[C]` | log-evidence, log-transition, log-root derivatives |
+| `codpula_token_marginals` | logits, log_pi, normalizers, gamma, tokens `[C,L]`, observed `[C,L]`, valid | detached `[C,L,V]` |
+| `codpula_emission_flows` | same readout inputs | detached tied emission occurrence counts `[K,V]` |
+
+Masks are binary floats; tokens are integral float IDs. Each chain's valid mask
+must be a prefix of ones. An all-zero row is inactive: logZ, statistics and
+derivatives are zero. Padding does not read padded logits/evidence.
+Unsupported shapes/dtypes/devices fail; invalid evidence and non-prefix chain
+masks produce nonfinite logZ, never a fabricated conditional distribution.
+Callers must reject nonfinite evidence
+mass before using a conditional readout. The caller also supplies normalized
+log rows, constructs normalized fixed-token evidence, applies any temperature
+to neural potentials, and masks observed-token-potential derivatives as required.
+
+The analytic first-order logZ derivative is gamma for log evidence, the sum of
+posterior edge occurrences for each chain's shared log transition, and the sum
+of initial posterior occurrences across chains for the shared log root.
+Leaf-normalizer derivatives include both neural logits and shared log_pi, summed
+across tied occurrences. These derivatives are with respect to the supplied
+log weights; row normalization and grouped gates remain differentiable caller
+operations. Direct VJP functions return detached tensors. Readout/statistics
+functions deliberately do not promise gradients or higher-order derivatives.
+Optional Burn fusion uses opaque deferred calls to these same kernels.
+
+One 32-lane workgroup handles each chain's stable log-space forward/backward.
+It retains at most 16x32 alpha values and a 32x32 transition matrix in shared
+memory, plus two 32-element beta buffers and one scalar: 1,601 elements, 6,404
+bytes for f32 or 12,808 bytes for f64. Each lane sums its own outgoing edge
+occurrences. Global chain outputs retain `C + C*L*K + C*K*K` elements; backward
+allocates `C*L*K + C*K*K + K` result elements with two dispatches.
+An untracked log-partition call omits backward messages and posterior outputs,
+allocating only its `C` logZ results; training retains the posterior statistics
+needed by the analytic VJP. Posterior writes are enclosed in a positive
+compile-time branch, not a compile-time early `terminate!()`: CubeCL's return
+marker alone does not exclude expansion of subsequent statements. This keeps
+the untracked path from writing through its unused evidence/transition aliases
+and preserves prepared inputs across repeated inference queries.
+Vocabulary normalizers use one 128-lane workgroup per leaf and one dispatch.
+Their full VJP uses two dispatches, allocating only its two result tensors.
+Autodiff skips the allocation and dispatch for each untracked parent; neural-only
+training therefore does not compute a discarded shared-base derivative.
+Marginals and tied emission counts each need one dispatch and only their result tensor.
+No path allocates a `[C,L,K,V]` tensor or uses floating-point atomics.
+
+`codpula_kernel_counters()` returns cumulative relaxed-atomic call counts,
+submitted dispatches and allocated output bytes. Differences around synchronized
+benchmark sections measure this path's submitted work, not peak allocator use,
+device completion or runtime. Counters are process-global; do not mix concurrent
+workloads when attributing them. All numeric and speed checks remain the
+integration owner's responsibility; no measured speedup is asserted here.
+
+The alternatives are the unchanged tensor solver, these whole-chain kernels,
+and a multi-dispatch parallel message implementation. The whole-chain design
+targets launch/intermediate overhead for L<=16; the tensor path remains the
+comparison and default until synchronized isolated and integrated measurements
+show a beyond-noise improvement. Parallel messages may help much longer chains
+but add dispatches and temporary storage at these short lengths.

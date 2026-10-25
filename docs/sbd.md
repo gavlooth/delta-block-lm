@@ -8,6 +8,8 @@ Step 8 adds temporary in-block reads through the existing HOLA read, selected by
 
 With `sbd` absent, the architecture, config serialization, random initialization order, fingerprints, causal training and checkpoints keep their historical behavior. `configs/lm512-sbd.json` enables the Step-7 architecture with SBD. `sbd.feedback` defaults to `soft_feedback`; `hard_mask` is the comparison. Candidate width, block lengths, HOLA capacity, computational chunk length and commit count are independent.
 
+The optional `sbd.joint_output: "codpula"` replaces the multi-token noisy output with a 32-state joint HMM over the full 257-symbol vocabulary; omitted or `"factorized"` retains the behavior described here and its historical serialization. Codpula feeds joint token marginals into sparse feedback, trains conditional joint block NLL, and can use `commitment: "dependence"` with `dependence_threshold: 0.05` and seeded joint proposals. The exact causal length-one bypass is unchanged. Decisions, inference, optimizer, numerical checks and cost measurements are specified in [Codpula](codpula.md); `configs/lm512-codpula.json` enables the new model.
+
 Enabled-SBD training and pilot fingerprints retain the semantic revision introduced after dense attention removal. Selecting `hola_read` additionally changes the serialized model identity; omitted/explicit `none` keeps the previous SBD identity. Old dense-SBD checkpoints remain incompatible. Configurations without `sbd` retain their hashes.
 
 The optional model selector `prefix_block_retrieval` extends HOLA's single

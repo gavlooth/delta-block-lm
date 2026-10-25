@@ -36,6 +36,25 @@ pub struct Block {
     pub(super) ohc_mixer: Option<OhcStage>,
     pub(super) ohc_mlp: Option<OhcStage>,
 }
+#[derive(Clone, Debug)]
+pub struct DenoisingOutput {
+    pub logits: Tensor<3>,
+    pub features: Tensor<3>,
+}
+impl DenoisingOutput {
+    pub fn detach(self) -> Self {
+        Self { logits: self.logits.detach(), features: self.features.detach() }
+    }
+    pub fn slice_positions(self, start: usize, length: usize) -> Self {
+        let [rows, _, vocab] = self.logits.dims();
+        let width = self.features.dims()[2];
+        Self {
+            logits: self.logits.slice([0..rows,start..start+length,0..vocab]),
+            features: self.features.slice([0..rows,start..start+length,0..width]),
+        }
+    }
+}
+
 #[derive(Module, Debug)]
 pub struct LanguageModel {
     pub(super) embedding: Embedding,
@@ -45,6 +64,7 @@ pub struct LanguageModel {
     pub(super) head: Linear,
     pub(super) ohc_init: Option<StreamInit>,
     pub(super) ohc_readout: Option<OhcReadout>,
+    pub(super) codpula: Option<crate::codpula::Codpula>,
     #[module(skip)]
     pub(super) ohc_backend: OhcBackend,
     #[module(skip)]
@@ -123,6 +143,7 @@ impl LanguageModel {
             head: linear(c.d_model, c.vocab()),
             ohc_init: None,
             ohc_readout: None,
+            codpula: None,
             ohc_backend: c.ohc_backend,
             normalization_backend: c.normalization_backend,
             head_backend: c.head_backend,
@@ -130,11 +151,18 @@ impl LanguageModel {
             loss_backend: c.loss_backend,
             update_backend: c.update_backend,
         };
-        Ok(if c.ohc_streams {
+        let mut model = if c.ohc_streams {
             model.with_ohc(c.d_model, device)
         } else {
             model
-        })
+        };
+        if let Some(sbd) = &c.sbd {
+            if sbd.joint_output == crate::config::SbdJointOutput::Codpula {
+                model.codpula = Some(crate::codpula::Codpula::new(c.d_model,c.seed,device)
+                    .with_execution(sbd.joint_execution));
+            }
+        }
+        Ok(model)
     }
     /// Attach only the added architecture, keeping all ordinary parameters shared with a clone.
     pub(super) fn with_ohc(mut self, width: usize, device: &Device) -> Self {
@@ -224,13 +252,16 @@ impl LanguageModel {
         self.forward_profiled(batch, &mut Unprofiled)
     }
     pub fn forward_profiled<P: Sections>(&self, batch: &Batch, profile: &mut P) -> Tensor<3> {
+        self.forward_output_profiled(batch,profile).logits
+    }
+    pub(super) fn forward_output_profiled<P: Sections>(&self, batch: &Batch, profile: &mut P) -> DenoisingOutput {
         let hidden = profile.section("Embedding", || self.embedding.forward(batch.input.clone()));
         self.forward_embedded(hidden, batch, profile, None)
     }
-    pub(super) fn forward_noisy(&self, embeddings: Tensor<3>, batch: &Batch, start: usize) -> Tensor<3> {
+    pub(super) fn forward_noisy(&self, embeddings: Tensor<3>, batch: &Batch, start: usize) -> DenoisingOutput {
         self.forward_embedded(embeddings, batch, &mut Unprofiled, Some(start))
     }
-    fn forward_embedded<P: Sections>(&self, mut hidden: Tensor<3>, batch: &Batch, profile: &mut P, start: Option<usize>) -> Tensor<3> {
+    fn forward_embedded<P: Sections>(&self, mut hidden: Tensor<3>, batch: &Batch, profile: &mut P, start: Option<usize>) -> DenoisingOutput {
         if self.ohc_init.is_some() {
             return self.forward_ohc_profiled(hidden, batch, profile, start);
         }
@@ -291,13 +322,14 @@ impl LanguageModel {
         }
         profile.block(None);
         profile.section("Final norm and vocabulary head", || {
-            self.head_forward(self.normalization_backend.rms(&self.norm, hidden))
+            let features = self.normalization_backend.rms(&self.norm, hidden);
+            DenoisingOutput { logits: self.head_forward(features.clone()), features }
         })
     }
     pub fn set_ohc_backend(&mut self, backend: OhcBackend) {
         self.ohc_backend = backend;
     }
-    fn forward_ohc_profiled<P: Sections>(&self, hidden: Tensor<3>, batch: &Batch, profile: &mut P, start: Option<usize>) -> Tensor<3> {
+    fn forward_ohc_profiled<P: Sections>(&self, hidden: Tensor<3>, batch: &Batch, profile: &mut P, start: Option<usize>) -> DenoisingOutput {
         let mut streams = profile.section("oHC stream init", || {
             self.ohc_init
                 .as_ref()
@@ -390,7 +422,8 @@ impl LanguageModel {
             self.ohc_readout.as_ref().unwrap().readout(streams)
         });
         profile.section("Final norm and vocabulary head", || {
-            self.head_forward(self.normalization_backend.rms(&self.norm, hidden))
+            let features = self.normalization_backend.rms(&self.norm, hidden);
+            DenoisingOutput { logits: self.head_forward(features.clone()), features }
         })
     }
 }
@@ -495,6 +528,7 @@ pub(super) fn check_parameter_gradients<P: Sections>(
     }
     impl ModuleVisitor for Check<'_> {
         fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+            if !param.val().is_require_grad() { return; }
             if let Some(g) = self.grads.get::<D>(param.id) {
                 // A squared sum catches NaN and overflow; reduce once on device per parameter.
                 self.norms.push(if self.backend.is_tensor() {
