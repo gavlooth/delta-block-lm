@@ -1,3 +1,6 @@
+[patch.crates-io]
+cubecl-wgpu = { path = "vendor/cubecl-wgpu" }
+
 [workspace]
 members = ["crates/kernels", "crates/mixers", "crates/experiment"]
 exclude = ["reuse"]
