@@ -483,6 +483,32 @@ timeout 400s bun scripts/certify-experiments.ts target/debug/delta-experiment ar
 
 The batch script never builds or trains. It writes schema-2 manifests, command outcomes and new stdout/stderr to a unique `artifacts/certification-batch-*` namespace; every filename has a configuration-index prefix, so normalized-path collisions or repeated arguments cannot overwrite an earlier stage. Summary values and per-seed diagnostics are ordered by the explicit `paired_seeds`, independently of manifest entry order; duplicate/unknown seeds fail. For manually pinned evidence, invoke the executable directly with a 300-second limit and the manifest path. Certification creates separate versioned reports; it does not mutate old `metrics.json` files to make the ordinary comparison cache accept them.
 
+## Separate held-out checkpoint evaluation
+
+`evaluate CONFIG --arm NAME --seed N --resume CHECKPOINT_DIR --eval-examples N`
+evaluates a completed LM checkpoint on a different-sized fixed validation
+sample without changing the training configuration or certification identity.
+The source configuration, original data identity, arm, seed and completed token
+budget must match the saved checkpoint. Loading uses the same synchronized,
+logical-value-and-ID-checked loader as certification.
+
+The new sample uses the existing `stratified-midpoint-disjoint-v1` selection:
+one complete context-length window per equal-width stratum of the validation
+book, each starting from BOS with all byte targets scored. The command repeats
+trained evaluation exactly, regenerates and repeat-checks a fresh seeded
+untrained baseline on the same sample, and records both fixture and source
+checkpoint hashes. It trains no tokens and does not evaluate the test split.
+Reports are unique files under `CONFIG.artifact_dir/evaluations/`; original
+metrics, checkpoints, configuration and certification reports are unchanged.
+
+```sh
+flock /tmp/delta-block-lm-gpu.lock \
+  timeout 900s /tmp/delta-bins/s7q/delta-experiment evaluate \
+  artifacts/step7-quality/configs/all.json --arm kronlstm-hola --seed 1 \
+  --resume artifacts/step7-quality/all/kronlstm-hola-seed1/checkpoint-440 \
+  --eval-examples 128
+```
+
 ## Causal Lngram commands
 
 `lngram_layers` selects injection block indices; `lngram_orders` selects the

@@ -39,7 +39,7 @@ fn execute() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     ensure!(
         args.len() >= 2,
-        "usage: delta-experiment <reference|lngram-reference|lngram-benchmark|lngram-attribution|lngram-smoke|wavelet-reference|wavelet-benchmark|wavelet-smoke|ohc-reference|ohc-benchmark|ohc-learning-smoke|convolution-reference|normalization-reference|epilogue-reference|epilogue-benchmark|kron-reference|gdn-reference|gdn-directional-diagnostic|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|optimization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|gdn-benchmark|kron-model-benchmark|hola-benchmark|io-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256|fused_gdn2 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
+        "usage: delta-experiment <reference|lngram-reference|lngram-benchmark|lngram-attribution|lngram-smoke|wavelet-reference|wavelet-benchmark|wavelet-smoke|ohc-reference|ohc-benchmark|ohc-learning-smoke|convolution-reference|normalization-reference|epilogue-reference|epilogue-benchmark|kron-reference|gdn-reference|gdn-directional-diagnostic|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|optimization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|gdn-benchmark|kron-model-benchmark|hola-benchmark|io-benchmark|smoke|train|evaluate|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--eval-examples N (evaluate only)] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256|fused_gdn2 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
     );
     let command = &args[0];
     let c = Config::load(Path::new(&args[1]))?;
@@ -51,6 +51,7 @@ fn execute() -> Result<()> {
     let mut checkpoint_manifest: Option<PathBuf> = None;
     let mut benchmark_warmups = None;
     let mut benchmark_trials = None;
+    let mut eval_examples = None;
     let mut reference_scan_backend = None;
     let mut reference_hola_backend = None;
     let mut reference_tokens = None;
@@ -73,6 +74,7 @@ fn execute() -> Result<()> {
             "--checkpoints" => checkpoint_manifest = Some(value.into()),
             "--warmups" => benchmark_warmups = Some(value.parse::<usize>()?),
             "--trials" => benchmark_trials = Some(value.parse::<usize>()?),
+            "--eval-examples" => eval_examples = Some(value.parse::<usize>()?),
             "--legacy-stress-report" => legacy_stress_report = Some(value.into()),
             "--model-scope" => {
                 ensure!(
@@ -219,6 +221,10 @@ fn execute() -> Result<()> {
                 | "lngram-attribution"
         ) || benchmark_trials.is_none(),
         "--trials is only valid for a benchmark command"
+    );
+    ensure!(
+        command == "evaluate" || eval_examples.is_none(),
+        "--eval-examples is only valid for evaluate"
     );
     ensure!(
         !matches!(
@@ -541,7 +547,7 @@ fn execute() -> Result<()> {
             benchmark_trials.unwrap_or(5),
             legacy_stress_report.as_deref(),
         )?,
-        "smoke" | "train" => {
+        "smoke" | "train" | "evaluate" => {
             let arm = if let Some(name) = arm_name {
                 c.arms
                     .iter()
@@ -550,7 +556,18 @@ fn execute() -> Result<()> {
             } else {
                 &c.arms[0]
             };
-            train::run(&c, arm, seed, &device, resume.as_deref())?
+            if command == "evaluate" {
+                train::evaluate_checkpoint(
+                    &c,
+                    arm,
+                    seed,
+                    &device,
+                    resume.as_deref().context("evaluate requires --resume CHECKPOINT_DIR")?,
+                    eval_examples.context("evaluate requires --eval-examples N")?,
+                )?
+            } else {
+                train::run(&c, arm, seed, &device, resume.as_deref())?
+            }
         }
         "compare" => {
             ensure!(
@@ -610,6 +627,7 @@ fn execute() -> Result<()> {
             | "convolution-benchmark"
             | "optimization-benchmark"
             | "gemm-micro"
+            | "evaluate"
     ) {
         let output = diagnostic_output.as_deref().unwrap_or(&c.artifact_dir);
         runtime::write_json(&output.join(format!("{command}.json")), &result)?;
@@ -646,6 +664,7 @@ fn execute() -> Result<()> {
             command.as_str(),
             "checkpoint-check"
                 | "certify"
+                | "evaluate"
                 | "kron-reference"
                 | "gdn-reference"
                 | "hola-reference"

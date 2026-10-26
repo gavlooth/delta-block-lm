@@ -207,6 +207,78 @@ pub(crate) fn checkpoint(
     )
 }
 
+/// Evaluate a completed checkpoint on a separate held-out fixture without changing its identity.
+pub fn evaluate_checkpoint(
+    c: &Config,
+    arm: &Arm,
+    seed: u64,
+    device: &Device,
+    path: &Path,
+    eval_examples: usize,
+) -> Result<Value> {
+    ensure!(c.task == "lm" && eval_examples > 0, "evaluation needs an LM and positive window count");
+    let corpus = loaded_corpus(c)?;
+    let original_rows = evaluations(c, corpus.as_ref(), "validation")?;
+    let state_path = path.join("state.json");
+    let state: State = serde_json::from_slice(&std::fs::read(&state_path)?)?;
+    let target_tokens = c.resolved_tokens()?;
+    ensure!(
+        state.schema == 1
+            && state.config_sha256 == data::hash(&serde_json::to_vec(&(c, target_tokens))?)
+            && state.data == data_identity(c, corpus.as_ref(), &original_rows)
+            && state.arm == arm.name
+            && state.seed == seed
+            && state.tokens == target_tokens,
+        "evaluation checkpoint does not match the completed source run"
+    );
+    let model_path = path.join("model.burnpack");
+    let model_sha256 = checkpoint::file_sha256(&model_path)?;
+    let state_sha256 = checkpoint::file_sha256(&state_path)?;
+    let mut evaluation_config = c.clone();
+    evaluation_config.eval_examples = eval_examples;
+    let rows = evaluations(&evaluation_config, corpus.as_ref(), "validation")?;
+    runtime::sync(device)?;
+    device.memory_cleanup();
+    device.seed(seed);
+    let initial = LanguageModel::new(c, arm, &device.clone().autodiff())?;
+    runtime::sync(device)?;
+    let baseline = evaluate(&initial, &evaluation_config, &rows, device)?;
+    let repeated_baseline = evaluate(&initial, &evaluation_config, &rows, device)?;
+    drop(initial);
+    let target = LanguageModel::new(c, arm, &device.clone().autodiff())?;
+    let model = checkpoint::load_model(target, &model_path, device)?;
+    let validation = evaluate(&model, &evaluation_config, &rows, device)?;
+    let repeated_validation = evaluate(&model, &evaluation_config, &rows, device)?;
+    let finite = [&baseline, &repeated_baseline, &validation, &repeated_validation]
+        .iter()
+        .all(|value| ["nll", "perplexity", "accuracy"].iter().all(|field| {
+            value[*field].as_f64().is_some_and(f64::is_finite)
+        }));
+    let unchanged = checkpoint::file_sha256(&model_path)? == model_sha256
+        && checkpoint::file_sha256(&state_path)? == state_sha256;
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+    let output = c.artifact_dir.join("evaluations").join(format!(
+        "validation{eval_examples}-{}-seed{seed}-{}-{stamp}.json", arm.name, std::process::id()
+    ));
+    let result = json!({
+        "schema":1,"command":"evaluate","passed":finite && unchanged
+            && baseline == repeated_baseline && validation == repeated_validation,
+        "source_config_sha256":state.config_sha256,"checkpoint":path,
+        "checkpoint_sha256":model_sha256,"checkpoint_state_sha256":state_sha256,
+        "source_files_unchanged":unchanged,"logical_parameters_and_ids_match_saved_record":true,
+        "arm":arm,"seed":seed,"steps":state.step,"tokens":state.tokens,"new_training_tokens":0,
+        "device":runtime::identity(device),"precision":"float32","split":"validation",
+        "eval_examples":eval_examples,"context":c.context,"evaluation_batch_size":c.batch_size,
+        "data":data_identity(&evaluation_config, corpus.as_ref(), &rows),
+        "validation":validation,"repeated_validation":repeated_validation,
+        "initial_validation":baseline,"repeated_initial_validation":repeated_baseline,
+        "baseline_definition":"Fresh regenerated seeded initialization; exact repeated evaluation, not a bitwise replay of unsaved training initialization.",
+        "output":output
+    });
+    runtime::write_json(&output, &result)?;
+    Ok(result)
+}
+
 pub fn run(
     c: &Config,
     arm: &Arm,
