@@ -31,6 +31,9 @@ pub(crate) struct NoisyPrefix {
     pub unresolved: Tensor<2>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum Sublayer { Wavelet, Lngram, Mixer }
+
 #[derive(Module, Debug)]
 pub struct Block {
     pub(super) wavelet_norm: Option<RmsNorm>,
@@ -297,66 +300,30 @@ impl LanguageModel {
     pub(super) fn forward_noisy(&self, embeddings: Tensor<3>, batch: &Batch, start: usize) -> DenoisingOutput {
         self.forward_embedded(embeddings, batch, &mut Unprofiled, Some(start))
     }
-    fn forward_embedded<P: Sections>(&self, mut hidden: Tensor<3>, batch: &Batch, profile: &mut P, start: Option<usize>) -> DenoisingOutput {
-        if self.ohc_init.is_some() {
-            return self.forward_ohc_profiled(hidden, batch, profile, start);
-        }
-        let lngram_layout = self
-            .blocks
-            .iter()
-            .any(|block| block.lngram.is_some())
-            .then(|| {
-                delta_mixers::lngram::LngramLayout::new(batch.valid.clone(), batch.reset.clone())
-            });
+    fn forward_embedded<P: Sections>(&self, hidden: Tensor<3>, batch: &Batch, profile: &mut P, start: Option<usize>) -> DenoisingOutput {
+        let mut representation = if let Some(init) = &self.ohc_init {
+            NoisyRepresentation::Streams(profile.section("oHC stream init", || init.forward(hidden, batch.valid.clone())))
+        } else { NoisyRepresentation::Hidden(hidden) };
+        let lngram_layout = self.blocks.iter().any(|block| block.lngram.is_some()).then(|| {
+            delta_mixers::lngram::LngramLayout::new(batch.valid.clone(), batch.reset.clone())
+        });
         for (index, block) in self.blocks.iter().enumerate() {
-            if let (Some(norm), Some(wavelet)) = (&block.wavelet_norm, &block.wavelet) {
-                profile.block(Some(index));
-                let normalized = profile.section("Block RMSNorm: wavelet", || {
-                    self.normalization_backend.rms(norm, hidden.clone())
-                });
-                if P::CAPTURE_CLEAN_INPUTS { profile.clean_input(index,"wavelet",&normalized); }
-                let update = wavelet.forward_profiled(
-                    normalized,
-                    batch.valid.clone(),
-                    batch.reset.clone(),
-                    profile,
-                );
-                hidden = profile.section("Residual adds", || hidden + update);
-            }
-            profile.block(Some(index));
-            if let (Some(norm), Some(lngram)) = (&block.lngram_norm, &block.lngram) {
-                let normalized = profile.section("Block RMSNorm: Lngram", || {
-                    self.normalization_backend.rms(norm, hidden.clone())
-                });
-                if P::CAPTURE_CLEAN_INPUTS { profile.clean_input(index,"lngram",&normalized); }
-                let update = profile.section("Lngram", || {
-                    lngram.forward(
-                        normalized,
-                        lngram_layout.as_ref().expect("active Lngram layout"),
-                    )
-                });
-                hidden = profile.section("Residual adds", || hidden + update);
-            }
-            let normalized = profile.section("Block RMSNorm: mixer", || {
-                self.normalization_backend.rms(&block.norm, hidden.clone())
+            representation = self.layer_step(index, representation, batch.valid.clone(), profile, |kind, input, profile| {
+                match kind {
+                    Sublayer::Wavelet => block.wavelet.as_ref().unwrap().forward_profiled(input, batch.valid.clone(), batch.reset.clone(), profile),
+                    Sublayer::Lngram => profile.section("Lngram", || block.lngram.as_ref().unwrap().forward(input, lngram_layout.as_ref().unwrap())),
+                    Sublayer::Mixer => match start {
+                        Some(start) => block.mixer.forward_sbd(input, batch.valid.clone(), batch.reset.clone(), start),
+                        None => block.mixer.forward_profiled(input, batch.valid.clone(), batch.reset.clone(), profile),
+                    },
+                }
             });
-            if P::CAPTURE_CLEAN_INPUTS { profile.clean_input(index,"mixer",&normalized); }
-            let update = if let Some(start) = start {
-                block.mixer.forward_sbd(normalized, batch.valid.clone(), batch.reset.clone(), start)
-            } else {
-                block.mixer.forward_profiled(normalized, batch.valid.clone(), batch.reset.clone(), profile)
-            };
-            hidden = profile.section("Residual adds", || hidden + update);
-            let normalized = profile.section("Block RMSNorm: MLP", || {
-                self.normalization_backend
-                    .rms(&block.ff_norm, hidden.clone())
-            });
-            let update = profile.section("MLP: up", || block.up.forward(normalized));
-            let update = profile.section("MLP: SiLU", || self.epilogue_backend.silu(update));
-            let update = profile.section("MLP: down", || block.down.forward(update));
-            hidden = profile.section("Residual adds", || hidden + update);
         }
         profile.block(None);
+        let hidden = match representation {
+            NoisyRepresentation::Hidden(hidden) => hidden,
+            NoisyRepresentation::Streams(streams) => profile.section("oHC readout", || self.ohc_readout.as_ref().unwrap().readout(streams)),
+        };
         profile.section("Final norm and vocabulary head", || {
             let features = self.normalization_backend.rms(&self.norm, hidden);
             DenoisingOutput { logits: self.head_forward(features.clone()), features }
@@ -365,102 +332,45 @@ impl LanguageModel {
     pub fn set_ohc_backend(&mut self, backend: OhcBackend) {
         self.ohc_backend = backend;
     }
-    fn forward_ohc_profiled<P: Sections>(&self, hidden: Tensor<3>, batch: &Batch, profile: &mut P, start: Option<usize>) -> DenoisingOutput {
-        let mut streams = profile.section("oHC stream init", || {
-            self.ohc_init
-                .as_ref()
-                .unwrap()
-                .forward(hidden, batch.valid.clone())
-        });
-        let lngram_layout = self
-            .blocks
-            .iter()
-            .any(|block| block.lngram.is_some())
-            .then(|| {
-                delta_mixers::lngram::LngramLayout::new(batch.valid.clone(), batch.reset.clone())
-            });
-        for (index, block) in self.blocks.iter().enumerate() {
-            profile.block(Some(index));
-            if let (Some(stage), Some(norm), Some(wavelet)) =
-                (&block.ohc_wavelet, &block.wavelet_norm, &block.wavelet)
-            {
-                let read = profile.section("oHC read: wavelet", || {
-                    stage.read_selected(streams, self.ohc_backend)
-                });
-                let normalized = profile.section("Block RMSNorm: wavelet", || {
-                    self.normalization_backend.rms(norm, read.work.clone())
-                });
-                if P::CAPTURE_CLEAN_INPUTS { profile.clean_input(index,"wavelet",&normalized); }
-                let update = wavelet.forward_profiled(
-                    normalized,
-                    batch.valid.clone(),
-                    batch.reset.clone(),
-                    profile,
-                );
-                streams = profile.section("oHC write: wavelet", || {
-                    stage.write(read, update, batch.valid.clone(), self.ohc_backend)
-                });
-            }
-            if let (Some(stage), Some(norm), Some(lngram)) =
-                (&block.ohc_lngram, &block.lngram_norm, &block.lngram)
-            {
-                let read = profile.section("oHC read: Lngram", || {
-                    stage.read_selected(streams, self.ohc_backend)
-                });
-                let normalized = profile.section("Block RMSNorm: Lngram", || {
-                    self.normalization_backend.rms(norm, read.work.clone())
-                });
-                if P::CAPTURE_CLEAN_INPUTS { profile.clean_input(index,"lngram",&normalized); }
-                let update = profile.section("Lngram", || {
-                    lngram.forward(
-                        normalized,
-                        lngram_layout.as_ref().expect("active Lngram layout"),
-                    )
-                });
-                streams = profile.section("oHC write: Lngram", || {
-                    stage.write(read, update, batch.valid.clone(), self.ohc_backend)
-                });
-            }
-            let stage = block.ohc_mixer.as_ref().unwrap();
-            let read = profile.section("oHC read: mixer", || {
-                stage.read_selected(streams, self.ohc_backend)
-            });
-            let normalized = profile.section("Block RMSNorm: mixer", || {
-                self.normalization_backend
-                    .rms(&block.norm, read.work.clone())
-            });
-            if P::CAPTURE_CLEAN_INPUTS { profile.clean_input(index,"mixer",&normalized); }
-            let update = if let Some(start) = start {
-                block.mixer.forward_sbd(normalized, batch.valid.clone(), batch.reset.clone(), start)
-            } else {
-                block.mixer.forward_profiled(normalized, batch.valid.clone(), batch.reset.clone(), profile)
+    /// The shared layer order for clean, reconstructed, cached, and marked-tail execution.
+    pub(crate) fn layer_step<P: Sections>(
+        &self, index: usize, mut representation: NoisyRepresentation, valid: Tensor<2>, profile: &mut P,
+        mut update: impl FnMut(Sublayer, Tensor<3>, &mut P) -> Tensor<3>,
+    ) -> NoisyRepresentation {
+        let block = &self.blocks[index];
+        profile.block(Some(index));
+        for (kind, norm, stage, capture, norm_label, read_label, write_label) in [
+            (Some(Sublayer::Wavelet), block.wavelet_norm.as_ref(), block.ohc_wavelet.as_ref(), "wavelet", "Block RMSNorm: wavelet", "oHC read: wavelet", "oHC write: wavelet"),
+            (Some(Sublayer::Lngram), block.lngram_norm.as_ref(), block.ohc_lngram.as_ref(), "lngram", "Block RMSNorm: Lngram", "oHC read: Lngram", "oHC write: Lngram"),
+            (Some(Sublayer::Mixer), Some(&block.norm), block.ohc_mixer.as_ref(), "mixer", "Block RMSNorm: mixer", "oHC read: mixer", "oHC write: mixer"),
+            (None, Some(&block.ff_norm), block.ohc_mlp.as_ref(), "", "Block RMSNorm: MLP", "oHC read: MLP", "oHC write: MLP"),
+        ] {
+            let Some(norm) = norm else { continue };
+            let mut run = |work: Tensor<3>, profile: &mut P| {
+                let input = profile.section(norm_label, || self.normalization_backend.rms(norm, work));
+                if let Some(kind) = kind {
+                    if P::CAPTURE_CLEAN_INPUTS { profile.clean_input(index, capture, &input); }
+                    update(kind, input, profile)
+                } else {
+                    let output = profile.section("MLP: up", || block.up.forward(input));
+                    let output = profile.section("MLP: SiLU", || self.epilogue_backend.silu(output));
+                    profile.section("MLP: down", || block.down.forward(output))
+                }
             };
-            streams = profile.section("oHC write: mixer", || {
-                stage.write(read, update, batch.valid.clone(), self.ohc_backend)
-            });
-            let stage = block.ohc_mlp.as_ref().unwrap();
-            let read = profile.section("oHC read: MLP", || {
-                stage.read_selected(streams, self.ohc_backend)
-            });
-            let normalized = profile.section("Block RMSNorm: MLP", || {
-                self.normalization_backend
-                    .rms(&block.ff_norm, read.work.clone())
-            });
-            let update = profile.section("MLP: up", || block.up.forward(normalized));
-            let update = profile.section("MLP: SiLU", || self.epilogue_backend.silu(update));
-            let update = profile.section("MLP: down", || block.down.forward(update));
-            streams = profile.section("oHC write: MLP", || {
-                stage.write(read, update, batch.valid.clone(), self.ohc_backend)
-            });
+            representation = match representation {
+                NoisyRepresentation::Hidden(hidden) => {
+                    let output = run(hidden.clone(), profile);
+                    NoisyRepresentation::Hidden(profile.section("Residual adds", || hidden + output))
+                }
+                NoisyRepresentation::Streams(streams) => {
+                    let stage = stage.expect("oHC sublayer");
+                    let read = profile.section(read_label, || stage.read_selected(streams, self.ohc_backend));
+                    let output = run(read.work.clone(), profile);
+                    NoisyRepresentation::Streams(profile.section(write_label, || stage.write(read, output, valid.clone(), self.ohc_backend)))
+                }
+            };
         }
-        profile.block(None);
-        let hidden = profile.section("oHC readout", || {
-            self.ohc_readout.as_ref().unwrap().readout(streams)
-        });
-        profile.section("Final norm and vocabulary head", || {
-            let features = self.normalization_backend.rms(&self.norm, hidden);
-            DenoisingOutput { logits: self.head_forward(features.clone()), features }
-        })
+        representation
     }
 }
 

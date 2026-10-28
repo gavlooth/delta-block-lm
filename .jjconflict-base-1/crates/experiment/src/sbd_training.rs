@@ -1,4 +1,4 @@
-use crate::{config::CocommitExecution, model::{DenoisingOutput, LanguageModel, NoisyRepresentation}, soft::SoftState};
+use crate::{config::CocommitExecution, model::{DenoisingOutput, LanguageModel, NoisyRepresentation, Sublayer}, soft::SoftState};
 pub(crate) use crate::model::NoisyPrefix;
 use burn::prelude::*;
 use delta_mixers::{profile::Sections, sbd::{BatchedMixerCache,BatchedWaveletCache,MixerCache,WaveletCache}};
@@ -134,71 +134,15 @@ impl LanguageModel {
     }
     pub fn cached_block_profiled<P: Sections>(&self, cache: &TrainingCache, block_index: usize, soft: &SoftState, hard: bool, profile: &mut P) -> DenoisingOutput {
         let n = soft.observed.len();
-        let start = cache.starts[block_index];
         let d = self.embedding.weight.val().dims()[1];
         let device = self.embedding.weight.val().device();
         let valid = Tensor::from_data(TensorData::new(soft.active.iter().map(|&x| if x {1.0f32} else {0.0}).collect::<Vec<_>>(),[1,n]),&device);
-        let mut hidden = soft.embeddings(self.embedding.weight.val(),self.sbd_mask.as_ref().unwrap().val(),hard).reshape([1,n,d]);
-        if self.cocommit_config.is_some() {
-            let representation = if let Some(init) = &self.ohc_init {
-                NoisyRepresentation::Streams(init.forward(hidden,valid.clone()))
-            } else { NoisyRepresentation::Hidden(hidden) };
-            let representation = self.cached_block_segment(cache,block_index,0,self.blocks.len(),representation,valid,profile);
-            return self.output_from_representation(representation);
-        }
-        let lngram_forward = |lngram: &delta_mixers::lngram::Lngram, input: Tensor<3>, clean: &Tensor<3>| {
-            let history = start.min(lngram.orders.iter().copied().max().unwrap()-1 + lngram.smoothing.as_ref().map_or(0,|s|2*s.dilation));
-            let combined = Tensor::cat(vec![clean.clone().slice([0..1,start-history..start,0..d]),input],1);
-            let layout = delta_mixers::lngram::LngramLayout::new(Tensor::ones([1,history+n],&device),Tensor::zeros([1,history+n],&device));
-            lngram.forward(combined,&layout).slice([0..1,history..history+n,0..d])
-        };
-        if let Some(init) = &self.ohc_init {
-            let mut streams = init.forward(hidden,valid.clone());
-            for (index,block) in self.blocks.iter().enumerate() {
-                let clean = &cache.layers[index];
-                if let (Some(stage),Some(norm),Some(wavelet)) = (&block.ohc_wavelet,&block.wavelet_norm,&block.wavelet) {
-                    let read = stage.read_selected(streams,self.ohc_backend);
-                    let input = self.normalization_backend.rms(norm,read.work.clone());
-                    let update = wavelet.forward_sbd_cached(input,clean.wavelet.as_ref().unwrap(),start);
-                    streams = stage.write(read,update,valid.clone(),self.ohc_backend);
-                }
-                if let (Some(stage),Some(norm),Some(lngram)) = (&block.ohc_lngram,&block.lngram_norm,&block.lngram) {
-                    let read = stage.read_selected(streams,self.ohc_backend);
-                    let input = self.normalization_backend.rms(norm,read.work.clone());
-                    let update = lngram_forward(lngram,input,clean.lngram.as_ref().unwrap());
-                    streams = stage.write(read,update,valid.clone(),self.ohc_backend);
-                }
-                let stage = block.ohc_mixer.as_ref().unwrap();
-                let read = stage.read_selected(streams,self.ohc_backend);
-                let input = self.normalization_backend.rms(&block.norm,read.work.clone());
-                let update = block.mixer.forward_sbd_cached_profiled(input,&clean.mixer,block_index,valid.clone(),profile);
-                streams = stage.write(read,update,valid.clone(),self.ohc_backend);
-                let stage = block.ohc_mlp.as_ref().unwrap();
-                let read = stage.read_selected(streams,self.ohc_backend);
-                let input = self.normalization_backend.rms(&block.ff_norm,read.work.clone());
-                let update = block.down.forward(self.epilogue_backend.silu(block.up.forward(input)));
-                streams = stage.write(read,update,valid.clone(),self.ohc_backend);
-            }
-            hidden = self.ohc_readout.as_ref().unwrap().readout(streams);
-        } else {
-            for (index,block) in self.blocks.iter().enumerate() {
-                let clean = &cache.layers[index];
-                if let (Some(norm),Some(wavelet)) = (&block.wavelet_norm,&block.wavelet) {
-                    let input = self.normalization_backend.rms(norm,hidden.clone());
-                    hidden = hidden + wavelet.forward_sbd_cached(input,clean.wavelet.as_ref().unwrap(),start);
-                }
-                if let (Some(norm),Some(lngram)) = (&block.lngram_norm,&block.lngram) {
-                    let input = self.normalization_backend.rms(norm,hidden.clone());
-                    hidden = hidden + lngram_forward(lngram,input,clean.lngram.as_ref().unwrap());
-                }
-                let input = self.normalization_backend.rms(&block.norm,hidden.clone());
-                hidden = hidden + block.mixer.forward_sbd_cached_profiled(input,&clean.mixer,block_index,valid.clone(),profile);
-                let input = self.normalization_backend.rms(&block.ff_norm,hidden.clone());
-                hidden = hidden + block.down.forward(self.epilogue_backend.silu(block.up.forward(input)));
-            }
-        }
-        let features = self.normalization_backend.rms(&self.norm,hidden);
-        DenoisingOutput { logits: self.head_forward(features.clone()), features }
+        let hidden = soft.embeddings(self.embedding.weight.val(),self.sbd_mask.as_ref().unwrap().val(),hard).reshape([1,n,d]);
+        let representation = if let Some(init) = &self.ohc_init {
+            NoisyRepresentation::Streams(init.forward(hidden,valid.clone()))
+        } else { NoisyRepresentation::Hidden(hidden) };
+        let representation = self.cached_block_segment(cache,block_index,0,self.blocks.len(),representation,valid,profile);
+        self.output_from_representation(representation)
     }
     pub fn training_cache_batched(&self, trace: &CleanInputs, blocks: &[(usize,usize)]) -> BatchedTrainingCache {
         assert!(!blocks.is_empty());
@@ -227,62 +171,13 @@ impl LanguageModel {
         let device = self.embedding.weight.val().device();
         let valid = Tensor::from_data(TensorData::new(
             soft.active.iter().map(|&x| if x {1.0f32} else {0.0}).collect::<Vec<_>>(),[blocks,n]),&device);
-        let mut hidden = soft.embeddings(self.embedding.weight.val(),self.sbd_mask.as_ref().unwrap().val(),hard)
+        let hidden = soft.embeddings(self.embedding.weight.val(),self.sbd_mask.as_ref().unwrap().val(),hard)
             .reshape([blocks,n,d]);
-        if self.cocommit_config.is_some() {
-            let representation = if let Some(init) = &self.ohc_init {
-                NoisyRepresentation::Streams(init.forward(hidden,valid.clone()))
-            } else { NoisyRepresentation::Hidden(hidden) };
-            let representation = self.cached_blocks_segment(cache,0,self.blocks.len(),representation,valid,profile);
-            return self.output_from_representation(representation);
-        }
-        if let Some(init) = &self.ohc_init {
-            let mut streams = init.forward(hidden,valid.clone());
-            for (index,block) in self.blocks.iter().enumerate() {
-                let clean = &cache.layers[index];
-                if let (Some(residual),Some(norm),Some(wavelet)) = (&block.ohc_wavelet,&block.wavelet_norm,&block.wavelet) {
-                    let read = residual.read_selected(streams,self.ohc_backend);
-                    let input = self.normalization_backend.rms(norm,read.work.clone());
-                    let update = wavelet.forward_sbd_batched(input,clean.wavelet.as_ref().unwrap());
-                    streams = residual.write(read,update,valid.clone(),self.ohc_backend);
-                }
-                if let (Some(residual),Some(norm),Some(lngram)) = (&block.ohc_lngram,&block.lngram_norm,&block.lngram) {
-                    let read = residual.read_selected(streams,self.ohc_backend);
-                    let input = self.normalization_backend.rms(norm,read.work.clone());
-                    let update = clean.lngram.as_ref().unwrap().forward(lngram,input,valid.clone());
-                    streams = residual.write(read,update,valid.clone(),self.ohc_backend);
-                }
-                let residual = block.ohc_mixer.as_ref().unwrap();
-                let read = residual.read_selected(streams,self.ohc_backend);
-                let input = self.normalization_backend.rms(&block.norm,read.work.clone());
-                let update = block.mixer.forward_sbd_batched_profiled(input,&clean.mixer,valid.clone(),profile);
-                streams = residual.write(read,update,valid.clone(),self.ohc_backend);
-                let residual = block.ohc_mlp.as_ref().unwrap();
-                let read = residual.read_selected(streams,self.ohc_backend);
-                let input = self.normalization_backend.rms(&block.ff_norm,read.work.clone());
-                let update = block.down.forward(self.epilogue_backend.silu(block.up.forward(input)));
-                streams = residual.write(read,update,valid.clone(),self.ohc_backend);
-            }
-            hidden = self.ohc_readout.as_ref().unwrap().readout(streams);
-        } else {
-            for (index,block) in self.blocks.iter().enumerate() {
-                let clean = &cache.layers[index];
-                if let (Some(norm),Some(wavelet)) = (&block.wavelet_norm,&block.wavelet) {
-                    let input = self.normalization_backend.rms(norm,hidden.clone());
-                    hidden = hidden + wavelet.forward_sbd_batched(input,clean.wavelet.as_ref().unwrap());
-                }
-                if let (Some(norm),Some(lngram)) = (&block.lngram_norm,&block.lngram) {
-                    let input = self.normalization_backend.rms(norm,hidden.clone());
-                    hidden = hidden + clean.lngram.as_ref().unwrap().forward(lngram,input,valid.clone());
-                }
-                let input = self.normalization_backend.rms(&block.norm,hidden.clone());
-                hidden = hidden + block.mixer.forward_sbd_batched_profiled(input,&clean.mixer,valid.clone(),profile);
-                let input = self.normalization_backend.rms(&block.ff_norm,hidden.clone());
-                hidden = hidden + block.down.forward(self.epilogue_backend.silu(block.up.forward(input)));
-            }
-        }
-        let features = self.normalization_backend.rms(&self.norm,hidden);
-        DenoisingOutput { logits: self.head_forward(features.clone()), features }
+        let representation = if let Some(init) = &self.ohc_init {
+            NoisyRepresentation::Streams(init.forward(hidden,valid.clone()))
+        } else { NoisyRepresentation::Hidden(hidden) };
+        let representation = self.cached_blocks_segment(cache,0,self.blocks.len(),representation,valid,profile);
+        self.output_from_representation(representation)
     }
     fn cached_block_segment<P: Sections>(
         &self, cache: &TrainingCache, cache_index: usize, first: usize, last: usize,
@@ -302,47 +197,13 @@ impl LanguageModel {
         for index in first..last {
             let block = &self.blocks[index];
             let clean = &cache.layers[index];
-            representation = match representation {
-                NoisyRepresentation::Streams(mut streams) => {
-                    if let (Some(stage),Some(norm),Some(wavelet)) = (&block.ohc_wavelet,&block.wavelet_norm,&block.wavelet) {
-                        let read = stage.read_selected(streams,self.ohc_backend);
-                        let input = self.normalization_backend.rms(norm,read.work.clone());
-                        streams = stage.write(read,wavelet.forward_sbd_cached(input,clean.wavelet.as_ref().unwrap(),cache.starts[cache_index]),
-                            valid.clone(),self.ohc_backend);
-                    }
-                    if let (Some(stage),Some(norm),Some(lngram)) = (&block.ohc_lngram,&block.lngram_norm,&block.lngram) {
-                        let read = stage.read_selected(streams,self.ohc_backend);
-                        let input = self.normalization_backend.rms(norm,read.work.clone());
-                        let update = lngram_forward(lngram,input,clean.lngram.as_ref().unwrap(),cache.starts[cache_index]);
-                        streams = stage.write(read,update,valid.clone(),self.ohc_backend);
-                    }
-                    let stage = block.ohc_mixer.as_ref().unwrap();
-                    let read = stage.read_selected(streams,self.ohc_backend);
-                    let input = self.normalization_backend.rms(&block.norm,read.work.clone());
-                    let update = block.mixer.forward_sbd_cached_profiled(input,&clean.mixer,cache_index,valid.clone(),profile);
-                    streams = stage.write(read,update,valid.clone(),self.ohc_backend);
-                    let stage = block.ohc_mlp.as_ref().unwrap();
-                    let read = stage.read_selected(streams,self.ohc_backend);
-                    let input = self.normalization_backend.rms(&block.ff_norm,read.work.clone());
-                    let update = block.down.forward(self.epilogue_backend.silu(block.up.forward(input)));
-                    NoisyRepresentation::Streams(stage.write(read,update,valid.clone(),self.ohc_backend))
+            representation = self.layer_step(index,representation,valid.clone(),profile,|kind,input,profile| {
+                match kind {
+                    Sublayer::Wavelet => block.wavelet.as_ref().unwrap().forward_sbd_cached(input,clean.wavelet.as_ref().unwrap(),cache.starts[cache_index]),
+                    Sublayer::Lngram => lngram_forward(block.lngram.as_ref().unwrap(),input,clean.lngram.as_ref().unwrap(),cache.starts[cache_index]),
+                    Sublayer::Mixer => block.mixer.forward_sbd_cached_profiled(input,&clean.mixer,cache_index,valid.clone(),profile),
                 }
-                NoisyRepresentation::Hidden(mut hidden) => {
-                    if let (Some(norm),Some(wavelet)) = (&block.wavelet_norm,&block.wavelet) {
-                        let input = self.normalization_backend.rms(norm,hidden.clone());
-                        hidden = hidden + wavelet.forward_sbd_cached(input,clean.wavelet.as_ref().unwrap(),cache.starts[cache_index]);
-                    }
-                    if let (Some(norm),Some(lngram)) = (&block.lngram_norm,&block.lngram) {
-                        let input = self.normalization_backend.rms(norm,hidden.clone());
-                        hidden = hidden + lngram_forward(lngram,input,clean.lngram.as_ref().unwrap(),cache.starts[cache_index]);
-                    }
-                    let input = self.normalization_backend.rms(&block.norm,hidden.clone());
-                    hidden = hidden + block.mixer.forward_sbd_cached_profiled(input,&clean.mixer,cache_index,valid.clone(),profile);
-                    let input = self.normalization_backend.rms(&block.ff_norm,hidden.clone());
-                    hidden = hidden + block.down.forward(self.epilogue_backend.silu(block.up.forward(input)));
-                    NoisyRepresentation::Hidden(hidden)
-                }
-            };
+            });
         }
         representation
     }
@@ -419,41 +280,13 @@ impl LanguageModel {
     ) -> NoisyRepresentation {
         for index in first..last {
             let block=&self.blocks[index]; let clean=&cache.layers[index];
-            representation = match representation {
-                NoisyRepresentation::Streams(mut streams) => {
-                    if let (Some(stage),Some(norm),Some(wavelet))=(&block.ohc_wavelet,&block.wavelet_norm,&block.wavelet) {
-                        let read=stage.read_selected(streams,self.ohc_backend);
-                        let update=wavelet.forward_sbd_batched(self.normalization_backend.rms(norm,read.work.clone()),clean.wavelet.as_ref().unwrap());
-                        streams=stage.write(read,update,valid.clone(),self.ohc_backend);
-                    }
-                    if let (Some(stage),Some(norm),Some(lngram))=(&block.ohc_lngram,&block.lngram_norm,&block.lngram) {
-                        let read=stage.read_selected(streams,self.ohc_backend);
-                        let update=clean.lngram.as_ref().unwrap().forward(lngram,self.normalization_backend.rms(norm,read.work.clone()),valid.clone());
-                        streams=stage.write(read,update,valid.clone(),self.ohc_backend);
-                    }
-                    let stage=block.ohc_mixer.as_ref().unwrap(); let read=stage.read_selected(streams,self.ohc_backend);
-                    let update=block.mixer.forward_sbd_batched_profiled(self.normalization_backend.rms(&block.norm,read.work.clone()),&clean.mixer,valid.clone(),profile);
-                    streams=stage.write(read,update,valid.clone(),self.ohc_backend);
-                    let stage=block.ohc_mlp.as_ref().unwrap(); let read=stage.read_selected(streams,self.ohc_backend);
-                    let update=block.down.forward(self.epilogue_backend.silu(block.up.forward(self.normalization_backend.rms(&block.ff_norm,read.work.clone()))));
-                    NoisyRepresentation::Streams(stage.write(read,update,valid.clone(),self.ohc_backend))
+            representation = self.layer_step(index,representation,valid.clone(),profile,|kind,input,profile| {
+                match kind {
+                    Sublayer::Wavelet => block.wavelet.as_ref().unwrap().forward_sbd_batched(input,clean.wavelet.as_ref().unwrap()),
+                    Sublayer::Lngram => clean.lngram.as_ref().unwrap().forward(block.lngram.as_ref().unwrap(),input,valid.clone()),
+                    Sublayer::Mixer => block.mixer.forward_sbd_batched_profiled(input,&clean.mixer,valid.clone(),profile),
                 }
-                NoisyRepresentation::Hidden(mut hidden) => {
-                    if let (Some(norm),Some(wavelet))=(&block.wavelet_norm,&block.wavelet) {
-                        let update=wavelet.forward_sbd_batched(self.normalization_backend.rms(norm,hidden.clone()),clean.wavelet.as_ref().unwrap());
-                        hidden=hidden+update;
-                    }
-                    if let (Some(norm),Some(lngram))=(&block.lngram_norm,&block.lngram) {
-                        let update=clean.lngram.as_ref().unwrap().forward(lngram,self.normalization_backend.rms(norm,hidden.clone()),valid.clone());
-                        hidden=hidden+update;
-                    }
-                    let update=block.mixer.forward_sbd_batched_profiled(self.normalization_backend.rms(&block.norm,hidden.clone()),&clean.mixer,valid.clone(),profile);
-                    hidden=hidden+update;
-                    let update=block.down.forward(self.epilogue_backend.silu(block.up.forward(self.normalization_backend.rms(&block.ff_norm,hidden.clone()))));
-                    hidden=hidden+update;
-                    NoisyRepresentation::Hidden(hidden)
-                }
-            };
+            });
         }
         representation
     }
@@ -529,3 +362,7 @@ impl LanguageModel {
         (a,b)
     }
 }
+
+#[cfg(test)]
+#[path = "layer_reference_tests.rs"]
+mod layer_reference_tests;
