@@ -50,28 +50,15 @@
     "noisy_read_backend": "fused_gpu",
     "feedback": "soft_feedback",
     "candidate_width": 4,
-    "commit_count": 2,
-    "entropy_threshold": null,
     "generate_tokens": 32,
     "joint_output": "codpula_contextual",
-    "commitment": "dependence",
-    "dependence_threshold": 0.05,
-    "rows_per_pass": 4,
+    "announcement": {"dependence_threshold": 0.05},
     "cocommit": {
       "tail_layers": 1,
-      "rounds": 1,
-      "training_bundle_max": 16,
-      "visible_loss_weight": 0.2
+      "training_bundle_max": 16
     },
     "refinement": {
-      "policy": "pairwise",
-      "energy_path": "artifacts/integrated11/energy.burnpack",
-      "data_path": "artifacts/integrated11/trajectories.json",
-      "states": 512,
-      "pairs_per_state": 4,
-      "horizon": 2,
-      "fit_steps": 100,
-      "fit_batch": 512
+      "policy": "confidence"
     },
     "training_mode": "tct"
   },

@@ -280,7 +280,7 @@ pub fn codpula(c:&Config,device:&Device,warmups:usize,trials:usize) -> Result<Va
     {
         let s=configs[0].sbd.as_mut().unwrap();
         s.joint_output=SbdJointOutput::Factorized;
-        s.commitment=SbdCommitment::Fixed;
+        s.commitment=Some(SbdCommitment::Fixed);
         s.joint_execution=CodpulaExecution::Tensor;
     }
     configs[1].sbd.as_mut().unwrap().joint_execution=CodpulaExecution::Tensor;

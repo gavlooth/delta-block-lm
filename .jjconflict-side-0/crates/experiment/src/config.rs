@@ -200,7 +200,12 @@ impl SbdCommitment {
     pub fn is_fixed(&self) -> bool { *self == Self::Fixed }
 }
 fn dependence_threshold() -> f64 { 0.05 }
-fn is_default_dependence_threshold(value: &f64) -> bool { *value == dependence_threshold() }
+fn is_default_dependence_threshold(value: &Option<f64>) -> bool {
+    value.is_none_or(|value| value == dependence_threshold())
+}
+fn is_fixed_commitment(value: &Option<SbdCommitment>) -> bool {
+    value.is_none_or(|value| value.is_fixed())
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -217,16 +222,28 @@ impl CocommitExecution {
 #[serde(default, deny_unknown_fields)]
 pub struct CocommitConfig {
     pub tail_layers: usize,
-    pub rounds: usize,
     pub training_bundle_max: usize,
-    pub visible_loss_weight: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visible_loss_weight: Option<f64>,
     #[serde(skip_serializing_if = "CocommitExecution::is_separate")]
     pub execution: CocommitExecution,
 }
 impl Default for CocommitConfig {
     fn default() -> Self {
-        Self { tail_layers: 1, rounds: 1, training_bundle_max: 16, visible_loss_weight: 0.2,
+        Self { tail_layers: 1, training_bundle_max: 16, visible_loss_weight: None,
             execution: CocommitExecution::Separate }
+    }
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AnnouncementConfig {
+    pub count: usize,
+    pub dependence_threshold: Option<f64>,
+    pub entropy_threshold: Option<f64>,
+}
+impl Default for AnnouncementConfig {
+    fn default() -> Self {
+        Self { count: 2, dependence_threshold: None, entropy_threshold: None }
     }
 }
 
@@ -241,22 +258,25 @@ pub struct SbdConfig {
     pub joint_output: SbdJointOutput,
     #[serde(skip_serializing_if = "crate::codpula::CodpulaExecution::is_tensor")]
     pub joint_execution: crate::codpula::CodpulaExecution,
-    #[serde(skip_serializing_if = "SbdCommitment::is_fixed")]
-    pub commitment: SbdCommitment,
+    #[serde(skip_serializing_if = "is_fixed_commitment")]
+    pub commitment: Option<SbdCommitment>,
     /// Appendix C Figures 12–13 report 0.05; the paper gives no global default.
     #[serde(skip_serializing_if = "is_default_dependence_threshold")]
-    pub dependence_threshold: f64,
+    pub dependence_threshold: Option<f64>,
     #[serde(skip_serializing_if = "delta_mixers::sbd::InBlockReads::is_none")]
     pub in_block_reads: delta_mixers::sbd::InBlockReads,
     #[serde(skip_serializing_if = "delta_mixers::sbd::NoisyReadBackend::is_tensor")]
     pub noisy_read_backend: delta_mixers::sbd::NoisyReadBackend,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cocommit: Option<CocommitConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub announcement: Option<AnnouncementConfig>,
     /// Optional exact row chunk size for SBD backward accumulation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rows_per_pass: Option<usize>,
     pub candidate_width: usize,
-    pub commit_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_count: Option<usize>,
     /// None selects fixed-count commitment; Some selects paper equation 8 (nats).
     pub entropy_threshold: Option<f64>,
     pub generate_tokens: usize,
@@ -271,20 +291,27 @@ impl Default for SbdConfig {
             block_execution: SbdBlockExecution::PerBlock,
             joint_output: SbdJointOutput::Factorized,
             joint_execution: crate::codpula::CodpulaExecution::Tensor,
-            commitment: SbdCommitment::Fixed, dependence_threshold: dependence_threshold(),
-            candidate_width: 4, commit_count: 2, entropy_threshold: None, generate_tokens: 32,
+            commitment: None, dependence_threshold: None,
+            candidate_width: 4, commit_count: None, entropy_threshold: None, generate_tokens: 32,
             in_block_reads: delta_mixers::sbd::InBlockReads::None,
             noisy_read_backend: delta_mixers::sbd::NoisyReadBackend::Tensor,
-            cocommit: None, rows_per_pass: None,
+            cocommit: None, announcement: None, rows_per_pass: None,
             refinement: None, training_mode: crate::tct::TrainingMode::Sbd }
     }
 }
+impl SbdConfig {
+    pub fn commitment(&self) -> SbdCommitment { self.commitment.unwrap_or_default() }
+    pub fn dependence_threshold(&self) -> f64 {
+        self.dependence_threshold.unwrap_or_else(dependence_threshold)
+    }
+    pub fn commit_count(&self) -> usize { self.commit_count.unwrap_or(2) }
+}
 
-// Keep the historical SBD revision; optional reads enter identity through their selectors.
-const SBD_MODEL_REVISION: &str = "sbd-recurrence-only-v1";
+// The corrected objectives and decoder transitions reject earlier SBD identities.
+const SBD_MODEL_REVISION: &str = "sbd-feedback-prepared-provisional-correction-v2";
 const PREFIX_RETRIEVAL_REVISION: &str = "prefix-block-moba-own-v1";
-const COCOMMIT_MODEL_REVISION: &str = "cocommit-full-stream-marker-event-v1";
-const COORDINATED_PROVISIONAL_REVISION: &str = "cocommit-coherent-b-permanent-O-provisional-R-v1";
+const COCOMMIT_MODEL_REVISION: &str = "cocommit-all-free-marked-conditional-v2";
+const COORDINATED_PROVISIONAL_REVISION: &str = "cocommit-coherent-all-free-B-provisional-inputs-v2";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -499,20 +526,41 @@ impl Config {
             ensure!(!sbd.block_lengths.is_empty() && sbd.block_lengths.iter().all(|&n| n > 0),
                 "SBD block lengths must be positive");
             ensure!(sbd.candidate_width > 0 && sbd.candidate_width <= self.vocab()
-                && sbd.commit_count > 0 && sbd.generate_tokens > 0, "invalid SBD decoding counts");
+                && sbd.commit_count() > 0 && sbd.generate_tokens > 0, "invalid SBD decoding counts");
             ensure!(sbd.entropy_threshold.is_none_or(|x| x.is_finite() && x >= 0.0),
                 "SBD entropy threshold must be finite and nonnegative");
-            ensure!(sbd.dependence_threshold.is_finite() && sbd.dependence_threshold > 0.0,
+            ensure!(sbd.dependence_threshold().is_finite() && sbd.dependence_threshold() > 0.0,
                 "SBD dependence threshold must be finite and positive");
-            ensure!(sbd.commitment != SbdCommitment::Dependence || sbd.joint_output.is_codpula(),
+            ensure!(sbd.commitment() != SbdCommitment::Dependence || sbd.joint_output.is_codpula(),
                 "dependence commitment requires a Codpula joint output");
             ensure!(!sbd.joint_output.is_codpula() || sbd.block_lengths.iter().all(|&n| n <= 16),
                 "Codpula block lengths must be at most 16");
+            ensure!(!sbd.joint_output.is_codpula() || self.soft_temperature == 1.0,
+                "Codpula requires soft_temperature=1 to match training potentials");
             ensure!(sbd.joint_execution.is_tensor()
                 || (sbd.joint_output.is_codpula()
                     && matches!(self.backend.as_str(),"vulkan" | "cuda") && !self.fusion),
                 "sbd.joint_execution=fused_gpu requires Codpula and explicit non-fusion GPU execution");
+            if let Some(announcement) = &sbd.announcement {
+                ensure!(sbd.refinement.is_some() && sbd.cocommit.is_some(),
+                    "sbd.announcement requires refinement and cocommit");
+                ensure!(announcement.count > 0,
+                    "sbd.announcement.count must be positive");
+                ensure!(announcement.dependence_threshold.is_none_or(|value| value.is_finite() && value > 0.0)
+                    && announcement.entropy_threshold.is_none_or(|value| value.is_finite() && value >= 0.0),
+                    "invalid sbd.announcement thresholds");
+                ensure!(announcement.dependence_threshold.is_none() || sbd.joint_output.is_codpula(),
+                    "dependence announcements require Codpula");
+                ensure!(announcement.dependence_threshold.is_none() || announcement.entropy_threshold.is_none(),
+                    "choose dependence or entropy announcements, not both");
+            }
             if let Some(refinement) = &sbd.refinement {
+                ensure!(sbd.commit_count.is_none() && sbd.commitment.is_none()
+                    && sbd.dependence_threshold.is_none() && sbd.entropy_threshold.is_none(),
+                    "refinement does not use SBD commit rules; omit commit_count, commitment, dependence_threshold and entropy_threshold");
+                ensure!((refinement.policy == crate::mask_energy::MaskPolicy::Confidence)
+                    == !sbd.training_mode.is_sbd(),
+                    "TCT requires refinement policy=confidence; ordinary SBD refinement requires uniform, unary or pairwise");
                 ensure!(sbd.block_lengths.iter().all(|&n| n <= 16),
                     "remasking supports block lengths at most 16");
                 ensure!(sbd.feedback == SbdFeedback::SoftFeedback && !self.hard_mask_only,
@@ -522,6 +570,10 @@ impl Config {
                     && refinement.fit_batch > 0, "remasking training counts must be positive");
             }
             if !sbd.training_mode.is_sbd() {
+                ensure!(sbd.rows_per_pass.is_none(),
+                    "TCT ignores sbd.rows_per_pass; use tct.rows_per_pass");
+                ensure!(sbd.refinement.is_some(),
+                    "TCT requires refinement policy=confidence");
                 ensure!(!sbd.joint_output.is_factorized()
                     && sbd.block_execution == SbdBlockExecution::Batched,
                     "TCT requires batched Codpula output");
@@ -538,10 +590,11 @@ impl Config {
             if let Some(cocommit) = &sbd.cocommit {
                 ensure!((1..=self.layers).contains(&cocommit.tail_layers),
                     "sbd.cocommit.tail_layers must be within 1..=layers");
-                ensure!(cocommit.rounds == 1, "sbd.cocommit currently requires rounds=1");
                 ensure!(cocommit.training_bundle_max > 0,
                     "sbd.cocommit.training_bundle_max must be positive");
-                ensure!(cocommit.visible_loss_weight.is_finite() && cocommit.visible_loss_weight >= 0.0,
+                ensure!(!sbd.joint_output.is_codpula() || cocommit.visible_loss_weight.is_none(),
+                    "Codpula ignores sbd.cocommit.visible_loss_weight; omit it");
+                ensure!(cocommit.visible_loss_weight.is_none_or(|weight| weight.is_finite() && weight >= 0.0),
                     "sbd.cocommit.visible_loss_weight must be finite and nonnegative");
                 ensure!(sbd.in_block_reads == delta_mixers::sbd::InBlockReads::HolaRead,
                     "sbd.cocommit requires in_block_reads=hola_read");
@@ -1261,7 +1314,7 @@ mod tests {
         assert_eq!(enabled.sbd.as_ref().unwrap().feedback, SbdFeedback::SoftFeedback);
         enabled.sbd.as_mut().unwrap().block_lengths = vec![1,4,8,16];
         enabled.sbd.as_mut().unwrap().candidate_width = 257;
-        enabled.sbd.as_mut().unwrap().commit_count = 3;
+        enabled.sbd.as_mut().unwrap().commit_count = Some(3);
         enabled.validate().unwrap();
         enabled.sbd.as_mut().unwrap().block_lengths = vec![0];
         assert!(enabled.validate().is_err());
@@ -1337,7 +1390,7 @@ mod tests {
         c.validate().unwrap();
         assert_ne!(c.training_fingerprint(c.train_tokens).unwrap(),training);
         assert_ne!(c.pilot_fingerprint().unwrap(),pilot);
-        c.sbd.as_mut().unwrap().commitment = SbdCommitment::Dependence;
+        c.sbd.as_mut().unwrap().commitment = Some(SbdCommitment::Dependence);
         c.validate().unwrap();
         let encoded = serde_json::to_value(&c).unwrap();
         assert_eq!(encoded["sbd"]["joint_output"],"codpula");
@@ -1350,10 +1403,10 @@ mod tests {
         assert!(c.validate().is_err());
         c.sbd.as_mut().unwrap().block_lengths = vec![1,4,16];
         for invalid in [0.0,-0.1,f64::NAN,f64::INFINITY] {
-            c.sbd.as_mut().unwrap().dependence_threshold = invalid;
+            c.sbd.as_mut().unwrap().dependence_threshold = Some(invalid);
             assert!(c.validate().is_err());
         }
-        c.sbd.as_mut().unwrap().dependence_threshold = 0.05;
+        c.sbd.as_mut().unwrap().dependence_threshold = Some(0.05);
         c.sbd.as_mut().unwrap().joint_execution = crate::codpula::CodpulaExecution::FusedGpu;
         assert!(c.validate().is_err());
         c.backend = "vulkan".into();
@@ -1375,7 +1428,7 @@ mod tests {
         let legacy_training = c.training_fingerprint(c.train_tokens).unwrap();
         let legacy_pilot = c.pilot_fingerprint().unwrap();
         c.sbd.as_mut().unwrap().joint_output = SbdJointOutput::CodpulaContextual;
-        c.sbd.as_mut().unwrap().commitment = SbdCommitment::Dependence;
+        c.sbd.as_mut().unwrap().commitment = Some(SbdCommitment::Dependence);
         c.sbd.as_mut().unwrap().block_lengths = vec![1, 4, 16];
         c.validate().unwrap();
         let encoded = serde_json::to_value(&c).unwrap();
@@ -1386,7 +1439,7 @@ mod tests {
         assert_ne!(c.training_fingerprint(c.train_tokens).unwrap(), legacy_training);
         assert_ne!(c.pilot_fingerprint().unwrap(), factorized_pilot);
         assert_ne!(c.pilot_fingerprint().unwrap(), legacy_pilot);
-        c.sbd.as_mut().unwrap().commitment = SbdCommitment::Fixed;
+        c.sbd.as_mut().unwrap().commitment = Some(SbdCommitment::Fixed);
         c.sbd.as_mut().unwrap().block_lengths = SbdConfig::default().block_lengths;
         assert_ne!(c.training_fingerprint(c.train_tokens).unwrap(), legacy_training);
         assert_ne!(c.pilot_fingerprint().unwrap(), legacy_pilot);
@@ -1426,9 +1479,8 @@ mod tests {
         )).unwrap());
         assert_eq!(c.training_fingerprint(tokens).unwrap(),combined);
         let refinement_identity = c.pilot_fingerprint().unwrap();
-        c.sbd.as_mut().unwrap().refinement = None;
+        c.sbd.as_mut().unwrap().refinement.as_mut().unwrap().policy = crate::mask_energy::MaskPolicy::Confidence;
         c.sbd.as_mut().unwrap().training_mode = crate::tct::TrainingMode::Tct;
-        c.sbd.as_mut().unwrap().rows_per_pass = Some(4);
         c.tct = Some(crate::tct::TctConfig {rows_per_pass:4});
         c.validate().unwrap();
         assert_eq!(c.coordination_contract_revision(),Some(COORDINATED_PROVISIONAL_REVISION));
@@ -1458,5 +1510,79 @@ mod tests {
         assert!(error.contains("doubled") && error.contains("retrieval"),"{error}");
         c.prefix_block_retrieval.as_mut().unwrap().layers=vec![0];
         c.validate().unwrap();
+    }
+    #[test]
+    fn ineffective_fields_are_rejected_in_their_execution_context() {
+        let ordinary = Config {task:"lm".into(), sbd:Some(SbdConfig {
+            joint_output:SbdJointOutput::Codpula,
+            block_execution:SbdBlockExecution::Batched,
+            in_block_reads:delta_mixers::sbd::InBlockReads::HolaRead,
+            cocommit:Some(CocommitConfig::default()), ..SbdConfig::default()
+        }), arms:vec![Arm {name:"kronlstm-hola".into(),mixer:"kronlstm".into(),cache:"surprise".into()}],
+            ..Config::default()};
+        ordinary.validate().unwrap();
+        let mut refined = ordinary.clone();
+        refined.sbd.as_mut().unwrap().refinement = Some(crate::remask::RefinementConfig::default());
+        refined.validate().unwrap();
+        for (key,value) in [
+            ("commit_count",serde_json::json!(2)),
+            ("commitment",serde_json::json!("fixed")),
+            ("commitment",serde_json::json!("dependence")),
+            ("dependence_threshold",serde_json::json!(0.05)),
+            ("entropy_threshold",serde_json::json!(0.5)),
+        ] {
+            let mut encoded = serde_json::to_value(&refined).unwrap();
+            encoded["sbd"][key] = value;
+            let invalid: Config = serde_json::from_value(encoded).unwrap();
+            assert!(invalid.validate().unwrap_err().to_string().contains("commit rules"),"{key}");
+        }
+        let mut invalid = ordinary.clone();
+        invalid.sbd.as_mut().unwrap().cocommit.as_mut().unwrap().visible_loss_weight = Some(0.2);
+        assert!(invalid.validate().unwrap_err().to_string().contains("visible_loss_weight"));
+        invalid.sbd.as_mut().unwrap().joint_output = SbdJointOutput::Factorized;
+        invalid.validate().unwrap();
+        let mut encoded = serde_json::to_value(&ordinary).unwrap();
+        encoded["sbd"]["cocommit"]["rounds"] = 1.into();
+        assert!(serde_json::from_value::<Config>(encoded).unwrap_err().to_string().contains("rounds"));
+        for output in [SbdJointOutput::Codpula,SbdJointOutput::CodpulaContextual] {
+            let mut invalid = ordinary.clone();
+            invalid.sbd.as_mut().unwrap().joint_output = output;
+            invalid.soft_temperature = 0.8;
+            assert!(invalid.validate().unwrap_err().to_string().contains("soft_temperature=1"));
+        }
+        let mut trajectory = refined;
+        trajectory.sbd.as_mut().unwrap().training_mode = crate::tct::TrainingMode::Tct;
+        trajectory.sbd.as_mut().unwrap().refinement.as_mut().unwrap().policy = crate::mask_energy::MaskPolicy::Confidence;
+        trajectory.tct = Some(crate::tct::TctConfig {rows_per_pass:4});
+        trajectory.validate().unwrap();
+        trajectory.sbd.as_mut().unwrap().rows_per_pass = Some(4);
+        assert!(trajectory.validate().unwrap_err().to_string().contains("TCT ignores sbd.rows_per_pass"));
+        trajectory.sbd.as_mut().unwrap().rows_per_pass = None;
+        for policy in [crate::mask_energy::MaskPolicy::Uniform,
+            crate::mask_energy::MaskPolicy::Unary,crate::mask_energy::MaskPolicy::Pairwise] {
+            trajectory.sbd.as_mut().unwrap().refinement.as_mut().unwrap().policy = policy;
+            assert!(trajectory.validate().unwrap_err().to_string().contains("policy=confidence"));
+        }
+        trajectory.sbd.as_mut().unwrap().refinement = None;
+        assert!(trajectory.validate().unwrap_err().to_string().contains("requires refinement"));
+        trajectory.sbd.as_mut().unwrap().refinement = Some(crate::remask::RefinementConfig {
+            policy:crate::mask_energy::MaskPolicy::Confidence,..Default::default()
+        });
+        trajectory.sbd.as_mut().unwrap().training_mode = crate::tct::TrainingMode::Sbd;
+        trajectory.tct = None;
+        assert!(trajectory.validate().unwrap_err().to_string().contains("policy=confidence"));
+    }
+    #[test]
+    fn every_tracked_experiment_config_validates() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+        let mut count = 0;
+        for entry in std::fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|extension| extension != "json")
+                || path.file_name().unwrap() == "corpus.lock.json" { continue; }
+            Config::load(&path).unwrap_or_else(|error| panic!("{}: {error:#}",path.display()));
+            count += 1;
+        }
+        assert!(count > 0);
     }
 }

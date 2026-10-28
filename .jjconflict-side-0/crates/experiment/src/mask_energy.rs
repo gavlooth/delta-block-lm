@@ -29,6 +29,7 @@ pub enum MaskPolicy {
     Uniform,
     Unary,
     Pairwise,
+    Confidence,
 }
 
 #[derive(Module, Debug)]
@@ -325,6 +326,7 @@ fn enumerated_weights(unary: &[f32], pairs: &[f32], eligible: &[usize], r: usize
 fn sample_with_branch(unary: &[f32], pairs: &[f32], eligible: &[usize], r: usize,
     policy: MaskPolicy, rng: &mut Rng) -> Result<(Vec<usize>, bool)>
 {
+    ensure!(policy != MaskPolicy::Confidence, "confidence reveals do not use mask energies");
     check_eligible(eligible, r)?;
     if r == 0 { return Ok((Vec::new(), false)); }
     if r == eligible.len() { return Ok((eligible.to_vec(), false)); }
@@ -332,7 +334,7 @@ fn sample_with_branch(unary: &[f32], pairs: &[f32], eligible: &[usize], r: usize
     let explore = policy == MaskPolicy::Uniform || uniform(rng) < EPSILON;
     if explore { return Ok((uniform_set(eligible, r, rng), true)); }
     let selected = match policy {
-        MaskPolicy::Uniform => unreachable!(),
+        MaskPolicy::Uniform | MaskPolicy::Confidence => unreachable!(),
         MaskPolicy::Unary => {
             let local = eligible.iter().map(|&i| f64::from(unary[i])).collect::<Vec<_>>();
             sample_unary(&local, eligible, r, || uniform(rng))
@@ -366,6 +368,7 @@ pub struct ReferenceDistribution {
 pub fn reference_distribution(unary: &[f64], pairs: &[f64], eligible: &[usize], r: usize,
     policy: MaskPolicy) -> Result<ReferenceDistribution>
 {
+    ensure!(policy != MaskPolicy::Confidence, "confidence reveals do not use mask energies");
     check_eligible(eligible, r)?;
     ensure!(eligible.iter().all(|&i| i < unary.len()), "reference position outside unary array");
     ensure!(policy != MaskPolicy::Pairwise || pairs.len() == unary.len() * unary.len(), "invalid reference pair shape");
@@ -489,7 +492,8 @@ impl Dataset {
 /// a fresh fit; its separate fit record explicitly records that no resume is used.
 pub fn fit(c: &Config, device: &Device) -> Result<Value> {
     let refinement = c.sbd.as_ref().and_then(|s| s.refinement.as_ref()).context("energy-fit requires sbd.refinement")?;
-    ensure!(refinement.policy != MaskPolicy::Uniform, "uniform remasking has no trainable energy");
+    ensure!(matches!(refinement.policy,MaskPolicy::Unary | MaskPolicy::Pairwise),
+        "energy fitting requires unary or pairwise remasking");
     ensure!(refinement.fit_steps > 0 && refinement.fit_batch > 0, "energy fit counts must be positive");
     let bytes = std::fs::read(&refinement.data_path).with_context(|| format!("reading {}", refinement.data_path.display()))?;
     let dataset: Dataset = serde_json::from_slice(&bytes)?;

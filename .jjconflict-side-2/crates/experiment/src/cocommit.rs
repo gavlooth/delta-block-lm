@@ -71,7 +71,7 @@ pub(crate) fn add_branch_losses(
             Ok(Some(a_circuit))
         }
     } else {
-        let weight = c.sbd.as_ref().unwrap().cocommit.as_ref().unwrap().visible_loss_weight as f32;
+        let weight = c.sbd.as_ref().unwrap().cocommit.as_ref().unwrap().visible_loss_weight.unwrap_or(0.2) as f32;
         let a_weights = soft.active.iter().zip(&soft.observed).zip(target_weights)
             .map(|((&active,observed),&w)| if !active {0.0} else if observed.is_some() {weight*w} else {w}).collect::<Vec<_>>();
         let marked_rows = marks.chunks_exact(width).map(|row|row.iter().any(|&mark|mark)).collect::<Vec<_>>();
@@ -317,7 +317,7 @@ fn prediction(model: &LanguageModel, c: &Config, output: DenoisingOutput, soft: 
         let host_logs=logs.clone().into_data().try_to_vec::<f32>().map_err(|e|anyhow::anyhow!("CoCommit probabilities {e:?}"))?;
         let entropies=checked_entropy_rows(&host_logs,c.vocab(),&soft.active)?;
         let proposals = if assignments {circuit.sample(tokens.clone(),observed.clone(),seed)?} else {Vec::new()};
-        let scores = if assignments && c.sbd.as_ref().unwrap().commitment==SbdCommitment::Dependence {
+        let scores = if assignments && c.sbd.as_ref().unwrap().commitment()==SbdCommitment::Dependence {
             Some(circuit.dependence_scores(tokens,observed,&proposals)?.remove(0))
         } else {None};
         Ok(Prediction { feedback: logs.reshape([n,c.vocab()]), host_logs,entropies,
@@ -341,7 +341,7 @@ fn select(c: &Config, prediction: &Prediction, soft: &SoftState, last_pass: bool
     if unresolved.is_empty() { return Ok(Vec::new()); }
     if let Some(scores) = &prediction.scores {
         ensure!(unresolved.iter().all(|&i|scores[i].is_finite()),"CoCommit dependence requires finite supported scores");
-        return Ok(sbd::dependence_commits(&unresolved,scores,s.dependence_threshold,last_pass));
+        return Ok(sbd::dependence_commits(&unresolved,scores,s.dependence_threshold(),last_pass));
     }
     let mut order=unresolved.into_iter().map(|i|(i,prediction.entropies[i])).collect::<Vec<_>>();
     order.sort_by(|a,b|a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
@@ -350,7 +350,7 @@ fn select(c: &Config, prediction: &Prediction, soft: &SoftState, last_pass: bool
         let mut sum = 0.0;
         while take < order.len() && sum+order[take-1].1 <= gamma { sum+=order[take-1].1; take+=1; }
         take
-    } else {s.commit_count.min(order.len())};
+    } else {s.commit_count().min(order.len())};
     Ok(order[..take].iter().map(|&(i,_)|i).collect())
 }
 pub(super) struct Assignment {
@@ -375,7 +375,7 @@ pub(super) fn assign(model: &LanguageModel, c: &Config, cache: &TrainingCache, s
     let b = prediction(model,c,output,soft,proposal_seed,c.soft_temperature,true)?;
     let commits = if let Some(scores) = &b.scores {
         ensure!(announcement.iter().all(|&i|scores[i].is_finite()),"marked CoCommit dependence requires finite scores");
-        sbd::dependence_commits(&announcement,scores,s.dependence_threshold,pass==n)
+        sbd::dependence_commits(&announcement,scores,s.dependence_threshold(),pass==n)
     } else {announcement};
     Ok(Assignment {proposals:b.proposals,commits,feedback:b.feedback,feedback_temperature:b.feedback_temperature,host_logs:b.host_logs})
 }

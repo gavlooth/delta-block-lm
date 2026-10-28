@@ -72,9 +72,7 @@
     "dependence_threshold": 0.05,
     "cocommit": {
       "tail_layers": 1,
-      "rounds": 1,
-      "training_bundle_max": 16,
-      "visible_loss_weight": 0.2
+      "training_bundle_max": 16
     }
   }
 }
