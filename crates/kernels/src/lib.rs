@@ -1,5 +1,9 @@
 //! Fused recurrent KronLSTM and supporting CubeCL kernels.
 //! KronLSTM uses key width 32 and value width 64; batch/time/head counts are dynamic.
+#[cfg(any(feature = "cpu", feature = "vulkan", feature = "cuda"))]
+mod soft_normalize;
+#[cfg(any(feature = "cpu", feature = "vulkan", feature = "cuda"))]
+pub use soft_normalize::soft_normalize;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 mod kron;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]

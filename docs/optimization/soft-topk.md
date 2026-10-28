@@ -76,6 +76,17 @@ parameters remain differentiable; teacher logits and probabilities do not.
 The candidate distribution is normalized before embedding expectation, so
 discarded top-k mass does not reduce the learned coefficient.
 
+Normalization uses a custom first-order VJP:
+`dp = (g - sum(g * normalized)) / mass`.
+The centered numerator is formed before direct division. Splitting this into
+reciprocal/divisor paths causes `inf - inf` for positive subnormal mass even
+when the true gradient of `sum(normalized)` is exactly zero. Sparse selection
+and dense references share the corrected operation; all-zero rows keep the
+existing denominator-one extension. References now check subnormal outputs
+and the constant-loss zero VJP, zero-row derivatives, and honest infinities
+for genuinely unrepresentable derivatives. No probability floor, gradient
+clamp, or selected-probability detach is introduced.
+
 Ordinary training samples soft students with probability `0.8` and binary
 students otherwise; binary draws do not run a teacher or train confidence
 parameters. Inference starts binary without an added initial teacher.

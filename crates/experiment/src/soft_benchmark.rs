@@ -225,9 +225,34 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
                 "invalid candidate accepted"
             );
         }
-        let tiny = Candidates::select(
-            Tensor::from_data([[-0.0f32, 0.0, f32::from_bits(1)]], &device), 1, path)?;
+        // Selection remains differentiable for accepted subnormals. In particular,
+        // sum(normalized top-1) is constant, so its VJP is exactly zero, not inf-inf.
+        let probability = Tensor::from_data([[-0.0f32, 0.0, f32::from_bits(1)]], &device).require_grad();
+        let tiny = Candidates::select(probability.clone(), 1, path)?;
         ensure!(ids_host(tiny.ids) == vec![2], "subnormal/signed-zero ordering");
+        ensure!(values(tiny.weights.clone()) == vec![1.0], "subnormal top-1 normalization");
+        let gradients = tiny.weights.sum().backward();
+        ensure!(values(probability.grad(&gradients).expect("subnormal selection VJP")) == vec![0.0;3],
+            "constant normalized selection loss has a nonzero/nonfinite VJP");
+        let probability = Tensor::from_data([[0.0f32, 0.0, f32::from_bits(1)],[0.0,0.0,0.0]], &device).require_grad();
+        let output = soft::dense_expected(probability.clone(), Tensor::ones([3,1], &device),
+            Tensor::zeros([1], &device), Tensor::ones([2,1], &device));
+        ensure!(values(output.clone()) == vec![1.0,0.0], "subnormal/zero-row dense normalization");
+        let gradients = output.sum().backward();
+        ensure!(values(probability.grad(&gradients).expect("subnormal dense VJP")) == vec![0.0;6],
+            "constant dense normalized loss has a nonzero/nonfinite VJP");
+        let probability = Tensor::from_data([[0.0f32,0.0,0.0]], &device).require_grad();
+        let zero = delta_kernels::soft_normalize(probability.clone(),probability.clone().sum_dim(1));
+        ensure!(values(zero.clone()) == vec![0.0;3], "zero-row normalization extension");
+        let gradients = zero.sum().backward();
+        ensure!(values(probability.grad(&gradients).expect("zero-row normalization VJP")) == vec![1.0;3],
+            "zero-row denominator-one derivative changed");
+        let probability = Tensor::from_data([[0.0f32,0.0,f32::from_bits(1)]], &device).require_grad();
+        let normalized = delta_kernels::soft_normalize(probability.clone(),probability.clone().sum_dim(1));
+        let gradients = (normalized*Tensor::from_data([[0.0f32,1.0,2.0]],&device)).sum().backward();
+        let derivative = values(probability.grad(&gradients).expect("unrepresentable normalization VJP"));
+        ensure!(derivative == vec![f32::NEG_INFINITY,f32::NEG_INFINITY,0.0],
+            "genuinely unrepresentable normalization derivatives were hidden");
         let mut a = SoftState::new(
             257,
             16,

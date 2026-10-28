@@ -120,7 +120,7 @@ impl Candidates {
             };
             let weights = probabilities.gather(1, ids.clone());
             let retained_mass = weights.clone().sum_dim(1);
-            let weights = weights / retained_mass.clone().mask_fill(retained_mass.clone().equal_elem(0.0), 1.0);
+            let weights = delta_kernels::soft_normalize(weights, retained_mass.clone());
             Ok(Self {
                 ids,
                 weights,
@@ -153,7 +153,7 @@ impl Candidates {
         // Index selection is discrete; selected probabilities and gathered embeddings stay differentiable.
         let weights = probabilities.gather(1, ids.clone());
         let retained_mass = weights.clone().sum_dim(1);
-        let weights = weights / retained_mass.clone().mask_fill(retained_mass.clone().equal_elem(0.0), 1.0);
+        let weights = delta_kernels::soft_normalize(weights, retained_mass.clone());
         Ok(Self {
             ids,
             weights,
@@ -271,7 +271,7 @@ pub fn dense_expected_masked(
     let probabilities = probabilities.mask_fill(hidden.expand([rows, vocab]), 0.0);
     let mass = probabilities.clone().sum_dim(1);
     let visibility = visibility.mask_fill(mass.clone().equal_elem(0.0), 0.0);
-    let probabilities = probabilities / mass.clone().mask_fill(mass.equal_elem(0.0), 1.0);
+    let probabilities = delta_kernels::soft_normalize(probabilities, mass);
     // Keep finite zero-probability derivatives; sanitize only unused nonfinite embedding rows.
     let unused = probabilities
         .clone()

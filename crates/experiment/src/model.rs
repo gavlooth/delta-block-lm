@@ -582,25 +582,33 @@ mod tests {
     }
 
     #[test]
-    fn singleton_draw_reports_missing_mask_instead_of_fabricating_gradient() {
+    fn singleton_masked_draw_trains_noisy_input_parameters() {
         let mut c = Config::default();
         c.task = "lm".into();
         c.context = 8;
         c.d_model = 8;
         c.layers = 1;
-        c.sbd = Some(crate::config::SbdConfig { block_lengths: vec![1], ..Default::default() });
+        c.sbd = Some(crate::config::SbdConfig {
+            block_lengths: vec![1], training_block_lengths: vec![1], ..Default::default()
+        });
+        c.soft_training_probability = 1.0;
         let device = Device::ndarray().autodiff();
         let model = LanguageModel::new(&c, &c.arms[0], &device).unwrap();
         let rows = vec![data::Example { input: vec![256,1,2,3,4,5,6,7],
             target: vec![1,2,3,4,5,6,7,8], weight: vec![1.0;8], groups: vec![None;8] }];
-        let result = crate::sbd::training_loss(&model, &c, &rows, &Batch::new(&rows,&device), 1).unwrap();
+        let batch = Batch::new(&rows,&device);
+        let blocks = vec![crate::sbd::TrainingBlock {
+            row:0, start:0, length:1, masked:vec![true],
+        }];
+        let result = crate::sbd::training_loss_sampled_profiled(
+            &model, &c, &rows, &batch, &blocks, None, &mut Unprofiled).unwrap();
         let (grads, report) = checked_gradients_with_unused(&model, result.loss,
             &result.unused_parameters, &mut Unprofiled).unwrap();
-        assert!(grads.get::<1>(model.sbd_mask.as_ref().unwrap().id).is_none());
-        assert_eq!(report["sbd_mask"].missing_steps, 1);
-        assert_eq!(report["sbd_mask"].zero_steps, 0);
+        assert!(grads.get::<1>(model.sbd_mask.as_ref().unwrap().id).is_some());
+        assert_eq!(report["sbd_mask"].missing_steps, 0);
+        assert_eq!(report["sbd_mask"].nonzero_steps, 1);
         assert_eq!(report["head.weight"].nonzero_steps, 1);
-        assert!(check_parameter_gradients(&model, &grads, &mut Unprofiled).is_err());
+        assert!(check_parameter_gradients(&model, &grads, &mut Unprofiled).is_ok());
     }
 
     struct Parameters(Vec<Vec<f32>>);

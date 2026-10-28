@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 default = ["cpu"]
-cpu = ["burn/ndarray", "delta-mixers/cpu"]
+cpu = ["burn/ndarray", "delta-mixers/cpu", "delta-kernels/cpu"]
 vulkan = ["burn/vulkan", "burn/cubecl", "dep:cubecl", "cubecl/vulkan", "dep:cubecl-environment", "delta-mixers/vulkan"]
 cuda = ["burn/cuda", "burn/cubecl", "dep:cubecl", "cubecl/cuda", "dep:cubecl-environment", "delta-mixers/cuda"]
 fusion = ["burn/fusion", "delta-mixers/fusion"]

@@ -6,6 +6,7 @@ license.workspace = true
 
 [features]
 default = []
+cpu = ["burn/ndarray"]
 vulkan = ["burn/vulkan", "dep:burn-cubecl", "dep:cubecl", "burn-cubecl/vulkan"]
 cuda = ["burn/cuda", "dep:burn-cubecl", "dep:cubecl", "burn-cubecl/cuda"]
 fusion = ["burn/fusion", "burn-cubecl?/fusion"]
