@@ -300,6 +300,8 @@ impl SbdConfig {
     pub fn commit_count(&self) -> usize { self.commit_count.unwrap_or(2) }
 }
 
+pub(crate) const KRON_MODEL_REVISION: &str = "kronlstm-learned-gate-biases-v1";
+
 // Keep the historical SBD revision; optional reads enter identity through their selectors.
 const SBD_MODEL_REVISION: &str = "sbd-recurrence-only-v1";
 const PREFIX_RETRIEVAL_REVISION: &str = "prefix-block-moba-own-v1";
@@ -820,23 +822,22 @@ impl Config {
         let bytes = if let Some(revision) = self.coordination_contract_revision() {
             serde_json::to_vec(&(self,target_tokens,SBD_MODEL_REVISION,
                 self.prefix_block_retrieval.as_ref().map(|_|PREFIX_RETRIEVAL_REVISION),
-                COCOMMIT_MODEL_REVISION,revision))?
+                COCOMMIT_MODEL_REVISION,revision,KRON_MODEL_REVISION))?
         } else if self.sbd.as_ref().is_some_and(|s|s.cocommit.is_some()) {
             serde_json::to_vec(&(self,target_tokens,SBD_MODEL_REVISION,
-                self.prefix_block_retrieval.as_ref().map(|_|PREFIX_RETRIEVAL_REVISION),COCOMMIT_MODEL_REVISION))?
+                self.prefix_block_retrieval.as_ref().map(|_|PREFIX_RETRIEVAL_REVISION),COCOMMIT_MODEL_REVISION,KRON_MODEL_REVISION))?
         } else if self.prefix_block_retrieval.is_some() {
             serde_json::to_vec(&(self,target_tokens,
-                self.sbd.as_ref().map(|_|SBD_MODEL_REVISION),PREFIX_RETRIEVAL_REVISION))?
+                self.sbd.as_ref().map(|_|SBD_MODEL_REVISION),PREFIX_RETRIEVAL_REVISION,KRON_MODEL_REVISION))?
         } else if self.sbd.is_some() {
-            serde_json::to_vec(&(self, target_tokens, SBD_MODEL_REVISION))?
+            serde_json::to_vec(&(self, target_tokens, SBD_MODEL_REVISION, KRON_MODEL_REVISION))?
         } else {
-            // Preserve historical causal checkpoint and metrics identities.
-            serde_json::to_vec(&(self, target_tokens))?
+            serde_json::to_vec(&(self, target_tokens, KRON_MODEL_REVISION))?
         };
         Ok(crate::data::hash(&bytes))
     }
     pub fn pilot_fingerprint(&self) -> Result<String> {
-        let mut identity = serde_json::json!({"config":self,"precision":"float32","training_algorithm":self.scan_backend.training_algorithm(),"optimizer":"AdamW"});
+        let mut identity = serde_json::json!({"config":self,"kron_model_revision":KRON_MODEL_REVISION,"precision":"float32","training_algorithm":self.scan_backend.training_algorithm(),"optimizer":"AdamW"});
         if self.sbd.is_some() {
             identity["sbd_model_revision"] = SBD_MODEL_REVISION.into();
         }
@@ -887,6 +888,20 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn learned_kron_gate_biases_change_causal_training_and_pilot_identity() {
+        let c = Config::default();
+        let legacy_training = crate::data::hash(&serde_json::to_vec(&(&c,2048usize)).unwrap());
+        assert_ne!(c.training_fingerprint(2048).unwrap(), legacy_training);
+        let expected_training = crate::data::hash(
+            &serde_json::to_vec(&(&c,2048usize,KRON_MODEL_REVISION)).unwrap());
+        assert_eq!(c.training_fingerprint(2048).unwrap(), expected_training);
+        let legacy_pilot = serde_json::json!({"config":c,"precision":"float32",
+            "training_algorithm":c.scan_backend.training_algorithm(),"optimizer":"AdamW"});
+        assert_ne!(c.pilot_fingerprint().unwrap(),
+            crate::data::hash(&serde_json::to_vec(&legacy_pilot).unwrap()));
+    }
+
     #[test]
     fn remasking_and_tct_omission_preserve_existing_identity() {
         let c = Config {task:"lm".into(),sbd:Some(SbdConfig::default()),..Config::default()};
@@ -1279,12 +1294,12 @@ mod tests {
         assert!(c.validate().is_err());
     }
     #[test]
-    fn sbd_revision_changes_only_enabled_model_fingerprints() {
+    fn sbd_revision_changes_only_enabled_model_fingerprints_with_kron_biases() {
         let causal = Config::default();
         let target_tokens = causal.train_tokens;
-        let legacy_training = |c: &Config| crate::data::hash(&serde_json::to_vec(&(c, target_tokens)).unwrap());
+        let legacy_training = |c: &Config| crate::data::hash(&serde_json::to_vec(&(c, target_tokens, KRON_MODEL_REVISION)).unwrap());
         let legacy_pilot = |c: &Config| crate::data::hash(&serde_json::to_vec(
-            &serde_json::json!({"config":c,"precision":"float32","training_algorithm":c.scan_backend.training_algorithm(),"optimizer":"AdamW"}),
+            &serde_json::json!({"config":c,"kron_model_revision":KRON_MODEL_REVISION,"precision":"float32","training_algorithm":c.scan_backend.training_algorithm(),"optimizer":"AdamW"}),
         ).unwrap());
         assert_eq!(causal.training_fingerprint(target_tokens).unwrap(), legacy_training(&causal));
         assert_eq!(causal.pilot_fingerprint().unwrap(), legacy_pilot(&causal));
@@ -1453,7 +1468,7 @@ mod tests {
         c.validate().unwrap();
         let tokens = 2048;
         let standalone = crate::data::hash(&serde_json::to_vec(&(
-            &c,tokens,SBD_MODEL_REVISION,Option::<&str>::None,COCOMMIT_MODEL_REVISION,
+            &c,tokens,SBD_MODEL_REVISION,Option::<&str>::None,COCOMMIT_MODEL_REVISION,KRON_MODEL_REVISION,
         )).unwrap());
         assert_eq!(c.coordination_contract_revision(),None);
         assert_eq!(c.training_fingerprint(tokens).unwrap(),standalone);
@@ -1463,7 +1478,7 @@ mod tests {
         assert_eq!(c.coordination_contract_revision(),Some(COORDINATED_PROVISIONAL_REVISION));
         let combined = crate::data::hash(&serde_json::to_vec(&(
             &c,tokens,SBD_MODEL_REVISION,Option::<&str>::None,
-            COCOMMIT_MODEL_REVISION,COORDINATED_PROVISIONAL_REVISION,
+            COCOMMIT_MODEL_REVISION,COORDINATED_PROVISIONAL_REVISION,KRON_MODEL_REVISION,
         )).unwrap());
         assert_eq!(c.training_fingerprint(tokens).unwrap(),combined);
         let refinement_identity = c.pilot_fingerprint().unwrap();
@@ -1474,7 +1489,7 @@ mod tests {
         assert_ne!(c.pilot_fingerprint().unwrap(),refinement_identity);
         c.sbd.as_mut().unwrap().cocommit = None;
         assert_eq!(c.coordination_contract_revision(),None);
-        let historical_tct = crate::data::hash(&serde_json::to_vec(&(&c,tokens,SBD_MODEL_REVISION)).unwrap());
+        let historical_tct = crate::data::hash(&serde_json::to_vec(&(&c,tokens,SBD_MODEL_REVISION,KRON_MODEL_REVISION)).unwrap());
         assert_eq!(c.training_fingerprint(tokens).unwrap(),historical_tct);
     }
     #[test]

@@ -217,13 +217,13 @@ pub(crate) fn checkpoint_with_tct(
         std::fs::create_dir_all(&pending)?;
         model.clone().save_file(pending.join("model.burnpack"))?;
         optim.save(pending.join("optimizer.burnpack"))?;
-        runtime::write_json(&pending.join("state.json"), state)?;
+        runtime::write_json(&pending.join("state.json"), &checkpoint::state_metadata(state)?)?;
         if let Some(chains) = tct {
             runtime::write_json(&pending.join("tct.json"), chains)?;
         }
         std::fs::rename(pending, path)?;
     } else {
-        let previous: State = serde_json::from_slice(&std::fs::read(path.join("state.json"))?)?;
+        let previous = checkpoint::load_state(path.join("state.json"))?;
         ensure!(
             previous.config_sha256 == state.config_sha256
                 && previous.data == state.data
@@ -293,7 +293,7 @@ pub fn run(
     let initial;
     let initial_trusted;
     if let Some(path) = resume {
-        let state: State = serde_json::from_slice(&std::fs::read(path.join("state.json"))?)?;
+        let state = checkpoint::load_state(path.join("state.json"))?;
         ensure!(
             state.schema == 1
                 && state.config_sha256 == fingerprint

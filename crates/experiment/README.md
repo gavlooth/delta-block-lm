@@ -433,6 +433,13 @@ A completed short command is not proof that held-out learning or architectural g
 
 ## Checkpoint/resume and artifact contract
 
+### Learned gate-bias checkpoint revision
+
+The KronLSTM parameterization includes learned beta, target and output-gate biases in every mixer layer, stored as `erase.bias`, `write.bias` and `output_gate.bias`. Training and pilot fingerprints include `kronlstm-learned-gate-biases-v1`; checkpoint `state.json` records this value in `kron_model_revision`.
+
+State/metadata loading rejects a missing or different revision with an explicit incompatibility error. Model-record loading also checks all three bias tensors and their shapes in every layer before applying the Burn record. Old KronLSTM checkpoints, including the earlier causal continuation fixtures, are intentionally incompatible: loading never silently inserts zero biases or treats the old parameterization as the new model. Historical checkpoint results below remain evidence for their original revision, not a promise that those payloads load now. Use a fresh artifact directory, pilot budget and checkpoint for the new parameterization.
+
+
 Each `ARM-seedN/` directory contains `training.jsonl`, `metrics.json`, `latest.json`, and numbered checkpoint directories. A checkpoint contains model weights, AdamW moments/step counters and `state.json`; metadata is written last. Resume validates the complete resolved configuration **and token budget**, dataset identity, arm and seed, then restores optimizer and example counters. Reusing an existing numbered destination requires exact logical model values/IDs and complete canonical optimizer state, not merely matching metadata; conflicting evidence is never overwritten or published as the latest checkpoint. Comparisons reuse validated completed metrics without model loading/evaluation and genuinely resume only matching incomplete runs. This cache preserves evidence; it does not certify that a measured outcome was numerically reliable. The explicit individual `train --resume` interface is:
 
 ```sh

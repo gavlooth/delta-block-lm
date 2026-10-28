@@ -1,6 +1,9 @@
 //! F32 KronLSTM recurrence, one 64-lane workgroup per batch/head.
 //! Each lane owns one value column. Backward replays a bounded chunk from a
 //! boundary checkpoint; it never reconstructs a state by dividing by alpha.
+//! `erase` and `write` are sigmoid-activated affine gates, including their
+//! learned per-head biases. The shared mixer projections apply those biases;
+//! this recurrence consumes the gates directly and returns their VJPs.
 use burn::backend::{TensorMetadata, ops::FloatTensorOps};
 use burn::{prelude::Shape, tensor::DType};
 use burn_cubecl::{CubeBackend, tensor::CubeTensor};

@@ -38,7 +38,10 @@ fn project<const N: usize>(input: Tensor<3>, layers: [&Linear; N]) -> [Tensor<3>
         let end = first + widths[index];
         let result = output.clone().slice([0..batch, 0..tokens, first..end]);
         first = end;
-        result
+        match &layers[index].bias {
+            Some(bias) => result + bias.val().reshape([1, 1, widths[index]]),
+            None => result,
+        }
     })
 }
 
@@ -153,8 +156,8 @@ fn compare(actual: &[f32], expected: &[f64]) -> Result<f64, String> {
     Ok(maximum)
 }
 
-/// Independent scalar-f64 dot products and analytic input/every-weight VJPs.
-/// Includes both gate-width conventions, strided input, tail widths and zeros.
+/// Independent scalar-f64 affine projections and analytic input/weight/bias VJPs.
+/// Includes learned nonzero gate offsets, strided input, tail widths and zeros.
 pub fn numerical_checks(device: &Device) -> Result<impl Serialize + use<>, String> {
     #[derive(Serialize)]
     struct Case {
@@ -166,6 +169,7 @@ pub fn numerical_checks(device: &Device) -> Result<impl Serialize + use<>, Strin
         strided_input: bool,
         max_abs_error: f64,
         all_seven_weight_and_input_gradients: bool,
+        all_gate_bias_gradients: bool,
     }
     #[derive(Serialize)]
     struct Report {
@@ -188,7 +192,13 @@ pub fn numerical_checks(device: &Device) -> Result<impl Serialize + use<>, Strin
                 chunk_size: 4,
                 ..Default::default()
             };
-            let base = config.init(&device);
+            let mut base = config.init(&device);
+            for layer in [&mut base.erase, &mut base.write, &mut base.output_gate] {
+                let bias = layer.bias.as_mut().expect("KronLSTM gate bias");
+                *bias = bias.clone().map(|x| {
+                    if zero { x } else { (x + 0.17).detach().require_grad() }
+                });
+            }
             let (batch, tokens, width) = (2, 7, config.d_model);
             // Swapping the last axes gives a genuinely strided backend input.
             let storage: Vec<f32> = (0..batch * tokens * width)
@@ -215,6 +225,7 @@ pub fn numerical_checks(device: &Device) -> Result<impl Serialize + use<>, Strin
                 &base.output_gate,
             ];
             let weights = layers.map(|layer| values(layer.weight.val()));
+            let biases = layers.map(|layer| layer.bias.as_ref().map(|bias| values(bias.val())));
             let widths = layers.map(|layer| layer.weight.dims()[1]);
             let upstream: [Vec<f32>; 7] = core::array::from_fn(|field| {
                 (0..batch * tokens * widths[field])
@@ -243,6 +254,13 @@ pub fn numerical_checks(device: &Device) -> Result<impl Serialize + use<>, Strin
                 }
                 gradient
             });
+            let expected_biases: [Vec<f64>; 7] = core::array::from_fn(|field| {
+                (0..widths[field])
+                    .map(|column| (0..batch * tokens)
+                        .map(|row| f64::from(upstream[field][row * widths[field] + column]))
+                        .sum())
+                    .collect()
+            });
             let expected_output: [Vec<f64>; 7] = core::array::from_fn(|field| {
                 (0..batch * tokens * widths[field])
                     .map(|index| {
@@ -253,7 +271,8 @@ pub fn numerical_checks(device: &Device) -> Result<impl Serialize + use<>, Strin
                                 input_values[row * width + k] as f64
                                     * weights[field][k * widths[field] + column] as f64
                             })
-                            .sum()
+                            .sum::<f64>()
+                            + biases[field].as_ref().map_or(0., |bias| f64::from(bias[column]))
                     })
                     .collect()
             });
@@ -309,6 +328,18 @@ pub fn numerical_checks(device: &Device) -> Result<impl Serialize + use<>, Strin
                         ),
                         &expected_weights[field],
                     )?);
+                    if let Some(bias) = &layers[field].bias {
+                        maximum = maximum.max(compare(
+                            &values(bias.val().grad(&grads).ok_or("missing gate bias gradient")?),
+                            &expected_biases[field],
+                        )?);
+                        if Some(bias.id) != [
+                            &base.q, &base.k, &base.v, &base.decay,
+                            &base.erase, &base.write, &base.output_gate,
+                        ][field].bias.as_ref().map(|bias| bias.id) {
+                            return Err("projection packing changed a bias parameter ID".into());
+                        }
+                    }
                     if layers[field].weight.id
                         != [
                             &base.q,
@@ -334,6 +365,7 @@ pub fn numerical_checks(device: &Device) -> Result<impl Serialize + use<>, Strin
                     strided_input: true,
                     max_abs_error: maximum,
                     all_seven_weight_and_input_gradients: true,
+                    all_gate_bias_gradients: true,
                 });
             }
         }

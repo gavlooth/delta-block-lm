@@ -581,7 +581,7 @@ fn validate_checkpoint_identity(c: &Config, arm: &Arm, seed: u64, saved: &crate:
 }
 
 pub fn checkpoint_report(c: &Config, arm: &Arm, seed: u64, device: &Device, checkpoint: &Path, with_generation: bool) -> Result<Value> {
-    let saved: crate::train::State = serde_json::from_slice(&std::fs::read(checkpoint.join("state.json"))?)?;
+    let saved = crate::checkpoint::load_state(checkpoint.join("state.json"))?;
     validate_checkpoint_identity(c,arm,seed,&saved)?;
     device.seed(seed);
     let model = crate::checkpoint::load_model(LanguageModel::new(c,arm,device)?,checkpoint.join("model.burnpack"),device)?;

@@ -1,6 +1,8 @@
 //! Cooperative key/value state partitioning: 128 or 256 lanes per batch/head.
 //! Each lane owns 16 or 8 key entries of one value column. Time remains exact
 //! and sequential; no transition summaries, floating atomics or alpha division.
+//! Like the 64-lane path, erase/write inputs already include learned gate
+//! biases and sigmoid activation from the shared mixer projections.
 use super::kron::ix;
 use cubecl::frontend::Tensor as View;
 use cubecl::prelude::*;

@@ -273,6 +273,7 @@ pub fn checkpoint_check(
         let mut model = LanguageModel::new(c, arm, &device.clone().autodiff())?;
         if let Some(path) = &source {
             let state: Value = serde_json::from_slice(&std::fs::read(path.join("state.json"))?)?;
+            checkpoint::validate_state_metadata(&state)?;
             ensure!(
                 state["config_sha256"] == contract["config_sha256"]
                     && state["data"] == identity

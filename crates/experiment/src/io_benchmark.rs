@@ -270,7 +270,7 @@ fn shape(
         training_seconds: cold_step_ms / 1000.0,
         initial_evaluation,
     };
-    let expected_state = serde_json::to_value(&state)?;
+    let expected_state = checkpoint::state_metadata(&state)?;
     let mut samples = BTreeMap::new();
     let mut comparisons = Vec::new();
     let mut peak_reserved = runtime::sampled_reserved(device);
@@ -413,6 +413,7 @@ fn shape(
             .context("atomic save differs from the retained pre-update fixture")?;
         let (loaded_state, state_ms) = timed(device, || {
             let value: Value = serde_json::from_slice(&std::fs::read(saved.join("state.json"))?)?;
+            checkpoint::validate_state_metadata(&value)?;
             ensure!(
                 value == expected_state,
                 "checkpoint config/data/counters changed"

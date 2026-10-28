@@ -127,6 +127,8 @@ pub fn run(c: &Config, config_path: &Path, device: &Device, manifest_path: &Path
         let arm = arms[entry.arm.as_str()];
         let model_path = entry.checkpoint.join("model.burnpack");
         let state_path = entry.checkpoint.join("state.json");
+        let state: Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
+        checkpoint::validate_state_metadata(&state)?;
         ensure!(
             checkpoint::file_sha256(&model_path)? == entry.checkpoint_sha256
                 && checkpoint::file_sha256(&state_path)? == entry.state_sha256,
@@ -153,7 +155,6 @@ pub fn run(c: &Config, config_path: &Path, device: &Device, manifest_path: &Path
             training_metrics["completed"] == true && training_metrics["tokens"] == target_tokens,
             "original training budget incomplete"
         );
-        let state: Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
         ensure!(
             state["config_sha256"] == source_contract["config_sha256"]
                 && state["data"] == identity

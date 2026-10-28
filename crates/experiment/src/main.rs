@@ -470,7 +470,10 @@ fn execute() -> Result<()> {
                 reference_tokens,
                 reference_objective,
             );
-            json!({"schema":1,"command":"kron-reference","passed":report.is_ok(),"device":runtime::identity(&device),"config":c,"scan_backend":selected,"tokens":reference_tokens,"objective":reference_objective,"numerical_report":report.as_ref().ok(),"error":report.as_ref().err()})
+            let gate_bias_report = delta_mixers::gate_bias_checks::numerical_checks_selected(&device, selected);
+            let errors = report.as_ref().err().into_iter().chain(gate_bias_report.as_ref().err())
+                .map(String::as_str).collect::<Vec<_>>();
+            json!({"schema":1,"command":"kron-reference","passed":report.is_ok() && gate_bias_report.is_ok(),"device":runtime::identity(&device),"config":c,"scan_backend":selected,"tokens":reference_tokens,"objective":reference_objective,"numerical_report":report.as_ref().ok(),"gate_bias_report":gate_bias_report.as_ref().ok(),"error":if errors.is_empty() {None}else{Some(errors.join("; "))}})
         }
         "kron-directional-diagnostic" => kron_benchmark::directional_diagnostic(&c, &device)?,
         "prefix-retrieval-benchmark" => prefix_retrieval::benchmark(&c,&device,

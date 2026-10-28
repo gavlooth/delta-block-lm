@@ -769,7 +769,7 @@ fn checkpoint_continuation(model: &LanguageModel, cfg: &Config, device: &Device)
     train::checkpoint(cfg,&path,&trained,&optimizer,&state)?;
     let restored = checkpoint::load_model(LanguageModel::new(cfg,&cfg.arms[0],device)?,path.join("model.burnpack"),device)?;
     let mut restored_optimizer = checkpoint::load_optimizer(cfg,path.join("optimizer.burnpack"))?;
-    let loaded_state: train::State = serde_json::from_slice(&std::fs::read(path.join("state.json"))?)?;
+    let loaded_state = checkpoint::load_state(path.join("state.json"))?;
     ensure!(loaded_state.schema == 1 && loaded_state.config_sha256 == cfg.training_fingerprint(cfg.resolved_tokens()?)? && loaded_state.arm == cfg.arms[0].name && loaded_state.seed == cfg.seed && loaded_state.step == 1 && loaded_state.tokens == 22 && loaded_state.data == state.data && loaded_state.training_seconds == state.training_seconds && loaded_state.initial_evaluation == state.initial_evaluation,"saved checkpoint run identity/counters changed");
     let loaded = compare_snapshots(&snapshot(&restored,None)?,&snapshot(&trained,None)?,true)?;
     ensure!(circuit_state(&restored)? == circuit_state(&trained)?,"loaded circuit update time/row state differs");
@@ -1011,30 +1011,22 @@ fn historical_checkpoint_compatibility(device: &Device) -> Result<Value> {
         "explicit factorized changes omitted-selector serialization or identity");
     let rejection = sbd::checkpoint_report(&dense,&dense.arms[0],dense.seed,device,&dense_directory.join("checkpoint-4"),false)
         .err().context("obsolete dense-SBD checkpoint unexpectedly resumed")?.to_string();
-    ensure!(rejection.contains("dense-attention"),"obsolete dense-SBD checkpoint failed for another reason: {rejection}");
+    ensure!(rejection.contains("without learned beta/target/output-gate biases"),
+        "obsolete dense-SBD checkpoint failed for another reason: {rejection}");
 
-    // Reuse the exact historical continuation fixture accepted by the batching turn.
+    // The learned gate biases intentionally reject the previously accepted causal fixture.
     let recorded: Value = serde_json::from_slice(&std::fs::read(artifacts.join("batching/historical/checkpoint-check.json"))?)?;
     ensure!(recorded["passed"] == true,"historical continuation evidence was not accepted");
-    let cfg: Config = serde_json::from_value(recorded["config"].clone())?;
-    ensure!(cfg.sbd.is_none(),"pinned historical causal fixture changed");
     let source = PathBuf::from(recorded["reports"][0]["source_checkpoint"].as_str().context("historical checkpoint path")?);
-    let state: train::State = serde_json::from_slice(&std::fs::read(source.join("state.json"))?)?;
-    let fingerprint = cfg.training_fingerprint(cfg.resolved_tokens()?)?;
-    ensure!(state.config_sha256 == fingerprint,"historical causal checkpoint identity changed");
-    let arm = cfg.arms.iter().find(|arm|arm.name==state.arm).context("historical checkpoint arm")?;
-    let path = source.join("model.burnpack");
-    let model = checkpoint::load_model(LanguageModel::new(&cfg,arm,device)?,&path,device)?;
-    ensure!(model.codpula.is_none(),"historical causal checkpoint acquired a circuit");
-    let optimizer_path = source.join("optimizer.burnpack");
-    let signature = checkpoint::optimizer_file_signature(&cfg,&optimizer_path)?;
-    ensure!(signature["tensors"].as_object().is_some_and(|x|!x.is_empty()),"historical checkpoint contains no optimizer moments");
-    Ok(json!({"passed":true,"fixture":source,"config":cfg,"checkpoint_step":state.step,
-        "config_sha256":fingerprint,"model_file_sha256":checkpoint::file_sha256(&path)?,
-        "optimizer_file_sha256":checkpoint::file_sha256(&optimizer_path)?,
+    let causal_rejection = checkpoint::load_state(source.join("state.json")).err()
+        .context("checkpoint without learned gate biases unexpectedly resumed")?.to_string();
+    ensure!(causal_rejection.contains("without learned beta/target/output-gate biases"),
+        "historical causal checkpoint failed for another reason: {causal_rejection}");
+    Ok(json!({"passed":true,"fixture":source,
+        "kron_model_revision":crate::config::KRON_MODEL_REVISION,
         "omitted_explicit_factorized_serialization_identical":true,
         "obsolete_dense_sbd_rejected":rejection,
-        "loaded_model_values_shapes_dtypes_and_parameter_ids_validated":true,
+        "obsolete_causal_checkpoint_rejected":causal_rejection,
         "historical_payloads_unchanged":true}))
 }
 

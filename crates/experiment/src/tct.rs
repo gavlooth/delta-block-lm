@@ -603,7 +603,7 @@ pub fn run(c: &Config, arm: &Arm, seed: u64, device: &Device, resume: Option<&Pa
     let mut chains;
     let mut previous_seconds = 0.0;
     if let Some(path) = resume {
-        let saved: train::State = serde_json::from_slice(&std::fs::read(path.join("state.json"))?)?;
+        let saved = checkpoint::load_state(path.join("state.json"))?;
         ensure!(saved.schema == 1 && saved.data == data && saved.arm == arm.name && saved.seed == seed,"TCT resume dataset, arm or seed mismatch");
         if path.join("tct.json").exists() {
             ensure!(saved.config_sha256 == fingerprint,"TCT resume training configuration mismatch");

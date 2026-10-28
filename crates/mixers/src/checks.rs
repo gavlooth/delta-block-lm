@@ -29,6 +29,7 @@ pub struct NumericalReport {
     pub layer: Vec<LayerCheck>,
     pub fused_kron: Vec<KronCheck>,
     pub fused_hola: Vec<HolaCheck>,
+    pub gate_bias: serde_json::Value,
 }
 #[derive(Debug, Serialize)]
 pub struct RecurrenceCheck {
@@ -63,6 +64,7 @@ pub struct LayerCheck {
     pub input_directional_gradient_error: f64,
     pub projection_gradient_error: f64,
     pub cache_parameter_gradient_errors: Vec<CacheParameterCheck>,
+    pub gate_bias_gradient_errors: Vec<CacheParameterCheck>,
 }
 #[derive(Debug, Serialize)]
 pub struct CacheParameterCheck {
@@ -491,6 +493,8 @@ pub fn numerical_checks(device: &Device) -> Result<NumericalReport, String> {
             )?);
         }
     }
+    let gate_bias = serde_json::to_value(crate::gate_bias_checks::numerical_checks(&device)?)
+        .map_err(|error| format!("serializing gate-bias reference report: {error}"))?;
     Ok(NumericalReport {
         precision: "f32 execution / f64 sequential analytic reference",
         absolute_tolerance: ATOL,
@@ -500,6 +504,7 @@ pub fn numerical_checks(device: &Device) -> Result<NumericalReport, String> {
         layer,
         fused_kron,
         fused_hola,
+        gate_bias,
     })
 }
 
@@ -657,7 +662,11 @@ fn layer_check(
         chunk_size: 4,
         cache_capacity: 3,
     };
-    let model = config.init(device);
+    let mut model = config.init(device);
+    for layer in [&mut model.erase, &mut model.write, &mut model.output_gate] {
+        let bias = layer.bias.as_mut().expect("KronLSTM gate bias");
+        *bias = bias.clone().map(|value| (value + 0.17).detach().require_grad());
+    }
     let data = (0..1 * 7 * 8)
         .map(|i| ((i * 3 + 1) as f64 * 0.19).sin() as f32)
         .collect::<Vec<_>>();
@@ -741,6 +750,40 @@ fn layer_check(
             dw[0]
         ));
     }
+    let mut gate_bias_errors = Vec::new();
+    for (field, (name, layer)) in [
+        ("erase.bias", &model.erase),
+        ("write.bias", &model.write),
+        ("output_gate.bias", &model.output_gate),
+    ].into_iter().enumerate() {
+        let parameter = layer.bias.as_ref().expect("learned gate bias").val();
+        let derivative = values(parameter.grad(&gradients)
+            .ok_or_else(|| format!("missing {name} gradient"))?)[0];
+        let adjust = |model: &mut crate::Mixer, amount: f64| {
+            let layer = match field {
+                0 => &mut model.erase,
+                1 => &mut model.write,
+                _ => &mut model.output_gate,
+            };
+            let parameter = layer.bias.as_mut().expect("learned gate bias");
+            let current = parameter.val();
+            let delta = Tensor::zeros(current.dims(), device)
+                .slice_assign([0..1], Tensor::full([1], amount, device));
+            *parameter = Param::from_tensor(current + delta);
+        };
+        let mut plus = inference.clone();
+        let mut minus = inference.clone();
+        adjust(&mut plus, epsilon);
+        adjust(&mut minus, -epsilon);
+        let numerical = (objective(&plus, data.clone()) - objective(&minus, data.clone()))
+            / (2. * epsilon);
+        let error = (numerical - f64::from(derivative)).abs();
+        if !derivative.is_finite() || !numerical.is_finite() || !error.is_finite()
+            || error > 3.0e-3 + 0.03 * f64::from(derivative).abs() {
+            return Err(format!("{name} gradient {kind:?}/{policy:?}: {derivative} != {numerical}"));
+        }
+        gate_bias_errors.push(CacheParameterCheck { parameter: name, absolute_error: error });
+    }
     let mut cache_errors = Vec::new();
     if let Some(cache) = &model.cache {
         for field in 0..4 {
@@ -798,6 +841,7 @@ fn layer_check(
         input_directional_gradient_error: input_error,
         projection_gradient_error: parameter_error,
         cache_parameter_gradient_errors: cache_errors,
+        gate_bias_gradient_errors: gate_bias_errors,
     })
 }
 

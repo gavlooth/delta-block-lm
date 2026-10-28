@@ -1,5 +1,15 @@
 # More-parallel fused KronLSTM scan
 
+On 2026-10-28, KronLSTM's learned beta, target and output-gate biases were
+restored from paper §2.2 Eq. (11) and its output-gate definition. They are
+zero-initialized because the paper gives no initialization recipe. The model
+revision is `kronlstm-learned-gate-biases-v1`; bias-free historical checkpoints
+are rejected. All scan widths consume the same already biased, activated
+beta/target gates, so their recurrence and custom VJPs need no ABI change.
+The output-gate bias is applied before ordinary or fused gated RMSNorm.
+The tables below remain historical evidence for the earlier parameterization,
+not performance measurements of the learned-bias revision.
+
 The baseline/paired/isolated tables below are the **pre-isolation,
 provisional sessions** retained for provenance. They used the initial shared
 shader cache and earlier build helper. The final isolated confirmation

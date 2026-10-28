@@ -945,7 +945,7 @@ fn checkpoint_training_identity(c: &Config, path: &Path, saved: &crate::train::S
 
 pub fn checkpoint_report(c: &Config, arm: &Arm, seed: u64, device: &Device, path: &Path, with_collection: bool) -> Result<Value> {
     settings(c)?;
-    let saved: crate::train::State = serde_json::from_slice(&std::fs::read(path.join("state.json"))?)?;
+    let saved = crate::checkpoint::load_state(path.join("state.json"))?;
     ensure!(saved.schema==1 && saved.arm==arm.name && saved.seed==seed,
         "remasking checkpoint schema, arm or seed changed");
     let (fingerprint,source_config_path) = checkpoint_training_identity(c,path,&saved)?;

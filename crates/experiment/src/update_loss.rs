@@ -234,10 +234,7 @@ pub fn reference(
             c,
             corpus.as_ref(),
             c.seed,
-            serde_json::from_slice::<Value>(&std::fs::read(historical.join("state.json"))?)?["step"]
-                .as_u64()
-                .ok_or_else(|| anyhow::anyhow!("checkpoint step missing"))? as usize
-                * c.batch_size,
+            checkpoint::load_state(historical.join("state.json"))?.step * c.batch_size,
             c.batch_size,
             "train",
         )?;

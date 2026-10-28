@@ -3,7 +3,7 @@
 Current local optimization results are in the root `RESULTS.md`. Fused KronLSTM and fused HOLA pass independent f64 operator checks, and the measured normalized models pass CPU parameter-gradient/update comparisons. A newly exposed legacy GPU TensorSolver gradient failure remains on the short nonzero-initial-state stress fixture; do not treat that path as an arbitrary-input numerical oracle. CPU remains the tensor reference. Explicit fused selection is recommended for new supported Vulkan experiments; historical defaults are unchanged.
 
 `delta-mixers` supplies a trainable Burn 0.22 module, not a frozen feature map.
-GDN-2 was removed on 2026-10-28 by user decision; KronLSTM is the only mixer.
+GDN-2 removed on 2026-10-28 by user decision; KronLSTM is the only mixer.
 The default configuration preserves four heads, key width 32, value width 64,
 and computational chunk length 16. Model width is independently configurable.
 Supported computational chunk sizes are 1 through 16, checked before parameter
@@ -49,6 +49,33 @@ learned Q/K/V projections, document-aware short convolutions of width four,
 channel-wise learned decay, scalar beta/c gates per head, sigmoid output gating,
 head RMS normalization and an output projection.
 
+The learned gate offsets from [Eq. (11)](https://arxiv.org/html/2610.26834#S2.E11)
+and the following output-gate definition are stored as `erase.bias` (`b_beta`),
+`write.bias` (`b_c`) and `output_gate.bias` (`b_o`). The first two have one
+entry per head; the last has one entry per head/value channel. All three are
+zero-initialized: the paper does not prescribe their initialization, so zero
+is the necessary local initialization choice, not a paper-specified recipe.
+Every separate, grouped and merged projection adds the bias before sigmoid.
+Clean, temporary noisy, cached and batched SBD paths use these same linears.
+The fused 64/128/256-lane scans consume already activated beta/c gates;
+the fused output RMSNorm consumes biased output-gate logits. Neither kernel
+applies another bias or sigmoid to beta/c. Their VJPs flow through the shared
+affine projections to all three learned offsets.
+
+The model identity is now `kronlstm-learned-gate-biases-v1`. Historical
+bias-free KronLSTM checkpoints are incompatible and must be rejected, not
+loaded with newly initialized missing parameters. Historical measurements
+below and in the root results describe the earlier parameterization unless
+their report explicitly names this revision.
+
+`gate_bias_checks::numerical_checks` independently evaluates a scalar-f64
+whole layer and finite-difference gradients at the unchanged
+`2e-5 + 3e-4 * abs(reference)` tolerance. It checks every learned bias
+coordinate, ordinary padding/resets, short tails, and reconstructed/cached/
+batched/captured-clean SBD at starts before/on/after a computational chunk
+edge, with nonzero offsets across separate/grouped/merged projections.
+The selected variant also exercises the fused scan's supported dimensions.
+
 `chunk::scan` derives a strictly lower-triangular correction system per chunk.
 Its unknowns are scalar bilinear corrections; the lower matrix is the product
 of decayed key overlap,
@@ -83,9 +110,10 @@ linears; `grouped` concatenates Q/K/decay, V/output-gate and erase/write weights
 into three temporary contractions; `merged` concatenates all seven into one.
 The dependent output projection remains separate: its input is the recurrent
 and optional cache result, not the common normalized block input. Packing uses
-Burn's differentiable concatenate/linear/slice operations. Original parameter
-names, shapes, IDs and AdamW state are unchanged; no packed parameter record,
-initializer, cached stale weight or checkpoint migration is introduced.
+Burn's differentiable concatenate/linear/slice operations plus each original
+learned gate bias. Switching projection execution preserves parameter names,
+shapes, IDs and AdamW state; no packed parameter record, cached stale weight
+or projection-specific checkpoint migration is introduced.
 Projection selection does not itself change activations or normalization.
 Nondefault selectors serialize explicitly and require a fresh run identity;
 the omitted default still serializes exactly as before. See `RESULTS.md` for

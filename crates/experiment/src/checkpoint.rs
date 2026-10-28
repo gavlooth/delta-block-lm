@@ -11,6 +11,69 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, io::Read, path::Path};
 
+const KRON_CHECKPOINT_INCOMPATIBILITY: &str =
+    "KronLSTM checkpoints without learned beta/target/output-gate biases are incompatible";
+
+pub(crate) fn state_metadata(state: &train::State) -> Result<Value> {
+    let mut value = serde_json::to_value(state)?;
+    value["kron_model_revision"] = crate::config::KRON_MODEL_REVISION.into();
+    Ok(value)
+}
+
+pub(crate) fn validate_state_metadata(value: &Value) -> Result<()> {
+    ensure!(
+        value["kron_model_revision"].as_str() == Some(crate::config::KRON_MODEL_REVISION),
+        "{KRON_CHECKPOINT_INCOMPATIBILITY}; expected model revision {}, found {}",
+        crate::config::KRON_MODEL_REVISION, value["kron_model_revision"]
+    );
+    Ok(())
+}
+
+pub(crate) fn load_state(path: impl AsRef<Path>) -> Result<train::State> {
+    let value: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    validate_state_metadata(&value)?;
+    Ok(serde_json::from_value(value)?)
+}
+
+#[derive(Default)]
+struct GateBiasShapes {
+    path: Vec<String>,
+    shapes: BTreeMap<String, Vec<usize>>,
+}
+impl ModuleVisitor for GateBiasShapes {
+    fn enter_module(&mut self, name: &str, _container_type: &str) {
+        self.path.push(name.to_owned());
+    }
+    fn exit_module(&mut self, _name: &str, _container_type: &str) {
+        self.path.pop();
+    }
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+        let name = self.path.join(".");
+        if [".mixer.erase.bias", ".mixer.write.bias", ".mixer.output_gate.bias"]
+            .iter().any(|suffix| name.ends_with(suffix)) {
+            self.shapes.insert(name, param.val().dims().to_vec());
+        }
+    }
+}
+
+fn validate_gate_biases(target: &LanguageModel, reader: Reader) -> Result<()> {
+    let mut required = GateBiasShapes::default();
+    target.visit(&mut required);
+    ensure!(required.shapes.len() == target.blocks.len()*3,
+        "KronLSTM target is missing learned beta/target/output-gate biases");
+    for tensor in reader.into_tensors()? {
+        let (name, _, shape, _, _) = tensor.into_parts()?;
+        if let Some(expected) = required.shapes.remove(&name) {
+            ensure!(shape.iter().copied().eq(expected),
+                "{KRON_CHECKPOINT_INCOMPATIBILITY}; {name} has an incompatible shape");
+        }
+    }
+    ensure!(required.shapes.is_empty(),
+        "{KRON_CHECKPOINT_INCOMPATIBILITY}; missing tensors: {:?}",
+        required.shapes.keys().collect::<Vec<_>>());
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Serialize)]
 struct TensorSignature {
     dtype: String,
@@ -106,6 +169,7 @@ pub fn load_model(
 ) -> Result<LanguageModel> {
     runtime::sync(device)?;
     let path = path.as_ref();
+    validate_gate_biases(&target, Reader::from_file(path)?)?;
     let mut model = target.try_load_file(path)?;
     if let Some(circuit) = &mut model.codpula {
         circuit.freeze_state();
@@ -178,6 +242,46 @@ pub fn file_sha256(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn kron_checkpoint_metadata_rejects_missing_or_obsolete_bias_revision() {
+        for value in [json!({}), json!({"kron_model_revision":"kronlstm-without-gate-biases"})] {
+            let error = validate_state_metadata(&value).unwrap_err().to_string();
+            assert!(error.contains(KRON_CHECKPOINT_INCOMPATIBILITY));
+        }
+        validate_state_metadata(&json!({
+            "kron_model_revision":crate::config::KRON_MODEL_REVISION
+        })).unwrap();
+    }
+
+    #[test]
+    fn kron_raw_checkpoint_requires_every_gate_bias_with_matching_shape() {
+        let device = Device::ndarray();
+        let c = Config { d_model:4, layers:1, heads:1, key_dim:2, value_dim:2, ..Config::default() };
+        let model = LanguageModel::new(&c, &c.arms[0], &device).unwrap();
+        let mut biases = GateBiasShapes::default();
+        model.visit(&mut biases);
+        assert_eq!(biases.shapes.len(), 3);
+        let make = |omit: Option<usize>, wrong_shape: bool| {
+            let tensors = biases.shapes.iter().enumerate().filter_map(|(index,(name,shape))| {
+                if omit == Some(index) { return None; }
+                let mut shape = shape.clone();
+                if wrong_shape && index == 0 { shape[0] += 1; }
+                let count = shape.iter().product::<usize>();
+                let data = TensorData::new(vec![0.0f32;count], shape);
+                let (bytes,shape,dtype) = data.into_parts();
+                Some(burn_pack::Tensor::new(name.clone(),dtype,shape,None,bytes))
+            }).collect();
+            Reader::from_bytes(burn_pack::Writer::new(tensors).into_bytes().unwrap()).unwrap()
+        };
+        validate_gate_biases(&model, make(None,false)).unwrap();
+        for missing in 0..3 {
+            let error = validate_gate_biases(&model,make(Some(missing),false)).unwrap_err().to_string();
+            assert!(error.contains(KRON_CHECKPOINT_INCOMPATIBILITY));
+        }
+        let error = validate_gate_biases(&model,make(None,true)).unwrap_err().to_string();
+        assert!(error.contains("incompatible shape"));
+    }
+
     fn record(reverse: bool, counter: u64, changed: bool) -> burn::tensor::Bytes {
         let make = |name: &str, id, values: Vec<f32>| {
             let data = TensorData::new(values, [2]);

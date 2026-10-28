@@ -4,6 +4,49 @@
 
 For historical optimized execution paths, measured speedups and legacy GPU-solver limitations, see [Early GPU kernel optimization](#early-gpu-kernel-optimization). The earlier batch-8 configuration and its combined measurements are in [Batch-8 component optimization round](#batch-8-component-optimization-round). Step 7 (oHC, wavelet mixer, three Lngram injections) is in [Step 7: oHC, wavelet and Lngram](#step-7-ohc-wavelet-and-lngram). The first sections retain the original pilot measurements.
 
+## KronLSTM-only learned-bias acceptance — 2026-10-28
+
+The current model restores the learned beta, target and output-gate biases
+from KronLSTM §2.2 Eq. (11) and the following gate definition. The paper
+does not give their initialization; all three use zero initialization.
+`kronlstm-learned-gate-biases-v1` enters training/pilot identity and checkpoint
+metadata. Raw model loading also requires each layer's three bias tensors
+with matching shapes. Earlier bias-free Kron checkpoints are rejected.
+
+Local CPU acceptance, using the existing CPU+Vulkan build features and
+NdArray execution, completed without changing any numerical tolerance:
+
+- Timed workspace/all-target compilation: exit 0 in 22.79 seconds, with
+  a 180-second command limit.
+- The first mixer run exposed three new-check failures: fixture parameter
+  replacement had not made its new tensor a gradient leaf. The independent
+  equations and tolerances were unchanged; fixture assignments were fixed
+  to retain the expected trainable leaves. A corrective all-target rebuild
+  exited 0 in 13.60 seconds.
+- Final mixer CPU tests: **19 passed, 0 failed, 1 GPU-only test ignored**,
+  exit 0 in 4.82 seconds. Kernel CPU address tests: **7 passed, 0 failed**,
+  exit 0 in 0.01 seconds.
+- `kron-reference configs/reference-cpu.json`: exit 0 in 1.27 seconds;
+  `passed: true`, 13 recurrence/state/score/continuation/gradient cases,
+  plus 48 whole-layer learned-bias reference cases. These cover ordinary,
+  reconstructed, cached, batched and captured-clean noisy execution across
+  separate/grouped/merged projections and starts 3/4/5 around chunk length 4.
+  All 10 bias coordinates in this two-head small fixture are checked in
+  every case. Maximum whole-layer output error was `1.042902405434809e-6`;
+  maximum gradient error was `1.7446377035934546e-5`, at the unchanged
+  `2e-5 + 3e-4 * abs(reference)` tolerance.
+- Three focused experiment regressions for checkpoint metadata rejection,
+  required raw bias names/shapes and changed training/pilot identity passed,
+  all exit 0.
+- Source/config/script search found no remaining removed-mixer references;
+  documentation matches describe explicitly marked history.
+
+Reference evidence: `artifacts/reference-cpu/kron-reference.json`.
+These are CPU correctness checks, not new GPU numerical, integrated
+training/generation or performance measurements. Full-suite and GPU
+acceptance remain the integrator's separate work.
+
+
 ## Scope and stopping point
 
 Implemented and exercised the active Burn workspace, causal GDN-2 and KronLSTM, optional HOLA/recency memory, soft top-k feedback, paired associative-recall experiments, and a tiny causal language-model comparison. The Steps 1–6 sections below predate Step 7. Step 8 includes selected HOLA in-block reads; Step 9 adds Codpula joint output; Step 10 adds CoCommit; Step 11 implements remasking, energy fitting and TCT with separate standalone evidence in `artifacts/remasking/`. Composition was published on main as `9e67b7ac` before full combined acceptance. Its actual failed collection and unexecuted fitting/guided/TCT/B8 commands are recorded in [integrated11 publication checkpoint](#integrated11-publication-checkpoint). No quality conclusion follows from any command smoke. Earlier dense-attention measurements remain historical.

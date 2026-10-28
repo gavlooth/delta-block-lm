@@ -2,7 +2,7 @@
 //! See `README.md` for recurrence equations, reference provenance and check commands.
 //! Training explicitly selects the tensor solver or an opt-in fused GPU scan.
 //! The default remains the differentiable tensor solver until paired measurements.
-use burn::module::{Module, Param};
+use burn::module::{Initializer, Module, Param};
 use burn::nn::{Linear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::prelude::*;
 use burn::tensor::{
@@ -15,6 +15,7 @@ mod cache_reference;
 pub mod checks;
 pub mod chunk;
 pub mod convolution;
+pub mod gate_bias_checks;
 pub use convolution::ConvolutionBackend;
 mod hola;
 pub mod prefix_retrieval;
@@ -196,6 +197,13 @@ impl MixerConfig {
         let kw = self.heads * self.key_dim;
         let vw = self.heads * self.value_dim;
         let linear = |i, o| LinearConfig::new(i, o).with_bias(false).init(device);
+        // Eq. 11 and the output-gate definition require learned offsets.
+        // The paper gives no bias initializer; zeros preserve neutral initial gates.
+        let gate = |i, o| {
+            let mut layer = linear(i, o);
+            layer.bias = Some(Initializer::Zeros.init([o], device));
+            layer
+        };
         let conv = |channels| {
             Param::from_tensor(Tensor::random(
                 [4, channels],
@@ -208,9 +216,9 @@ impl MixerConfig {
             k: linear(self.d_model, kw),
             v: linear(self.d_model, vw),
             decay: linear(self.d_model, kw),
-            erase: linear(self.d_model, self.heads),
-            write: linear(self.d_model, self.heads),
-            output_gate: linear(self.d_model, vw),
+            erase: gate(self.d_model, self.heads),
+            write: gate(self.d_model, self.heads),
+            output_gate: gate(self.d_model, vw),
             output: linear(vw, self.d_model),
             q_conv: conv(kw),
             k_conv: conv(kw),
