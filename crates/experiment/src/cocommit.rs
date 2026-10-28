@@ -195,7 +195,7 @@ pub(super) fn training_loss_sampled_profiled<P:Sections>(model:&LanguageModel,c:
     if model.codpula.is_some() {
         ensure!(rows.iter().all(|row| row.weight.iter().all(|&w| w == 1.0)),"Codpula joint event loss requires unit valid target weights");
     }
-    let mut trace = CleanInputs::default();
+    let mut trace = CleanInputs::new(blocks.iter().filter(|block|block.masked.len()>1).map(|block|block.start+1));
     let clean_logits = model.forward_profiled(batch,&mut trace);
     let [batch_size,sequence_length,_] = clean_logits.dims();
     let denominator = (batch_size*sequence_length) as f64;
@@ -266,7 +266,7 @@ pub(super) fn training_loss_sampled_profiled<P:Sections>(model:&LanguageModel,c:
 
 pub(super) fn prepare_clean_cache(model: &LanguageModel, prefix: &[i32], device: &Device) -> TrainingCache {
     assert!(!prefix.is_empty());
-    let mut trace = CleanInputs::default();
+    let mut trace = CleanInputs::new([prefix.len()]);
     let _ = model.forward_profiled(&sbd::prefix_batch(prefix,device),&mut trace);
     model.training_cache(&trace,0,&[prefix.len()])
 }

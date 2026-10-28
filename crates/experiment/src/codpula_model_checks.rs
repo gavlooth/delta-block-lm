@@ -831,9 +831,9 @@ fn evaluation_and_generation(model: &LanguageModel, cfg: &Config, device: &Devic
     let generated = sbd::generate(model,&cfg,&[256,65,66],device)?;
     let repeated = sbd::generate(model,&cfg,&[256,65,66],device)?;
     ensure!(generated["tokens"] == repeated["tokens"],"seeded joint generation is not repeatable");
-    ensure!(generated["finalized_tokens"] == 5 && generated["causally_replayed_tokens"] == 5 && generated["commit_rule"] == "dependence","joint generation did not complete/replay every requested position");
+    ensure!(generated["finalized_tokens"] == 5 && generated["clean_history_appended_tokens"] == 5 && generated["commit_rule"] == "dependence","joint generation did not finalize/append every requested position");
     ensure!(generated["tokens"].as_array().context("generated token list")?.iter().all(|x|x.as_u64().is_some_and(|x|x<VOCAB as u64)),"joint generation leaves the full output vocabulary");
-    Ok(json!({"passed":true,"evaluation":evaluation,"generation_tokens":generated["tokens"],"generation_passes":generated["denoising_passes"],"seeded_repeat_identical":true,"all_requested_tokens_finalized_and_causally_replayed":true}))
+    Ok(json!({"passed":true,"evaluation":evaluation,"generation_tokens":generated["tokens"],"generation_passes":generated["denoising_passes"],"seeded_repeat_identical":true,"all_requested_tokens_finalized_and_appended":true}))
 }
 
 struct RolloutRound {
