@@ -4,6 +4,12 @@
 
 **Implemented, 2026-10-25.** R²D, stochastic mask-set energy training and TCT are implemented behind explicit selectors. Section9 records the director's decisions; section14 records numerical gates, command smokes and execution costs. Earlier arithmetic estimates are not measurements.
 
+Training writes the source `metrics.json` before SBD diagnostics or generation.
+End-of-training generation is explicitly skipped when refinement is selected:
+the energy must first be fitted to that checkpoint. Run `remask-collect`,
+`energy-fit`, then `remask-generate`; guided generation still rejects a missing
+energy rather than silently using uniform masks.
+
 The research question is whether **learning where to perturb, while still sampling**, improves refinement at equal work. It is not whether token confidence predicts an error. A confident wrong token remains eligible. An energy head predicts the usefulness of a *set to remask*, not the probability of the current text, and not a deterministic token replacement score.
 
 **Authorized scope:** implement the selected mechanism, its actual training commands, correctness gates, tiny context-32 end-to-end smokes and execution optimization. Every earlier discussion below of quality comparisons, extra arms, sweeps, calibration grids, budget curves, hard-mask alternatives, separate paper-reference training, or policy-transfer studies is **not authorized**. Those passages explain source distinctions only; they are not an execution plan. Fixed-call trajectories are authorized solely as the equal-work energy-training recipe. Only execution-layout comparisons with unchanged mathematics are authorized for timing.

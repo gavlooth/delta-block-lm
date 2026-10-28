@@ -446,10 +446,6 @@ pub fn run(
         "byte_associative_retrieval_diagnostic":retrieval,
         "warm_decode_latency_ms":decode_ms,"decode_method":"next-token logits by full causal-prefix recomputation, context fixed; no incremental-state optimization",
         "checkpoint":checkpoint_path});
-    if c.sbd.is_some() {
-        metrics["sbd_validation"] = crate::sbd::evaluate(&model,c,&validation,device)?;
-        metrics["sbd_generation"] = crate::sbd::generate(&model,c,&validation[0].input[..validation[0].input.len().min(17)],device)?;
-    }
     metrics["initial_validation"] = initial;
     metrics["initial_validation_trusted"] = json!(initial_trusted);
     metrics["initial_validation_provenance"] = json!(if initial_trusted {
@@ -457,6 +453,16 @@ pub fn run(
     } else {
         "historical checkpoint baseline; certify a regenerated baseline before learning claims"
     });
+    // Collection and warm-start consume this source record before an energy can exist.
+    runtime::write_json(&run_dir.join("metrics.json"), &metrics)?;
+    if let Some(sbd) = &c.sbd {
+        metrics["sbd_validation"] = crate::sbd::evaluate(&model,c,&validation,device)?;
+        metrics["sbd_generation"] = if sbd.refinement.is_some() {
+            json!({"performed":false,"reason":"refinement generation is separate: run remask-collect, energy-fit, then remask-generate with this checkpoint"})
+        } else {
+            crate::sbd::generate(&model,c,&validation[0].input[..validation[0].input.len().min(17)],device)?
+        };
+    }
     runtime::write_json(&run_dir.join("metrics.json"), &metrics)?;
     Ok(metrics)
 }
@@ -810,6 +816,51 @@ pub fn compare(c: &Config, device: &Device, decision: bool) -> Result<Value> {
 #[cfg(test)]
 mod summary_tests {
     use super::*;
+    #[test]
+    fn pairwise_training_writes_source_metrics_without_an_energy() {
+        let root = std::env::temp_dir().join(format!("delta-source-metrics-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut documents = Vec::new();
+        for (split, text) in [("train", "training bytes for the tiny model"), ("validation", "held out validation bytes"), ("test", "separate final test bytes")] {
+            let path = format!("{split}.txt");
+            std::fs::write(root.join(&path), text).unwrap();
+            documents.push(json!({"id":split,"split":split,"path":path,"sha256":data::hash(text.as_bytes())}));
+        }
+        let manifest = root.join("corpus.json");
+        runtime::write_json(&manifest, &json!({"tokenizer":"utf8-bytes-v1-bos256","documents":documents})).unwrap();
+        let mut c = Config::default();
+        c.task = "lm".into();
+        c.backend = "cpu".into();
+        c.corpus_manifest = manifest;
+        c.artifact_dir = root.join("runs");
+        c.d_model = 8;
+        c.layers = 1;
+        c.heads = 1;
+        c.key_dim = 2;
+        c.value_dim = 2;
+        c.chunk_size = 4;
+        c.context = 8;
+        c.train_tokens = 8;
+        c.eval_examples = 1;
+        c.sbd = Some(crate::config::SbdConfig {
+            block_lengths: vec![2],
+            refinement: Some(crate::remask::RefinementConfig {
+                policy: crate::mask_energy::MaskPolicy::Pairwise,
+                energy_path: Some(root.join("missing-energy.burnpack")),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let result = run(&c, &c.arms[0], 1, &Device::ndarray(), None).unwrap();
+        assert_eq!(result["completed"], true);
+        assert_eq!(result["sbd_generation"]["performed"], false);
+        let source = root.join("runs").join(format!("{}-seed1", c.arms[0].name)).join("metrics.json");
+        let saved: Value = serde_json::from_slice(&std::fs::read(source).unwrap()).unwrap();
+        assert_eq!(saved["config"], serde_json::to_value(&c).unwrap());
+        assert!(std::path::Path::new(saved["checkpoint"].as_str().unwrap()).join("state.json").exists());
+        assert!(!root.join("missing-energy.burnpack").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn chance_recall_cannot_recommend_architecture_even_when_nll_improves() {
         let mut c = Config::default();
