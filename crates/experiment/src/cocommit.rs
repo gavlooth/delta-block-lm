@@ -197,14 +197,10 @@ pub(super) fn training_loss_sampled_profiled<P:Sections>(model:&LanguageModel,c:
     let [batch_size,sequence_length,_] = clean_logits.dims();
     let denominator = (batch_size*sequence_length) as f64;
     let device = clean_logits.device();
-    let mut loss = model.loss(clean_logits.clone(),batch)
-        + model.sbd_mask.as_ref().unwrap().val().sum()*0.0
-        + model.cocommit_marker.as_ref().unwrap().val().sum()*0.0;
-    if let Some(circuit) = &model.codpula {
-        loss = loss + circuit.gate_head.weight.val().sum()*0.0;
-        if let Some(bias) = &circuit.gate_head.bias { loss = loss + bias.val().sum()*0.0; }
-    }
-    let mut result = SbdTrainingResult { loss, circuit_flows: None };
+    let loss = model.loss(clean_logits.clone(),batch);
+    let mut result = SbdTrainingResult { loss, circuit_flows: None,
+        unused_parameters: model::unused_denoising_parameters(blocks.iter().any(|b| b.masked.len() > 1),
+            bundles.iter().any(|bundle| bundle.iter().any(|&marked| marked))) };
     let teacher_model=(s.feedback==SbdFeedback::SoftFeedback && blocks.iter().any(|block|block.masked.len()>1)).then(||model.valid());
     for block in blocks.iter().filter(|block|block.masked.len()==1) {
         let logits = clean_logits.clone().slice([block.row..block.row+1,block.start..block.start+1,0..c.vocab()]);

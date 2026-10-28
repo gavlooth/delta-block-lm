@@ -551,58 +551,130 @@ pub fn checked_gradients_profiled<P: Sections>(
     check_parameter_gradients(model, &grads, profile)?;
     Ok(grads)
 }
+/// Draw-specific exceptions are exact parameter paths, never a blanket exemption.
+pub(crate) fn unused_denoising_parameters(noisy: bool, marked: bool) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    if !noisy {
+        names.extend(["sbd_mask", "codpula.gate_head.weight", "codpula.gate_head.bias"]);
+    }
+    if !marked { names.push("cocommit_marker"); }
+    names
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct GradientCount {
+    pub nonzero_steps: usize,
+    pub zero_steps: usize,
+    pub missing_steps: usize,
+}
+pub(crate) type GradientReport = std::collections::BTreeMap<String, GradientCount>;
+pub(crate) fn accumulate_gradient_report(total: &mut GradientReport, current: GradientReport) {
+    for (name, count) in current {
+        let entry = total.entry(name).or_default();
+        entry.nonzero_steps += count.nonzero_steps;
+        entry.zero_steps += count.zero_steps;
+        entry.missing_steps += count.missing_steps;
+    }
+}
+pub(crate) fn checked_gradients_with_unused<P: Sections>(
+    model: &LanguageModel, loss: Tensor<1>, unused: &[&str], profile: &mut P,
+) -> Result<(GradientsParams, GradientReport)> {
+    let grads = profile.section("Backward (total only)", || GradientsParams::from_grads(loss.backward(), model));
+    let report = check_parameter_gradients_with_unused(model, &grads, unused, profile)?;
+    Ok((grads, report))
+}
 pub(super) fn check_parameter_gradients<P: Sections>(
-    model: &LanguageModel,
-    grads: &GradientsParams,
-    profile: &mut P,
+    model: &LanguageModel, grads: &GradientsParams, profile: &mut P,
 ) -> Result<()> {
+    check_parameter_gradients_with_unused(model, grads, &[], profile).map(|_| ())
+}
+pub(crate) fn check_parameter_gradients_with_unused<P: Sections>(
+    model: &LanguageModel, grads: &GradientsParams, unused: &[&str], profile: &mut P,
+) -> Result<GradientReport> {
     struct Check<'a> {
         grads: &'a GradientsParams,
-        missing: usize,
+        path: Vec<String>,
+        names: Vec<String>,
+        missing: Vec<String>,
         norms: Vec<Tensor<1>>,
         backend: UpdateBackend,
     }
     impl ModuleVisitor for Check<'_> {
+        fn enter_module(&mut self, name: &str, _: &str) { self.path.push(name.to_owned()); }
+        fn exit_module(&mut self, _: &str, _: &str) { self.path.pop(); }
         fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
             if !param.val().is_require_grad() { return; }
+            let name = self.path.join(".");
             if let Some(g) = self.grads.get::<D>(param.id) {
-                // A squared sum catches NaN and overflow; reduce once on device per parameter.
+                self.names.push(name);
                 self.norms.push(if self.backend.is_tensor() {
                     g.square().sum()
                 } else {
                     crate::update::square_sum(g)
                 });
             } else {
-                self.missing += 1;
+                self.missing.push(name);
             }
         }
     }
-    let total = profile.section("Gradient checks: reductions", || -> Result<Tensor<1>> {
-        let mut check = Check {
-            grads,
-            missing: 0,
-            norms: Vec::new(),
-            backend: model.update_backend,
-        };
-        model.visit(&mut check);
-        ensure!(
-            check.missing == 0,
-            "{} trainable parameters have no gradient: refusing partial/readout-only training",
-            check.missing
-        );
-        Ok(Tensor::cat(check.norms, 0).sum())
-    })?;
-    let finite = profile
-        .section("Host/device: gradient norm readback", || scalar(total))
-        .is_ok();
-    ensure!(finite, "nonfinite parameter gradients");
-    Ok(())
+    let mut check = Check { grads, path: Vec::new(), names: Vec::new(),
+        missing: Vec::new(), norms: Vec::new(), backend: model.update_backend };
+    profile.section("Gradient checks: reductions", || model.visit(&mut check));
+    let unexpected = check.missing.iter().filter(|name| !unused.contains(&name.as_str())).collect::<Vec<_>>();
+    ensure!(unexpected.is_empty(), "trainable parameters have no gradient: {unexpected:?}; refusing partial/readout-only training");
+    let mut report = GradientReport::new();
+    for name in check.missing { report.insert(name, GradientCount { missing_steps: 1, ..Default::default() }); }
+    if !check.norms.is_empty() {
+        let norms = profile.section("Host/device: gradient norm readback", || {
+            Tensor::cat(check.norms, 0).into_data().try_to_vec::<f32>()
+        }).map_err(|e| anyhow::anyhow!("reading gradient norms: {e:?}"))?;
+        for (name, norm) in check.names.into_iter().zip(norms) {
+            ensure!(norm.is_finite(), "nonfinite parameter gradients: {name}");
+            report.insert(name, GradientCount { nonzero_steps: usize::from(norm > 0.0),
+                zero_steps: usize::from(norm == 0.0), missing_steps: 0 });
+        }
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::data;
+
+    #[test]
+    fn unused_denoising_list_does_not_hide_disconnected_backbone() {
+        let mut c = Config::default();
+        c.d_model = 8;
+        c.layers = 1;
+        let model = LanguageModel::new(&c, &c.arms[0], &Device::ndarray().autodiff()).unwrap();
+        let error = checked_gradients_with_unused(&model, model.head.weight.val().sum(),
+            &unused_denoising_parameters(false, false), &mut Unprofiled).unwrap_err();
+        assert!(error.to_string().contains("embedding.weight"));
+        assert!(error.to_string().contains("refusing partial"));
+    }
+
+    #[test]
+    fn singleton_draw_reports_missing_mask_instead_of_fabricating_gradient() {
+        let mut c = Config::default();
+        c.task = "lm".into();
+        c.context = 8;
+        c.d_model = 8;
+        c.layers = 1;
+        c.sbd = Some(crate::config::SbdConfig { block_lengths: vec![1], ..Default::default() });
+        let device = Device::ndarray().autodiff();
+        let model = LanguageModel::new(&c, &c.arms[0], &device).unwrap();
+        let rows = vec![data::Example { input: vec![256,1,2,3,4,5,6,7],
+            target: vec![1,2,3,4,5,6,7,8], weight: vec![1.0;8], groups: vec![None;8] }];
+        let result = crate::sbd::training_loss(&model, &c, &rows, &Batch::new(&rows,&device), 1).unwrap();
+        let (grads, report) = checked_gradients_with_unused(&model, result.loss,
+            &result.unused_parameters, &mut Unprofiled).unwrap();
+        assert!(grads.get::<1>(model.sbd_mask.as_ref().unwrap().id).is_none());
+        assert_eq!(report["sbd_mask"].missing_steps, 1);
+        assert_eq!(report["sbd_mask"].zero_steps, 0);
+        assert_eq!(report["head.weight"].nonzero_steps, 1);
+        assert!(check_parameter_gradients(&model, &grads, &mut Unprofiled).is_err());
+    }
 
     struct Parameters(Vec<Vec<f32>>);
     impl ModuleVisitor for Parameters {

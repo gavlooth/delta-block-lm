@@ -15,6 +15,7 @@ pub(crate) struct Backward {
     pub circuit_flows: Option<CircuitFlows>,
     pub passes: usize,
     pub rows_per_pass: usize,
+    pub gradient_report: model::GradientReport,
 }
 
 pub(crate) fn backward(
@@ -41,13 +42,14 @@ pub(crate) fn backward_profiled<P: Sections>(
     if rows_per_pass == rows.len() {
         let result = sbd::training_loss_profiled(model, c, rows, batch, seed, profile)?;
         let loss = model::scalar(result.loss.clone())?;
-        let gradients = model::checked_gradients_profiled(model, result.loss, profile)?;
+        let (gradients, gradient_report) = model::checked_gradients_with_unused(model, result.loss, &result.unused_parameters, profile)?;
         return Ok(Backward {
             loss,
             gradients,
             circuit_flows: result.circuit_flows,
             passes: 1,
             rows_per_pass,
+            gradient_report,
         });
     }
 
@@ -59,6 +61,7 @@ pub(crate) fn backward_profiled<P: Sections>(
     let mut circuit_flows = None::<CircuitFlows>;
     let mut loss = 0.0;
     let mut passes = 0;
+    let mut unused_parameters: Option<Vec<&str>> = None;
 
     for row_start in (0..rows.len()).step_by(rows_per_pass) {
         let row_end = (row_start + rows_per_pass).min(rows.len());
@@ -87,6 +90,11 @@ pub(crate) fn backward_profiled<P: Sections>(
             pass_bundles.as_deref(),
             profile,
         )?;
+        if let Some(unused) = &mut unused_parameters {
+            unused.retain(|name| pass.unused_parameters.contains(name));
+        } else {
+            unused_parameters = Some(pass.unused_parameters);
+        }
         let scale = pass_rows.len() as f64 / rows.len() as f64;
         loss += model::scalar(pass.loss.clone())? * scale;
         accumulator.accumulate(
@@ -104,12 +112,13 @@ pub(crate) fn backward_profiled<P: Sections>(
     }
 
     let gradients = accumulator.grads();
-    model::check_parameter_gradients(model, &gradients, profile)?;
+    let gradient_report = model::check_parameter_gradients_with_unused(model, &gradients, &unused_parameters.unwrap_or_default(), profile)?;
     Ok(Backward {
         loss,
         gradients,
         circuit_flows,
         passes,
         rows_per_pass,
+        gradient_report,
     })
 }
