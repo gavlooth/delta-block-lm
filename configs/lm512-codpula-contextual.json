@@ -32,7 +32,7 @@
   "wavelet_backend": "fused_gpu",
   "lngram_layers": [0,1,2],
   "lngram_orders": [2,3],
-  "lngram_routes": 32,
+  "lngram_routes": 64,
   "lngram_bits": 4,
   "lngram_memory_dim": 8,
   "lngram_backend": "fused_gpu",

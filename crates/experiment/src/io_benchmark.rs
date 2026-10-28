@@ -250,7 +250,7 @@ fn shape(
     let (base, cold_step_ms) = timed(device, || step(c, initial, &mut optimizer, &resident))?;
     let before_signature = checkpoint::optimizer_signature(c, optimizer.into_bytes()?)?;
     let base_path = directory.join("resident-base.burnpack");
-    base.clone().save_file(&base_path)?;
+    checkpoint::save_model(&base, &base_path)?;
     checkpoint::validate_model(&base, &base_path)
         .context("resident base serialization self-check before any comparison")?;
     ensure!(
@@ -388,14 +388,14 @@ fn shape(
                 if parameters["passed"] != true || optimizer_state["passed"] != true {
                     let actual_path =
                         directory.join(format!("continuation-{mode}-{iteration}.burnpack"));
-                    updated.clone().save_file(&actual_path)?;
+                    checkpoint::save_model(&updated, &actual_path)?;
                     anyhow::bail!(
                         "iteration {iteration}, {mode}: recomputed next step exceeds numerical tolerance; comparison and actual record retained"
                     );
                 }
                 mode_comparisons.push(comparison);
             } else {
-                updated.clone().save_file(&reference_path)?;
+                checkpoint::save_model(&updated, &reference_path)?;
                 checkpoint::validate_model(&updated, &reference_path)
                     .with_context(|| format!("iteration {iteration}, {mode}: continuation reference serialization self-check"))?;
                 mode_comparisons.push(

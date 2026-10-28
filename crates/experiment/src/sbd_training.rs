@@ -56,7 +56,7 @@ struct BatchedLngramCache {
 impl BatchedLngramCache {
     fn new(lngram: &delta_mixers::lngram::Lngram, input: Tensor<3>, blocks: &[(usize,usize)]) -> Self {
         let history = lngram.orders.iter().copied().max().unwrap()-1
-            + lngram.smoothing.as_ref().map_or(0,|s|2*s.dilation);
+            + lngram.smoothing.as_ref().map_or(0,|s|3*s.dilation);
         if history == 0 {
             return Self {history:None};
         }
@@ -210,7 +210,7 @@ impl LanguageModel {
         let d = self.embedding.weight.val().dims()[1];
         let lngram_forward = |lngram: &delta_mixers::lngram::Lngram, input: Tensor<3>, clean: &Tensor<3>, start: usize| {
             let history = start.min(lngram.orders.iter().copied().max().unwrap()-1
-                + lngram.smoothing.as_ref().map_or(0,|s|2*s.dilation));
+                + lngram.smoothing.as_ref().map_or(0,|s|3*s.dilation));
             let combined = Tensor::cat(vec![clean.clone().slice([0..rows,start-history..start,0..d]),input],1);
             let layout = delta_mixers::lngram::LngramLayout::new(
                 Tensor::ones([rows,history+n],&device),Tensor::zeros([rows,history+n],&device));

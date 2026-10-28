@@ -826,7 +826,7 @@ fn training_equivalence(c:&Config,device:&Device)->Result<Value> {
         cfg.association_counts=vec![1];
         cfg.ohc_streams=true;cfg.ohc_backend=delta_mixers::ohc::OhcBackend::Tensor;
         cfg.wavelet_layers=vec![0,1,2];cfg.lngram_layers=vec![0,1,2];
-        cfg.lngram_routes=2;cfg.lngram_bits=1;cfg.lngram_memory_dim=2;
+        cfg.lngram_routes=cfg.d_model;cfg.lngram_bits=1;cfg.lngram_memory_dim=2;
         cfg.lngram_orders=vec![2,3];
         cfg.sbd=Some(SbdConfig{block_lengths:vec![4],feedback,
             block_execution:crate::config::SbdBlockExecution::Batched,in_block_reads:InBlockReads::HolaRead,

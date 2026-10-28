@@ -70,6 +70,16 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
     };
     for backend in backends {
         direct_strided_smoothing(&mut report, backend, &device)?;
+        // Three db10 levels reach exactly 1 + 19*(1+2+4) = 134 positions.
+        let mut impulse = vec![0.0; 136];
+        impulse[0] = 1.0;
+        let support = undecimated_bands(upload(&impulse, [1,136,1], &device),
+            Tensor::ones([1,136], &device), Tensor::ones([1,136], &device), 3, backend);
+        assert_eq!(support.len(), 4);
+        let coarse = values(support[0].clone());
+        if coarse[133] == 0.0 || coarse[134..].iter().any(|&x| x != 0.0) {
+            return Err("J3 coarse band must have exactly 134-position causal support".into());
+        }
         for case in 0..4 {
             let shape = Shape {
                 documents: if case == 3 {
@@ -80,7 +90,7 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
                 tokens: if case == 3 { 317 } else { 31 },
                 d: 8,
                 groups: 2,
-                levels: 4,
+                levels: 3,
             };
             let [b, t, d] = [shape.documents.len(), shape.tokens, shape.d];
             let mut rng = Rng::new(741 + case);
@@ -96,7 +106,7 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
             let valid_t = upload(&valid, [b, t], &device);
             let reset_t = upload(&reset, [b, t], &device);
             let docs = (reset_t.clone() * valid_t.clone()).cumsum(1);
-            let module = WaveletDyn::new(d, 4, 2, backend, &device);
+            let module = WaveletDyn::new(d, 3, 2, backend, &device);
             let weights = Weights {
                 input: wide(module.input.weight.val()),
                 gate: wide(module.gate.weight.val()),
@@ -104,6 +114,9 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
                 value: wide(module.value.weight.val()),
                 output: wide(module.output.weight.val()),
             };
+            close(&mut report, "initial gate bias probabilities",
+                &weights.gate_bias.iter().map(|b| (1.0 / (1.0 + (-b).exp())) as f32).collect::<Vec<_>>(),
+                &[0.88,0.88,0.12,0.12,0.12,0.12,0.12,0.12])?;
             let u = (0..shape.rows() * d)
                 .map(|i| {
                     if valid[i / d] == 0. {
@@ -191,10 +204,11 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
                 upload(&clean, [b, t, d], &device),
                 valid_t.clone(),
                 docs,
-                4,
+                3,
                 backend,
             );
             let expected_bands = reference::bands(&shape, &clean);
+            assert_eq!(bands.len(), 4, "WNet-Dyn J3 has [A3,D3,D2,D1]");
             let mut sum = vec![0f32; u.len()];
             for (band, want) in bands.into_iter().zip(expected_bands) {
                 let band = values(band);

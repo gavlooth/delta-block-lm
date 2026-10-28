@@ -684,12 +684,7 @@ fn checkpoint_cost(c: &Config, runner: &Runner, device: &Device, dir: &Path) -> 
     std::fs::create_dir_all(dir)?;
     runtime::sync(device)?;
     let clock = Instant::now();
-    runner
-        .model
-        .as_ref()
-        .unwrap()
-        .clone()
-        .save_file(dir.join("model.burnpack"))?;
+    checkpoint::save_model(runner.model.as_ref().unwrap(), dir.join("model.burnpack"))?;
     runner.optim.save(dir.join("optimizer.burnpack"))?;
     runtime::sync(device)?;
     let save = clock.elapsed().as_secs_f64() * 1000.;

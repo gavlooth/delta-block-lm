@@ -73,7 +73,7 @@ pub enum SurrogateGradient {
     LocalExpectation,
 }
 
-/// Configuration of one Lngram module. Defaults are the spec §3.3 / §13 values.
+/// Configuration of one Lngram module; routing partitions all model channels (paper §2.2).
 #[derive(Config, Debug)]
 pub struct LngramConfig {
     #[config(default = "LngramBackend::Tensor")]
@@ -81,8 +81,8 @@ pub struct LngramConfig {
     /// Width of the input and output features.
     #[config(default = 512)]
     pub d_model: usize,
-    /// Number of discrete routes `R`.
-    #[config(default = 64)]
+    /// Number of discrete routes `R = d_model / bits_per_route`; zero derives it.
+    #[config(default = 0)]
     pub routes: usize,
     /// Bits per route `m`; each route symbol takes `K = 2^m` values.
     #[config(default = 4)]
@@ -93,7 +93,7 @@ pub struct LngramConfig {
     /// N-gram orders, one table each.
     #[config(default = "vec![2, 3]")]
     pub orders: Vec<usize>,
-    /// Depthwise 3-tap causal smoothing of the readout (`Y = V + SiLU(conv(RMSNorm(V)))`).
+    /// Depthwise 4-tap causal smoothing of the readout (`Y = V + SiLU(conv(RMSNorm(V)))`).
     #[config(default = true)]
     pub smoothing: bool,
     /// Distance between smoothing taps; `None` uses the largest order, as the paper's dilation.
@@ -125,9 +125,18 @@ impl LngramConfig {
         1 << self.bits_per_route
     }
 
+    pub fn routes(&self) -> usize {
+        assert!(self.bits_per_route > 0 && self.d_model > 0 && self.d_model % self.bits_per_route == 0,
+            "Lngram d_model must be positive and divisible by bits_per_route");
+        let routes = self.d_model / self.bits_per_route;
+        assert!(self.routes == 0 || self.routes == routes,
+            "Lngram routes must equal d_model / bits_per_route");
+        routes
+    }
+
     /// Rows of the table for `order`: `R · K^order`.
     pub fn table_rows(&self, order: usize) -> usize {
-        self.routes * self.alphabet().pow(order as u32)
+        self.routes() * self.alphabet().pow(order as u32)
     }
 
     pub fn init(&self, device: &Device) -> Lngram {
@@ -169,7 +178,7 @@ impl LngramConfig {
                 .init(device)
         };
         let projection = || {
-            let mut linear = LinearConfig::new(self.routes * self.memory_dim, self.d_model)
+            let mut linear = LinearConfig::new(self.routes() * self.memory_dim, self.d_model)
                 .with_initializer(weights.clone())
                 .init(device);
             linear.bias = Some(Initializer::Zeros.init([self.d_model], device));
@@ -177,13 +186,13 @@ impl LngramConfig {
         };
         let smoothing = self.smoothing.then(|| Smoothing {
             norm: norm(),
-            weight: Initializer::Zeros.init([3, self.d_model], device),
+            weight: Initializer::Zeros.init([4, self.d_model], device),
             dilation: self.smoothing_dilation.unwrap_or(sorted[sorted.len() - 1]),
         });
         Lngram {
             backend: self.backend,
             discretizer_norm: norm(),
-            discretizer: LinearConfig::new(self.d_model, self.routes * self.bits_per_route)
+            discretizer: LinearConfig::new(self.d_model, self.d_model)
                 .with_bias(false)
                 .with_initializer(weights.clone())
                 .init(device),
@@ -202,7 +211,7 @@ impl LngramConfig {
             key_norm: norm(),
             smoothing,
             orders: self.orders.clone(),
-            routes: self.routes,
+            routes: self.routes(),
             bits_per_route: self.bits_per_route,
             memory_dim: self.memory_dim,
             surrogate: self.surrogate,
@@ -219,7 +228,7 @@ pub struct Lngram {
     pub backend: LngramBackend,
     /// RMSNorm in front of the discretizer (paper: `U = RMSNorm(H)`).
     pub discretizer_norm: RmsNorm,
-    /// `W_q: [d_model, routes · bits_per_route]`, no bias.
+    /// Square `W_q: [d_model, d_model]`, partitioned into `routes · bits_per_route` channels, no bias.
     pub discretizer: Linear,
     /// One table per entry of `orders`, `[routes · K^n, memory_dim]`, row `g = r·K^n + Σ_i a_{t−n+1+i,r} K^i`.
     pub tables: Vec<Embedding>,
@@ -242,12 +251,12 @@ pub struct Lngram {
     pub surrogate_scale: f64,
 }
 
-/// Depthwise 3-tap convolution over `RMSNorm(V)` with taps at `t`, `t − dilation`, `t − 2*dilation`; taps outside
-/// the position's document read zero.
+/// Depthwise 4-tap convolution over `RMSNorm(V)` at `t`, `t − dilation`, `t − 2*dilation`,
+/// and `t − 3*dilation`; taps outside the position's document read zero.
 #[derive(Module, Debug)]
 pub struct Smoothing {
     pub norm: RmsNorm,
-    /// `[3, d_model]`: rows are the taps at `t`, `t − dilation`, `t − 2*dilation`. Starts at zero.
+    /// `[4, d_model]`: current, first, second and third lag. Starts at zero.
     pub weight: Param<Tensor<2>>,
     pub dilation: usize,
 }
@@ -639,7 +648,7 @@ impl Smoothing {
                 .reshape([1, 1, d_model])
         };
         let mut convolution: Option<Tensor<3>> = None;
-        for row in 0..3 {
+        for row in 0..4 {
             let lag = row * self.dilation;
             let outside = layout
                 .history(lag)
@@ -653,7 +662,7 @@ impl Smoothing {
                 Some(sum) => sum + contribution,
             });
         }
-        silu(convolution.expect("three taps")).mask_fill(padding, 0.0)
+        silu(convolution.expect("four taps")).mask_fill(padding, 0.0)
     }
 }
 

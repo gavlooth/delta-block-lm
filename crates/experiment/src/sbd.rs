@@ -670,7 +670,7 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
                 cfg.wavelet_backend = delta_mixers::WaveletBackend::Tensor;
                 cfg.lngram_layers = if step7 {vec![0]} else {vec![]};
                 cfg.lngram_backend = delta_mixers::lngram::LngramBackend::Tensor;
-                cfg.lngram_routes = 2;
+                cfg.lngram_routes = cfg.d_model;
                 cfg.lngram_bits = 1;
                 cfg.lngram_memory_dim = 2;
                 cfg.lngram_orders = vec![2,3];
@@ -855,7 +855,7 @@ mod tests {
             let device=Device::ndarray();
             device.seed(913);
             let c=Config {task:"lm".into(),d_model:8,layers:2,heads:2,key_dim:2,value_dim:2,chunk_size:4,cache_capacity:2,
-                ohc_streams:ohc,wavelet_layers:vec![0],lngram_layers:vec![0],lngram_routes:2,lngram_bits:1,lngram_memory_dim:2,lngram_orders:vec![2,3],
+                ohc_streams:ohc,wavelet_layers:vec![0],lngram_layers:vec![0],lngram_routes:8,lngram_bits:1,lngram_memory_dim:2,lngram_orders:vec![2,3],
                 projection_backend:delta_mixers::ProjectionBackend::Merged,
                 sbd:Some(crate::config::SbdConfig {block_lengths:vec![3],generate_tokens:6,commit_count:Some(3),feedback:SbdFeedback::HardMask,..Default::default()}),
                 ..Default::default()};

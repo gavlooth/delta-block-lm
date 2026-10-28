@@ -167,7 +167,7 @@ fn phase(
         !checkpoint.exists(),
         "diagnostic checkpoint path must be fresh"
     );
-    model.clone().save_file(&checkpoint)?;
+    checkpoint::save_model(model, &checkpoint)?;
     runtime::sync(device)?;
     let after_save = parameters(model)?;
     let load_target = LanguageModel::new(c, arm, &device.clone().autodiff())?;

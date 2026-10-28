@@ -27,7 +27,7 @@ impl Part {
                 format!("Order {} OneBit counterfactual term", layer.orders[o])
             }
             Self::Readout => "Key/value projections, query/key norms and sigmoid gates".into(),
-            Self::Smoothing => "Causal smoothing norm, three taps, SiLU and residual".into(),
+            Self::Smoothing => "Causal smoothing norm, four taps, SiLU and residual".into(),
             Self::FusedMemory => {
                 "Fused exact memory and analytic counterfactual/table VJPs, all orders".into()
             }

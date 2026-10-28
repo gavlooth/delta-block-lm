@@ -182,7 +182,7 @@ fn fixture_config(c: &Config, mixer: &str, extended: bool) -> (Config, Arm) {
     cfg.wavelet_backend = delta_mixers::WaveletBackend::Tensor;
     cfg.lngram_layers = if extended { vec![0] } else { vec![] };
     cfg.lngram_backend = delta_mixers::lngram::LngramBackend::Tensor;
-    cfg.lngram_routes = 2;
+    cfg.lngram_routes = cfg.d_model;
     cfg.lngram_bits = 1;
     cfg.lngram_memory_dim = 2;
     cfg.lngram_orders = vec![2, 3];
@@ -1011,19 +1011,19 @@ fn historical_checkpoint_compatibility(device: &Device) -> Result<Value> {
         "explicit factorized changes omitted-selector serialization or identity");
     let rejection = sbd::checkpoint_report(&dense,&dense.arms[0],dense.seed,device,&dense_directory.join("checkpoint-4"),false)
         .err().context("obsolete dense-SBD checkpoint unexpectedly resumed")?.to_string();
-    ensure!(rejection.contains("without learned beta/target/output-gate biases"),
+    ensure!(rejection.contains("pre-correction checkpoints are incompatible"),
         "obsolete dense-SBD checkpoint failed for another reason: {rejection}");
 
-    // The learned gate biases intentionally reject the previously accepted causal fixture.
+    // The corrected model equations reject the previously accepted causal fixture.
     let recorded: Value = serde_json::from_slice(&std::fs::read(artifacts.join("batching/historical/checkpoint-check.json"))?)?;
     ensure!(recorded["passed"] == true,"historical continuation evidence was not accepted");
     let source = PathBuf::from(recorded["reports"][0]["source_checkpoint"].as_str().context("historical checkpoint path")?);
     let causal_rejection = checkpoint::load_state(source.join("state.json")).err()
         .context("checkpoint without learned gate biases unexpectedly resumed")?.to_string();
-    ensure!(causal_rejection.contains("without learned beta/target/output-gate biases"),
+    ensure!(causal_rejection.contains("pre-correction checkpoints are incompatible"),
         "historical causal checkpoint failed for another reason: {causal_rejection}");
     Ok(json!({"passed":true,"fixture":source,
-        "kron_model_revision":crate::config::KRON_MODEL_REVISION,
+        "model_math_revision":crate::config::MODEL_MATH_REVISION,
         "omitted_explicit_factorized_serialization_identical":true,
         "obsolete_dense_sbd_rejected":rejection,
         "obsolete_causal_checkpoint_rejected":causal_rejection,

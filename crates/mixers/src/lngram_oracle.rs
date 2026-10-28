@@ -167,7 +167,7 @@ pub struct Model {
     pub key_gamma: Vec<f64>,
     /// `None` when smoothing is off.
     pub smoothing_gamma: Option<Vec<f64>>,
-    /// `[3, d_model]`, taps at `t`, `t − dilation`, `t − 2*dilation`.
+    /// `[4, d_model]`, taps at `t`, `t − dilation`, `t − 2*dilation`, `t − 3*dilation`.
     pub smoothing_weight: Option<Vec<f64>>,
     pub dilation: usize,
     pub epsilon: f64,
@@ -375,7 +375,7 @@ pub fn evaluate(model: &Model, batch: &Batch, fixed_symbols: Option<&[i64]>) -> 
                     .map(|v| tape.rms_norm(v, &leaves.smoothing_gamma, model.epsilon))
             })
             .collect();
-        let offsets = [0, -(model.dilation as i64), -2 * model.dilation as i64];
+        let offsets = [0, -(model.dilation as i64), -2 * model.dilation as i64, -3 * model.dilation as i64];
         (0..positions)
             .map(|p| {
                 let v = readout[p].as_ref()?;

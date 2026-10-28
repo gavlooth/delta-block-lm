@@ -179,7 +179,7 @@ fn load(model: &Model, device: &Device, backend: LngramBackend) -> Lngram {
     lngram.key_norm.gamma = p1(&model.key_gamma);
     if let Some(smoothing) = lngram.smoothing.as_mut() {
         smoothing.norm.gamma = p1(model.smoothing_gamma.as_ref().expect("smoothing on"));
-        smoothing.weight = p2(model.smoothing_weight.as_ref().expect("smoothing on"), 3);
+        smoothing.weight = p2(model.smoothing_weight.as_ref().expect("smoothing on"), 4);
     }
     lngram
 }
@@ -213,7 +213,7 @@ fn random_model(
         query_gamma: rng.normals(d, 1.0, 0.1),
         key_gamma: rng.normals(d, 1.0, 0.1),
         smoothing_gamma: Some(rng.normals(d, 1.0, 0.1)),
-        smoothing_weight: Some(rng.normals(3 * d, 0.0, 0.5)),
+        smoothing_weight: Some(rng.normals(4 * d, 0.0, 0.5)),
         dilation: 3,
         orders,
         epsilon: 1e-6,
@@ -223,17 +223,17 @@ fn random_model(
     }
 }
 
-/// Small non-default fixture: `d=24, R=4, m=4, d_m=3`, rows `[[4,1,6],[7]]` in `T=11`. The six-token document
-/// repeats `A B A B A B`, so several table rows are hit more than once. Seeds are skipped until every valid
-/// discretizer logit is at least `1e-3` away from 0, so `f32` and `f64` agree on every bit.
+/// Small non-default fixture: `d=24, R=6, m=4, d_m=3`, rows `[[4,1,6],[13]]` in `T=17`. The six-token document
+/// repeats `A B A B A B`, so several table rows are hit more than once. The 13-token document exercises all four smoothing taps.
+/// Seeds are skipped until every valid logit is at least `1e-3` from zero, so `f32` and `f64` agree on every bit.
 fn small_fixture(surrogate: Surrogate) -> (Model, Batch, HostLayout, Evaluation) {
-    let rows = vec![vec![4, 1, 6], vec![7]];
-    let tokens = 11;
+    let rows = vec![vec![4, 1, 6], vec![13]];
+    let tokens = 17;
     let layout = HostLayout::packed(rows, tokens);
     let (starts, ends) = limits(&layout);
     for seed in 1.. {
         let mut rng = Rng(seed);
-        let model = random_model(&mut rng, 24, 4, 4, 3, surrogate);
+        let model = random_model(&mut rng, 24, 6, 4, 3, surrogate);
         let d = model.d_model;
         let mut u = rng.normals(2 * tokens * d, 0.0, 1.0);
         for (target, source) in [(7, 5), (8, 6), (9, 5), (10, 6)] {

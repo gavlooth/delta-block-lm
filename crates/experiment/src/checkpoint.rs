@@ -11,20 +11,20 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, io::Read, path::Path};
 
-const KRON_CHECKPOINT_INCOMPATIBILITY: &str =
-    "KronLSTM checkpoints without learned beta/target/output-gate biases are incompatible";
+const MODEL_CHECKPOINT_INCOMPATIBILITY: &str =
+    "pre-correction checkpoints are incompatible: require corrected KronLSTM, WNet-Dyn J3/affine LayerNorm, four-tap Lngram, oHC and learned soft-feedback parameters";
 
 pub(crate) fn state_metadata(state: &train::State) -> Result<Value> {
     let mut value = serde_json::to_value(state)?;
-    value["kron_model_revision"] = crate::config::KRON_MODEL_REVISION.into();
+    value["model_math_revision"] = crate::config::MODEL_MATH_REVISION.into();
     Ok(value)
 }
 
 pub(crate) fn validate_state_metadata(value: &Value) -> Result<()> {
     ensure!(
-        value["kron_model_revision"].as_str() == Some(crate::config::KRON_MODEL_REVISION),
-        "{KRON_CHECKPOINT_INCOMPATIBILITY}; expected model revision {}, found {}",
-        crate::config::KRON_MODEL_REVISION, value["kron_model_revision"]
+        value["model_math_revision"].as_str() == Some(crate::config::MODEL_MATH_REVISION),
+        "{MODEL_CHECKPOINT_INCOMPATIBILITY}; expected model revision {}, found {}",
+        crate::config::MODEL_MATH_REVISION, value["model_math_revision"]
     );
     Ok(())
 }
@@ -36,11 +36,12 @@ pub(crate) fn load_state(path: impl AsRef<Path>) -> Result<train::State> {
 }
 
 #[derive(Default)]
-struct GateBiasShapes {
+struct ModelShapes {
     path: Vec<String>,
     shapes: BTreeMap<String, Vec<usize>>,
+    gate_biases: usize,
 }
-impl ModuleVisitor for GateBiasShapes {
+impl ModuleVisitor for ModelShapes {
     fn enter_module(&mut self, name: &str, _container_type: &str) {
         self.path.push(name.to_owned());
     }
@@ -51,26 +52,67 @@ impl ModuleVisitor for GateBiasShapes {
         let name = self.path.join(".");
         if [".mixer.erase.bias", ".mixer.write.bias", ".mixer.output_gate.bias"]
             .iter().any(|suffix| name.ends_with(suffix)) {
-            self.shapes.insert(name, param.val().dims().to_vec());
+            self.gate_biases += 1;
         }
+        self.shapes.insert(name, param.transform_for_save().val().dims().to_vec());
+    }
+    fn visit_int<const D: usize>(&mut self, param: &Param<Tensor<D, Int>>) {
+        self.shapes.insert(self.path.join("."), param.transform_for_save().val().dims().to_vec());
     }
 }
 
-fn validate_gate_biases(target: &LanguageModel, reader: Reader) -> Result<()> {
-    let mut required = GateBiasShapes::default();
+fn validate_model_shapes(target: &LanguageModel, reader: Reader) -> Result<()> {
+    ensure!(reader.metadata().get("model_math_revision").map(String::as_str) == Some(crate::config::MODEL_MATH_REVISION),
+        "{MODEL_CHECKPOINT_INCOMPATIBILITY}; missing or obsolete model_math_revision");
+    let mut required = ModelShapes::default();
     target.visit(&mut required);
-    ensure!(required.shapes.len() == target.blocks.len()*3,
+    ensure!(required.gate_biases == target.blocks.len()*3,
         "KronLSTM target is missing learned beta/target/output-gate biases");
     for tensor in reader.into_tensors()? {
         let (name, _, shape, _, _) = tensor.into_parts()?;
-        if let Some(expected) = required.shapes.remove(&name) {
-            ensure!(shape.iter().copied().eq(expected),
-                "{KRON_CHECKPOINT_INCOMPATIBILITY}; {name} has an incompatible shape");
-        }
+        let expected = required.shapes.remove(&name).ok_or_else(|| anyhow::anyhow!(
+            "{MODEL_CHECKPOINT_INCOMPATIBILITY}; obsolete or unexpected tensor {name}"))?;
+        ensure!(shape.iter().copied().eq(expected),
+            "{MODEL_CHECKPOINT_INCOMPATIBILITY}; {name} has an incompatible shape");
     }
     ensure!(required.shapes.is_empty(),
-        "{KRON_CHECKPOINT_INCOMPATIBILITY}; missing tensors: {:?}",
+        "{MODEL_CHECKPOINT_INCOMPATIBILITY}; missing tensors: {:?}",
         required.shapes.keys().collect::<Vec<_>>());
+    Ok(())
+}
+
+/// Native on-save tensors and IDs, with the model equation revision in the record itself.
+/// Module::save_file does not expose a metadata hook.
+pub fn save_model(model: &LanguageModel, path: impl AsRef<Path>) -> Result<()> {
+    #[derive(Default)]
+    struct Save {
+        path: Vec<String>,
+        tensors: Vec<burn_pack::Tensor>,
+    }
+    impl Save {
+        fn record(&mut self, id: burn::module::ParamId, data: TensorData) {
+            let (bytes, shape, dtype) = data.into_parts();
+            self.tensors.push(burn_pack::Tensor::new(self.path.join("."), dtype, shape, Some(id.val()), bytes));
+        }
+    }
+    impl ModuleVisitor for Save {
+        fn enter_module(&mut self, name: &str, _container_type: &str) { self.path.push(name.to_owned()); }
+        fn exit_module(&mut self, _name: &str, _container_type: &str) { self.path.pop(); }
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+            self.record(param.id, param.transform_for_save().val().into_data());
+        }
+        fn visit_int<const D: usize>(&mut self, param: &Param<Tensor<D, Int>>) {
+            self.record(param.id, param.transform_for_save().val().into_data());
+        }
+        fn visit_bool<const D: usize>(&mut self, param: &Param<Tensor<D, Bool>>) {
+            self.record(param.id, param.transform_for_save().val().into_data());
+        }
+    }
+    let mut save = Save::default();
+    model.visit(&mut save);
+    burn_pack::Writer::new(save.tensors)
+        .with_metadata("model_math_revision", crate::config::MODEL_MATH_REVISION)
+        .write_to_file(path)?;
     Ok(())
 }
 
@@ -169,7 +211,7 @@ pub fn load_model(
 ) -> Result<LanguageModel> {
     runtime::sync(device)?;
     let path = path.as_ref();
-    validate_gate_biases(&target, Reader::from_file(path)?)?;
+    validate_model_shapes(&target, Reader::from_file(path)?)?;
     let mut model = target.try_load_file(path)?;
     if let Some(circuit) = &mut model.codpula {
         circuit.freeze_state();
@@ -243,24 +285,28 @@ pub fn file_sha256(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
     #[test]
-    fn kron_checkpoint_metadata_rejects_missing_or_obsolete_bias_revision() {
-        for value in [json!({}), json!({"kron_model_revision":"kronlstm-without-gate-biases"})] {
+    fn model_checkpoint_metadata_rejects_missing_or_obsolete_math_revision() {
+        for value in [json!({}), json!({"kron_model_revision":"kronlstm-learned-gate-biases-v1"}), json!({"model_math_revision":"obsolete"})] {
             let error = validate_state_metadata(&value).unwrap_err().to_string();
-            assert!(error.contains(KRON_CHECKPOINT_INCOMPATIBILITY));
+            assert!(error.contains(MODEL_CHECKPOINT_INCOMPATIBILITY));
         }
         validate_state_metadata(&json!({
-            "kron_model_revision":crate::config::KRON_MODEL_REVISION
+            "model_math_revision":crate::config::MODEL_MATH_REVISION
         })).unwrap();
     }
 
     #[test]
-    fn kron_raw_checkpoint_requires_every_gate_bias_with_matching_shape() {
+    fn raw_checkpoint_requires_exact_corrected_parameter_set_and_shapes() {
         let device = Device::ndarray();
-        let c = Config { d_model:4, layers:1, heads:1, key_dim:2, value_dim:2, ..Config::default() };
+        let c = Config { d_model:8, layers:1, heads:1, key_dim:2, value_dim:2,
+            wavelet_layers:vec![0],lngram_layers:vec![0],lngram_routes:8,lngram_bits:1,lngram_memory_dim:2,
+            ..Config::default() };
         let model = LanguageModel::new(&c, &c.arms[0], &device).unwrap();
-        let mut biases = GateBiasShapes::default();
+        let mut biases = ModelShapes::default();
         model.visit(&mut biases);
-        assert_eq!(biases.shapes.len(), 3);
+        assert_eq!(biases.gate_biases, 3);
+        assert!(biases.shapes.keys().any(|name|name.ends_with(".wavelet_norm.beta")));
+        assert!(biases.shapes.iter().any(|(name,shape)|name.ends_with(".lngram.smoothing.weight") && shape == &[4,8]));
         let make = |omit: Option<usize>, wrong_shape: bool| {
             let tensors = biases.shapes.iter().enumerate().filter_map(|(index,(name,shape))| {
                 if omit == Some(index) { return None; }
@@ -271,15 +317,31 @@ mod tests {
                 let (bytes,shape,dtype) = data.into_parts();
                 Some(burn_pack::Tensor::new(name.clone(),dtype,shape,None,bytes))
             }).collect();
-            Reader::from_bytes(burn_pack::Writer::new(tensors).into_bytes().unwrap()).unwrap()
+            Reader::from_bytes(burn_pack::Writer::new(tensors)
+                .with_metadata("model_math_revision",crate::config::MODEL_MATH_REVISION)
+                .into_bytes().unwrap()).unwrap()
         };
-        validate_gate_biases(&model, make(None,false)).unwrap();
-        for missing in 0..3 {
-            let error = validate_gate_biases(&model,make(Some(missing),false)).unwrap_err().to_string();
-            assert!(error.contains(KRON_CHECKPOINT_INCOMPATIBILITY));
+        validate_model_shapes(&model, make(None,false)).unwrap();
+        for missing in 0..biases.shapes.len() {
+            let error = validate_model_shapes(&model,make(Some(missing),false)).unwrap_err().to_string();
+            assert!(error.contains(MODEL_CHECKPOINT_INCOMPATIBILITY));
         }
-        let error = validate_gate_biases(&model,make(None,true)).unwrap_err().to_string();
+        let error = validate_model_shapes(&model,make(None,true)).unwrap_err().to_string();
         assert!(error.contains("incompatible shape"));
+        // Even an otherwise exact tensor set cannot impersonate revised equations.
+        for revision in [None,Some("kronlstm-learned-gate-biases-v1")] {
+            let mut writer=burn_pack::Writer::new(make(None,false).into_tensors().unwrap());
+            if let Some(revision)=revision {writer=writer.with_metadata("model_math_revision",revision);}
+            let reader=Reader::from_bytes(writer.into_bytes().unwrap()).unwrap();
+            assert!(validate_model_shapes(&model,reader).unwrap_err().to_string().contains("missing or obsolete model_math_revision"));
+        }
+        // An obsolete outer Lngram norm is rejected rather than silently ignored.
+        let mut tensors=make(None,false).into_tensors().unwrap();
+        let (bytes,shape,dtype)=TensorData::new(vec![1.0f32;8],[8]).into_parts();
+        tensors.push(burn_pack::Tensor::new("blocks.0.lngram_norm.gamma".into(),dtype,shape,None,bytes));
+        let reader=Reader::from_bytes(burn_pack::Writer::new(tensors)
+            .with_metadata("model_math_revision",crate::config::MODEL_MATH_REVISION).into_bytes().unwrap()).unwrap();
+        assert!(validate_model_shapes(&model,reader).unwrap_err().to_string().contains("obsolete or unexpected tensor"));
     }
 
     fn record(reverse: bool, counter: u64, changed: bool) -> burn::tensor::Bytes {

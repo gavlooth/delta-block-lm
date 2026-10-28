@@ -5,7 +5,7 @@ use crate::{
 use anyhow::{Result, ensure};
 use burn::{
     module::{Initializer, ModuleVisitor, Param, ParamId},
-    nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig},
+    nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig},
     optim::GradientsParams,
     prelude::*,
     tensor::activation::log_softmax,
@@ -36,9 +36,8 @@ pub(crate) enum Sublayer { Wavelet, Lngram, Mixer }
 
 #[derive(Module, Debug)]
 pub struct Block {
-    pub(super) wavelet_norm: Option<RmsNorm>,
+    pub(super) wavelet_norm: Option<LayerNorm>,
     pub(super) wavelet: Option<delta_mixers::WaveletDyn>,
-    pub(super) lngram_norm: Option<RmsNorm>,
     pub(super) lngram: Option<delta_mixers::lngram::Lngram>,
     pub(super) norm: RmsNorm,
     pub(super) mixer: Mixer,
@@ -116,14 +115,15 @@ impl LanguageModel {
         let mut blocks = Vec::with_capacity(c.layers);
         for index in 0..c.layers {
             blocks.push(Block {
-                lngram_norm: c.lngram_layers.contains(&index).then(norm),
                 lngram: c
                     .lngram_layers
                     .contains(&index)
                     .then(|| c.lngram_config().init(device)),
-                wavelet_norm: c.wavelet_layers.contains(&index).then(norm),
+                wavelet_norm: c.wavelet_layers.contains(&index).then(|| {
+                    LayerNormConfig::new(c.d_model).with_epsilon(1e-6).with_bias(true).init(device)
+                }),
                 wavelet: c.wavelet_layers.contains(&index).then(|| {
-                    delta_mixers::WaveletDyn::new(c.d_model, 4, 8, c.wavelet_backend, device)
+                    delta_mixers::WaveletDyn::new(c.d_model, 3, 8, c.wavelet_backend, device)
                 }),
                 norm: norm(),
                 mixer: {
@@ -144,7 +144,10 @@ impl LanguageModel {
                 },
                 ff_norm: norm(),
                 up: linear(c.d_model, 2 * c.d_model),
-                down: linear(2 * c.d_model, c.d_model),
+                down: LinearConfig::new(2 * c.d_model, c.d_model)
+                    .with_bias(false)
+                    .with_initializer(Initializer::Normal { mean: 0.0, std: 0.02 / (2.0 * c.layers as f64).sqrt() })
+                    .init(device),
                 ohc_wavelet: None,
                 ohc_lngram: None,
                 ohc_mixer: None,
@@ -339,15 +342,21 @@ impl LanguageModel {
     ) -> NoisyRepresentation {
         let block = &self.blocks[index];
         profile.block(Some(index));
-        for (kind, norm, stage, capture, norm_label, read_label, write_label) in [
-            (Some(Sublayer::Wavelet), block.wavelet_norm.as_ref(), block.ohc_wavelet.as_ref(), "wavelet", "Block RMSNorm: wavelet", "oHC read: wavelet", "oHC write: wavelet"),
-            (Some(Sublayer::Lngram), block.lngram_norm.as_ref(), block.ohc_lngram.as_ref(), "lngram", "Block RMSNorm: Lngram", "oHC read: Lngram", "oHC write: Lngram"),
-            (Some(Sublayer::Mixer), Some(&block.norm), block.ohc_mixer.as_ref(), "mixer", "Block RMSNorm: mixer", "oHC read: mixer", "oHC write: mixer"),
-            (None, Some(&block.ff_norm), block.ohc_mlp.as_ref(), "", "Block RMSNorm: MLP", "oHC read: MLP", "oHC write: MLP"),
+        for (kind, enabled, stage, capture, read_label, write_label) in [
+            (Some(Sublayer::Wavelet), block.wavelet.is_some(), block.ohc_wavelet.as_ref(), "wavelet", "oHC read: wavelet", "oHC write: wavelet"),
+            (Some(Sublayer::Lngram), block.lngram.is_some(), block.ohc_lngram.as_ref(), "lngram", "oHC read: Lngram", "oHC write: Lngram"),
+            (Some(Sublayer::Mixer), true, block.ohc_mixer.as_ref(), "mixer", "oHC read: mixer", "oHC write: mixer"),
+            (None, true, block.ohc_mlp.as_ref(), "", "oHC read: MLP", "oHC write: MLP"),
         ] {
-            let Some(norm) = norm else { continue };
+            if !enabled { continue; }
             let mut run = |work: Tensor<3>, profile: &mut P| {
-                let input = profile.section(norm_label, || self.normalization_backend.rms(norm, work));
+                let input = match kind {
+                    Some(Sublayer::Wavelet) => profile.section("Block LayerNorm: wavelet", || block.wavelet_norm.as_ref().unwrap().forward(work)),
+                    // Lngram applies its own separate routing and query norms to H.
+                    Some(Sublayer::Lngram) => work,
+                    Some(Sublayer::Mixer) => profile.section("Block RMSNorm: mixer", || self.normalization_backend.rms(&block.norm, work)),
+                    None => profile.section("Block RMSNorm: MLP", || self.normalization_backend.rms(&block.ff_norm, work)),
+                };
                 if let Some(kind) = kind {
                     if P::CAPTURE_CLEAN_INPUTS { profile.clean_input(index, capture, &input); }
                     update(kind, input, profile)
@@ -659,10 +668,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("delta-experiment-resume-{}", std::process::id()));
         std::fs::create_dir_all(&path).unwrap();
-        model
-            .clone()
-            .save_file(path.join("model.burnpack"))
-            .unwrap();
+        crate::checkpoint::save_model(&model, path.join("model.burnpack")).unwrap();
         optim.save(path.join("optimizer.burnpack")).unwrap();
         let restored = crate::checkpoint::load_model(
             LanguageModel::new(&c, arm, &device).unwrap(),

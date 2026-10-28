@@ -215,7 +215,7 @@ pub(crate) fn checkpoint_with_tct(
             .as_nanos();
         let pending = path.with_extension(format!("pending-{}-{stamp}", std::process::id()));
         std::fs::create_dir_all(&pending)?;
-        model.clone().save_file(pending.join("model.burnpack"))?;
+        checkpoint::save_model(model, pending.join("model.burnpack"))?;
         optim.save(pending.join("optimizer.burnpack"))?;
         runtime::write_json(&pending.join("state.json"), &checkpoint::state_metadata(state)?)?;
         if let Some(chains) = tct {

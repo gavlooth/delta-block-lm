@@ -100,7 +100,7 @@ fn fixture_config(c: &Config, mixer: &str, cache: &str, step7: bool, reads: InBl
     cfg.wavelet_backend = delta_mixers::WaveletBackend::Tensor;
     cfg.lngram_layers = if step7 { vec![0] } else { vec![] };
     cfg.lngram_backend = delta_mixers::lngram::LngramBackend::Tensor;
-    cfg.lngram_routes = 2;
+    cfg.lngram_routes = cfg.d_model;
     cfg.lngram_bits = 1;
     cfg.lngram_memory_dim = 2;
     cfg.lngram_orders = vec![2, 3];

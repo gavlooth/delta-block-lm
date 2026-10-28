@@ -172,7 +172,7 @@ fn paired(base: &[f64], other: &[f64]) -> Value {
 fn isolated(c: &Config, device: &Device, warmups: usize, trials: usize) -> Result<Value> {
     let train_device = device.clone().autodiff();
     train_device.seed(c.seed);
-    let base = WaveletDyn::new(c.d_model, 4, 8, WaveletBackend::Tensor, &train_device);
+    let base = WaveletDyn::new(c.d_model, 3, 8, WaveletBackend::Tensor, &train_device);
     let x = Tensor::<3>::random(
         [c.batch_size, c.context, c.d_model],
         burn::tensor::Distribution::Uniform(-0.5, 0.5),
@@ -268,7 +268,7 @@ pub fn benchmark(c: &Config, device: &Device, warmups: usize, trials: usize) -> 
     let d = c.d_model;
     let n = c.batch_size * c.context * d;
     Ok(
-        json!({"schema":1,"command":"wavelet-benchmark","completed":true,"config":c,"device":runtime::identity(device),"dtype":"f32","warmups":warmups,"trials":trials,"isolated":isolated,"integrated":rows,"paired_tensor_to_fused":paired(&samples[1],&samples[2]),"paired_off_to_tensor":paired(&samples[0],&samples[1]),"paired_off_to_fused":paired(&samples[0],&samples[2]),"protocol":"matched initial common weights; independent AdamW trajectories, alternating forward/reverse order; same row indices/seed; steps include host batches, forward, loss, every gradient check, clipping and AdamW","memory":{"component_parameters_each":3*d*d+40*d+40,"with_prenorm_parameters_each":3*d*d+41*d+40,"table_bytes":0,"fixed_filter_device_bytes":0,"band_output_bytes_each":5*n*4,"fused_smoothing_vjp_retains_input":false,"fused_shared_metadata_bytes_each":2*c.batch_size*c.context*4,"sampled_reserved_bytes":peak,"limitation":"allocator pool sample across all trajectories; not physical peak or live activations; bands exclude projection, gate, value, pointwise and library matmul autodiff storage"}}),
+        json!({"schema":1,"command":"wavelet-benchmark","completed":true,"config":c,"device":runtime::identity(device),"dtype":"f32","warmups":warmups,"trials":trials,"isolated":isolated,"integrated":rows,"paired_tensor_to_fused":paired(&samples[1],&samples[2]),"paired_off_to_tensor":paired(&samples[0],&samples[1]),"paired_off_to_fused":paired(&samples[0],&samples[2]),"protocol":"matched initial common weights; independent AdamW trajectories, alternating forward/reverse order; same row indices/seed; steps include host batches, forward, loss, every gradient check, clipping and AdamW","memory":{"component_parameters_each":3*d*d+32*d+32,"with_prenorm_parameters_each":3*d*d+34*d+32,"table_bytes":0,"fixed_filter_device_bytes":0,"band_output_bytes_each":4*n*4,"fused_smoothing_vjp_retains_input":false,"fused_shared_metadata_bytes_each":2*c.batch_size*c.context*4,"sampled_reserved_bytes":peak,"limitation":"allocator pool sample across all trajectories; not physical peak or live activations; bands exclude projection, gate, value, pointwise and library matmul autodiff storage"}}),
     )
 }
 pub fn smoke(c: &Config, device: &Device) -> Result<Value> {

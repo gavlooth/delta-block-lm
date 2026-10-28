@@ -83,7 +83,7 @@ fn model_gate(c: &Config, device: &Device) -> Result<Value> {
     config.ohc_backend = crate::config::Config::default().ohc_backend;
     config.wavelet_layers.clear();
     config.lngram_layers = vec![0, 1, 2];
-    config.lngram_routes = 2;
+    config.lngram_routes = config.d_model / 2;
     config.lngram_bits = 2;
     config.lngram_memory_dim = 3;
     config.lngram_backend = LngramBackend::Tensor;
@@ -103,7 +103,7 @@ fn model_gate(c: &Config, device: &Device) -> Result<Value> {
         }
         let smooth = module.smoothing.as_mut().unwrap();
         smooth.weight = Param::from_tensor(Tensor::random(
-            [3, 32],
+            [4, 32],
             Distribution::Uniform(-0.1, 0.1),
             &cpu,
         ));
@@ -342,7 +342,6 @@ pub fn benchmark(c: &Config, device: &Device, warmups: usize, trials: usize) -> 
     let mut models = [base.clone(), base.clone(), base.clone()];
     for b in &mut models[0].blocks {
         b.lngram = None;
-        b.lngram_norm = None;
         b.ohc_lngram = None;
     }
     models[1].set_lngram_backend(LngramBackend::Tensor);
@@ -407,7 +406,7 @@ pub fn learning_smoke(c: &Config, device: &Device) -> Result<Value> {
     config.context = 16;
     config.batch_size = 1;
     config.lngram_layers = vec![0, 1, 2];
-    config.lngram_routes = 2;
+    config.lngram_routes = config.d_model / 2;
     config.lngram_bits = 2;
     config.lngram_memory_dim = 3;
     config.pilot_steps = 200;
@@ -416,7 +415,6 @@ pub fn learning_smoke(c: &Config, device: &Device) -> Result<Value> {
     let mut off = base.clone();
     for b in &mut off.blocks {
         b.lngram = None;
-        b.lngram_norm = None;
         b.ohc_lngram = None;
     }
     let mut configs = [config.clone(), config.clone()];

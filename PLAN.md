@@ -12,8 +12,8 @@ Build and optimize the specified semi-autoregressive block-denoising language mo
 
 - Rust, Burn and custom CubeCL kernels. Intel Arc/Vulkan locally; DGX Spark/CUDA for larger runs after arranging GPU access. Follow `AGENTS.md` for build limits, mold, debug-free tests and experiment records.
 - KronLSTM with optional HOLA is the only recurrent mixer. Preserve its shared scan, chunking, convolution and exact-memory machinery.
-- KronLSTM learns beta, target and output-gate biases in every layer (`erase.bias`, `write.bias`, `output_gate.bias`). The model identity is `kronlstm-learned-gate-biases-v1` in training/pilot fingerprints and checkpoint `kron_model_revision`; old checkpoints without that revision and bias tensors are rejected explicitly, not converted on load. Earlier numerical and continuation results remain historical evidence for their original parameterization.
-- Keep wavelet token mixing, orthogonal hyper-connections (oHC) and three Lngram orders in the target design. Isolate their costs and contributions rather than enabling everything in the first run.
+- KronLSTM learns beta, target and output-gate biases in every layer (`erase.bias`, `write.bias`, `output_gate.bias`). Corrected KronLSTM, oHC, WNet-Dyn J3/affine LayerNorm, square/four-tap Lngram and learned soft feedback share `model_math_revision: "paper-local-math-v2"` in training/pilot identities, checkpoint state and model burnpack metadata. Old equations, missing parameters and mismatched parameter sets/shapes are rejected explicitly, not converted on load. Earlier numerical and continuation results remain historical evidence for their original parameterization.
+- Keep wavelet token mixing, orthogonal hyper-connections (oHC) and **three Lngram modules/injections**, each with the supported paper orders `[2,3]`, in the target design. The original user wording “number of lngrams will remain to 3” refers to the module count, not three suffix orders. Use the square routing relationship `R=d_model/bits` (D256/M4 gives R64), preserving memory_dim 8 and the small model's other budgets.
 - Use Set Block Decoding (SBD) as the initial semi-autoregressive recipe. Block length, computational chunk length and tokens committed per denoising step are separate variables.
 - Preserve the predecessor's soft top-k diffusion mechanism as the block-denoising baseline: probability-weighted candidate feedback, separate visibility, and revisable proposals. Hard-mask-only feedback is an ablation, not a replacement. Add joint token prediction, coordination before writes, and revision after provisional writes on this foundation.
 - Energy-guided stochastic remasking is the user's research proposal against pure random remasking. It must not be replaced by confidence ranking or a deterministic correction-value predictor.
@@ -250,7 +250,7 @@ long-context learning or a surviving recall advantage.
 ### Step 7 — Add oHC, wavelet mixing and the three Lngram components
 
 - Reuse the copied implementations, introducing one component at a time on the selected small backbone.
-- Preserve all three Lngram components in the target design; verify the predecessor's distinction between injection count and n-gram orders before mapping configuration fields.
+- Preserve all three Lngram modules in the target design, mapped to `lngram_layers: [0,1,2]`, with `lngram_orders: [2,3]` in every module. Injection count and suffix order count are separate.
 - Check stream mixing, table addressing and surrogate gradients, and account for residual-stream/table memory.
 - Use causal masks/history in the causal model and define the future-block visibility rules needed by the next step.
 

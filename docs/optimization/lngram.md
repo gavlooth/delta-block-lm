@@ -8,18 +8,22 @@ The migration inputs are identical to the relation-extractor source snapshot.
 Equations follow the predecessor's `docs/references/lngram.md` and
 [Lngram §2.2–2.5 and Appendix A](https://arxiv.org/html/2605.24869v1).
 
-The predecessor schedule is `[L,W,N,D,F,H,W,N,D,F,H,W,N,D,F]`:
-`dre-encoder/src/schedule.rs` explicitly requires **three N stages**. Each N is
-one module with **two n-gram orders, `[2,3]`**, not two stages. The LM maps this
-to `lngram_layers: [0,1,2]` in the four-block target configuration, independently
-of `lngram_orders: [2,3]`. Every selected block has a separate RMSNorm, module
-and residual addition before its recurrent mixer (after wavelet when composed).
-No Step 8 components are introduced.
+The user's recovered wording is **“number of lngrams will remain to 3”**:
+three modules/injections, not three suffix orders. The target preserves
+`lngram_layers: [0,1,2]` and each module's supported paper orders `[2,3]`.
+Earlier “three orders” wording in the plan/audit conflated these two counts;
+no third order is missing and no new suffix length is inferred.
+Each selected block adds the module's output before its recurrent mixer
+(after wavelet when composed), with its own oHC read/write stage when enabled.
+The module receives raw hidden/oHC work vectors: its routing and query
+RMSNorms separately normalize H, with no additional caller-side input norm.
 
 All `lngram_*` options are absent from historical serialized configurations by
-default. An empty layer list allocates no new parameters and executes the old
-forward path. Enabling an injection changes serialized architecture identity
-and needs a new run; existing checkpoints are not reinterpreted.
+default. An empty layer list allocates no Lngram parameters. The combined
+model revision is `model_math_revision: "paper-local-math-v2"` in training/pilot
+identities, checkpoint state and model burnpack metadata. Earlier narrowed
+routing, three-tap and extra-input-norm checkpoints are incompatible; loading
+requires the exact corrected parameter set/shapes and never converts them.
 
 ## Causal adaptations
 
@@ -35,10 +39,11 @@ and needs a new run; existing checkpoints are not reinterpreted.
   padding and padded input gradients are exactly zero. Prefix positions still
   receive the original key/value projection biases: zero memory does not mean
   skipping the readout.
-- The predecessor's bidirectional 3-tap smoothing is replaced with three causal
-  taps at `[t, t-dilation, t-2*dilation]`, dilation `max(orders)` by default.
-  Sources outside the document or at padding read zero. Tap row 0 is current,
-  row 1 the first lag and row 2 the second lag. No right extension is used.
+- The paper §2.4 and official single-table source specify **four causal taps**
+  `[t,t-dilation,t-2*dilation,t-3*dilation]`, dilation `max(orders)` by default.
+  Sources outside the document or at padding read zero. Four weights per
+  channel start at zero. Cached execution retains `(max_order-1)+3*dilation`
+  raw clean-input positions, never clean positions inside the noisy block.
 - FP32 is the active model precision; the predecessor's mixed-BF16 projection
   switch is not carried into this FP32 LM.
 
@@ -50,26 +55,31 @@ projection biases zero, RMSNorm epsilon 1e-6 and smoothing weights zero.
 
 ## Dimensions, optimizer and memory
 
-For d_model 256, the target uses 32 routes, 4 bits and memory_dim 8. This halves
-the predecessor's 64 routes in proportion to model width and keeps its alphabet
-and per-route row width. The concatenated readout width is 256. Each injection
-has `32 * (16^2 + 16^3) = 139,264` rows, or 1,114,112 FP32 entries:
-**4,456,448 table bytes per injection; 13,369,344 bytes for all three**.
-The two dense Adam moments add 26,738,688 bytes for all tables; table gradients
-are dense too, although their nonzero support is only the indexed rows.
+Paper §2.2 partitions the entire square routing projection into M-bit groups:
+`W_q: [d_model,d_model]`, `R=d_model/M`. At D256/M4 the target therefore uses
+**64 routes**, preserving memory_dim 8 and `[2,3]` in all three injections.
+Omitted routes derive from width/bits; an explicit count must equal that ratio.
+The concatenated readout width is 512. Each injection has
+`64*(16^2+16^3)=278,528` rows, or 2,228,224 FP32 entries:
+**8,912,896 table bytes per injection; 26,738,688 bytes for all three**.
+The two dense Adam moments add 53,477,376 bytes for all tables; table gradients
+are dense, although their nonzero support is only the indexed rows.
+Relative to the old R32 layout, table storage increases by 13,369,344 bytes and
+the two moments by 26,738,688 bytes total. These are arithmetic sizes, not
+measured peak allocations; no model/token/cache/training budget is increased.
 
 Table parameters use their own production optimizer group, learning rate x5
-and weight decay zero. The x5 multiplier is this repository's choice inherited
-from its predecessor, not the official implementation's default multiplier
-of 3.0. Both tensor and fused AdamW use that group. With fresh state, an
+and weight decay zero, matching paper Table 14 and the pinned official
+single-table source (`18e96ae...`, `table_lr_multiplier: 5.0`).
+Both tensor and fused AdamW use that group. With fresh state, an
 unindexed row is unchanged even if its stored
 value is nonzero. As with ordinary Adam, a row indexed on an earlier step can
 subsequently move through momentum; this is not a sparse-moment optimizer.
 `LanguageModel::lngram_table_ids` exposes the exact table parameter IDs.
 
 At B8/T512 the one-bit detached counterfactual difference tensors retain
-`B*T*R*bits*memory_dim*sum(orders)*4 = 83,886,080` bytes per injection,
-251,658,240 bytes for three, excluding probabilities, projections, normalization
+`B*T*R*bits*memory_dim*sum(orders)*4 = 167,772,160` bytes per injection,
+503,316,480 bytes for three, excluding probabilities, projections, normalization
 and smoothing intermediates. Local expectation replaces `bits` with `K=16`,
 so this term is four times larger. These are logical tensor sizes, not a
 measured physical memory peak. The benchmark also samples allocator pool
@@ -103,12 +113,26 @@ repeatability on repeated row hits.
 **every** parameter gradient under `2e-5 + 3e-4*abs(reference)`, for every
 available backend and both surrogates. Cases include packed resets, short documents,
 trailing padding, empty rows, zero inputs, strict-zero bits, strided inputs,
-repeated row hits and poisoned inactive lookup rows. The oracle's continuous
+repeated row hits, all four smoothing taps and poisoned inactive lookup rows. The oracle's continuous
 chain-rule gradients are also independently checked by directional central
 differences with hard addresses held fixed. Causality tests perturb a token,
 an entire later document and a second batch row. A small three-injection LM
 compares logits, all gradients and updated parameters to CPU tensor execution,
 and checks the production table optimizer group's fresh-state row support.
+
+The four-tap fix keeps the existing library depthwise arithmetic rather than
+adding a custom smoother kernel: expanding the current path and independent
+scalar reverse-mode oracle provides exact chain-rule derivatives on every
+backend without another implementation. Longer reference documents make the
+fourth tap nontrivial. Shared model references use nonzero table/tap weights
+and cover raw input capture and clean-prefix history in ordinary,
+reconstructed, cached, batched and marked-tail execution.
+
+**Historical measurements below use the former R32/three-tap/extra-input-norm
+model unless explicitly labeled otherwise.** They are not measurements of the
+corrected model. No builds, tests or benchmarks were run by this correction
+slice; final integrated acceptance is the integrator's responsibility.
+
 
 ### Tensor duplicate-index raw-gradient determinism
 
