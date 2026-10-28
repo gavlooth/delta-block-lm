@@ -359,6 +359,7 @@ pub(super) struct Assignment {
     pub commits: Vec<usize>,
     pub feedback: Tensor<2>,
     pub feedback_temperature: f64,
+    pub host_logs: Vec<f32>,
 }
 pub(super) fn assign(model: &LanguageModel, c: &Config, cache: &TrainingCache, soft: &SoftState, pass: usize, proposal_seed: u64, device: &Device) -> Result<Assignment> {
     let s = c.sbd.as_ref().unwrap();
@@ -367,7 +368,7 @@ pub(super) fn assign(model: &LanguageModel, c: &Config, cache: &TrainingCache, s
     let output = model.cached_block_tail_profiled(cache,0,hidden.clone(),None,&mut Unprofiled);
     let a = prediction(model,c,output,soft,proposal_seed,c.soft_temperature,true)?;
     let announcement = select(c,&a,soft,pass==n)?;
-    if announcement.is_empty() { return Ok(Assignment {proposals:a.proposals, commits:announcement,feedback:a.feedback,feedback_temperature:a.feedback_temperature}); }
+    if announcement.is_empty() { return Ok(Assignment {proposals:a.proposals, commits:announcement,feedback:a.feedback,feedback_temperature:a.feedback_temperature,host_logs:a.host_logs}); }
     drop(a);
     let mut marks = vec![false;n];
     for &i in &announcement {marks[i]=true;}
@@ -377,10 +378,10 @@ pub(super) fn assign(model: &LanguageModel, c: &Config, cache: &TrainingCache, s
         ensure!(announcement.iter().all(|&i|scores[i].is_finite()),"marked CoCommit dependence requires finite scores");
         sbd::dependence_commits(&announcement,scores,s.dependence_threshold,pass==n)
     } else {announcement};
-    Ok(Assignment {proposals:b.proposals,commits,feedback:b.feedback,feedback_temperature:b.feedback_temperature})
+    Ok(Assignment {proposals:b.proposals,commits,feedback:b.feedback,feedback_temperature:b.feedback_temperature,host_logs:b.host_logs})
 }
 
-pub(super) fn evaluate(model: &LanguageModel, c: &Config, examples: &[Example], device: &Device) -> Result<Value> {
+pub(super) fn teacher_prefix_evaluate(model: &LanguageModel, c: &Config, examples: &[Example], device: &Device) -> Result<Value> {
     let s = c.sbd.as_ref().unwrap();
     let model = model.valid();
     let mut nll = 0.0;
@@ -491,5 +492,26 @@ mod tests {
         let entropy=checked_entropy_rows(&[negative_infinity,0.5f32.ln(),0.5f32.ln()],3,&[true]).unwrap();
         assert!((entropy[0]-std::f64::consts::LN_2).abs()<1e-7);
         assert_eq!(checked_entropy_rows(&[f32::NAN,f32::INFINITY],2,&[false]).unwrap(),vec![0.0]);
+    }
+    #[test]
+    fn decoder_fix_validation_scores_marked_decoder_not_unmarked_teacher() {
+        use crate::config::{Arm,CocommitConfig,SbdConfig,SbdFeedback};
+        let device=Device::ndarray();
+        device.seed(179);
+        let c=Config {task:"lm".into(),d_model:16,layers:1,heads:4,key_dim:32,value_dim:64,
+            sbd:Some(SbdConfig {block_lengths:vec![4],feedback:SbdFeedback::SoftFeedback,
+                cocommit:Some(CocommitConfig::default()),..SbdConfig::default()}),..Config::default()};
+        let arm=Arm {name:"validation".into(),mixer:"kronlstm".into(),cache:"none".into()};
+        let model=LanguageModel::new(&c,&arm,&device).unwrap();
+        let rows=[Example {input:vec![256,11,19,23],target:vec![11,19,23,29],weight:vec![1.0;4],groups:vec![None;4]}];
+        let before=sbd::evaluate(&model,&c,&rows,&device).unwrap();
+        let mut changed=model.clone();
+        changed.cocommit_marker=Some(burn::module::Param::from_tensor(Tensor::from_data(
+            TensorData::new((0..16).map(|i|((i*7%13) as f32-6.0)*2.0).collect::<Vec<_>>(),[1,16]),&device)));
+        let after=sbd::evaluate(&changed,&c,&rows,&device).unwrap();
+        assert!((before["block_nll"].as_f64().unwrap()-after["block_nll"].as_f64().unwrap()).abs()>1e-6,
+            "primary validation ignores the marked branch used by generation");
+        assert_eq!(before["teacher_prefix_diagnostic"]["block_nll"],after["teacher_prefix_diagnostic"]["block_nll"]);
+        assert_eq!(after["predicted_tokens"],4);
     }
 }
