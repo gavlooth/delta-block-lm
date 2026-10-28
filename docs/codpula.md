@@ -6,9 +6,17 @@ This document records the paper equations, the model-specific decisions in §5, 
 
 **Original implementation 2026-10-25.** The `codpula` profile, full-vocabulary inference, dual-flow updates, seeded joint proposals and dependence commitments are integrated. Its historical CPU/Vulkan and cost results are in §10. The explicitly selected `codpula_contextual` revision changes only decisions 3, 4 and 6 below; it does not reinterpret old selectors or checkpoints.
 
+The later contextual+CoCommit+refinement composition is on main as `9e67b7ac`,
+not an isolated future cutover. Publication preceded complete acceptance:
+`artifacts/integrated11/commands/collect-real-1792953578755.stderr` records
+failed collection, with no combined fit/guided/TCT CLI/B8 execution afterward.
+The complete command ledger and both fixture failures are in
+[RESULTS: integrated11 publication checkpoint](../RESULTS.md#integrated11-publication-checkpoint).
+Standalone measurements below do not establish combined costs or quality.
+
 Source: Shao et al., [Learning to Couple: Context-Adaptive Joint Denoising for Diffusion Language Models, arXiv:2610.25723v1](https://arxiv.org/html/2610.25723v1), including Appendices A–G. The [abstract/version page](https://arxiv.org/abs/2610.25723) identifies the version. References such as Eq. (10) refer to that paper, not numbered equations in this document.
 
-Repository context: [PLAN.md §5.1 and Step 9](../PLAN.md), [SBD](sbd.md), and `configs/lm512-sbd.json`. Step 9 adds a joint output distribution and dependence-adaptive commitment; it does not change KronLSTM, HOLA, oHC, wavelet, Lngram, or MoBA prefix retrieval. The optional Step-10 [CoCommit](cocommit.md) now composes with this output: each marked tail regenerates token potentials and gates, prepares a fresh circuit, and recomputes joint proposals/dependence scores. Its marked training event fixes only selected targets, marginalizing other masks; the existing full conditional NLL is that generalized event's all-unresolved special case. Remasking remains separate work.
+Repository context: [PLAN.md §5.1 and Step 9](../PLAN.md), [SBD](sbd.md), and `configs/lm512-sbd.json`. Step 9 adds a joint output distribution and dependence-adaptive commitment; it does not change KronLSTM, HOLA, oHC, wavelet, Lngram, or MoBA prefix retrieval. The historical standalone Step-10 [CoCommit](cocommit.md) evidence describes fresh marked token potentials/gates/circuits and a marked-subset training event. Those results and their costs are scoped to that profile. Remasking has standalone implementation/evidence in `artifacts/remasking/`; combined publication acceptance is recorded separately above.
 
 Fixed model requirements:
 

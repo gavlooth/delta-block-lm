@@ -2,7 +2,7 @@
 
 ## Status, scope and sources
 
-**Implemented, 2026-10-25.** R²D, stochastic mask-set energy training and TCT are implemented behind explicit selectors. Section9 records the director's decisions; section14 records numerical gates, command smokes and execution costs. Earlier arithmetic estimates are not measurements.
+**Standalone profile implemented, 2026-10-25.** R²D, stochastic mask-set energy training and TCT are implemented behind explicit selectors. Section9 records the decisions; section14 records standalone numerical gates, command smokes and costs in `artifacts/remasking/`. Composition with contextual Codpula and CoCommit was published on main as `9e67b7ac` with partial acceptance. Its actual collection failed, and fitting/guided/TCT CLI/B8 checks were not executed; see [RESULTS: integrated11 publication checkpoint](../RESULTS.md#integrated11-publication-checkpoint) and `artifacts/integrated11/commands/`. Earlier arithmetic estimates are not measurements.
 
 Training writes the source `metrics.json` before SBD diagnostics or generation.
 End-of-training generation is explicitly skipped when refinement is selected:
@@ -552,7 +552,7 @@ All measurements below use the existing **`joint_output:codpula` profile**, Inte
 
 | Gate | Observed result |
 |---|---|
-| Workspace suite | 62 experiment +7 kernel +16 mixer tests pass; one pre-existing GPU-sharing test ignored |
+| Standalone workspace suite | Historical62experiment+7kernel+16mixer passes, one ignored; `artifacts/remasking/summary.json`. Integrated11 later recorded73+7+16passes, one ignored, in `artifacts/integrated11/commands/conditioned-build-tests-1792953155667.stdout`; not post-fix acceptance |
 | Mask-set laws | 990 exact-law cases, all n0..16/r, uniform/unary/pairwise; largest logZ error1.13687e-13, probability error3.33067e-16 |
 | Fixed-seed sampling | 65,536 draws/case; largest frequency error0.00291679 versus simultaneous Hoeffding limit0.01355672; no numerical tolerance substituted for sampling uncertainty |
 | Energy/features/rank CPU/Vulkan | Max absolute error3.305467803915718e-6, max elementwise tolerance ratio0.006872483698735233 |
@@ -607,7 +607,7 @@ B1/T512/L8 complete-step timing used2warmups and11same-session interleaved pairs
 | Paired saving | **15711.721ms**, 95% bootstrap interval[15625.973,16349.399],11/11 faster |
 | B8/T512,4rows/pass, one warmed diagnostic | **7267.660ms** |
 
-The B1 two-runner process sampled1,452,711,808bytes pool reservation, not a per-runner peak. Full B8 without row accumulation failed a2GiB allocation with either tensor or fused circuit execution. Circuit fusion alone therefore was not adopted as a memory fix. Exact row accumulation was selected; **four rows/pass fit immediately**, producing exactly two passes and one optimizer/EM update per full B8 batch. Smaller chunks were not tried. Sampled pool reservation was **4,399,520,256bytes**, not an exact physical/live peak.
+The B1 two-runner process sampled1,452,711,808bytes pool reservation, not a per-runner peak. Full B8 without row accumulation failed a2GiB allocation with either tensor or fused circuit execution. Circuit fusion alone therefore was not adopted as a memory fix. Exact row accumulation was selected; **four rows/pass fit immediately**, producing exactly two passes and one neural optimizer/signed dual-flow circuit update per full B8 batch, not EM (`codpula.md:211–222`). Smaller chunks were not tried. Sampled pool reservation was **4,399,520,256bytes**, not an exact physical/live peak.
 
 The selected circuit execution remains tensor when omitted. `configs/lm512-tct.json` records rows_per_pass4. The B8 step is not a paired quality or speed comparison against the supplied~8s ordinary SBD+Codpula step: the objectives, target visits and detached-teacher work differ.
 
