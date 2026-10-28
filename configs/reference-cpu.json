@@ -8,5 +8,5 @@
   "association_counts":[2,4],
   "eval_examples":4,
   "max_seconds":30,
-  "soft_candidate_width":4
+  "soft_candidate_width":3
 }

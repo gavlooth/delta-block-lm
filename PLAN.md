@@ -15,7 +15,7 @@ Build and optimize the specified semi-autoregressive block-denoising language mo
 - KronLSTM learns beta, target and output-gate biases in every layer (`erase.bias`, `write.bias`, `output_gate.bias`). Corrected KronLSTM, oHC, WNet-Dyn J3/affine LayerNorm, square/four-tap Lngram and learned soft feedback share `model_math_revision: "paper-local-math-v2"` in training/pilot identities, checkpoint state and model burnpack metadata. Old equations, missing parameters and mismatched parameter sets/shapes are rejected explicitly, not converted on load. Earlier numerical and continuation results remain historical evidence for their original parameterization.
 - Keep wavelet token mixing, orthogonal hyper-connections (oHC) and **three Lngram modules/injections**, each with the supported paper orders `[2,3]`, in the target design. The original user wording “number of lngrams will remain to 3” refers to the module count, not three suffix orders. Use the square routing relationship `R=d_model/bits` (D256/M4 gives R64), preserving memory_dim 8 and the small model's other budgets.
 - Use Set Block Decoding (SBD) as the initial semi-autoregressive recipe. Block length, computational chunk length and tokens committed per denoising step are separate variables.
-- Preserve the predecessor's soft top-k diffusion mechanism as the block-denoising baseline: probability-weighted candidate feedback, separate visibility, and revisable proposals. Hard-mask-only feedback is an ablation, not a replacement. Add joint token prediction, coordination before writes, and revision after provisional writes on this foundation.
+- Preserve the predecessor's soft top-k diffusion structure as the block-denoising baseline: candidate feedback and revisable proposals remain separate from permanent observations. Its feedback math follows the soft-masking paper: latest detached probabilities, normalized top-3, and a learned constrained entropy coefficient. Ordinary training mixes soft/binary students with probability 0.8; remasking retains candidate information and learned feedback. Hard-mask-only feedback remains an ablation.
 - Energy-guided stochastic remasking is the user's research proposal against pure random remasking. It must not be replaced by confidence ranking or a deterministic correction-value predictor.
 - Preserve the specified architecture while optimizing execution time and memory. Verify numerical correctness; do not require components to earn inclusion through quality comparisons.
 
@@ -76,13 +76,13 @@ The predecessor sources needed for these components are copied under `reuse/crat
 | `dre-wavelet/`, `dre-ohc/`, `dre-lngram/` | Existing implementations and tests; preserve the three Lngram components and verify causal/block visibility before training |
 | `dre-relations/src/state.rs` | Soft distributions and separate visibility state |
 | `dre-relations/src/denoiser.rs` | Probability-weighted expected embeddings mixed with mask embeddings; adapt field embeddings to vocabulary candidates |
-| `dre-relations/src/diffusion_scheduler.rs` and its tests | Convex feedback updates, visibility resets that preserve soft beliefs, and circuit-conditioned feedback |
+| `dre-relations/src/diffusion_scheduler.rs` and its tests | Reuse candidate/proposal separation and circuit-conditioned feedback, not temporal averaging or scheduled visibility; the current soft-masking paper supplies the feedback equation |
 | `dre-relations/src/joint_circuit.rs` | Existing log-space joint inference and reusable message preparation; replace the five relation/pointer fields with token positions and audit against Codpula |
 | `dre-relations/src/remask.rs` | Existing proposal/retained-answer distinction; reuse state semantics without inheriting its learned policy as the new energy policy |
 
 These are unchanged migration inputs, not a second executable workspace. The partial `dre-relations` copy is not a buildable crate. Record source provenance in `reuse/PROVENANCE.json`; port useful code into the active workspace and remove obsolete snapshots as each component is migrated. Do not import the predecessor's full trainer, datasets, run artifacts, or vendored backend tree.
 
-The inspected feedback path uses full probability tensors and weighted matrix products; an inspected top-k call in `boundary_pair.rs` selects source boundaries. Do not mislabel that boundary selector as a reusable vocabulary top-k kernel. Preserve the existing soft mechanism while identifying which operations need a new sparse vocabulary implementation. Validate sparse top-k expectation/update results against the copied dense path before optimizing them.
+The inspected feedback path uses full probability tensors and weighted matrix products; an inspected top-k call in `boundary_pair.rs` selects source boundaries. Do not mislabel that boundary selector as a reusable vocabulary top-k kernel. Preserve the candidate-feedback structure while using the paper's latest-prediction, normalized-top-k, learned-entropy equation. Validate sparse expectation and gradients against independent dense/scalar references before optimizing them.
 
 ## 4. Block-denoising semantics
 
@@ -98,7 +98,7 @@ Proposed recurrent adaptation:
 
 Verify short convolution, wavelet taps, Lngram addressing and all caches against the same visibility rules. No path may read later clean targets. Keep a test for block boundaries inside a computational chunk.
 
-Soft top-k feedback is part of the initial denoising path. Preserve candidate IDs, weights and retained mass, rather than treating each provisional prediction as hard observed evidence. Remasking changes visibility without automatically deleting the candidate distribution or retained proposal. Candidate width is independent of block length, HOLA capacity and the number of committed positions. A dense/full-support reference and a hard-mask-only ablation isolate truncation and soft-feedback effects. Verify selected-value/embedding gradients, padding, observed-token immutability, ties and zero-mass behavior against the source semantics.
+Soft top-k feedback is part of the denoising path. Preserve candidate IDs, normalized weights and raw retained mass separately, rather than treating provisional predictions as permanent evidence. Remasking retains the latest candidate distribution and learned feedback coefficient; only the temporary revealed-input view becomes hard. Candidate width (LM default 3) is independent of block length, HOLA capacity and discrete commitment/remask counts; those counts are not learned by the confidence head. The initial inference input is binary; ordinary training selects a soft student with probability 0.8 and otherwise optimizes a binary student. Verify confidence/embedding gradients, detached predictions, latest-only replacement, immutable observations and padding with independent references.
 
 ## 5. Joint prediction and commitment
 
@@ -110,7 +110,7 @@ The selected implementation is a homogeneous 32-state HMM over each actual SBD b
 
 The existing vocabulary head supplies token potentials from final-normalized noisy features. Original `joint_output: codpula` retains its valid-state mean and 64 biased linear log-gates exactly. Explicit `codpula_contextual` selects ordered `[valid mean, first, last]`, one zero-initialized `3D -> 96` head (64 transition plus 32 normalized-root log-gates), and moderate seeded emission/transition contrasts. Both share one b=4 transition grid across edges. Local emission, transition-row, root-row and visible-evidence normalizers are included in conditional joint NLL. Circuit rows retain the explicit nonnegative dual-flow split, summed occurrence reaches, separate bias-corrected momentum 0.9 and constant alpha 0.05; backbone/head/gate parameters retain existing AdamW.
 
-All 257 symbols participate in circuit inference: candidate-support truncation loss is zero, while the existing width-four sparse feedback remains separate and receives detached joint marginals. The selected input-plus-coupling model, exact causal singleton bypass and old factorized default are implemented. No input-only/64-state/quality study was run in this turn.
+All 257 symbols participate in circuit inference: candidate-support truncation loss is zero, while width-three sparse embedding feedback remains separate and receives detached joint marginals. Candidate truncation never narrows circuit support. The selected input-plus-coupling model and exact causal singleton bypass remain.
 
 Dependence commitment uses exact conditional joint proposals and absolute marginal-versus-conditional log-probability changes for all unresolved positions. It reuses one prepared circuit, evaluates leave-one-out probabilities with cavity messages, uses strict threshold 0.05, minimum-score progress fallback and at most L passes with final completion. Invalid evidence fails clearly.
 
@@ -193,15 +193,15 @@ GDN-2 removed on 2026-10-28 by user decision. The following checklist records th
 
 ### Step 3 — Migrate the existing soft top-k diffusion foundation
 
-- Reuse the copied soft state, weighted embedding, feedback scheduler and proposal/retained-answer semantics.
-- Generalize annotation values to token candidates: candidate IDs/weights, visibility, provisional values and retained values stay separate.
+- Reuse candidate state, weighted embeddings and proposal/retained-answer separation; use the paper's learned entropy coefficient, latest detached prediction and normalized top-k rather than the predecessor scheduler's math.
+- Generalize annotation values to token candidates; learned feedback weights, provisional values, retained values and permanent observations stay separate.
 - Remasking must not silently delete the soft distribution. Observed prompt tokens stay fixed.
 - Keep the dense probability-weighted path as the numerical reference. Port or implement sparse selection/gather/update only where needed; do not confuse source-boundary top-k with vocabulary top-k.
 - Make candidate width configurable independently of block length, recurrent chunk length and HOLA capacity.
 
 **Deliverable:** a runnable miniature token-refinement episode using the reused soft-feedback mechanism, before adding learned energy selection.
 
-**Gate:** sparse/full-support feedback agrees with the dense reference where their support matches; embedding/weight gradients, retained mass, zero-mass behavior and visibility transitions are checked. A hard-mask-only path exists solely as a comparison.
+**Gate:** sparse/full-support feedback agrees with an independent dense/scalar reference where support matches; confidence and embedding gradients, teacher detachment, latest-only replacement, normalized truncation, raw retained mass, zero-mass behavior and immutable observations are checked. A hard-mask-only path exists solely as a comparison.
 
 ### Step 4 — Implement KronLSTM and HOLA memory
 

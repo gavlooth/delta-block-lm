@@ -10,9 +10,10 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use burn::{module::{Module,ModuleVisitor,Param},prelude::*};
 use delta_mixers::{profile::Unprofiled,sbd::InBlockReads};
-use crate::kron_benchmark::{parameters,values};
+use crate::kron_benchmark::{parameters,parameters_with_unused,values};
 use serde_json::{Value,json};
 use std::{collections::BTreeMap,path::Path};
+use crate::train;
 
 fn compare(actual: &[f32], reference: &[f32]) -> Result<Value> {
     sbd::compare(actual,&reference.iter().map(|&x|f64::from(x)).collect::<Vec<_>>())
@@ -191,7 +192,9 @@ fn retrieval_case(device: &Device, with_moba: bool, doubled: bool) -> Result<Val
         let loss=circuit_a.conditional_nll(clean.clone(),observed_a,8.0)?.loss
             +circuit_b.event_nll(clean,observed_b,selected,8.0)?.loss;
         let value=model::scalar(loss.clone())? as f32;
-        let gradients=parameters(model,Some(&model::checked_gradients(model,loss)?))?;
+        let unused=model::unused_soft_parameters();
+        let (checked,_) = model::checked_gradients_with_unused(model,loss,&unused,&mut Unprofiled)?;
+        let gradients=parameters_with_unused(model,Some(&checked),&unused)?;
         Ok((value,gradients))
     };
     let (cpu_loss,cpu_gradient)=normalized(&cpu_model,&cpu_soft,&cpu)?;
@@ -268,7 +271,7 @@ fn cocommit_checkpoint_continuation(c:&Config,device:&Device,seed:u64)->Result<V
         cfg.soft_selection_backend=c.soft_selection_backend;
     }
     let source=c.sbd.as_ref().context("checkpoint gate needs SBD config")?;
-    cfg.sbd=Some(SbdConfig {block_lengths:vec![4],feedback:source.feedback,block_execution:source.block_execution,in_block_reads:InBlockReads::HolaRead,rows_per_pass:Some(1),
+    cfg.sbd=Some(SbdConfig {block_lengths:vec![4],training_block_lengths:vec![4],feedback:source.feedback,block_execution:source.block_execution,in_block_reads:InBlockReads::HolaRead,rows_per_pass:Some(1),
         noisy_read_backend:if cfg.backend=="cpu" {delta_mixers::sbd::NoisyReadBackend::Tensor}else{source.noisy_read_backend},
         joint_output:source.joint_output,
         joint_execution:if cfg.backend=="cpu" {crate::codpula::CodpulaExecution::Tensor}else{source.joint_execution},
@@ -280,7 +283,7 @@ fn cocommit_checkpoint_continuation(c:&Config,device:&Device,seed:u64)->Result<V
         Example{input:sequence[..8].to_vec(),target:sequence[1..].to_vec(),weight:vec![1.0;8],groups:vec![None;8]}
     }).collect::<Vec<_>>();
     let train_device=device.clone().autodiff(); train_device.seed(seed);
-    let step=|model:LanguageModel,optimizer:&mut burn::optim::ModuleOptimizer,rows:&[Example],step_seed:u64|->Result<(LanguageModel,f64,usize)> {
+    let step=|model:LanguageModel,optimizer:&mut train::NeuralOptimizer,rows:&[Example],step_seed:u64|->Result<(LanguageModel,f64,usize)> {
         let batch=Batch::new(rows,&train_device);
         let result=crate::sbd_step::backward(&model,&cfg,rows,&batch,step_seed)?;
         ensure!(result.passes==2 && result.rows_per_pass==1,"checkpoint fixture did not accumulate both single-row passes");
@@ -386,6 +389,7 @@ fn model_case(c: &Config, device: &Device, ohc: bool, codpula: bool) -> Result<V
     cfg.epilogue_backend = crate::config::EpilogueBackend::Native;
     cfg.sbd = Some(SbdConfig {
         block_lengths: vec![1, 4],
+        training_block_lengths: vec![1,4],
         in_block_reads: InBlockReads::HolaRead,
         feedback: SbdFeedback::HardMask,
         cocommit: Some(CocommitConfig {execution:crate::config::CocommitExecution::Doubled,..CocommitConfig::default()}),
@@ -525,7 +529,7 @@ fn model_case(c: &Config, device: &Device, ohc: bool, codpula: bool) -> Result<V
         "requires_grad":false
     });
     let teacher = tracked_teacher.detach();
-    soft_feedback.update(teacher.logits.reshape([4,cfg.vocab()]),1.0,cfg.soft_temperature,cfg.soft_steps,cfg.sbd.as_ref().unwrap().candidate_width)?;
+    soft_feedback.update(teacher.logits.reshape([4,cfg.vocab()]),cfg.soft_temperature,cfg.sbd.as_ref().unwrap().candidate_width,requested.soft_confidence.as_ref().unwrap())?;
     let soft_a = crate::cocommit::reconstruct_output(&requested,prefix,&soft_feedback,false,None,target);
     let soft_b = crate::cocommit::reconstruct_output(&requested,prefix,&soft_feedback,false,Some(Tensor::<2>::zeros([1,4],target)),target);
     let soft_equivalence = compare(&values(soft_a.logits),&values(soft_b.logits)).context("soft-feedback zero marker")?;
@@ -828,7 +832,8 @@ fn training_equivalence(c:&Config,device:&Device)->Result<Value> {
         cfg.wavelet_layers=vec![0,1,2];cfg.lngram_layers=vec![0,1,2];
         cfg.lngram_routes=cfg.d_model;cfg.lngram_bits=1;cfg.lngram_memory_dim=2;
         cfg.lngram_orders=vec![2,3];
-        cfg.sbd=Some(SbdConfig{block_lengths:vec![4],feedback,
+        cfg.soft_training_probability=1.0;
+        cfg.sbd=Some(SbdConfig{block_lengths:vec![4],training_block_lengths:vec![4],feedback,
             block_execution:crate::config::SbdBlockExecution::Batched,in_block_reads:InBlockReads::HolaRead,
             joint_output:if joint {SbdJointOutput::Codpula}else{SbdJointOutput::Factorized},
             cocommit:Some(CocommitConfig{execution:crate::config::CocommitExecution::Doubled,..CocommitConfig::default()}),..SbdConfig::default()});
@@ -847,8 +852,8 @@ fn training_equivalence(c:&Config,device:&Device)->Result<Value> {
             let batch=Batch::new(&examples,device);
             let result=sbd::training_loss(model,config,&examples,&batch,41)?;
             let loss=model::scalar(result.loss.clone())? as f32;
-            let gradients=model::checked_gradients(model,result.loss)?;
-            Ok((loss,parameters(model,Some(&gradients))?))
+            let (gradients,_) = model::checked_gradients_with_unused(model,result.loss,&result.unused_parameters,&mut Unprofiled)?;
+            Ok((loss,parameters_with_unused(model,Some(&gradients),&result.unused_parameters)?))
         };
         let (cpu_loss,cpu_gradients)=collect(&reference,&cfg,&cpu)?;
         let mut individual=cfg.clone();individual.sbd.as_mut().unwrap().block_execution=crate::config::SbdBlockExecution::PerBlock;
@@ -928,7 +933,7 @@ fn row_accumulation_equivalence(device:&Device)->Result<Value> {
         cfg.d_model=16;cfg.layers=4;cfg.heads=4;cfg.key_dim=32;cfg.value_dim=64;
         cfg.context=20;cfg.batch_size=2;cfg.chunk_size=16;cfg.cache_capacity=4;
         cfg.association_counts=vec![1];cfg.ohc_streams=true;
-        cfg.sbd=Some(SbdConfig{block_lengths:vec![4],feedback:SbdFeedback::SoftFeedback,
+        cfg.sbd=Some(SbdConfig{block_lengths:vec![4],training_block_lengths:vec![4],feedback:SbdFeedback::SoftFeedback,
             block_execution:crate::config::SbdBlockExecution::Batched,in_block_reads:InBlockReads::HolaRead,
             joint_output:joint,cocommit:cocommit.then(CocommitConfig::default),rows_per_pass:None,
             ..SbdConfig::default()});

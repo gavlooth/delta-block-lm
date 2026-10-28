@@ -73,6 +73,7 @@ impl DenoisingOutput {
 pub struct LanguageModel {
     pub(super) embedding: Embedding,
     pub(super) sbd_mask: Option<Param<Tensor<1>>>,
+    pub(super) soft_confidence: Option<crate::soft::SoftConfidence>,
     pub(super) cocommit_marker: Option<Param<Tensor<2>>>,
     pub(super) blocks: Vec<Block>,
     pub(super) norm: RmsNorm,
@@ -156,6 +157,9 @@ impl LanguageModel {
         }
         let model = Self {
             sbd_mask: c.sbd.as_ref().map(|_| init.init([c.d_model], device)),
+            soft_confidence: c.sbd.as_ref()
+                .filter(|s| s.feedback == crate::config::SbdFeedback::SoftFeedback)
+                .map(|_| crate::soft::SoftConfidence::new(device)),
             cocommit_marker: None,
             embedding: EmbeddingConfig::new(c.vocab(), c.d_model)
                 .with_initializer(init.clone())
@@ -478,6 +482,10 @@ pub(crate) fn unused_denoising_parameters(noisy: bool, marked: bool) -> Vec<&'st
     }
     if !marked { names.push("cocommit_marker"); }
     names
+}
+/// A binary-input draw does not use the learned soft-feedback coefficient.
+pub(crate) fn unused_soft_parameters() -> [&'static str; 3] {
+    ["soft_confidence.raw_scale", "soft_confidence.raw_centre_neg", "soft_confidence.raw_steep"]
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]

@@ -285,7 +285,7 @@ impl Default for SbdConfig {
             joint_output: SbdJointOutput::Factorized,
             joint_execution: crate::codpula::CodpulaExecution::Tensor,
             commitment: None, dependence_threshold: None,
-            candidate_width: 4, commit_count: None, entropy_threshold: None, generate_tokens: 32,
+            candidate_width: 3, commit_count: None, entropy_threshold: None, generate_tokens: 32,
             in_block_reads: delta_mixers::sbd::InBlockReads::None,
             noisy_read_backend: delta_mixers::sbd::NoisyReadBackend::Tensor,
             cocommit: None, announcement: None, rows_per_pass: None,
@@ -412,8 +412,8 @@ pub struct Config {
     pub soft_candidate_width: usize,
     #[serde(skip_serializing_if = "SoftSelectionBackend::is_cpu")]
     pub soft_selection_backend: SoftSelectionBackend,
-    pub soft_steps: usize,
-    pub soft_eta: f64,
+    /// Probability of a two-pass soft student; complementary draws train binary inputs.
+    pub soft_training_probability: f64,
     pub soft_temperature: f64,
     pub hard_mask_only: bool,
 }
@@ -490,10 +490,9 @@ impl Default for Config {
             pilot_seconds: 10.0,
             comparison_seconds: 60.0,
             max_seconds: 90.0,
-            soft_candidate_width: 4,
+            soft_candidate_width: 3,
             soft_selection_backend: SoftSelectionBackend::Cpu,
-            soft_steps: 4,
-            soft_eta: 0.5,
+            soft_training_probability: 0.8,
             soft_temperature: 1.0,
             hard_mask_only: false,
         }
@@ -798,10 +797,9 @@ impl Config {
         );
         ensure!(
             self.soft_candidate_width > 0
-                && self.soft_steps > 0
-                && (0.0..=1.0).contains(&self.soft_eta)
-                && self.soft_temperature > 0.0,
-            "invalid feedback schedule"
+                && (0.0..=1.0).contains(&self.soft_training_probability)
+                && self.soft_temperature.is_finite() && self.soft_temperature > 0.0,
+            "invalid soft feedback settings"
         );
         Ok(())
     }

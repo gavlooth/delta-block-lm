@@ -37,15 +37,15 @@
   "lngram_memory_dim": 8,
   "lngram_backend": "fused_gpu",
   "soft_selection_backend": "gpu",
+  "soft_training_probability": 0.8,
   "sbd": {
     "block_lengths": [8],
     "block_execution": "batched",
     "in_block_reads": "hola_read",
     "noisy_read_backend": "fused_gpu",
     "feedback": "soft_feedback",
-    "candidate_width": 4,
-    "commit_count": 2,
-    "entropy_threshold": null,
+    "candidate_width": 3,
+    "entropy_threshold": 0.1,
     "generate_tokens": 32
   }
 }

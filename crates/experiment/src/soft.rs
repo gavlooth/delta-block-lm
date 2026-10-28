@@ -1,13 +1,52 @@
-//! Vocabulary port of reuse/crates/dre-relations/{state,diffusion_scheduler,denoiser}.rs.
-//! Convex probability updates, visibility-only remasking, and weighted mask mixing are preserved.
-//! This standalone episode is not SBD training and never updates recurrent state.
+//! Soft-masking: latest detached predictions, normalized top-k, and learned entropy weighting.
+//! Candidate information survives remasking; completed observations remain exact inputs.
 use crate::{
     config::{Config, SoftSelectionBackend},
     model::scalar,
 };
 use anyhow::{Result, ensure};
-use burn::{prelude::*, tensor::activation::softmax};
+use burn::{
+    module::{Param, ParamId},
+    prelude::*,
+    tensor::activation::{sigmoid, softmax, softplus},
+};
 use serde_json::{Value, json};
+
+/// Paper Eq. (3), with the official constrained parameterization and initialization.
+#[derive(Module, Debug)]
+pub struct SoftConfidence {
+    pub(crate) raw_scale: Param<Tensor<1>>,
+    pub(crate) raw_centre_neg: Param<Tensor<1>>,
+    pub(crate) raw_steep: Param<Tensor<1>>,
+}
+impl SoftConfidence {
+    pub fn new(device: &Device) -> Self {
+        Self::from_raw([
+            (1e-6f64 / (1.0 - 1e-6)).ln(),
+            0.75f64.exp_m1().ln(),
+            (10.0f64 / 1.5).exp_m1().ln(),
+        ], device)
+    }
+    pub(crate) fn from_raw(raw: [f64; 3], device: &Device) -> Self {
+        let param = |value: f64| {
+            let value = Tensor::full([1], value, device);
+            let value = if device.is_autodiff() { value.require_grad() } else { value };
+            Param::initialized(ParamId::new(), value)
+        };
+        Self {
+            raw_scale: param(raw[0]),
+            raw_centre_neg: param(raw[1]),
+            raw_steep: param(raw[2]),
+        }
+    }
+    pub fn weight(&self, negative_entropy: Tensor<2>) -> Tensor<2> {
+        let scale = sigmoid(self.raw_scale.val()).reshape([1, 1]);
+        let centre = -softplus(self.raw_centre_neg.val(), 1.0) - 1e-6;
+        let steep = softplus(self.raw_steep.val(), 1.0) + 1e-6;
+        scale * sigmoid((negative_entropy.detach() - centre.reshape([1, 1]))
+            * steep.reshape([1, 1]))
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Candidates {
@@ -81,6 +120,7 @@ impl Candidates {
             };
             let weights = probabilities.gather(1, ids.clone());
             let retained_mass = weights.clone().sum_dim(1);
+            let weights = weights / retained_mass.clone().mask_fill(retained_mass.clone().equal_elem(0.0), 1.0);
             Ok(Self {
                 ids,
                 weights,
@@ -113,6 +153,7 @@ impl Candidates {
         // Index selection is discrete; selected probabilities and gathered embeddings stay differentiable.
         let weights = probabilities.gather(1, ids.clone());
         let retained_mass = weights.clone().sum_dim(1);
+        let weights = weights / retained_mass.clone().mask_fill(retained_mass.clone().equal_elem(0.0), 1.0);
         Ok(Self {
             ids,
             weights,
@@ -150,7 +191,8 @@ impl Candidates {
         let [rows, k] = self.ids.dims();
         let d = embeddings.dims()[1];
         let inactive = active.lower_elem(0.5);
-        let visibility = visibility.mask_fill(inactive.clone(), 0.0);
+        let visibility = visibility.mask_fill(
+            inactive.clone().bool_or(self.retained_mass.clone().equal_elem(0.0)), 0.0);
         if hard_mask {
             let first = self.ids.clone().slice([0..rows, 0..1]).reshape([rows]);
             let visible = visibility
@@ -189,11 +231,10 @@ impl Candidates {
                 .bool_or(unused_nonfinite),
             0.0,
         );
-        let mass = weights.clone().sum_dim(1);
         let weighted = (selected * weights.unsqueeze_dim(2))
             .sum_dim(1)
             .reshape([rows, d]);
-        let mask_weight = (visibility.clone() * mass).neg().add_scalar(1.0);
+        let mask_weight = visibility.clone().neg().add_scalar(1.0);
         let masks = mask.reshape([1, d]).expand([rows, d]).mask_fill(
             mask_weight
                 .clone()
@@ -228,6 +269,9 @@ pub fn dense_expected_masked(
     let visibility = visibility.mask_fill(inactive.clone(), 0.0);
     let hidden = visibility.clone().equal_elem(0.0).bool_or(inactive.clone());
     let probabilities = probabilities.mask_fill(hidden.expand([rows, vocab]), 0.0);
+    let mass = probabilities.clone().sum_dim(1);
+    let visibility = visibility.mask_fill(mass.clone().equal_elem(0.0), 0.0);
+    let probabilities = probabilities / mass.clone().mask_fill(mass.equal_elem(0.0), 1.0);
     // Keep finite zero-probability derivatives; sanitize only unused nonfinite embedding rows.
     let unused = probabilities
         .clone()
@@ -238,8 +282,7 @@ pub fn dense_expected_masked(
         .expand([vocab, d]);
     let unused_nonfinite = unused.bool_and(embeddings.clone().is_finite().bool_not());
     let embeddings = embeddings.mask_fill(unused_nonfinite, 0.0);
-    let mass = probabilities.clone().sum_dim(1);
-    let mask_weight = (visibility.clone() * mass).neg().add_scalar(1.0);
+    let mask_weight = visibility.clone().neg().add_scalar(1.0);
     let masks = mask.reshape([1, d]).expand([rows, d]).mask_fill(
         mask_weight
             .clone()
@@ -281,7 +324,11 @@ fn difference<const D: usize>(a: Tensor<D>, b: Tensor<D>) -> f64 {
 #[derive(Clone, Debug)]
 pub struct SoftState {
     pub candidates: Candidates,
+    /// Historical field name: now exactly learned lambda (one only for hard observations).
     pub visibility: Tensor<2>,
+    /// Detached full-support statistic, not entropy of the truncated candidates.
+    pub negative_entropy: Tensor<2>,
+    pub prediction_available: Tensor<2, Bool>,
     pub observed: Vec<Option<usize>>,
     pub active: Vec<bool>,
     pub provisional: Tensor<2, Int>,
@@ -345,6 +392,8 @@ impl SoftState {
         Ok(Self {
             candidates: Candidates::select(p, width, backend)?,
             visibility: Tensor::from_data(TensorData::new(visibility, [rows, 1]), device),
+            negative_entropy: Tensor::zeros([rows, 1], device),
+            prediction_available: Tensor::<2>::zeros([rows, 1], device).greater_elem(0.0),
             mutable,
             active_device: Tensor::from_data(
                 TensorData::new(
@@ -367,17 +416,17 @@ impl SoftState {
     pub fn update(
         &mut self,
         logits: Tensor<2>,
-        eta: f64,
         temperature: f64,
-        steps: usize,
         width: usize,
+        confidence: &SoftConfidence,
     ) -> Result<()> {
         let rows = self.observed.len();
         ensure!(logits.dims() == [rows, self.vocab], "feedback logits shape");
+        ensure!(temperature.is_finite() && temperature > 0.0, "invalid feedback temperature");
+        let logits = logits.detach();
         let device = logits.device();
-        let (mix, best, available) = if self.backend.is_cpu() {
+        let (best, available) = if self.backend.is_cpu() {
             let raw = host(logits.clone());
-            let mut eta_rows = vec![0.0; rows];
             let mut ids = vec![-1i32; rows];
             for row in 0..rows {
                 let values = &raw[row * self.vocab..(row + 1) * self.vocab];
@@ -391,18 +440,13 @@ impl SoftState {
                     && self.observed[row].is_none()
                     && !values.iter().all(|v| *v == f32::NEG_INFINITY)
                 {
-                    eta_rows[row] = eta as f32;
                     ids[row] = (0..self.vocab)
                         .max_by(|&a, &b| values[a].total_cmp(&values[b]).then(b.cmp(&a)))
                         .unwrap() as i32;
                 }
             }
             let best = Tensor::<2, Int>::from_data(TensorData::new(ids, [rows, 1]), &device);
-            (
-                Tensor::from_data(TensorData::new(eta_rows, [rows, 1]), &device),
-                best.clone(),
-                best.greater_equal_elem(0),
-            )
+            (best.clone(), best.greater_equal_elem(0))
         } else {
             #[cfg(any(feature = "vulkan", feature = "cuda"))]
             {
@@ -421,34 +465,38 @@ impl SoftState {
                     .not_equal_elem(-2139095041_i32)
                     .bool_and(self.mutable.clone());
                 let best = top_ids(keys, 1);
-                let mix = Tensor::zeros([rows, 1], &device).mask_fill(available.clone(), eta);
-                (mix, best, available)
+                (best, available)
             }
             #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
             anyhow::bail!("GPU soft update requires vulkan or cuda");
         };
-        self.provisional = self.provisional.clone().mask_where(available, best);
-        self.visibility = self.visibility.clone().mask_where(
-            self.mutable.clone(),
-            (self.visibility.clone() + 1.0 / steps as f32).clamp_max(1.0),
-        );
-        let old = self.candidates.dense(self.vocab);
-        // Unavailable rows are sanitized before softmax; the logits graph is retained.
+        self.provisional = self.provisional.clone().mask_where(available.clone(), best);
+        // Sanitize unavailable rows before softmax, then replace only mutable predictions.
         let prediction = softmax(
-            logits.mask_fill(mix.clone().equal_elem(0.0).expand([rows, self.vocab]), 0.0)
+            logits.mask_fill(available.clone().bool_not().expand([rows, self.vocab]), 0.0)
                 / temperature,
             1,
         );
-        self.candidates = Candidates::select(
-            old * mix.clone().neg().add_scalar(1.0) + prediction * mix,
-            width,
-            self.backend,
-        )?;
+        let entropy = (prediction.clone() * (prediction.clone() + 1e-10).log()).sum_dim(1);
+        self.negative_entropy = self.negative_entropy.clone().mask_where(available.clone(), entropy).detach();
+        self.prediction_available = self.prediction_available.clone().bool_or(available.clone());
+        let selected = Candidates::select(prediction, width, self.backend)?;
+        let [_, k] = selected.ids.dims();
+        ensure!(self.candidates.ids.dims()[1] == k, "feedback candidate width changed");
+        self.candidates.ids = self.candidates.ids.clone().mask_where(available.clone().expand([rows,k]), selected.ids);
+        self.candidates.weights = self.candidates.weights.clone().mask_where(available.clone().expand([rows,k]), selected.weights).detach();
+        self.candidates.retained_mass = self.candidates.retained_mass.clone().mask_where(available, selected.retained_mass).detach();
+        self.refresh_feedback(confidence);
         Ok(())
     }
-    pub fn remask(&mut self, positions: &[usize]) {
-        let mask = self.positions(positions).bool_and(self.mutable.clone());
-        self.visibility = self.visibility.clone().mask_fill(mask, 0.0);
+    /// Rebuild the trainable coefficient after restoring detached persistent feedback.
+    pub fn refresh_feedback(&mut self, confidence: &SoftConfidence) {
+        let observed = self.mutable.clone().bool_not()
+            .bool_and(self.active_device.clone().greater_elem(0.5));
+        self.visibility = confidence.weight(self.negative_entropy.clone())
+            .mask_fill(self.prediction_available.clone().bool_not(), 0.0)
+            .mask_fill(observed, 1.0)
+            .mask_fill(self.active_device.clone().lower_elem(0.5), 0.0);
     }
     pub fn retain(&mut self, positions: &[usize]) {
         let mask = self
@@ -722,126 +770,115 @@ pub fn episode(c: &Config, device: &Device) -> Result<Value> {
             == vec![0, 1, 2],
         "ties must select ascending token ID"
     );
-    let mut state = SoftState::new(
-        vocab,
-        c.soft_candidate_width,
-        vec![Some(2), None, None, None],
-        vec![true, true, true, false],
-        &device,
-        c.soft_selection_backend,
-    )?;
+    let confidence = SoftConfidence::from_raw([0.2,-0.3,0.4], &device);
+    let confidence_checks = confidence_reference(&device)?;
+    let mut state = SoftState::new(vocab, c.soft_candidate_width,
+        vec![Some(2), None, None, None], vec![true, true, true, false],
+        &device, c.soft_selection_backend)?;
+    let initial = host(state.embeddings(table.clone(), mask.clone(), false));
+    ensure!(initial[d..3*d] == host(mask.clone()).repeat(2), "initial unresolved input is not binary");
+    let observed_before = host(state.candidates.dense(vocab))[..vocab].to_vec();
     let mut rounds = Vec::new();
-    let mut full_state = SoftState::new(
-        vocab,
-        vocab,
-        state.observed.clone(),
-        state.active.clone(),
-        &device,
-        c.soft_selection_backend,
-    )?;
     let mut update_error = 0.0f64;
-    for step in 0..c.soft_steps {
-        let embedded = state.embeddings(table.clone(), mask.clone(), c.hard_mask_only);
-        let logits = embedded.matmul(table.clone().transpose())
-            + Tensor::from_data(
-                TensorData::new(
-                    (0..4 * vocab)
-                        .map(|i| ((i + step * 3) % vocab) as f32 / 4.0)
-                        .collect::<Vec<_>>(),
-                    [4, vocab],
-                ),
-                &device,
-            );
-        let before = full_state.candidates.dense(vocab);
-        let before_values = host(before.clone());
-        let predicted = softmax(logits.clone() / c.soft_temperature, 1);
-        let reference = before * (1.0 - c.soft_eta) + predicted * c.soft_eta;
-        full_state.update(
-            logits.clone(),
-            c.soft_eta,
-            c.soft_temperature,
-            c.soft_steps,
-            vocab,
-        )?;
-        let expected = host(reference);
-        let after = host(full_state.candidates.dense(vocab));
-        for row in 0..4 {
-            for id in 0..vocab {
-                let goal = if row == 0 || row == 3 {
-                    before_values[row * vocab + id]
-                } else {
-                    expected[row * vocab + id]
-                };
-                let delta = after[row * vocab + id] - goal;
-                ensure!(
-                    delta.is_finite(),
-                    "nonfinite dense/full-support update comparison at row {row}, token {id}"
-                );
-                update_error = update_error.max(delta.abs() as f64);
+    for step in 0..4 {
+        let lv = (0..4*vocab).map(|i| ((i + step*3) % vocab) as f32 / 4.0).collect::<Vec<_>>();
+        let logits = Tensor::from_data(TensorData::new(lv.clone(), [4,vocab]), &device).require_grad();
+        state.update(logits.clone(), c.soft_temperature, c.soft_candidate_width, &confidence)?;
+        let actual_entropy = host(state.negative_entropy.clone());
+        let actual_weights = host(state.candidates.weights.clone());
+        let actual_mass = host(state.candidates.retained_mass.clone());
+        let actual_ids = ids_host(state.candidates.ids.clone());
+        let k = c.soft_candidate_width.min(vocab);
+        for row in [1,2] {
+            let logits = lv[row*vocab..(row+1)*vocab].iter().map(|&x| f64::from(x)/c.soft_temperature).collect::<Vec<_>>();
+            let maximum = logits.iter().copied().fold(f64::NEG_INFINITY,f64::max);
+            let total = logits.iter().map(|&x|(x-maximum).exp()).sum::<f64>();
+            let p = logits.iter().map(|&x|(x-maximum).exp()/total).collect::<Vec<_>>();
+            let entropy = p.iter().map(|&x|x*(x+1e-10).ln()).sum::<f64>();
+            ensure!((f64::from(actual_entropy[row])-entropy).abs()<2e-6, "full-support entropy reference");
+            let mass = actual_ids[row*k..(row+1)*k].iter().map(|&id|p[id as usize]).sum::<f64>();
+            ensure!((f64::from(actual_mass[row])-mass).abs()<2e-6, "raw retained mass reference");
+            for j in 0..k {
+                let q = p[actual_ids[row*k+j] as usize]/mass;
+                ensure!((f64::from(actual_weights[row*k+j])-q).abs()<2e-6, "normalized top-k reference");
             }
         }
-        state.update(
-            logits,
-            c.soft_eta,
-            c.soft_temperature,
-            c.soft_steps,
-            c.soft_candidate_width,
-        )?;
-        if step == 0 || step + 1 == c.soft_steps {
-            state.retain(&[1, 2]);
-        }
-        if step == 0 {
-            let before = host(state.candidates.weights.clone());
-            let retained = ids_host(state.retained.clone());
-            state.remask(&[0, 1, 3]);
-            ensure!(
-                before == host(state.candidates.weights.clone())
-                    && retained == ids_host(state.retained.clone())
-                    && host(state.visibility.clone())[0] == 1.0,
-                "remasking erased beliefs or changed observations"
-            );
-        }
-        ensure!(
-            state.observed[0] == Some(2)
-                && ids_host(state.provisional.clone())[0] == -1
-                && host(state.visibility.clone())[3] == 0.0,
-            "observed/padding transition failure"
-        );
-        rounds.push(json!({"step":step,"ids":ids_host(state.candidates.ids.clone()),"weights":host(state.candidates.weights.clone()),"retained_mass":host(state.candidates.retained_mass.clone()),"visibility":host(state.visibility.clone()),"provisional":proposals(state.provisional.clone()),"retained":proposals(state.retained.clone())}));
+        let mut fresh = SoftState::new(vocab, c.soft_candidate_width,
+            state.observed.clone(), state.active.clone(), &device, c.soft_selection_backend)?;
+        fresh.update(logits.clone(), c.soft_temperature, c.soft_candidate_width, &confidence)?;
+        update_error = update_error.max(difference(state.candidates.weights.clone(), fresh.candidates.weights.clone()));
+        ensure!(ids_host(state.candidates.ids.clone()) == ids_host(fresh.candidates.ids.clone()),
+            "candidate identities depend on earlier predictions");
+        ensure!(host(state.candidates.dense(vocab))[..vocab] == observed_before,
+            "teacher changed permanent observations");
+        ensure!(host(state.visibility.clone())[0] == 1.0 && host(state.visibility.clone())[3] == 0.0,
+            "observed/padding coefficient changed");
+        state.retain(&[1,2]);
+        let gradients = state.embeddings(table.clone(), mask.clone(), false).sum().backward();
+        ensure!(logits.grad(&gradients).is_none(), "teacher prediction received a student gradient");
+        ensure!(confidence.raw_scale.val().grad(&gradients).is_some(), "confidence scale is disconnected");
+        ensure!(table.grad(&gradients).is_some(), "embedding table is disconnected");
+        rounds.push(json!({"step":step,"ids":ids_host(state.candidates.ids.clone()),
+            "weights":host(state.candidates.weights.clone()),"retained_mass":host(state.candidates.retained_mass.clone()),
+            "lambda":host(state.visibility.clone()),"provisional":proposals(state.provisional.clone()),
+            "retained":proposals(state.retained.clone())}));
     }
-    ensure!(update_error < 2e-6, "full-support convex feedback mismatch");
-    let mut unavailable = SoftState::new(
-        vocab,
-        vocab,
-        vec![None],
-        vec![true],
-        &device,
-        c.soft_selection_backend,
-    )?;
-    let previous = host(unavailable.candidates.weights.clone());
-    unavailable.update(
-        Tensor::full([1, vocab], f32::NEG_INFINITY, &device),
-        c.soft_eta,
-        c.soft_temperature,
-        c.soft_steps,
-        vocab,
-    )?;
-    ensure!(
-        host(unavailable.candidates.weights.clone()) == previous
-            && ids_host(unavailable.provisional.clone())[0] == -1
-            && host(unavailable.visibility.clone())[0] > 0.0,
-        "unavailable predictions must retain beliefs independently of visibility gain"
-    );
-    let final_norm = scalar(
-        state
-            .embeddings(table, mask, c.hard_mask_only)
-            .square()
-            .sum(),
-    )?;
+    ensure!(update_error < 2e-6, "latest-only feedback mismatch");
+    let before = host(state.candidates.weights.clone());
+    let weight_before = host(state.visibility.clone());
+    state.update(Tensor::full([4,vocab], f32::NEG_INFINITY, &device),
+        c.soft_temperature, c.soft_candidate_width, &confidence)?;
+    ensure!(host(state.candidates.weights.clone()) == before && host(state.visibility.clone()) == weight_before,
+        "unavailable predictions changed retained feedback");
     let endpoint_checks = endpoint_poison_checks(&device)?;
-    Ok(
-        json!({"mechanism":"copied_dense_convex_feedback_vocabulary_port","not_sbd":true,"candidate_width":c.soft_candidate_width,"hard_mask_only":c.hard_mask_only,"expectation_max_error":expectation_error,"weight_gradient_max_error":weight_gradient_error,"embedding_gradient_max_error":embedding_gradient_error,"truncated_expectation_max_error":truncated_expectation_error,"truncated_weight_gradient_max_error":truncated_weight_gradient_error,"truncated_embedding_gradient_max_error":truncated_embedding_gradient_error,"endpoint_checks":endpoint_checks,"full_support_update_max_error":update_error,"final_embedding_squared_norm":final_norm,"rounds":rounds}),
-    )
+    Ok(json!({"mechanism":"learned_entropy_latest_normalized_topk","not_sbd":true,
+        "candidate_width":c.soft_candidate_width,"hard_mask_only":c.hard_mask_only,
+        "expectation_max_error":expectation_error,"weight_gradient_max_error":weight_gradient_error,
+        "embedding_gradient_max_error":embedding_gradient_error,"truncated_expectation_max_error":truncated_expectation_error,
+        "truncated_weight_gradient_max_error":truncated_weight_gradient_error,
+        "truncated_embedding_gradient_max_error":truncated_embedding_gradient_error,
+        "endpoint_checks":endpoint_checks,"confidence_checks":confidence_checks,
+        "latest_only_max_error":update_error,"rounds":rounds}))
+}
+
+/// Independent scalar Eq. (3) and raw-parameter derivatives, shared by CPU/GPU acceptance.
+fn confidence_reference(device: &Device) -> Result<Value> {
+    let initialized = SoftConfidence::new(device);
+    let initial = host(initialized.weight(Tensor::from_data([[0.0f32],[-10.0]], device)));
+    ensure!(initial[0] > 0.0 && initial[0] < 1.01e-6 && initial[1] < initial[0],
+        "official near-zero confidence initialization changed");
+    let raw = [0.2f64, -0.3, 0.4];
+    let head = SoftConfidence::from_raw(raw, device);
+    let entropy = [0.0f64, -0.75, -8.0];
+    let sigmoid = |x:f64| 1.0/(1.0+(-x).exp());
+    let scale = sigmoid(raw[0]);
+    let centre = -(1.0+raw[1].exp()).ln()-1e-6;
+    let steep = (1.0+raw[2].exp()).ln()+1e-6;
+    let mut expected = Vec::new();
+    let mut derivatives = [0.0f64;3];
+    for h in entropy {
+        let s = sigmoid(steep*(h-centre));
+        expected.push(scale*s);
+        derivatives[0] += scale*(1.0-scale)*s;
+        derivatives[1] += scale*s*(1.0-s)*steep*sigmoid(raw[1]);
+        derivatives[2] += scale*s*(1.0-s)*(h-centre)*sigmoid(raw[2]);
+    }
+    let input = Tensor::from_data([[0.0f32],[-0.75],[-8.0]], device).require_grad();
+    let actual = head.weight(input.clone());
+    let observed = host(actual.clone());
+    for (&a,&e) in observed.iter().zip(&expected) {
+        ensure!((f64::from(a)-e).abs()<2e-6, "scalar confidence mismatch");
+    }
+    ensure!(observed[0] > observed[1] && observed[1] > observed[2]
+        && observed.iter().all(|&x| x>=0.0 && f64::from(x)<scale), "confidence constraints/entropy ordering");
+    let gradients = actual.sum().backward();
+    ensure!(input.grad(&gradients).is_none(), "entropy is not detached");
+    for (parameter, expected) in [&head.raw_scale,&head.raw_centre_neg,&head.raw_steep].into_iter().zip(derivatives) {
+        let actual = f64::from(host(parameter.val().grad(&gradients).context("confidence gradient")?)[0]);
+        ensure!((actual-expected).abs()<2e-6, "scalar confidence derivative mismatch");
+    }
+    Ok(json!({"official_initial_lambda":initial,"entropy":entropy,"lambda":observed,
+        "independent_raw_parameter_derivatives":derivatives,"teacher_entropy_detached":true}))
 }
 use anyhow::Context;
 
