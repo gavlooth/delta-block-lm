@@ -171,10 +171,18 @@ pub(super) fn raw_timed(
 }
 struct Parameters<'a> {
     grads: Option<&'a GradientsParams>,
+    path: Vec<String>,
+    unused: &'a [&'a str],
     tensors: Vec<(Vec<usize>, Vec<f32>)>,
     missing: usize,
 }
 impl ModuleVisitor for Parameters<'_> {
+    fn enter_module(&mut self, name: &str, _: &str) {
+        self.path.push(name.to_owned());
+    }
+    fn exit_module(&mut self, _: &str, _: &str) {
+        self.path.pop();
+    }
     fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
         if self.grads.is_some() && !param.val().is_require_grad() {
             return;
@@ -183,6 +191,9 @@ impl ModuleVisitor for Parameters<'_> {
             match grads.get::<D>(param.id) {
                 Some(g) => g,
                 None => {
+                    if self.unused.contains(&self.path.join(".").as_str()) {
+                        return;
+                    }
                     self.missing += 1;
                     return;
                 }
@@ -197,8 +208,17 @@ pub(super) fn parameters(
     model: &LanguageModel,
     grads: Option<&GradientsParams>,
 ) -> Result<Vec<(Vec<usize>, Vec<f32>)>> {
+    parameters_with_unused(model, grads, &[])
+}
+pub(super) fn parameters_with_unused(
+    model: &LanguageModel,
+    grads: Option<&GradientsParams>,
+    unused: &[&str],
+) -> Result<Vec<(Vec<usize>, Vec<f32>)>> {
     let mut visitor = Parameters {
         grads,
+        path: Vec::new(),
+        unused,
         tensors: Vec::new(),
         missing: 0,
     };

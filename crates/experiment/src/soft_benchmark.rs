@@ -3,7 +3,7 @@ use crate::{
     config::{Config, SoftSelectionBackend as Path},
     profile::median,
     runtime,
-    soft::{self, Candidates, SoftState, ids_host},
+    soft::{self, Candidates, SoftConfidence, SoftState, ids_host},
 };
 use anyhow::{Result, ensure};
 use burn::{
@@ -65,6 +65,7 @@ fn state_equal(a: &SoftState, b: &SoftState) -> Result<()> {
 }
 pub fn reference(c: &Config, device: &Device) -> Result<Value> {
     let device = device.clone().autodiff();
+    let confidence = SoftConfidence::new(&device);
     let mut cases = Vec::new();
     for path in [Path::Cpu, Path::Gpu, Path::GpuTiled] {
         if c.backend == "cpu" && !path.is_cpu() {
@@ -90,7 +91,7 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
                 .collect::<Vec<_>>();
             pv[..vocab].fill(0.0);
             pv[0] = -0.0;
-            pv[1] = f32::from_bits(1);
+            pv[1] = 0.0;
             // A zero row, repeated ties, a padded row, and an ordinary tail row.
             let p = if strided {
                 let mut transposed = vec![0f32; pv.len()];
@@ -140,23 +141,29 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
                 if r == 2 {
                     continue;
                 }
-                for j in 0..d {
-                    output[r * d + j] = mv[j] as f64 * (1.0 - rv[r] * mass[r]);
-                    dm[j] += 1.0 - rv[r] * mass[r];
+                let lambda = if mass[r] > 0.0 { rv[r] } else { 0.0 };
+                let mut average = vec![0.0f64; d];
+                if lambda != 0.0 {
+                    for &id in &oracle_ids[r*k..(r+1)*k] {
+                        let id = id as usize;
+                        let q = f64::from(pv[r*vocab+id])/mass[r];
+                        for j in 0..d {
+                            average[j] += q*f64::from(ev[id*d+j]);
+                            de[id*d+j] += lambda*q;
+                        }
+                    }
                 }
-                for &id in &oracle_ids[r * k..(r + 1) * k] {
-                    let id = id as usize;
-                    let pval = pv[r * vocab + id] as f64;
-                    for j in 0..d {
-                        output[r * d + j] += rv[r] * pval * ev[id * d + j] as f64;
-                        de[id * d + j] += rv[r] * pval;
+                for j in 0..d {
+                    output[r*d+j] = (1.0-lambda)*f64::from(mv[j])+lambda*average[j];
+                    dm[j] += 1.0-lambda;
+                }
+                if lambda != 0.0 {
+                    for &id in &oracle_ids[r*k..(r+1)*k] {
+                        let id = id as usize;
+                        dp[r*vocab+id] = lambda/mass[r]
+                            *(0..d).map(|j|f64::from(ev[id*d+j])-average[j]).sum::<f64>();
                     }
-                    if rv[r] != 0.0 {
-                        dp[r * vocab + id] =
-                            rv[r] * (0..d).map(|j| (ev[id * d + j] - mv[j]) as f64).sum::<f64>();
-                        dr[r] +=
-                            pval * (0..d).map(|j| (ev[id * d + j] - mv[j]) as f64).sum::<f64>();
-                    }
+                    dr[r] = (0..d).map(|j|average[j]-f64::from(mv[j])).sum::<f64>();
                 }
             }
             for r in 0..rows {
@@ -218,6 +225,9 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
                 "invalid candidate accepted"
             );
         }
+        let tiny = Candidates::select(
+            Tensor::from_data([[-0.0f32, 0.0, f32::from_bits(1)]], &device), 1, path)?;
+        ensure!(ids_host(tiny.ids) == vec![2], "subnormal/signed-zero ordering");
         let mut a = SoftState::new(
             257,
             16,
@@ -227,7 +237,7 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
             Path::Cpu,
         )?;
         let mut b = SoftState::new(257, 16, a.observed.clone(), a.active.clone(), &device, path)?;
-        let mut logit_pairs = Vec::new();
+        let mut latest_logits = None;
         for step in 0..4 {
             let mut lv = (0..4 * 257)
                 .map(|i| ((i + step * 7) % 17) as f32 / 17.0 - 0.5)
@@ -238,18 +248,16 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
             let left =
                 Tensor::from_data(TensorData::new(lv.clone(), [4, 257]), &device).require_grad();
             let right = Tensor::from_data(TensorData::new(lv, [4, 257]), &device).require_grad();
-            let eta = if step == 0 { 0.0 } else { 0.5 };
-            a.update(left.clone(), eta, 1.0, 4, 16)?;
-            b.update(right.clone(), eta, 1.0, 4, 16)?;
-            logit_pairs.push((left, right));
+            a.update(left.clone(), 1.0, 16, &confidence)?;
+            b.update(right.clone(), 1.0, 16, &confidence)?;
+            latest_logits = Some((left, right));
             a.retain(&[0, 1, 2, 3]);
             b.retain(&[0, 1, 2, 3]);
-            a.remask(&[0, 1, 3]);
-            b.remask(&[0, 1, 3]);
             state_equal(&a, &b)?;
             ensure!(
-                values(b.visibility.clone()) == vec![1.0, 0.0, (step + 1) as f32 / 4.0, 0.0],
-                "independent visibility schedule"
+                values(b.visibility.clone())[0] == 1.0 && values(b.visibility.clone())[1] == 0.0
+                    && values(b.visibility.clone())[2] > 0.0 && values(b.visibility.clone())[3] == 0.0,
+                "learned coefficient/immutable observations"
             );
             ensure!(
                 ids_host(b.provisional.clone()) == vec![-1, -1, 1, -1],
@@ -260,29 +268,27 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
                 "independent retained proposals"
             );
         }
-        let ga = a.candidates.weights.clone().square().sum().backward();
-        let gb = b.candidates.weights.clone().square().sum().backward();
-        for (left, right) in logit_pairs {
-            close(
-                &values(right.grad(&gb).expect("GPU feedback logit VJP")),
-                &values(left.grad(&ga).expect("CPU feedback logit VJP"))
-                    .into_iter()
-                    .map(f64::from)
-                    .collect::<Vec<_>>(),
-                "feedback logit VJP",
-            )?;
-        }
+        let (left,right) = latest_logits.unwrap();
+        let table = Tensor::ones([257,2], &device).require_grad();
+        let mask = Tensor::zeros([2], &device).require_grad();
+        let out = b.embeddings(table.clone(),mask.clone(),false);
+        let gb = out.sum().backward();
+        ensure!(left.grad(&gb).is_none() && right.grad(&gb).is_none(),
+            "teacher logits received feedback gradients");
+        ensure!(confidence.raw_scale.val().grad(&gb).is_some()
+            && table.grad(&gb).is_some() && mask.grad(&gb).is_some(),
+            "live confidence/embedding/mask gradients absent");
         for invalid in [f32::NAN, f32::INFINITY] {
             let invalid = Tensor::full([4, 257], invalid, &device);
             ensure!(
-                b.update(invalid, 0.5, 1.0, 4, 16).is_err(),
+                b.update(invalid, 1.0, 16, &confidence).is_err(),
                 "nonfinite logits accepted"
             );
         }
         cases.push(json!({"path":path,"episode":episode,"state_transition_rounds":4,"nonfinite_rejection":true}));
     }
     Ok(
-        json!({"passed":true,"cases":cases,"absolute_tolerance":2e-5,"relative_tolerance":3e-4,"scope":"selection, dense/f64 expectations, all differentiable inputs, immutable observations, padding, signed-zero ties, unavailable rows, eta-zero, retain/remask; no recurrent resets exist in this component"}),
+        json!({"passed":true,"cases":cases,"absolute_tolerance":2e-5,"relative_tolerance":3e-4,"scope":"normalized top-k selection, independent f64 outputs and VJPs, learned entropy coefficient and raw-parameter derivatives, latest-only detached prediction, immutable observations, padding, signed-zero ties, unavailable rows; no recurrent resets exist in this component"}),
     )
 }
 fn timed<T>(device: &Device, run: impl FnOnce() -> Result<T>) -> Result<f64> {
@@ -310,6 +316,7 @@ pub fn run(c: &Config, device: &Device, warmups: usize, trials: usize) -> Result
         c.batch_size, c.context, c.soft_candidate_width
     ));
     let device = device.clone().autodiff();
+    let confidence = SoftConfidence::new(&device);
     for positions in [c.context] {
         for vocab in [257, 32000] {
             for width in [c.soft_candidate_width] {
@@ -379,9 +386,8 @@ pub fn run(c: &Config, device: &Device, warmups: usize, trials: usize) -> Result
                         })?;
                         let fm = timed(&device, || {
                             let s = &mut states[m];
-                            s.update(logits.clone(), 0.5, 1.0, 4, width)?;
+                            s.update(logits.clone(), 1.0, width, &confidence)?;
                             s.retain(&[0]);
-                            s.remask(&[0]);
                             Ok(s.embeddings(table.clone(), mask.clone(), false))
                         })?;
                         let fb = timed(&device, || {

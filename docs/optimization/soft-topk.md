@@ -2,22 +2,25 @@
 
 ## Scope and execution identity
 
-This changes the existing standalone soft-feedback episode, not the causal LM
-or an implementation of block diffusion/SBD. `soft_selection_backend` is an
-explicit serialized selector: omitted/`cpu` preserves historical selection;
-`gpu` uses the native GPU reduction; `gpu_tiled` is the alternative two-stage
-GPU design. Historical configurations, parameters, checkpoints and omitted
-selector fingerprints are unchanged. Fusion and matmul autotuning stay off.
+The selector is shared by the standalone soft episode and the active SBD
+denoiser. `soft_selection_backend` explicitly selects `cpu`, native `gpu`,
+or the two-stage `gpu_tiled` implementation. Fusion and matmul autotuning
+remain independent. The current feedback equation follows the
+[soft-masking paper, Eq. (3)](https://arxiv.org/html/2510.17206v2#S3.E3)
+and [official constrained head](https://github.com/IBM/soft-masked-diffusion-language-models/blob/8c3ec65872f6943ad366ffac877a0d6d8cffe29e/coding/train/components/transparency_head.py).
+The historical measurements below used the predecessor equation, not this
+repair; they are not acceptance or speed evidence for the new math.
 
 The 8.64×/24.44× figures below are isolated complete-feedback-round gains,
 not full-model training or decoder speedups. Their raw paired samples are
 `artifacts/soft-topk/selection-1792868611613-2908803/`; inclusion of the same
 selector in a later model config does not extend that measurement's scope.
 
-The CPU baseline remains the original full probability download, per-row
-`total_cmp`/ascending-ID sort, ID upload, differentiable gather and sum. Both
-GPU designs replace only discrete selection and state bookkeeping. Selected
-weights and retained mass still use the original gather/sum autodiff paths.
+The CPU baseline downloads full probabilities, sorts each row with
+`total_cmp`/ascending-ID ties, uploads IDs, and gathers selected values.
+Both GPU designs replace only discrete selection and state bookkeeping.
+Selected probabilities are now normalized over top-k; raw selected mass is
+retained separately. No circuit vocabulary support is removed.
 
 ## Designs compared
 
@@ -50,12 +53,12 @@ or an unnecessary selected-value output. Width continues to clamp to vocab.
 
 ## Device-resident state and gradients
 
-Candidate IDs, selected weights, retained mass, visibility, provisional IDs,
-retained IDs, mutable-row masks and active-row tensors remain on the device.
-Immutable observed/active host metadata is retained for episode reporting and
-the explicit CPU oracle. Initial probability tables are generated on device,
-not uploaded as a rows-by-vocabulary host vector. Retain/remask upload only the
-requested position IDs and update device tensors; they do not download state.
+Candidate IDs, normalized weights, raw retained mass, full-distribution
+negative entropy, prediction availability and proposal/retained IDs remain
+on device. The historical `visibility` field is now only the learned
+embedding coefficient, not an adjustable schedule. Permanent observations
+have coefficient one, initial unresolved positions and padding zero.
+Remasking retains soft information; only temporary reveal views become hard.
 
 A GPU selection reads back **one boolean validity result**, not the
 probability tensor. A feedback update reads one logits validity boolean and
@@ -63,14 +66,29 @@ one candidate validity boolean. Immediate `Result` rejection is preserved;
 there is no silent fallback, suppressed invalid input or unchecked delayed
 failure. Final report/debug snapshots intentionally read selected tensors.
 
-The convex update, temperature, visibility schedule, unavailable-row
-sanitization, eta-zero proposal behavior, immutable observations,
-padding, zero-mass mask expectation and visibility-only remasking retain
-historical semantics. Discrete IDs have no VJP; gather/softmax/expectation
-retain gradients to probabilities/logits, embeddings, mask and visibility.
-No recurrent state or document reset exists in this component.
+Each update replaces candidates from the latest detached prediction.
+The learned coefficient is scale times sigmoid of positive steepness times
+negative entropy minus the negative center. Scale uses sigmoid; steepness
+and negative center use softplus with the official `1e-6` offsets.
+Official initialization is scale `1e-6`, center about `-0.75`, steepness
+about `6.67`. Student embedding/mask values and all three confidence
+parameters remain differentiable; teacher logits and probabilities do not.
+The candidate distribution is normalized before embedding expectation, so
+discarded top-k mass does not reduce the learned coefficient.
+
+Ordinary training samples soft students with probability `0.8` and binary
+students otherwise; binary draws do not run a teacher or train confidence
+parameters. Inference starts binary without an added initial teacher.
+Discrete remask counts/support are unchanged and are not learned by this head.
+Old head-free checkpoints are incompatible under the shared model-math
+revision. Current independent scalar/tensor/CPU/GPU references are in
+`soft.rs` and `soft_benchmark.rs`; this repair did not execute them.
 
 ## Measurement protocol and interpretation
+The rest of this document records historical predecessor-formula measurements.
+Its convex-update/visibility references explain those archived artifacts only,
+not controls or equations accepted by the current implementation.
+
 
 Local Intel Arc MTL integrated GPU, Vulkan, Burn 0.22/CubeCL 0.11, f32,
 heuristic matmuls, fusion off. Shape fixtures use seed 1307 and resident
