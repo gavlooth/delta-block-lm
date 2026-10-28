@@ -9,6 +9,9 @@ use serde_json::{Value, json};
 const ABSOLUTE_TOLERANCE: f64 = 2e-5;
 const RELATIVE_TOLERANCE: f64 = 3e-4;
 
+
+#[path = "codpula_marginal_reference.rs"]
+mod marginal_ce_reference;
 #[derive(Default)]
 struct Errors {
     count: usize,
@@ -1807,12 +1810,14 @@ pub fn numerical_checks(device: &Device) -> Result<Value> {
     let gates = gate_and_observed_gradients(device).context("valid-state gate pooling and observed derivative paths")?;
     let fused = fused_checks(device).context("real K32 V257 fused forward and full VJP")?;
     let contextual = contextual_checks(device).context("contextual roots, ordered neural summary and full VJPs")?;
+    let marginal_token_ce = marginal_ce_reference::checks(device).context("weighted singleton marginal CE, logical-chain flows and finite update")?;
     Ok(json!({"passed":true,"device":crate::runtime::identity(device),
         "absolute_tolerance":ABSOLUTE_TOLERANCE,"relative_tolerance":RELATIVE_TOLERANCE,
         "enumeration":enumeration,"structure":structure,"tensor":tensor,
         "marginal_vjp":marginal,"sampling":sampling,"eq9":update,"state_update":state_update,
         "neural_gates":gates,"fused":fused,
         "contextual":contextual,
+        "marginal_token_ce":marginal_token_ce,
         "support_and_dependence_regressions":support_regressions,
         "indexed_uniform_regressions":uniform_regressions,
         "integration_scope":"model final-RMSNorm provenance, clean singleton bypass, soft-feedback detach/embedding, decoder commitment ties and checkpoint/model optimizer integration belong to the model integration checks"}))

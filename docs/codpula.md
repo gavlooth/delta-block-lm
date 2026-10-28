@@ -755,3 +755,38 @@ cargo test --workspace --features delta-experiment/vulkan
 .cache/delta-experiment sbd-evaluate artifacts/codpula-context/smoke/config.json --resume artifacts/codpula-context/smoke/kronlstm-hola-seed1/checkpoint-3
 .cache/delta-experiment sbd-generate artifacts/codpula-context/smoke/config.json --resume artifacts/codpula-context/smoke/kronlstm-hola-seed1/checkpoint-3
 ```
+
+## 11. Conditional marginal-token loss in the combined decoder
+
+The standalone joint circuit objective and FFBS sampler remain available.
+CoCommit and TCT token cross entropy instead require singleton conditional
+events, not the joint probability of all selected gold tokens:
+
+`loss = sum_i w_i [log Z(O) - log Z(O, X_i = y_i)] / denominator`.
+
+`PreparedCircuit::marginal_ce` accepts gold labels and observation values
+separately. Padding and permanent observations do not become prediction
+targets. Each selected token is conditioned only on the existing observations;
+other gold labels never enter its evidence. Row-specific nonnegative weights
+scale both the neural loss and the positive/negative manual circuit statistics.
+Statistics sum over target events, while prior traversal reach and
+`active_blocks` count each logical chain once, not once per singleton query.
+This prevents an unintended change in the circuit update's effective scale
+when the number of scored positions changes.
+
+The existing zero-initialized EMA and bias correction are supported by
+[Anemone §5.1](https://arxiv.org/html/2505.19982v2#S5.SS1):
+`Fm <- beta Fm + (1-beta) F`, followed by `Fm / (1-beta^t)`, with `beta=0.9`.
+The implementation applies that equation separately to its nonnegative
+positive/negative statistics. Its normalized tied-HMM positive/negative split
+is an explicit implementation convention, not an assertion that unavailable
+official Codpula code uses the unique same split. Neither that split nor the
+existing step-size schedule is replaced here.
+
+`codpula-reference` includes exhaustive f64 singleton-event enumeration,
+all-coordinate finite differences for token potentials, grouped gates,
+emission/transition/root parameters and contextual roots, separate signed-flow
+comparisons, padded/weighted rows with observations distinct from gold labels,
+logical-chain reach counts, and a first finite bias-corrected circuit update.
+These are numerical checks, not language-quality or exact-reproduction evidence.
+

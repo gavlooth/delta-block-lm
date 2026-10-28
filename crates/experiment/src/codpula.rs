@@ -63,23 +63,34 @@ pub struct CircuitFlows {
     pub active_blocks: usize,
 }
 impl CircuitFlows {
-    pub fn add(&mut self, other: Self) {
+    fn add_event_statistics(&mut self, other: Self) -> (Tensor<1>, Tensor<1>, Tensor<1>, usize) {
         self.emission_positive = self.emission_positive.clone() + other.emission_positive;
         self.emission_negative = self.emission_negative.clone() + other.emission_negative;
         self.transition_positive = self.transition_positive.clone() + other.transition_positive;
         self.transition_negative = self.transition_negative.clone() + other.transition_negative;
         self.root_positive = self.root_positive.clone() + other.root_positive;
         self.root_negative = self.root_negative.clone() + other.root_negative;
-        self.emission_reach = self.emission_reach.clone() + other.emission_reach;
-        self.transition_reach = self.transition_reach.clone() + other.transition_reach;
-        self.root_reach = self.root_reach.clone() + other.root_reach;
-        self.active_blocks += other.active_blocks;
+        (other.emission_reach, other.transition_reach, other.root_reach, other.active_blocks)
+    }
+    pub fn add(&mut self, other: Self) {
+        let (emission, transition, root, count) = self.add_event_statistics(other);
+        self.emission_reach = self.emission_reach.clone() + emission;
+        self.transition_reach = self.transition_reach.clone() + transition;
+        self.root_reach = self.root_reach.clone() + root;
+        self.active_blocks += count;
     }
 }
 
 pub struct CircuitLoss {
     pub loss: Tensor<1>,
     pub flows: CircuitFlows,
+}
+
+struct CircuitReach {
+    emission: Tensor<1>,
+    transition: Tensor<1>,
+    root: Tensor<1>,
+    active_blocks: usize,
 }
 
 /// Neural outputs and local normalizers remain fixed across all evidence queries.
@@ -648,19 +659,33 @@ impl PreparedCircuit {
     /// Joint event loss for target positions conditioned on the existing observations.
     /// Target positions not selected by this mask remain marginalized.
     pub fn event_nll(&self, clean: Tensor<2, Int>, observed: Tensor<2, Bool>, targets: Tensor<2, Bool>, denominator: f64) -> Result<CircuitLoss> {
+        self.event_nll_weighted(clean, observed, targets, denominator, None, None)
+    }
+    fn event_nll_weighted(&self, clean: Tensor<2, Int>, observed: Tensor<2, Bool>,
+        targets: Tensor<2, Bool>, denominator: f64, row_weights: Option<Tensor<1>>,
+        fixed_query: Option<(&Statistics, &CircuitReach)>) -> Result<CircuitLoss> {
         ensure!(denominator.is_finite() && denominator > 0.0, "invalid joint loss denominator");
         let (rows, width, states, vocab) = self.shape();
         ensure!(observed.dims() == [rows, width] && targets.dims() == [rows, width], "invalid event mask shape");
         let valid = self.valid.clone().greater_elem(0.0);
         let observed = observed.bool_and(valid.clone());
         let targets = targets.bool_and(valid.clone());
-        ensure!(!observed.clone().bool_and(targets.clone()).any().into_scalar::<bool>(), "event targets overlap observations");
+        if row_weights.is_none() {
+            ensure!(!observed.clone().bool_and(targets.clone()).any().into_scalar::<bool>(), "event targets overlap observations");
+        }
         let numerator_fixed = observed.clone().bool_or(targets.clone());
         let plus = self.statistics(clean.clone(), numerator_fixed.clone())?;
-        let minus = self.statistics(clean.clone(), observed.clone())?;
+        let computed_negative;
+        let minus = match fixed_query {
+            Some((negative, _)) => negative,
+            None => { computed_negative = self.statistics(clean.clone(), observed.clone())?; &computed_negative }
+        };
         let active = targets.float().sum_dim(1).greater_elem(0.0).float().reshape([rows]);
-        let active_blocks = active.clone().sum().into_scalar::<f32>() as usize;
-        let loss = (minus.log_z.clone() - plus.log_z.clone()).mask_fill(active.clone().equal_elem(0.0), 0.0).sum() / denominator;
+        let active_blocks = fixed_query.map_or_else(|| active.clone().sum().into_scalar::<f32>() as usize, |(_,reach)| reach.active_blocks);
+        let weighted = row_weights.is_some();
+        let active = match row_weights { Some(weights) => active * weights, None => active };
+        let events = (minus.log_z.clone() - plus.log_z.clone()).mask_fill(active.clone().equal_elem(0.0), 0.0);
+        let loss = (if weighted {events * active.clone()} else {events}).sum() / denominator;
         let clean_ids = clean.mask_fill(self.valid.clone().equal_elem(0.0), 0);
         let gamma_plus = plus.state.detach();
         let gamma_minus = minus.state.detach();
@@ -707,16 +732,18 @@ impl PreparedCircuit {
         };
         let root_positive = ((gamma_plus.narrow(1, 0, 1).reshape([rows, states]) + rho.clone()) * active.clone().reshape([rows, 1])).sum_dim(0).reshape([states]);
         let root_negative = ((gamma_minus.narrow(1, 0, 1).reshape([rows, states]) + rho) * active.clone().reshape([rows, 1])).sum_dim(0).reshape([states]);
-        // Traversal is unconditional under each block's current, modulated transition.
-        let prior = self.statistics(Tensor::<2, Int>::zeros([rows, width], &self.logits.device()), self.valid.clone().lower_elem(0.0))?;
-        let reaches = prior.state * active.clone().reshape([rows, 1, 1]);
-        let emission_reach = reaches.sum_dim(0).sum_dim(1).reshape([states]);
-        let transition_reach = prior.summed_edge.sum_dim(2).reshape([rows, states]) * active.reshape([rows, 1]);
-        let transition_reach = transition_reach.sum_dim(0).reshape([states]);
+        let computed_reach;
+        let reach = match fixed_query {
+            Some((_, reach)) => reach,
+            None => {
+                computed_reach = self.circuit_reach(active, active_blocks)?;
+                &computed_reach
+            }
+        };
         let flows = CircuitFlows {
             emission_positive, emission_negative, transition_positive, transition_negative, root_positive, root_negative,
-            emission_reach, transition_reach,
-            root_reach: Tensor::from_data([active_blocks as f32], &self.logits.device()), active_blocks,
+            emission_reach: reach.emission.clone(), transition_reach: reach.transition.clone(),
+            root_reach: reach.root.clone(), active_blocks: reach.active_blocks,
         };
         Ok(CircuitLoss { loss, flows })
     }
@@ -724,6 +751,54 @@ impl PreparedCircuit {
     pub fn conditional_nll(&self, clean: Tensor<2, Int>, observed: Tensor<2, Bool>, denominator: f64) -> Result<CircuitLoss> {
         let targets = self.valid.clone().greater_elem(0.0).bool_and(observed.clone().bool_not());
         self.event_nll(clean, observed, targets, denominator)
+    }
+    fn circuit_reach(&self, active: Tensor<1>, active_blocks: usize) -> Result<CircuitReach> {
+        let (rows, width, states, _) = self.shape();
+        let prior = self.statistics(Tensor::<2, Int>::zeros([rows, width], &self.logits.device()), self.valid.clone().lower_elem(0.0))?;
+        let reaches = prior.state * active.clone().reshape([rows, 1, 1]);
+        Ok(CircuitReach {
+            emission: reaches.sum_dim(0).sum_dim(1).reshape([states]),
+            transition: (prior.summed_edge.sum_dim(2).reshape([rows, states]) * active.reshape([rows, 1])).sum_dim(0).reshape([states]),
+            root: Tensor::from_data([active_blocks as f32], &self.logits.device()),
+            active_blocks,
+        })
+    }
+    /// Weighted singleton conditional cross entropy. Observations use their own
+    /// values; gold labels at unselected positions never become evidence.
+    /// Neural loss uses the supplied denominator. Circuit statistics are summed
+    /// over weighted targets, with traversal reach/count once per logical chain.
+    pub fn marginal_ce(&self, clean: Tensor<2, Int>, evidence_values: Tensor<2, Int>,
+        observed: Tensor<2, Bool>, weights: Tensor<2>, denominator: f64) -> Result<CircuitLoss> {
+        let (rows, width, _, _) = self.shape();
+        ensure!(clean.dims() == [rows, width] && evidence_values.dims() == [rows, width]
+            && observed.dims() == [rows, width] && weights.dims() == [rows, width],
+            "invalid marginal cross-entropy layout");
+        ensure!(denominator.is_finite() && denominator > 0.0, "invalid marginal loss denominator");
+        let observed = observed.bool_and(self.valid.clone().greater_elem(0.0));
+        let weights = weights.mask_fill(observed.clone().bool_or(self.valid.clone().equal_elem(0.0)), 0.0);
+        let host_weights = tensor_values(weights.clone())?;
+        ensure!(host_weights.iter().all(|x| x.is_finite() && *x >= 0.0), "marginal weights must be finite and nonnegative");
+        let active_rows = host_weights.chunks_exact(width).map(|row| row.iter().any(|&w| w > 0.0)).collect::<Vec<_>>();
+        let count = active_rows.iter().filter(|&&active| active).count();
+        let active = Tensor::<1>::from_data(TensorData::new(active_rows.into_iter().map(|active| if active {1.0f32} else {0.0}).collect::<Vec<_>>(), [rows]), &self.logits.device());
+        let reach = self.circuit_reach(active, count)?;
+        let values = clean.mask_where(observed.clone(), evidence_values);
+        let negative = self.statistics(values.clone(), observed.clone())?;
+        let positions = Tensor::<1, Int>::arange(0..width as i64, &self.logits.device()).reshape([1,width]);
+        let mut total: Option<CircuitLoss> = None;
+        for position in 0..width {
+            if count != 0 && !(0..rows).any(|row| host_weights[row*width+position] > 0.0) { continue; }
+            if count == 0 && position != 0 { break; }
+            let targets = positions.clone().equal_elem(position as i32).expand([rows,width])
+                .bool_and(weights.clone().greater_elem(0.0));
+            let next = self.event_nll_weighted(values.clone(), observed.clone(), targets, denominator,
+                Some(weights.clone().narrow(1,position,1).reshape([rows])), Some((&negative,&reach)))?;
+            if let Some(total) = &mut total {
+                total.loss = total.loss.clone() + next.loss;
+                total.flows.add_event_statistics(next.flows);
+            } else { total = Some(next); }
+        }
+        Ok(total.expect("prepared circuits have positive width"))
     }
     /// Forward-filter/backward-sampling draws a joint latent path before emissions.
     pub fn sample(&self, values: Tensor<2, Int>, fixed: Tensor<2, Bool>, seed: u64) -> Result<Vec<Vec<usize>>> {
