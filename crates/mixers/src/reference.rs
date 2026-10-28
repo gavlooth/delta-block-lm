@@ -1,5 +1,5 @@
-//! Plain f64 sequential oracle. GDN-2 equations match the copied predecessor oracle;
-//! KronLSTM is arXiv:2610.26834 Eq. (10), transposed to key-major state storage.
+//! Plain f64 sequential KronLSTM oracle for arXiv:2610.26834 Eq. (10),
+//! transposed to key-major state storage.
 use crate::MixerKind;
 #[derive(Clone, Debug)]
 pub struct Token {
@@ -39,7 +39,7 @@ pub struct Scan {
     pub final_state: Vec<f64>,
 }
 pub fn scan(
-    kind: MixerKind,
+    _kind: MixerKind,
     tokens: &[Token],
     valid: &[bool],
     reset: &[bool],
@@ -74,27 +74,15 @@ pub fn scan(
             }
         }
         let mut edit = vec![0.; v];
-        match kind {
-            MixerKind::Gdn2 => {
-                for j in 0..v {
-                    edit[j] = x.write[j] * x.v[j];
-                    for i in 0..k {
-                        edit[j] -= x.erase[i] * x.k[i] * state[i * v + j];
-                    }
-                }
+        let mut bilinear = 0.;
+        for i in 0..k {
+            for j in 0..v {
+                bilinear += x.k[i] * state[i * v + j] * x.v[j];
             }
-            MixerKind::KronLstm => {
-                let mut bilinear = 0.;
-                for i in 0..k {
-                    for j in 0..v {
-                        bilinear += x.k[i] * state[i * v + j] * x.v[j];
-                    }
-                }
-                let correction = x.write[0] - x.erase[0] * bilinear;
-                for j in 0..v {
-                    edit[j] = correction * x.v[j];
-                }
-            }
+        }
+        let correction = x.write[0] - x.erase[0] * bilinear;
+        for j in 0..v {
+            edit[j] = correction * x.v[j];
         }
         let score = (x.k.iter().map(|x| x * x).sum::<f64>()
             * edit.iter().map(|x| x * x).sum::<f64>())
@@ -165,40 +153,6 @@ pub fn backward(
             }
         }
         let mut dbar = adj.clone();
-        match kind {
-            MixerKind::Gdn2 => {
-                let mut delta = vec![0.; v];
-                let mut dz = vec![0.; v];
-                for j in 0..v {
-                    delta[j] = x.write[j] * x.v[j];
-                    for i in 0..k {
-                        delta[j] -= x.erase[i] * x.k[i] * bar[i * v + j];
-                        dz[j] += adj[i * v + j] * x.k[i];
-                    }
-                }
-                let nk = x.k.iter().map(|x| x * x).sum::<f64>().sqrt();
-                let nd = delta.iter().map(|x| x * x).sum::<f64>().sqrt();
-                if nk > 0. && nd > 0. {
-                    for i in 0..k {
-                        g.k[i] += score_adjoint[t] * nd / nk * x.k[i];
-                    }
-                    for j in 0..v {
-                        dz[j] += score_adjoint[t] * nk / nd * delta[j];
-                    }
-                }
-                for i in 0..k {
-                    for j in 0..v {
-                        g.k[i] += adj[i * v + j] * delta[j] - bar[i * v + j] * x.erase[i] * dz[j];
-                        g.erase[i] -= bar[i * v + j] * x.k[i] * dz[j];
-                        dbar[i * v + j] -= x.erase[i] * x.k[i] * dz[j];
-                    }
-                }
-                for j in 0..v {
-                    g.v[j] = x.write[j] * dz[j];
-                    g.write[j] = x.v[j] * dz[j];
-                }
-            }
-            MixerKind::KronLstm => {
                 let mut bilinear = 0.;
                 let mut dz = 0.;
                 for i in 0..k {
@@ -237,8 +191,6 @@ pub fn backward(
                         dbar[i * v + j] -= x.erase[0] * dz * x.k[i] * x.v[j];
                     }
                 }
-            }
-        }
         for i in 0..k {
             for j in 0..v {
                 g.alpha[i] += dbar[i * v + j] * previous[i * v + j];
