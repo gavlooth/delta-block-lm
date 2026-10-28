@@ -223,7 +223,7 @@ pub(super) fn training_loss_sampled_profiled<P:Sections>(model:&LanguageModel,c:
             if s.feedback == SbdFeedback::SoftFeedback {
                 let teacher_model=teacher_model.as_ref().unwrap();
                 let teacher=teacher_model.cached_block_profiled(&cache.detached(),0,&soft,false,profile);
-                sbd::update_feedback(teacher_model,c,teacher,&mut soft,1.0)?;
+                sbd::prepare_training_feedback(teacher_model,c,teacher,&mut soft,&[block.start])?;
             }
             let prefix = model.cached_block_prefix_profiled(&cache,0,&soft,s.feedback==SbdFeedback::HardMask,profile);
             let a = model.cached_block_tail_profiled(&cache,0,prefix.clone(),None,profile);
@@ -259,7 +259,7 @@ pub(super) fn training_loss_sampled_profiled<P:Sections>(model:&LanguageModel,c:
     if s.feedback == SbdFeedback::SoftFeedback {
         let teacher_model=teacher_model.as_ref().unwrap();
         let teacher=teacher_model.cached_blocks_profiled(&cache.detached(),&soft,false,profile);
-        sbd::update_feedback(teacher_model,c,teacher,&mut soft,1.0)?;
+        sbd::prepare_training_feedback(teacher_model,c,teacher,&mut soft,&blocks.iter().filter(|block|block.masked.len()>1).map(|block|block.start).collect::<Vec<_>>())?;
     }
     let row_bundles = marks.chunks_exact(width).map(|chunk| chunk.to_vec()).collect::<Vec<_>>();
     let (a,b,_work) = training_pair_profiled(model,c,&cache,&soft,&row_bundles,profile)?;

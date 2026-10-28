@@ -91,6 +91,18 @@ pub(super) fn prepare_generation_feedback(model: &LanguageModel, c: &Config, cac
     }
     Ok(())
 }
+pub(super) fn prepare_training_feedback(model: &LanguageModel, c: &Config, teacher: DenoisingOutput, soft: &mut SoftState, identities: &[usize]) -> Result<()> {
+    let provisional=c.sbd.as_ref().unwrap().refinement.is_some().then(||teacher.clone().detach());
+    update_feedback(model,c,teacher,soft,1.0)?;
+    if let Some(provisional)=provisional {
+        let width=provisional.logits.dims()[1];
+        let seeds=soft.observed.chunks_exact(width).zip(soft.active.chunks_exact(width)).zip(identities).map(|((row,active),&identity)| {
+            row.iter().zip(active).filter(|(_,active)|**active).fold(c.seed ^ identity as u64,|seed,(value,_)|seed.rotate_left(7) ^ value.map_or(u64::MAX,|value|value as u64))
+        }).collect::<Vec<_>>();
+        crate::remask::training_provisional_input(model,c,provisional,soft,&seeds)?;
+    }
+    Ok(())
+}
 
 pub struct SbdTrainingResult {
     pub loss: Tensor<1>,
@@ -166,7 +178,7 @@ fn training_loss_per_block<P: delta_mixers::profile::Sections>(model: &LanguageM
             if s.feedback == SbdFeedback::SoftFeedback {
                 let teacher_model=teacher_model.as_ref().unwrap();
                 let teacher=teacher_model.cached_block_profiled(teacher_cache.as_ref().unwrap(),block_index,&soft,false,profile);
-                update_feedback(teacher_model,c,teacher,&mut soft,1.0)?;
+                prepare_training_feedback(teacher_model,c,teacher,&mut soft,&[block.start])?;
             }
             let output = model.cached_block_profiled(cache,block_index,&soft,s.feedback == SbdFeedback::HardMask,profile);
             if model.codpula.is_some() {
@@ -221,7 +233,7 @@ fn training_loss_batched<P: delta_mixers::profile::Sections>(model: &LanguageMod
         let teacher_model=model.valid();
         let teacher_cache=cache.detached();
         let teacher=teacher_model.cached_blocks_profiled(&teacher_cache,&soft,false,profile);
-        update_feedback(&teacher_model,c,teacher,&mut soft,1.0)?;
+        prepare_training_feedback(&teacher_model,c,teacher,&mut soft,&blocks.iter().filter(|block|block.masked.len()>1).map(|block|block.start).collect::<Vec<_>>())?;
     }
     let output = model.cached_blocks_profiled(&cache,&soft,s.feedback == SbdFeedback::HardMask,profile);
     if model.codpula.is_some() {

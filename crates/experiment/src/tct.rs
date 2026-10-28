@@ -67,20 +67,27 @@ impl Chain {
     fn len(&self) -> usize { self.permanent.len() }
     /// Only still-masked slots are revealed. Earlier self-generated errors remain inputs.
     fn reveal(&mut self, proposal: &[usize], confidence: &[f32]) -> Result<()> {
-        ensure!(self.round < TRAIN_ROUNDS && proposal.len() == self.len() && confidence.len() == self.len(), "invalid TCT reveal round or shape");
-        ensure!(confidence.iter().all(|x| x.is_finite() && (0.0..=1.00001).contains(x)), "invalid TCT proposal confidence");
-        let mut masked = (0..self.len()).filter(|&i| self.permanent[i].is_none() && !self.revealed[i]).collect::<Vec<_>>();
-        let minimum = masked.len().div_ceil(TRAIN_ROUNDS - self.round);
-        masked.sort_by(|&a, &b| confidence[b].total_cmp(&confidence[a]).then(a.cmp(&b)).then(proposal[a].cmp(&proposal[b])));
-        for (rank, &i) in masked.iter().enumerate() {
-            if rank < minimum || confidence[i] >= REVEAL_THRESHOLD {
-                self.values[i] = proposal[i];
-                self.revealed[i] = true;
-            }
-        }
+        confidence_reveal(self.round,&self.permanent,&mut self.values,&mut self.revealed,proposal,confidence)?;
         self.round += 1;
         Ok(())
     }
+}
+pub(crate) fn confidence_reveal(round: usize, permanent: &[Option<usize>], values: &mut [usize],
+    revealed: &mut [bool], proposal: &[usize], confidence: &[f32]) -> Result<()> {
+    let n=permanent.len();
+    ensure!(round<TRAIN_ROUNDS && [values.len(),revealed.len(),proposal.len(),confidence.len()].iter().all(|&length|length==n),
+        "invalid TCT reveal round or shape");
+    ensure!(confidence.iter().all(|x|x.is_finite() && (0.0..=1.00001).contains(x)),"invalid TCT proposal confidence");
+    let mut masked=(0..n).filter(|&i|permanent[i].is_none() && !revealed[i]).collect::<Vec<_>>();
+    let minimum=masked.len().div_ceil(TRAIN_ROUNDS-round);
+    masked.sort_by(|&a,&b|confidence[b].total_cmp(&confidence[a]).then(a.cmp(&b)).then(proposal[a].cmp(&proposal[b])));
+    for (rank,&i) in masked.iter().enumerate() {
+        if rank<minimum || confidence[i]>=REVEAL_THRESHOLD {
+            values[i]=proposal[i];
+            revealed[i]=true;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -200,6 +207,8 @@ fn validate_config(c: &Config) -> Result<()> {
     let s = c.sbd.as_ref().context("TCT requires SBD configuration")?;
     ensure!(s.training_mode == TrainingMode::Tct && !s.joint_output.is_factorized() && c.task == "lm", "TCT is the explicit joint LM training mode");
     ensure!(s.feedback == SbdFeedback::SoftFeedback && !c.hard_mask_only, "TCT requires retained soft feedback on unresolved masks");
+    ensure!(s.refinement.as_ref().is_some_and(|refinement|refinement.policy==crate::mask_energy::MaskPolicy::Confidence),
+        "TCT requires refinement with the confidence reveal policy used by training");
     ensure!(!s.block_lengths.is_empty() && s.block_lengths.iter().all(|&n| n > 0) && c.soft_steps > 0 && s.candidate_width > 0, "invalid TCT lengths or feedback settings");
     Ok(())
 }
@@ -961,7 +970,9 @@ fn restart_fixture() -> (Config,Arm,Corpus) {
     let c = Config {task:"lm".into(),context:32,batch_size:1,d_model:16,layers:1,heads:4,key_dim:32,value_dim:64,
         chunk_size:16,cache_capacity:4,train_tokens:32*8,checkpoint_every:2,
         sbd:Some(SbdConfig {block_lengths:vec![8],block_execution:SbdBlockExecution::Batched,joint_output:SbdJointOutput::Codpula,
-            training_mode:TrainingMode::Tct,feedback:SbdFeedback::SoftFeedback,..SbdConfig::default()}),
+            training_mode:TrainingMode::Tct,feedback:SbdFeedback::SoftFeedback,
+            refinement:Some(crate::remask::RefinementConfig {policy:crate::mask_energy::MaskPolicy::Confidence,..Default::default()}),
+            ..SbdConfig::default()}),
         arms:vec![arm.clone()],..Config::default()};
     let bytes = (0..512).map(|i|((i*37+11)%256) as u8).collect::<Vec<_>>();
     let corpus = Corpus {train:vec![bytes.clone()],validation:vec![bytes.clone()],test:vec![bytes],manifest_sha256:"tct-restart-fixture-v1".into()};

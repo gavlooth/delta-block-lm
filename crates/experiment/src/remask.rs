@@ -94,6 +94,37 @@ pub(crate) fn provisional_input(soft: &SoftState, values: &[usize], revealed: &[
     view.visibility = view.visibility.mask_fill(selected,1.0);
     Ok(view)
 }
+/// Ordinary refinement trains on detached self-generated hard inputs, never gold free tokens.
+/// Uniform cardinalities cover empty, partial and fully revealed provisional inputs without
+/// requiring an energy fitted to the model currently being trained.
+pub(crate) fn training_provisional_input(model: &LanguageModel, c: &Config, output: crate::model::DenoisingOutput,
+    soft: &mut SoftState, seeds: &[u64]) -> Result<()> {
+    let [rows,width,_]=output.logits.dims();
+    ensure!(seeds.len()==rows,"provisional training random identities differ");
+    let proposals=if model.codpula.is_some() {
+        let device=output.logits.device();
+        let uniforms=seeds.iter().flat_map(|&seed| {
+            let mut random=Rng(seed);
+            (0..width*2).map(move |_|(random.next()>>40) as f32/16777216.0)
+        }).collect::<Vec<_>>();
+        let (circuit,tokens,observed)=crate::sbd::prepare_circuit(model,output.detach(),soft,c.soft_temperature)?;
+        circuit.sample_with_uniforms(tokens,observed,Tensor::from_data(TensorData::new(uniforms,[rows,width,2]),&device))?
+            .into_iter().flat_map(|mut row| {row.resize(width,0);row}).collect::<Vec<_>>()
+    } else {crate::soft::ids_host(output.logits.reshape([rows*width,c.vocab()]).argmax(1)).into_iter().map(|x|x as usize).collect()};
+    let mut revealed=vec![false;rows*width];
+    for row in 0..rows {
+        let mut random=Rng(seeds[row] ^ 0x70726f766973696f);
+        let mut free=(row*width..(row+1)*width).filter(|&i|soft.active[i] && soft.observed[i].is_none()).collect::<Vec<_>>();
+        let count=integer(&mut random,free.len()+1);
+        for position in 0..count {
+            let selected=position+integer(&mut random,free.len()-position);
+            free.swap(position,selected);
+            revealed[free[position]]=true;
+        }
+    }
+    *soft=provisional_input(soft,&proposals,&revealed,&soft.visibility.device())?;
+    Ok(())
+}
 
 #[derive(Clone)]
 struct Episode {
@@ -406,11 +437,24 @@ fn energy_terms(energy: &MaskEnergy, input: Tensor<3>, state: &Episode, policy: 
 struct EpisodeResult { state: Episode, calls: usize, row_calls: Vec<usize>, work: crate::cocommit::CoordinationWork }
 fn prepare_episode_feedback(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, state: &mut Episode) -> Result<()> {
     if c.sbd.as_ref().unwrap().feedback == crate::config::SbdFeedback::SoftFeedback
+        && state.soft.observed.iter().zip(&state.soft.active).any(|(observed,&active)|active && observed.is_none())
         && c.sbd.as_ref().unwrap().training_mode != crate::tct::TrainingMode::Tct
         && !state.revealed.iter().any(|&revealed|revealed)
         && host(state.soft.visibility.clone())?.iter().zip(&state.soft.observed).all(|(&visibility,observed)|observed.is_some() || visibility==0.0) {
         let teacher=model.cached_blocks(cache,&state.soft,false);
         crate::sbd::update_feedback(model,c,teacher,&mut state.soft,1.0)?;
+    }
+    Ok(())
+}
+fn apply_confidence_reveals(state: &mut Episode, before: &Episode, logs: Tensor<2>, round: usize) -> Result<()> {
+    let width=state.width();
+    let confidence=host(logs.exp().max_dim(1).reshape([state.values.len()]))?;
+    for row in 0..state.lengths.len() {
+        let range=row*width..row*width+state.lengths[row];
+        let proposals=state.values[range.clone()].to_vec();
+        state.values[range.clone()].copy_from_slice(&before.values[range.clone()]);
+        crate::tct::confidence_reveal(round,&state.soft.observed[range.clone()],&mut state.values[range.clone()],
+            &mut state.revealed[range.clone()],&proposals,&confidence[range])?;
     }
     Ok(())
 }
@@ -420,27 +464,34 @@ fn episode(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, mut 
     let policy = settings(c)?.policy;
     let rows = state.lengths.len();
     let free = (0..rows).map(|row|state.eligible(row).len()).collect::<Vec<_>>();
-    let levels = free.iter().copied().max().unwrap_or(0);
+    let confidence=policy==MaskPolicy::Confidence;
+    let levels=if confidence && free.iter().any(|&n|n>0) {crate::tct::TRAIN_ROUNDS+1} else {free.iter().copied().max().unwrap_or(0)};
     let mut calls = 0;
     let mut work = crate::cocommit::CoordinationWork::default();
     let mut row_calls=vec![0;rows];
     for level in (0..levels).rev() {
         let mut previous: Vec<Option<Vec<usize>>> = vec![None;rows];
         let mut repeats = vec![0;rows];
-        let mut done = (0..rows).map(|row|level>=free[row]).collect::<Vec<_>>();
-        for inner in 0..CALLS_PER_LEVEL {
+        let mut done = (0..rows).map(|row|if confidence {free[row]==0} else {level>=free[row]}).collect::<Vec<_>>();
+        for inner in 0..if confidence {1} else {CALLS_PER_LEVEL} {
             if done.iter().all(|&v|v) { break; }
             let before = state.clone();
-            let decision_index = (levels-1-level)*CALLS_PER_LEVEL+inner;
+            let decision_index=if confidence {levels-1-level} else {(levels-1-level)*CALLS_PER_LEVEL+inner};
             let output = predict(model,c,cache,&mut state,keys,seed,decision_index,device)?;
             work.add(output.work);
-            let cardinalities = (0..rows).map(|row|level.min(free[row])).collect::<Vec<_>>();
-            let noise = (0..rows).map(|row|level as f32/free[row].max(1) as f32).collect::<Vec<_>>();
-            let terms = if policy == MaskPolicy::Uniform || cardinalities.iter().all(|&r|r==0) {None} else {
-                Some(energy_terms(energy.context("learned mask policy requires loaded energy")?,features(model,c,&state,&output,&cardinalities,&noise,device)?,&state,policy,device)?)
-            };
-            let sets = choose_sets(&state,&cardinalities,policy,terms.as_ref(),keys,seed,decision_index)?;
-            state.apply_sets(&sets,&cardinalities,c,device)?;
+            if confidence {
+                if decision_index<crate::tct::TRAIN_ROUNDS {
+                    apply_confidence_reveals(&mut state,&before,output.logs.clone(),decision_index)?;
+                }
+            } else {
+                let cardinalities = (0..rows).map(|row|level.min(free[row])).collect::<Vec<_>>();
+                let noise = (0..rows).map(|row|level as f32/free[row].max(1) as f32).collect::<Vec<_>>();
+                let terms = if policy == MaskPolicy::Uniform || cardinalities.iter().all(|&r|r==0) {None} else {
+                    Some(energy_terms(energy.context("learned mask policy requires loaded energy")?,features(model,c,&state,&output,&cardinalities,&noise,device)?,&state,policy,device)?)
+                };
+                let sets = choose_sets(&state,&cardinalities,policy,terms.as_ref(),keys,seed,decision_index)?;
+                state.apply_sets(&sets,&cardinalities,c,device)?;
+            }
             remember(&mut state,&output);
             let width = state.width();
             for row in 0..rows {
@@ -453,7 +504,7 @@ fn episode(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, mut 
                 let current = state.eligible(row).iter().map(|&i|state.values[row*width+i]).collect::<Vec<_>>();
                 if previous[row].as_ref() == Some(&current) { repeats[row] += 1; } else { repeats[row] = 0; }
                 previous[row] = Some(current);
-                if adaptive && repeats[row]>=PATIENCE { done[row] = true; }
+                if !confidence && adaptive && repeats[row]>=PATIENCE { done[row] = true; }
             }
             calls += 1;
         }
@@ -500,7 +551,7 @@ fn prefix_cache(model: &LanguageModel, prefixes: &[Vec<i32>], device: &Device) -
 }
 fn load_energy(model: &LanguageModel, c: &Config, device: &Device) -> Result<Option<MaskEnergy>> {
     let refinement = settings(c)?;
-    if refinement.policy == MaskPolicy::Uniform { return Ok(None); }
+    if matches!(refinement.policy,MaskPolicy::Uniform|MaskPolicy::Confidence) { return Ok(None); }
     let path = refinement.energy_path();
     let metadata: Value = serde_json::from_slice(&std::fs::read(path.with_extension("fit.json"))?)?;
     let checkpoint_identity = metadata["checkpoint_identity"].as_str().context("energy source checkpoint identity is missing")?;
@@ -565,7 +616,9 @@ pub fn generate(model: &LanguageModel, c: &Config, prompt: &[i32], device: &Devi
         "coordination_work":coordination,
         "denoising_passes":calls,"active_row_calls":row_calls,"blocks":blocks,"causally_replayed_tokens":generated.len(),
         "includes_replay":true,"prefill_included":true,"commit_rule":"delay_until_episode_end","policy":settings(c)?.policy,
-        "levels":"K=eligible_count","calls_per_level_max":CALLS_PER_LEVEL,"patience":PATIENCE,
+        "levels":if settings(c)?.policy==MaskPolicy::Confidence {"four confidence reveals plus endpoint"}else{"K=eligible_count"},
+        "calls_per_level_max":if settings(c)?.policy==MaskPolicy::Confidence {1}else{CALLS_PER_LEVEL},
+        "patience":if settings(c)?.policy==MaskPolicy::Confidence {None}else{Some(PATIENCE)},
         "token_operator":if s.training_mode == crate::tct::TrainingMode::Tct {"correction_all_free"}else if model.codpula.is_some(){"indexed_seeded_ffbs_standard_carry"}else{"factorized_argmax_standard_carry"},
         "feedback":"retained_topk_masked_visibility_1_over_soft_steps","feature_definition":FEATURE_VERSION,"rng":RANDOM_VERSION,
         "proposal_evidence":if s.training_mode == crate::tct::TrainingMode::Tct {"permanent_O_only"}else{"permanent_O_plus_provisional_reveals"},"feedback_and_feature_evidence":"permanent_O_only",
@@ -912,7 +965,7 @@ pub fn checkpoint_report(c: &Config, arm: &Arm, seed: u64, device: &Device, path
     device.seed(seed);
     let model = crate::checkpoint::load_model(LanguageModel::new(c,arm,device)?,path.join("model.burnpack"),device)?;
     let checkpoint_identity = crate::checkpoint::file_sha256(&path.join("model.burnpack"))?;
-    if !with_collection && settings(c)?.policy!=MaskPolicy::Uniform && c.sbd.as_ref().unwrap().generate_tokens>1
+    if !with_collection && !matches!(settings(c)?.policy,MaskPolicy::Uniform|MaskPolicy::Confidence) && c.sbd.as_ref().unwrap().generate_tokens>1
         && c.sbd.as_ref().unwrap().block_lengths.iter().any(|&n|n>1) {
         mask_energy::validate_checkpoint(&settings(c)?.energy_path(),2*c.d_model+12,&checkpoint_identity,settings(c)?.policy)?;
     }
@@ -942,7 +995,7 @@ pub fn benchmark(c: &Config, arm: &Arm, seed: u64, device: &Device, warmups: usi
     device.seed(seed);
     let model = LanguageModel::new(c,arm,device)?.valid();
     // Scratch parameters measure the selected policy's execution cost, never generated-text quality.
-    let energy = if settings(c)?.policy==MaskPolicy::Uniform {None}else{Some(MaskEnergy::new(2*c.d_model+12,device).valid())};
+    let energy = if matches!(settings(c)?.policy,MaskPolicy::Uniform|MaskPolicy::Confidence) {None}else{Some(MaskEnergy::new(2*c.d_model+12,device).valid())};
     let prefix_length = 512usize;
     let length = 8usize;
     let prefixes = (0..c.batch_size).map(|row| {
@@ -1480,4 +1533,70 @@ fn model_identity(model: &LanguageModel) -> Result<String> {
     model.visit(&mut visitor);
     ensure!(visitor.errors.is_empty(),"{}",visitor.errors.join("; "));
     Ok(format!("{:x}",visitor.digest.finalize()))
+}
+
+#[cfg(test)]
+mod decoder_fix_tests {
+    use super::*;
+    fn fixture() -> (Config,crate::config::Arm,Device) {
+        let device=Device::ndarray();
+        device.seed(71);
+        let c=Config {task:"lm".into(),d_model:16,layers:1,heads:4,key_dim:32,value_dim:64,
+            sbd:Some(crate::config::SbdConfig {block_lengths:vec![8],refinement:Some(RefinementConfig::default()),
+                feedback:crate::config::SbdFeedback::SoftFeedback,..Default::default()}),..Config::default()};
+        let arm=crate::config::Arm {name:"provisional".into(),mixer:"kronlstm".into(),cache:"none".into()};
+        (c,arm,device)
+    }
+    #[test]
+    fn decoder_fix_provisional_training_consumes_self_generated_inputs_without_evidence() {
+        let (c,arm,device)=fixture();
+        let model=LanguageModel::new(&c,&arm,&device).unwrap();
+        let cache=crate::cocommit::prepare_clean_cache(&model,&[256,13,19],&device);
+        let initial=crate::sbd::state(&c,vec![None;8],&device).unwrap();
+        let teacher=model.cached_block(&cache,0,&initial,false);
+        let mut soft_only=initial.clone();
+        crate::sbd::update_feedback(&model,&c,teacher.clone(),&mut soft_only,1.0).unwrap();
+        let expected=host(soft_only.embeddings(model.embedding.weight.val(),model.sbd_mask.as_ref().unwrap().val(),false)).unwrap();
+        let mut saw_reveal=false;
+        for identity in 0..16 {
+            let mut prepared=initial.clone();
+            crate::sbd::prepare_training_feedback(&model,&c,teacher.clone(),&mut prepared,&[identity]).unwrap();
+            assert!(prepared.observed.iter().all(Option::is_none));
+            let visibility=host(prepared.visibility.clone()).unwrap();
+            if visibility.iter().any(|&value|value==1.0) {
+                let actual=host(prepared.embeddings(model.embedding.weight.val(),model.sbd_mask.as_ref().unwrap().val(),false)).unwrap();
+                assert!(actual.iter().zip(&expected).any(|(a,b)|(a-b).abs()>1e-6));
+                saw_reveal=true;
+            }
+        }
+        assert!(saw_reveal,"ordinary refinement training never received provisional hard inputs");
+    }
+    #[test]
+    fn decoder_fix_tct_decode_uses_four_monotone_confidence_reveals_and_endpoint() {
+        let (mut c,arm,device)=fixture();
+        c.sbd.as_mut().unwrap().training_mode=crate::tct::TrainingMode::Tct;
+        c.sbd.as_mut().unwrap().joint_output=crate::config::SbdJointOutput::Codpula;
+        c.sbd.as_mut().unwrap().refinement.as_mut().unwrap().policy=MaskPolicy::Confidence;
+        let model=LanguageModel::new(&c,&arm,&device).unwrap();
+        let cache=prefix_cache(&model,&[vec![256,13,19]],&device).unwrap();
+        let initial=Episode::new(&c,vec![8],8,vec![None;8],&device).unwrap();
+        let mut state=initial.clone();
+        for round in 0..crate::tct::TRAIN_ROUNDS {
+            let before=state.clone();
+            let output=predict(&model,&c,&cache,&mut state,&[0],c.seed,round,&device).unwrap();
+            let proposals=state.values.clone();
+            let confidence=host(output.logs.clone().exp().max_dim(1).reshape([8])).unwrap();
+            let mut expected_values=before.values.clone();
+            let mut expected_revealed=before.revealed.clone();
+            crate::tct::confidence_reveal(round,&before.soft.observed,&mut expected_values,&mut expected_revealed,&proposals,&confidence).unwrap();
+            apply_confidence_reveals(&mut state,&before,output.logs,round).unwrap();
+            assert_eq!(state.values,expected_values);
+            assert_eq!(state.revealed,expected_revealed);
+            for i in 0..8 {if before.revealed[i] {assert_eq!(state.values[i],before.values[i]);}}
+        }
+        assert!(state.revealed.iter().all(|&revealed|revealed));
+        let result=episode(&model,&c,&cache,initial,&[0],c.seed,None,true,&device).unwrap();
+        assert_eq!(result.calls,crate::tct::TRAIN_ROUNDS+1);
+        assert!(result.state.revealed.iter().all(|&revealed|revealed));
+    }
 }

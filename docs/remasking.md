@@ -14,6 +14,12 @@ The research question is whether **learning where to perturb, while still sampli
 
 **Authorized scope:** implement the selected mechanism, its actual training commands, correctness gates, tiny context-32 end-to-end smokes and execution optimization. Every earlier discussion below of quality comparisons, extra arms, sweeps, calibration grids, budget curves, hard-mask alternatives, separate paper-reference training, or policy-transfer studies is **not authorized**. Those passages explain source distinctions only; they are not an execution plan. Fixed-call trajectories are authorized solely as the equal-work energy-training recipe. Only execution-layout comparisons with unchanged mathematics are authorized for timing.
 
+### Training and decoding input alignment
+
+Ordinary SBD/CoCommit with refinement keeps the energy/uniform decoder. Its detached teacher now also supplies self-generated provisional hard inputs during training: a uniformly drawn reveal cardinality and subset includes empty, partial and fully revealed cases. Joint proposals are coherent FFBS draws; free gold tokens are labels only. Provisional reveals remain outside permanent circuit evidence. This training exploration does not require a fitted energy and does not assert that uniform training draws equal the learned decoder's state distribution.
+
+TCT requires explicit `refinement.policy: "confidence"`. Both streaming training and the existing remask decoder call one confidence-reveal transition: four monotone reveal rounds, at least `ceil(masked / remaining_rounds)` positions each round, plus any confidence at least 0.9. Earlier self-generated reveals remain unchanged neural inputs. An additional fully revealed endpoint is scored during training and decoded once for final output. TCT does not load a mask energy, and learned/uniform policies are rejected for TCT rather than silently ignored. Ordinary refinement rejects confidence policy.
+
 Required sources:
 
 - Zhou, Wu and Zanette, [Random Remasking Scales Masked Diffusion Inference, arXiv:2610.30744v1](https://arxiv.org/html/2610.30744v1), full paper including Appendices A–E; [version page](https://arxiv.org/abs/2610.30744). Algorithm and equation numbers below refer to this version.
