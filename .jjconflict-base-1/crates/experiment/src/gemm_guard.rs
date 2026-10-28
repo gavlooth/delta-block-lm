@@ -18,7 +18,7 @@ pub fn validate(c: &Config) -> Result<()> {
         c.scan_backend.is_fused()
             && c.hola_backend.is_fused()
             && c.arms.iter().all(|arm| arm.mixer == "kronlstm"),
-        "autotune requires fused KronLSTM scan and HOLA; tensor_solver, GDN2, and tensor HOLA are not certified"
+        "autotune requires fused KronLSTM scan and HOLA; tensor_solver and tensor HOLA are not certified"
     );
     ensure!(
         matches!(
@@ -474,7 +474,7 @@ mod tests {
         bad.projection_backend = ProjectionBackend::Grouped;
         assert!(validate(&bad).is_err());
         let mut bad = c.clone();
-        bad.arms[0].mixer = "gdn2".into();
+        bad.arms[0].mixer = "unsupported".into();
         assert!(validate(&bad).is_err());
         c.fusion = true;
         assert!(validate(&c).is_err());

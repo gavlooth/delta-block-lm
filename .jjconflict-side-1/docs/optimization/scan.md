@@ -217,6 +217,8 @@ relative `artifacts/lm512-vulkan` output directory is local to that staging
 directory. The checkpoint itself is read by absolute path and not modified.
 Result: `artifacts/scan/historical-check/artifacts/lm512-vulkan/checkpoint-check.json`.
 
+**Historical validation matrix — GDN-2 removed on 2026-10-28 by user decision.** The following counts and selector rejection cases describe the original run, not the current KronLSTM-only test inventory.
+
 The unchanged CPU `reference` diagnostic passes. Workspace CPU tests pass:
 **36 passed,0 failed** (26 experiment,10 mixer). The default test feature
 set does not execute GPU kernel unit tests; the explicit GPU/f64 diagnostics

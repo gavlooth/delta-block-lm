@@ -1,4 +1,4 @@
-//! Trainable causal GDN-2 and KronLSTM with optional HOLA exact memory.
+//! Trainable causal KronLSTM with optional HOLA exact memory.
 //! See `README.md` for recurrence equations, reference provenance and check commands.
 //! Training explicitly selects the tensor solver or an opt-in fused GPU scan.
 //! The default remains the differentiable tensor solver until paired measurements.
@@ -15,7 +15,6 @@ mod cache_reference;
 pub mod checks;
 pub mod chunk;
 pub mod convolution;
-pub mod gdn2_reference;
 pub use convolution::ConvolutionBackend;
 mod hola;
 pub mod prefix_retrieval;
@@ -39,7 +38,6 @@ pub use wavelet::{WaveletBackend, WaveletDyn};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MixerKind {
-    Gdn2,
     KronLstm,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,18 +48,10 @@ pub enum ScanBackend {
     FusedGpu,
     FusedParallel128,
     FusedParallel256,
-    FusedGdn2,
 }
 impl ScanBackend {
     pub fn is_tensor_solver(&self) -> bool {
         *self == Self::TensorSolver
-    }
-    pub fn supports(&self, kind: MixerKind) -> bool {
-        match self {
-            Self::TensorSolver => true,
-            Self::FusedGdn2 => kind == MixerKind::Gdn2,
-            _ => kind == MixerKind::KronLstm,
-        }
     }
     pub fn is_fused(&self) -> bool {
         !self.is_tensor_solver()
@@ -79,7 +69,6 @@ impl ScanBackend {
             Self::FusedGpu => "fused_kron_gpu",
             Self::FusedParallel128 => "fused_kron_parallel128_gpu",
             Self::FusedParallel256 => "fused_kron_parallel256_gpu",
-            Self::FusedGdn2 => "fused_gdn2_gpu",
         }
     }
 }
@@ -143,7 +132,7 @@ pub struct AttentionWork {
 impl Default for MixerConfig {
     fn default() -> Self {
         Self {
-            kind: MixerKind::Gdn2,
+            kind: MixerKind::KronLstm,
             cache_policy: CachePolicy::None,
             scan_backend: ScanBackend::TensorSolver,
             hola_backend: HolaBackend::Tensor,
@@ -174,10 +163,6 @@ impl MixerConfig {
         );
         assert!(self.cache_policy == CachePolicy::None || self.cache_capacity > 0);
         if self.scan_backend.is_fused() {
-            assert!(
-                self.scan_backend.supports(self.kind),
-                "fused scan selector does not support this mixer kind"
-            );
             assert_eq!(
                 (self.key_dim, self.value_dim),
                 (32, 64),
@@ -218,14 +203,13 @@ impl MixerConfig {
                 device,
             ))
         };
-        let scalar = self.kind == MixerKind::KronLstm;
         Mixer {
             q: linear(self.d_model, kw),
             k: linear(self.d_model, kw),
             v: linear(self.d_model, vw),
             decay: linear(self.d_model, kw),
-            erase: linear(self.d_model, if scalar { self.heads } else { kw }),
-            write: linear(self.d_model, if scalar { self.heads } else { vw }),
+            erase: linear(self.d_model, self.heads),
+            write: linear(self.d_model, self.heads),
             output_gate: linear(self.d_model, vw),
             output: linear(vw, self.d_model),
             q_conv: conv(kw),
@@ -371,10 +355,6 @@ impl Mixer {
     /// Changes execution only; trainable tensors and their identities remain unchanged.
     pub fn set_scan_backend(&mut self, backend: ScanBackend) {
         if backend.is_fused() {
-            assert!(
-                backend.supports(self.kind),
-                "fused scan selector does not support this mixer kind"
-            );
             assert_eq!(
                 (self.key_dim, self.value_dim),
                 (32, 64),
@@ -492,11 +472,7 @@ impl Mixer {
             (
                 self.normalization_backend.l2(raw_q.clone()),
                 self.normalization_backend.l2(raw_k.clone()),
-                if self.kind == MixerKind::KronLstm {
-                    self.normalization_backend.l2(raw_v.clone())
-                } else {
-                    raw_v.clone()
-                },
+                self.normalization_backend.l2(raw_v.clone()),
             )
         });
         let decay = projected[3].take().unwrap_or_else(|| {
@@ -509,27 +485,17 @@ impl Mixer {
                 self.decay_scale.val(),
             )
         });
-        let erase_width = if self.kind == MixerKind::Gdn2 {
-            self.key_dim
-        } else {
-            1
-        };
-        let write_width = if self.kind == MixerKind::Gdn2 {
-            self.value_dim
-        } else {
-            1
-        };
         let erase = projected[4].take().unwrap_or_else(|| {
             profile.section("Projection: erase", || self.erase.forward(input.clone()))
         });
         let erase = profile.section("L2 normalization and gate activations", || {
-            sigmoid(erase).reshape([b, t, self.heads, erase_width])
+            sigmoid(erase).reshape([b, t, self.heads, 1])
         });
         let write = projected[5].take().unwrap_or_else(|| {
             profile.section("Projection: write", || self.write.forward(input.clone()))
         });
         let write = profile.section("L2 normalization and gate activations", || {
-            sigmoid(write).reshape([b, t, self.heads, write_width])
+            sigmoid(write).reshape([b, t, self.heads, 1])
         });
         let clean_scan = P::CAPTURE_CLEAN_MIXERS.then(||chunk::ScanInput {
             q:q.clone(),k:k.clone(),v:v.clone(),alpha:alpha.clone(),erase:erase.clone(),write:write.clone(),

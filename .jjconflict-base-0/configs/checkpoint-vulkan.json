@@ -10,11 +10,8 @@
   "eval_examples":4,
   "association_counts":[2,4],
   "arms":[
-    {"name":"gdn2","mixer":"gdn2","cache":"none"},
-    {"name":"gdn2-hola","mixer":"gdn2","cache":"surprise"},
     {"name":"kronlstm","mixer":"kronlstm","cache":"none"},
     {"name":"kronlstm-hola","mixer":"kronlstm","cache":"surprise"},
-    {"name":"gdn2-recency","mixer":"gdn2","cache":"recency"},
     {"name":"kronlstm-recency","mixer":"kronlstm","cache":"recency"}
   ]
 }

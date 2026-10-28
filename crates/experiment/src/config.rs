@@ -23,7 +23,6 @@ pub struct Arm {
 impl Arm {
     pub fn mixer_config(&self, c: &Config) -> Result<MixerConfig> {
         let kind = match self.mixer.as_str() {
-            "gdn2" => MixerKind::Gdn2,
             "kronlstm" => MixerKind::KronLstm,
             value => anyhow::bail!("unknown mixer {value}"),
         };
@@ -36,10 +35,6 @@ impl Arm {
         ensure!(
             c.sbd.as_ref().is_none_or(|s| s.in_block_reads.is_none()) || cache_policy != CachePolicy::None,
             "sbd.in_block_reads=hola_read requires HOLA in every layer; arm {} has cache=none", self.name
-        );
-        ensure!(
-            c.scan_backend.supports(kind),
-            "scan selector does not support mixer kind: use fused_gdn2 for GDN-2, existing fused selectors for KronLSTM"
         );
         Ok(MixerConfig {
             d_model: c.d_model,
@@ -68,8 +63,6 @@ impl Arm {
             (ScanBackend::FusedParallel256, false) => "fused_kron_parallel256_gpu",
             (ScanBackend::FusedParallel128, true) => "fused_kron_parallel128_and_hola_gpu",
             (ScanBackend::FusedParallel256, true) => "fused_kron_parallel256_and_hola_gpu",
-            (ScanBackend::FusedGdn2, false) => "fused_gdn2_gpu",
-            (ScanBackend::FusedGdn2, true) => "fused_gdn2_and_hola_gpu",
         }
     }
     pub fn uses_custom_gpu(&self, c: &Config) -> bool {
@@ -432,8 +425,8 @@ impl Default for Config {
             seed: 1,
             seeds: vec![1, 2, 3],
             arms: vec![Arm {
-                name: "gdn2".into(),
-                mixer: "gdn2".into(),
+                name: "kronlstm".into(),
+                mixer: "kronlstm".into(),
                 cache: "none".into(),
             }],
             d_model: 128,
@@ -1210,12 +1203,12 @@ mod tests {
         }
     }
     #[test]
-    fn fused_selectors_reject_cpu_and_gdn_scan_without_fallback() {
+    fn fused_selectors_reject_cpu_without_fallback() {
         let mut config = Config::default();
         config.scan_backend = ScanBackend::FusedGpu;
         assert!(config.validate().is_err());
         config.backend = "vulkan".into();
-        assert!(config.arms[0].mixer_config(&config).is_err());
+        assert!(config.arms[0].mixer_config(&config).is_ok());
         config.scan_backend = ScanBackend::TensorSolver;
         config.backend = "cpu".into();
         for backend in [

@@ -1,5 +1,7 @@
 # Predecessor inventory: diffusion-relation-extractor → delta-block-lm
 
+**Historical inventory:** **GDN-2 removed on 2026-10-28 by user decision.** References to its source paths below describe the 2026-10-25 audit, not retained code or current porting work. `reuse/crates/dre-gdn2` has been deleted; `reuse/PROVENANCE.json` records both the original copy and the retained subset.
+
 Read-only audit, 2026-10-25. Source: `/home/heefoo/Documents/code/diffusion-relation-extractor` (current working tree; Burn 0.22.1 / cubecl 0.11.1, seven vendored patches). Snapshot reference: `reuse/PROVENANCE.json` (copied 2026-10-24, 48 files hash-verified). Every hash-differing file was diffed; line numbers below are from the current predecessor tree.
 
 Excluded by assignment: `dre-relations/src/joint_circuit.rs` and `commitment.rs` (owned by the Step-9 Codpula agent). Their dependencies are listed in §3.

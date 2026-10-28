@@ -68,15 +68,9 @@ pub(super) struct Raw {
 }
 impl Raw {
     pub(super) fn new(device: &Device, batch: usize, time: usize, seed: u64) -> Self {
-        Self::new_kind(device, batch, time, seed, MixerKind::KronLstm)
-    }
-    fn new_kind(device: &Device, batch: usize, time: usize, seed: u64, kind: MixerKind) -> Self {
+        let kind = MixerKind::KronLstm;
         let heads = 4;
-        let widths = if kind == MixerKind::Gdn2 {
-            [32, 32, 64, 32, 32, 64]
-        } else {
-            [32, 32, 64, 32, 1, 1]
-        };
+        let widths = [32, 32, 64, 32, 1, 1];
         let mut rng = data::Rng(seed);
         let x = widths
             .into_iter()
@@ -422,16 +416,6 @@ fn prepare_model_case(
     hola: bool,
     selected: Option<(ScanBackend, HolaBackend)>,
 ) -> Result<PreparedModelCase> {
-    prepare_model_case_kind(c, device, context, hola, selected, MixerKind::KronLstm)
-}
-fn prepare_model_case_kind(
-    c: &Config,
-    device: &Device,
-    context: usize,
-    hola: bool,
-    selected: Option<(ScanBackend, HolaBackend)>,
-    kind: MixerKind,
-) -> Result<PreparedModelCase> {
     let mut config = c.clone();
     config.context = context;
     config.scan_backend = ScanBackend::TensorSolver;
@@ -442,20 +426,8 @@ fn prepare_model_case_kind(
     config.prefix_block_retrieval_backend = delta_mixers::prefix_retrieval::PrefixRetrievalBackend::Tensor;
     if !hola { config.prefix_block_retrieval = None; }
     let arm = Arm {
-        name: if kind == MixerKind::Gdn2 {
-            if hola { "gdn-hola" } else { "gdn" }
-        } else if hola {
-            "kron-hola"
-        } else {
-            "kron"
-        }
-        .into(),
-        mixer: if kind == MixerKind::Gdn2 {
-            "gdn2"
-        } else {
-            "kronlstm"
-        }
-        .into(),
+        name: if hola { "kron-hola" } else { "kron" }.into(),
+        mixer: "kronlstm".into(),
         cache: if hola { "surprise" } else { "none" }.into(),
     };
     let rows = (0..c.batch_size)
@@ -484,11 +456,7 @@ fn prepare_model_case_kind(
     let base = reference.base.clone().fork(&train_device);
     runtime::sync(device)?;
     let batch = Batch::new(&rows, &train_device);
-    let fused = if kind == MixerKind::Gdn2 {
-        ScanBackend::FusedGdn2
-    } else {
-        ScanBackend::FusedGpu
-    };
+    let fused = ScanBackend::FusedGpu;
     let paths = if let Some(path) = selected {
         vec![path]
     } else if c.backend == "vulkan" {
@@ -1085,143 +1053,6 @@ pub fn run(c: &Config, device: &Device, warmups: usize, trials: usize) -> Result
     Ok(result)
 }
 
-/// Paired GDN-2 training paths; original tolerances, independent CPU model oracle.
-pub fn gdn_run(c: &Config, device: &Device, warmups: usize, trials: usize) -> Result<Value> {
-    ensure!(
-        (1..=20).contains(&warmups) && (3..=31).contains(&trials),
-        "warmups 1..20 and trials 3..31 required"
-    );
-    ensure!(
-        c.backend == "vulkan" || c.backend == "cpu",
-        "GDN benchmark is local CPU/Vulkan only"
-    );
-    ensure!(
-        c.heads == 4 && c.key_dim == 32 && c.value_dim == 64 && c.chunk_size == 16,
-        "GDN benchmark fixture requires H4/K32/V64/chunk16"
-    );
-    let started = Instant::now();
-    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let directory = c
-        .artifact_dir
-        .join(format!("gdn-benchmark-{}-{nonce}", std::process::id()));
-    std::fs::create_dir_all(&directory)?;
-    let report_path = directory.join("report.json");
-    let td = device.clone().autodiff();
-    let backends = if c.backend == "vulkan" {
-        vec![ScanBackend::TensorSolver, ScanBackend::FusedGdn2]
-    } else {
-        vec![ScanBackend::TensorSolver]
-    };
-    let mut result = json!({"schema":1,"command":"gdn-benchmark","completed":false,
-        "config":c,"device":runtime::identity(device),"report_path":report_path,
-        "absolute_tolerance":ATOL,"relative_tolerance":RTOL,"warmups":warmups,"trials":trials,
-        "timing_method":"resident identical fixtures, synchronize before/after, alternating paired order; first-use separate; no transfers/checkpoint IO in warm timing",
-        "memory_scope":"analytic f32 allocations, not measured peak GPU memory; slice/autodiff/runtime allocations excluded",
-        "numerical_gate":[],"raw":[],"full_model":[]});
-    runtime::write_json(&report_path, &result)?;
-    for &backend in &backends {
-        deadline(started, c)?;
-        result["active_case"] = json!({"scope":"f64 numerical gate","scan_backend":backend});
-        runtime::write_json(&report_path, &result)?;
-        let gate = delta_mixers::checks::gdn_numerical_checks_selected(&td, backend, None, None)
-            .map_err(anyhow::Error::msg)?;
-        result["numerical_gate"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!(gate));
-        runtime::write_json(&report_path, &result)?;
-    }
-    for time in [128usize, 512] {
-        for batch_size in [1usize, 8] {
-            deadline(started, c)?;
-            let raw = Raw::new_kind(&td, batch_size, time, c.seed, MixerKind::Gdn2);
-            let mut first_use = Vec::new();
-            for &backend in &backends {
-                first_use.push(json!({"scan_backend":backend,
-                    "forward_backward_ms":raw_timed(&raw, backend, true, device)?}));
-            }
-            let mut timings = vec![vec![Vec::new(), Vec::new()]; backends.len()];
-            for iteration in 0..warmups + trials {
-                for offset in 0..backends.len() {
-                    deadline(started, c)?;
-                    let index = (iteration + offset) % backends.len();
-                    for (mode, backward) in [false, true].into_iter().enumerate() {
-                        let ms = raw_timed(&raw, backends[index], backward, device)?;
-                        if iteration >= warmups {
-                            timings[index][mode].push(ms);
-                        }
-                    }
-                }
-            }
-            let measurements = backends
-                .iter()
-                .enumerate()
-                .map(|(i, backend)| {
-                    json!({
-                        "scan_backend":backend,"forward_ms":timings[i][0],
-                        "forward_median_ms":median(&timings[i][0]),
-                        "forward_backward_ms":timings[i][1],
-                        "forward_backward_median_ms":median(&timings[i][1])
-                    })
-                })
-                .collect::<Vec<_>>();
-            result["raw"].as_array_mut().unwrap().push(json!({
-                "batch":batch_size,"context":time,"heads":4,"key_dim":32,"value_dim":64,"chunk_size":16,
-                "first_shape_use_after_numerical_gate":first_use,"measurements":measurements,
-                "fused_checkpoint_bytes":4*batch_size*4*time.div_ceil(16)*32*64,
-                "fused_auxiliary_bytes":4*batch_size*time*4*66,
-                "fused_backward_replay_bytes":4*batch_size*4*16*32*64,
-                "fused_packed_output_bytes":4*(batch_size*time*4*65+batch_size*4*32*64),
-                "fused_forward_dispatches":1,"fused_backward_dispatches":1,
-                "fused_shared_bytes_per_backward_workgroup":32768,
-                "fused_recurrence_work":"O(B*T*H*K*V), sequential time, no quadratic time materialization"
-            }));
-            runtime::write_json(&report_path, &result)?;
-        }
-        for hola in [false, true] {
-            deadline(started, c)?;
-            result["active_case"] =
-                json!({"scope":"CPU full-model oracle and steps","context":time,"hola":hola});
-            runtime::write_json(&report_path, &result)?;
-            let mut config = c.clone();
-            config.batch_size = 8;
-            let PreparedModelCase {
-                config,
-                batch,
-                mut runners,
-                mut report,
-            } = prepare_model_case_kind(&config, device, time, hola, None, MixerKind::Gdn2)?;
-            let mut samples = vec![Vec::new(); runners.len()];
-            for iteration in 0..warmups + trials {
-                for offset in 0..runners.len() {
-                    deadline(started, c)?;
-                    let index = (iteration + offset) % runners.len();
-                    let ms = runners[index].step(&config, &batch, device)?;
-                    if iteration >= warmups {
-                        samples[index].push(ms);
-                    }
-                }
-            }
-            report["measurements"] = json!(
-                runners
-                    .iter()
-                    .enumerate()
-                    .map(|(i, runner)| json!({
-                        "scan_backend":runner.backend,"hola_backend":runner.hola_backend,
-                        "step_ms":samples[i],"median_step_ms":median(&samples[i]),
-                        "tokens_per_second":(8*time) as f64/(median(&samples[i])/1000.)
-                    }))
-                    .collect::<Vec<_>>()
-            );
-            result["full_model"].as_array_mut().unwrap().push(report);
-            runtime::write_json(&report_path, &result)?;
-        }
-    }
-    result["completed"] = json!(true);
-    result["elapsed_seconds"] = json!(started.elapsed().as_secs_f64());
-    runtime::write_json(&report_path, &result)?;
-    Ok(result)
-}
 
 #[derive(Default)]
 struct MembershipTrace {
@@ -1335,7 +1166,7 @@ pub fn directional_diagnostic(c: &Config, device: &Device) -> Result<Value> {
     config.loss_backend = crate::config::LossBackend::Tensor;
     config.update_backend = crate::config::UpdateBackend::Tensor;
     let mut report = json!({
-        "command":"gdn-directional-diagnostic","completed":false,"acceptance_changed":false,
+        "command":"kron-directional-diagnostic","completed":false,"acceptance_changed":false,
         "original_epsilon":0.002,"absolute_tolerance":0.003,"relative_tolerance":0.03,
         "source_config":c,"cpu_oracle_config":config,"device":runtime::identity(device),
         "report_path":path,"cases":[],
@@ -1343,21 +1174,12 @@ pub fn directional_diagnostic(c: &Config, device: &Device) -> Result<Value> {
     });
     runtime::write_json(&path, &report)?;
     let td = device.clone().autodiff();
-    for (kind, batch_size) in [
-        (MixerKind::Gdn2, 8usize),
-        (MixerKind::KronLstm, 1),
-        (MixerKind::KronLstm, 8),
-    ] {
+    for batch_size in [1usize, 8] {
         deadline(started, c)?;
         config.batch_size = batch_size;
         let arm = Arm {
-            name: format!("{kind:?}-hola"),
-            mixer: if kind == MixerKind::Gdn2 {
-                "gdn2"
-            } else {
-                "kronlstm"
-            }
-            .into(),
+            name: "kronlstm-hola".into(),
+            mixer: "kronlstm".into(),
             cache: "surprise".into(),
         };
         td.seed(c.seed);
@@ -1388,7 +1210,7 @@ pub fn directional_diagnostic(c: &Config, device: &Device) -> Result<Value> {
         let traced_loss = model::scalar(inference.loss(base_logits, &batch))?;
         let index = report["cases"].as_array().unwrap().len();
         report["cases"].as_array_mut().unwrap().push(json!({
-            "mixer":kind,"batch":batch_size,"context":c.context,"cache":"surprise",
+            "mixer":MixerKind::KronLstm,"batch":batch_size,"context":c.context,"cache":"surprise",
             "initial_parameters_sha256":data::hash(&serde_json::to_vec(&parameters(&base, None)?)?),
             "fixture_sha256":data::fixture_hash(&rows),"all_parameter_tensors_perturbed":snapshot.len(),
             "analytic":analytic,"tolerance":tolerance,

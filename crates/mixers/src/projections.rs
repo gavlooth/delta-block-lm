@@ -176,7 +176,7 @@ pub fn numerical_checks(device: &Device) -> Result<impl Serialize + use<>, Strin
     }
     let device = device.clone().autodiff();
     let mut cases = Vec::new();
-    for kind in [crate::MixerKind::Gdn2, crate::MixerKind::KronLstm] {
+    let kind = crate::MixerKind::KronLstm;
         for zero in [false, true] {
             device.seed(1039);
             let config = crate::MixerConfig {
@@ -337,7 +337,6 @@ pub fn numerical_checks(device: &Device) -> Result<impl Serialize + use<>, Strin
                 });
             }
         }
-    }
     Ok(Report {
         passed: true,
         absolute_tolerance: 2e-5,
@@ -488,7 +487,7 @@ mod tests {
         )
         .swap_dims(1, 2)
         .require_grad();
-        for kind in [crate::MixerKind::Gdn2, crate::MixerKind::KronLstm] {
+        let kind = crate::MixerKind::KronLstm;
             for cache_policy in [
                 crate::CachePolicy::None,
                 crate::CachePolicy::Surprise,
@@ -542,6 +541,5 @@ mod tests {
                     }
                 }
             }
-        }
     }
 }

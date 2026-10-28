@@ -54,7 +54,7 @@ fn execute() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     ensure!(
         args.len() >= 2,
-        "usage: delta-experiment <cocommit-reference|cocommit-benchmark|cocommit-diagnostic|remask-reference|remask-generate|remask-collect|energy-fit|remask-benchmark|tct-reference|tct-train|tct-benchmark|codpula-reference|codpula-model-reference|codpula-benchmark|codpula-diagnostic|prefix-retrieval-reference|prefix-retrieval-benchmark|prefix-retrieval-sbd-diagnostic|prefix-retrieval-sbd-benchmark|sbd-reference|sbd-batching-reference|sbd-batching-benchmark|sbd-batching-diagnostic|sbd-diagnostic|sbd-benchmark|sbd-train|sbd-generate|sbd-evaluate|reference|lngram-reference|lngram-benchmark|lngram-attribution|lngram-smoke|wavelet-reference|wavelet-benchmark|wavelet-smoke|ohc-reference|ohc-benchmark|ohc-learning-smoke|convolution-reference|normalization-reference|epilogue-reference|epilogue-benchmark|kron-reference|gdn-reference|gdn-directional-diagnostic|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|optimization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|gdn-benchmark|kron-model-benchmark|hola-benchmark|io-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256|fused_gdn2 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
+        "usage: delta-experiment <cocommit-reference|cocommit-benchmark|cocommit-diagnostic|remask-reference|remask-generate|remask-collect|energy-fit|remask-benchmark|tct-reference|tct-train|tct-benchmark|codpula-reference|codpula-model-reference|codpula-benchmark|codpula-diagnostic|prefix-retrieval-reference|prefix-retrieval-benchmark|prefix-retrieval-sbd-diagnostic|prefix-retrieval-sbd-benchmark|sbd-reference|sbd-batching-reference|sbd-batching-benchmark|sbd-batching-diagnostic|sbd-diagnostic|sbd-benchmark|sbd-train|sbd-generate|sbd-evaluate|reference|lngram-reference|lngram-benchmark|lngram-attribution|lngram-smoke|wavelet-reference|wavelet-benchmark|wavelet-smoke|ohc-reference|ohc-benchmark|ohc-learning-smoke|convolution-reference|normalization-reference|epilogue-reference|epilogue-benchmark|kron-reference|kron-directional-diagnostic|hola-reference|kron-model-check|soft|soft-reference|soft-benchmark|soft-step|update-loss-reference|update-loss-benchmark|benchmark|profile|backward-profile|gemm-micro|gemm-step|projection-benchmark|convolution-benchmark|normalization-benchmark|optimization-benchmark|scan-benchmark|hola-cost|hola-tune|kron-benchmark|kron-model-benchmark|hola-benchmark|io-benchmark|smoke|train|compare|decision|checkpoint-check|certify> CONFIG.json [--arm NAME] [--seed N] [--resume CHECKPOINT_DIR] [--diagnostic-backend cpu|vulkan --diagnostic-output DIR] [--checkpoints MANIFEST.json] [--warmups N --trials N] [--contexts 128,512] [--legacy-stress-report FILE.json] [--scan-backend tensor_solver|fused_gpu|fused_parallel128|fused_parallel256 --tokens N --objective combined|output_only|final_state_only|score_only] [--hola-backend tensor|fused_gpu|fused_gpu_pairs|fused_gpu_pairs_norms] [--model-scope all|configured]"
     );
     let command = &args[0];
     let c = Config::load(Path::new(&args[1]))?;
@@ -164,7 +164,7 @@ fn execute() -> Result<()> {
         "--legacy-stress-report is only valid for kron-model-benchmark"
     );
     ensure!(
-        matches!(command.as_str(), "kron-reference" | "gdn-reference")
+        command == "kron-reference"
             || (reference_scan_backend.is_none()
                 && reference_tokens.is_none()
                 && reference_objective.is_none()),
@@ -183,7 +183,6 @@ fn execute() -> Result<()> {
             command.as_str(),
             "kron-benchmark"
                 | "kron-model-benchmark"
-                | "gdn-benchmark"
                 | "profile"
                 | "backward-profile"
                 | "projection-benchmark"
@@ -218,7 +217,6 @@ fn execute() -> Result<()> {
             command.as_str(),
             "kron-benchmark"
                 | "kron-model-benchmark"
-                | "gdn-benchmark"
                 | "hola-benchmark"
                 | "profile"
                 | "backward-profile"
@@ -252,7 +250,7 @@ fn execute() -> Result<()> {
     ensure!(
         !matches!(
             command.as_str(),
-            "kron-benchmark" | "kron-model-benchmark" | "hola-benchmark" | "gdn-benchmark"
+            "kron-benchmark" | "kron-model-benchmark" | "hola-benchmark"
         ) || (arm_name.is_none() && resume.is_none() && seed == c.seed),
         "benchmarks use configured/fixed paired fixtures, not --arm/--seed/--resume"
     );
@@ -263,7 +261,7 @@ fn execute() -> Result<()> {
                 | "gemm-step"
                 | "update-loss-benchmark"
                 | "update-loss-reference"
-                | "gdn-directional-diagnostic"
+                | "kron-directional-diagnostic"
                 | "ohc-reference"
                 | "ohc-benchmark"
                 | "ohc-learning-smoke"
@@ -311,7 +309,6 @@ fn execute() -> Result<()> {
                     | "io-benchmark"
                     | "kron-benchmark"
                     | "kron-model-benchmark"
-                    | "gdn-benchmark"
             ),
         "autotuned training certifies the configured fused LM only; this command changes GEMM execution/geometry internally"
     );
@@ -475,23 +472,7 @@ fn execute() -> Result<()> {
             );
             json!({"schema":1,"command":"kron-reference","passed":report.is_ok(),"device":runtime::identity(&device),"config":c,"scan_backend":selected,"tokens":reference_tokens,"objective":reference_objective,"numerical_report":report.as_ref().ok(),"error":report.as_ref().err()})
         }
-        "gdn-reference" => {
-            let selected = reference_scan_backend.unwrap_or(c.scan_backend);
-            let report = delta_mixers::checks::gdn_numerical_checks_selected(
-                &device,
-                selected,
-                reference_tokens,
-                reference_objective,
-            );
-            json!({"schema":1,"command":command,"passed":report.is_ok(),"device":runtime::identity(&device),"config":c,"scan_backend":selected,"tokens":reference_tokens,"objective":reference_objective,"numerical_report":report.as_ref().ok(),"error":report.as_ref().err()})
-        }
-        "gdn-benchmark" => kron_benchmark::gdn_run(
-            &c,
-            &device,
-            benchmark_warmups.unwrap_or(2),
-            benchmark_trials.unwrap_or(5),
-        )?,
-        "gdn-directional-diagnostic" => kron_benchmark::directional_diagnostic(&c, &device)?,
+        "kron-directional-diagnostic" => kron_benchmark::directional_diagnostic(&c, &device)?,
         "prefix-retrieval-benchmark" => prefix_retrieval::benchmark(&c,&device,
             benchmark_warmups.unwrap_or(2),benchmark_trials.unwrap_or(11))?,
         "prefix-retrieval-sbd-diagnostic" => prefix_retrieval::sbd_diagnostic(&c,&device)?,
@@ -717,8 +698,7 @@ fn execute() -> Result<()> {
                 | "soft-benchmark"
                 | "soft-step"
                 | "io-benchmark"
-                | "gdn-benchmark"
-                | "gdn-directional-diagnostic"
+                | "kron-directional-diagnostic"
                 | "ohc-benchmark"
                 | "lngram-benchmark"
                 | "lngram-attribution"
@@ -747,7 +727,6 @@ fn execute() -> Result<()> {
                 | "codpula-model-reference"
                 | "cocommit-reference"
                 | "kron-reference"
-                | "gdn-reference"
                 | "hola-reference"
                 | "prefix-retrieval-reference"
                 | "kron-model-check"

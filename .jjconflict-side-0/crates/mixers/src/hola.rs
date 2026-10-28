@@ -1,4 +1,4 @@
-//! Exact original KV memory, shared by both recurrence families.
+//! Exact original KV memory for KronLSTM.
 //! Reads see the previous chunk's top-capacity cache plus causal current-chunk KV.
 //! Selection is discrete; gradients flow through gathered K/V and cache-read norms.
 use crate::{CachePolicy, HolaBackend};

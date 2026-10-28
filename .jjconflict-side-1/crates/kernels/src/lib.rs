@@ -1,17 +1,5 @@
-//! Causal GDN-2 chunk-WY and fused recurrent KronLSTM CubeCL kernels.
-//! Both use key width 32 and value width 64; batch/time/head counts are dynamic.
-#[cfg(any(feature = "vulkan", feature = "cuda"))]
-mod gdn2;
-#[cfg(any(feature = "vulkan", feature = "cuda"))]
-mod ops;
-#[cfg(any(feature = "vulkan", feature = "cuda"))]
-pub use ops::gdn2_scan;
-#[cfg(any(feature = "vulkan", feature = "cuda"))]
-mod gdn_training;
-#[cfg(any(feature = "vulkan", feature = "cuda"))]
-mod gdn_training_ops;
-#[cfg(any(feature = "vulkan", feature = "cuda"))]
-pub use gdn_training_ops::{GdnTrainingOutput, gdn_training_scan};
+//! Fused recurrent KronLSTM and supporting CubeCL kernels.
+//! KronLSTM uses key width 32 and value width 64; batch/time/head counts are dynamic.
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 mod kron;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]

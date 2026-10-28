@@ -1,5 +1,7 @@
 # Optimization checklist
 
+**Current backbone:** KronLSTM only. **GDN-2 removed on 2026-10-28 by user decision.** Retained measurements describe their original parameterization and execution, not acceptance of later changes.
+
 Each item follows the "Optimize components before scaling" rules in `AGENTS.md`. An item is done only when it has: a saved baseline, an independent numerical check, isolated and full-model timings, memory/work numbers, and an entry in `RESULTS.md`.
 
 Status: `[ ]` not started, `[~]` in progress, `[x]` done.
@@ -41,12 +43,12 @@ Outside the resident step:
 - [x] Data pipeline: corpus rows + host packing + upload ≈1.3 ms of a ≈950 ms B8/T512 step (<0.2%); a resident-batch run shows no measurable step gain, so **no prefetch**. Exact-capacity host packing (1.18 → 0.90 ms) kept. `io.md`.
 - [x] Checkpoint save/load: measured with all integrity checks: 28.6 MB, atomic save ≈267 ms, validated model load ≈178 ms, validated optimizer load ≈187 ms at B8/T512. No code change: at `checkpoint_every: 4` and a 506 ms step the save adds ≈13% per step, so raise the cadence for long runs instead of adding an asynchronous writer. `io.md`.
 - [~] Soft top-k selection: `soft_selection_backend: gpu` keeps selection and feedback state on device; the **isolated feedback episode** measured B8×512/k16 gains of 8.64× (V257), 24.44× (V32k). These are not whole-model training/decode gains; integrated acceptance under the checklist's full-model criterion is not established by those measurements. Tiled variant not adopted. `docs/optimization/soft-topk.md`, `artifacts/soft-topk/selection-1792868611613-2908803/`.
-- [x] GDN-2 training: `scan_backend: fused_gdn2` with full stateful analytic VJP passes independent f64 gates and the CPU model oracle; B8/T512 step with HOLA 2,609.6 → 1,710.9 ms (1.53×), without HOLA 2,095.5 → 1,296.2 ms. Comparison arm only. `gdn.md`, `RESULTS.md`.
+- Historical only — **GDN-2 removed on 2026-10-28 by user decision.** Former fused training measured B8/T512 step with HOLA 2,609.6 → 1,710.9 ms (1.53×), without HOLA 2,095.5 → 1,296.2 ms. Numeric evidence remains in `RESULTS.md`; the selector and implementation document have been removed.
 
 ## Correctness
 
 - [x] Legacy GPU tensor solver key-gradient mismatch: **fixed**. The rank-4 row-dot `sum_dim(3)` VJP lost the initial-state erase adjoint on Vulkan; replaced by a row-wise dot `matmul`. New regression fails before and passes after; historical T7 fixtures pass. `tensor-solver.md`.
-- [x] CPU full-parameter directional check with HOLA: the perturbed forwards now replay the unperturbed forward's kept cache slots, so the difference matches the fixed-membership gradient; ε and tolerance unchanged. All GDN-2/Kron HOLA cases pass at every tested ε (errors ≤ 6.2e-4 vs limits ≥ 3.3e-3). `RESULTS.md`.
+- [x] Historical CPU full-parameter directional check with HOLA: perturbed forwards replayed the unperturbed forward's kept cache slots, matching the fixed-membership gradient; ε and tolerance were unchanged. The former GDN-2/Kron matrix passed at every tested ε (errors ≤ 6.2e-4 vs limits ≥ 3.3e-3). GDN-2 removed on 2026-10-28 by user decision; current fixtures use KronLSTM only. `RESULTS.md`.
 
 ## Later steps (optimize when each is built)
 

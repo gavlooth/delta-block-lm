@@ -1,5 +1,7 @@
 # Input pipeline and checkpoint IO evaluation
 
+**Current mixer:** KronLSTM only. **GDN-2 removed on 2026-10-28 by user decision.** Original IO measurements below used the former first arm; they are historical evidence, not fresh timings for the current configuration.
+
 ## Status and scope
 
 The implementation was verified by the integration owner, and the measurements are recorded under "Measured results" below. The integration owner exercised two revisions early on and found GPU recomputation nondeterminism, documented below; the final run passed all checks. Steps 1–6 only.
@@ -48,7 +50,7 @@ First, in the final integration workspace, create an explicit benchmark-only con
 bun -e 'const c = await Bun.file("configs/lm512.json").json(); c.budget_file = null; c.train_tokens = 8192; c.max_seconds = 900; c.artifact_dir = "artifacts/optimization-io"; c.cache_dir = ".cache/io"; await Bun.write(".cache/io-benchmark.json", JSON.stringify(c, null, 2));'
 ```
 
-The width 256, four-layer model, real corpus, first GDN2 arm, precision and configured kernel paths are retained. The command's four explicit B/T overrides are written into each report. `train_tokens=8192` is a diagnostic checkpoint identity budget divisible by all four shapes; timing executes only the bounded fixture steps, not that training budget.
+The current recipe retains width 256, four layers, the real corpus, precision and configured kernel paths, using the first KronLSTM arm. Historical measurements below used the former first GDN2 arm; GDN-2 removed on 2026-10-28 by user decision. The four explicit B/T overrides are written into each report. `train_tokens=8192` is a diagnostic checkpoint identity budget divisible by all four shapes; timing executes only the fixture steps, not that training budget.
 
 Queue these with the owner's single final verification batch, not mid-integration:
 

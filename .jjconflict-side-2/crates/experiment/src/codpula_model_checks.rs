@@ -197,7 +197,7 @@ fn fixture_config(c: &Config, mixer: &str, extended: bool) -> (Config, Arm) {
 fn requested_backends(model: &mut LanguageModel, cfg: &mut Config, c: &Config) {
     cfg.backend = c.backend.clone();
     if c.backend != "cpu" {
-        cfg.scan_backend = if cfg.arms[0].mixer == "gdn2" { delta_mixers::ScanBackend::FusedGdn2 } else { delta_mixers::ScanBackend::FusedGpu };
+        cfg.scan_backend = delta_mixers::ScanBackend::FusedGpu;
         cfg.hola_backend = delta_mixers::HolaBackend::FusedGpu;
         cfg.sbd.as_mut().unwrap().noisy_read_backend = if cfg.sbd.as_ref().unwrap().in_block_reads.is_none() { NoisyReadBackend::Tensor } else { NoisyReadBackend::FusedGpu };
         cfg.sbd.as_mut().unwrap().joint_execution = c.sbd.as_ref().map_or(CodpulaExecution::Tensor, |s| s.joint_execution);
@@ -1060,11 +1060,8 @@ pub fn run(c: &Config, device: &Device) -> Result<Value> {
     let mut cases = Vec::new();
     let mut continuation = None;
     let mut contextual_continuation = None;
-    // Retain the historical matrix. The contextual profile fixes KronLSTM and all
-    // existing auxiliary components rather than adding another architecture sweep.
+    // Exercise KronLSTM with and without auxiliary components, plus contextual output.
     for (mixer,extended,joint_output) in [
-        ("gdn2",false,SbdJointOutput::Codpula),
-        ("gdn2",true,SbdJointOutput::Codpula),
         ("kronlstm",false,SbdJointOutput::Codpula),
         ("kronlstm",true,SbdJointOutput::Codpula),
         ("kronlstm",true,SbdJointOutput::CodpulaContextual),

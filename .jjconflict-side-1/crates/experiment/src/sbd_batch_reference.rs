@@ -111,9 +111,9 @@ fn fixture_config(c: &Config, mixer: &str, cache: &str, step7: bool, reads: InBl
     (cfg, arm)
 }
 
-fn requested_backends(model: &mut LanguageModel, cfg: &mut Config, c: &Config, mixer: &str, reads: InBlockReads) {
+fn requested_backends(model: &mut LanguageModel, cfg: &mut Config, c: &Config, reads: InBlockReads) {
     cfg.backend = c.backend.clone();
-    cfg.scan_backend = if mixer == "gdn2" { delta_mixers::ScanBackend::FusedGdn2 } else { delta_mixers::ScanBackend::FusedGpu };
+    cfg.scan_backend = delta_mixers::ScanBackend::FusedGpu;
     cfg.hola_backend = delta_mixers::HolaBackend::FusedGpu;
     cfg.sbd.as_mut().unwrap().noisy_read_backend = if reads.is_none() { NoisyReadBackend::Tensor } else { NoisyReadBackend::FusedGpu };
     model.set_scan_backend(cfg.scan_backend);
@@ -351,7 +351,7 @@ pub fn run(c: &Config, device: &Device) -> Result<Value> {
     let cpu = Device::ndarray().autodiff();
     let requested = device.clone().autodiff();
     let mut reports = Vec::new();
-    for mixer in ["gdn2", "kronlstm"] {
+    for mixer in ["kronlstm"] {
         for cache in ["none", "surprise"] {
             for step7 in [false, true] {
                 for reads in [InBlockReads::None, InBlockReads::HolaRead] {
@@ -367,7 +367,7 @@ pub fn run(c: &Config, device: &Device) -> Result<Value> {
                             let mut cfg = cfg.clone();
                             let mut model = if requested_device { base.clone().fork(&requested) } else { base.clone() };
                             let target = if requested_device { &requested } else { &cpu };
-                            if requested_device { requested_backends(&mut model, &mut cfg, c, mixer, reads); }
+                            if requested_device { requested_backends(&mut model, &mut cfg, c, reads); }
                             cfg.validate()?;
                             for feedback in [SbdFeedback::SoftFeedback, SbdFeedback::HardMask] {
                                 cfg.sbd.as_mut().unwrap().feedback = feedback;

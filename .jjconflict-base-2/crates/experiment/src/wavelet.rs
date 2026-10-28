@@ -89,8 +89,8 @@ fn model_gate(c: &Config, device: &Device) -> Result<Value> {
     tiny.wavelet_layers = vec![0];
     tiny.seed = c.seed;
     let arm = Arm {
-        name: "gdn2".into(),
-        mixer: "gdn2".into(),
+        name: "kronlstm".into(),
+        mixer: "kronlstm".into(),
         cache: "none".into(),
     };
     let corpus = train::loaded_corpus(&tiny)?;

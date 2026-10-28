@@ -16,7 +16,6 @@
   "pilot_seconds":5,
   "comparison_seconds":10,
   "arms":[
-    {"name":"gdn2-hola","mixer":"gdn2","cache":"surprise"},
     {"name":"kronlstm-hola","mixer":"kronlstm","cache":"surprise"}
   ]
 }

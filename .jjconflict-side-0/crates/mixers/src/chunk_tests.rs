@@ -21,7 +21,7 @@ fn assert_close(name: &str, actual: &[f32], expected: &[f64]) {
 
 // Independent of the normalized trigonometric acceptance fixture. A padded reset
 // between active tokens must preserve the initial-state path; a later valid reset
-// must sever it. Check both common-solver callers and all computational partitions.
+// must sever it. Check the solver across all computational partitions.
 fn initial_key_reset_padding(device: Device) {
     let device = device.autodiff();
     let (b, t, h, k, v) = (2, 5, 2, 3, 4);
@@ -37,15 +37,8 @@ fn initial_key_reset_padding(device: Device) {
     let upstream: Vec<f32> = (0..b * t * h * v)
         .map(|i| 0.04 * ((i % 9) as f32 - 3.))
         .collect();
-    for kind in [MixerKind::KronLstm, MixerKind::Gdn2] {
-        let widths = [
-            k,
-            k,
-            v,
-            k,
-            if kind == MixerKind::KronLstm { 1 } else { k },
-            if kind == MixerKind::KronLstm { 1 } else { v },
-        ];
+    let kind = MixerKind::KronLstm;
+    let widths = [k, k, v, k, 1, 1];
         let data: Vec<Vec<f32>> = widths
             .iter()
             .enumerate()
@@ -228,7 +221,6 @@ fn initial_key_reset_padding(device: Device) {
                 &expected_initial,
             );
         }
-    }
 }
 
 #[cfg(feature = "cpu")]

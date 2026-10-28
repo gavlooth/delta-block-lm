@@ -11,9 +11,9 @@ pub struct ScanInput {
     pub k: Tensor<4>,
     pub v: Tensor<4>,
     pub alpha: Tensor<4>,
-    /// Channel-wise erase for GDN-2, scalar beta per head for KronLSTM.
+    /// Scalar beta per head.
     pub erase: Tensor<4>,
-    /// Channel-wise write for GDN-2, scalar target per head for KronLSTM.
+    /// Scalar target per head.
     pub write: Tensor<4>,
 }
 
@@ -37,43 +37,7 @@ pub fn scan_selected(
 ) -> ScanOutput {
     match backend {
         ScanBackend::TensorSolver => scan(kind, input, valid, reset, chunk_size, initial),
-        ScanBackend::FusedGdn2 => {
-            assert_eq!(kind, MixerKind::Gdn2, "fused_gdn2 requires GDN-2");
-            assert_fused_device(&input.q.device());
-            #[cfg(any(feature = "vulkan", feature = "cuda"))]
-            {
-                let [batch, _, heads, keys] = input.q.dims();
-                let values = input.v.dims()[3];
-                let initial = initial.unwrap_or_else(|| {
-                    Tensor::zeros([batch, heads, keys, values], &input.q.device())
-                });
-                let result = delta_kernels::gdn_training_scan(
-                    input.q,
-                    input.k,
-                    input.v,
-                    input.alpha,
-                    input.erase,
-                    input.write,
-                    valid,
-                    reset,
-                    initial,
-                    chunk_size,
-                );
-                ScanOutput {
-                    output: result.output,
-                    final_state: result.final_state,
-                    scores: result.scores,
-                }
-            }
-            #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
-            unreachable!("fused GDN-2 scan requires the vulkan or cuda feature")
-        }
         ScanBackend::FusedGpu | ScanBackend::FusedParallel128 | ScanBackend::FusedParallel256 => {
-            assert_eq!(
-                kind,
-                MixerKind::KronLstm,
-                "fused GPU scan requires KronLSTM"
-            );
             assert_fused_device(&input.q.device());
             #[cfg(any(feature = "vulkan", feature = "cuda"))]
             {
@@ -127,7 +91,7 @@ pub(crate) fn assert_fused_device(device: &Device) {
 /// Padding freezes the state. A reset on a valid token discards the previous document.
 /// Supported computational chunk sizes are 1..=16, independently of context length.
 pub fn scan(
-    kind: MixerKind,
+    _kind: MixerKind,
     input: ScanInput,
     valid: Tensor<2>,
     reset: Tensor<2>,
@@ -186,28 +150,19 @@ pub fn scan(
                 .sum_dim(4)
                 .reshape([batch, heads, size, size])
         };
-        let (lower, rhs) = match kind {
-            MixerKind::Gdn2 => (
-                key_overlap(erase.clone() * k.clone()),
-                write * v.clone()
-                    - (erase.clone() * k.clone() * prefix.clone()).matmul(state.clone()),
-            ),
-            MixerKind::KronLstm => (
-                key_overlap(k.clone())
-                    * v.clone().matmul(v.clone().swap_dims(2, 3))
-                    * erase.clone(),
-                // A rowwise dot GEMM preserves the initial-state VJP. A multiply/sum
-                // reduction loses it on GPU in the erase/solve graph, even at rank 2
-                // for size=1; see docs/optimization/tensor-solver.md.
-                write
-                    - (k.clone() * prefix.clone())
-                        .matmul(state.clone())
-                        .unsqueeze_dim::<5>(3)
-                        .matmul(v.clone().unsqueeze_dim::<5>(4))
-                        .reshape([batch, heads, size, 1])
-                        * erase,
-            ),
-        };
+        let lower = key_overlap(k.clone())
+            * v.clone().matmul(v.clone().swap_dims(2, 3))
+            * erase.clone();
+        // A rowwise dot GEMM preserves the initial-state VJP. A multiply/sum
+        // reduction loses it on GPU in the erase/solve graph, even at rank 2
+        // for size=1; see docs/optimization/tensor-solver.md.
+        let rhs = write
+            - (k.clone() * prefix.clone())
+                .matmul(state.clone())
+                .unsqueeze_dim::<5>(3)
+                .matmul(v.clone().unsqueeze_dim::<5>(4))
+                .reshape([batch, heads, size, 1])
+                * erase;
         let mut power = lower.tril(-1).neg();
         let mut inverse = Tensor::<2>::eye(size, &device).reshape([1, 1, size, size]);
         let mut covered = 1;
@@ -219,10 +174,7 @@ pub fn scan(
             }
         }
         let correction = inverse.matmul(rhs);
-        let edits = match kind {
-            MixerKind::Gdn2 => correction,
-            MixerKind::KronLstm => correction * v,
-        };
+        let edits = correction * v;
         let out = (q.clone() * prefix.clone()).matmul(state.clone())
             + key_overlap(q).tril(0).matmul(edits.clone());
         let squared_magnitude = k.clone().square().sum_dim(3) * edits.clone().square().sum_dim(3);

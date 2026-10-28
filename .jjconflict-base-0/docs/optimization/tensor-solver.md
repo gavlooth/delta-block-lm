@@ -163,6 +163,8 @@ projected_initial
     .reshape([batch, heads, size, 1])
 ```
 
+**Historical solver repair — GDN-2 removed on 2026-10-28 by user decision.** Comparisons to that former mixer below explain the original diagnosis only.
+
 This computes the same row dot products, does not divide by decay, and preserves
 all input gradients and existing reset/padding behavior. It is unconditional
 for KronLSTM shapes, not a fixture-specific branch, detached-gradient workaround,
@@ -230,6 +232,8 @@ identical. Retained logs:
 | Unified executable build | PASS | 5 |
 | Historical T7 output/state/score objectives | all PASS | 7 |
 | Default TensorSolver Kron reference | PASS | 5 |
+
+**Historical diagnostic ordering — GDN-2 removed on 2026-10-28 by user decision.** The original failure and numeric decomposition below are retained unchanged.
 
 The GPU regression fails identically before and after:
 `key VJP[3]: -0.0014381682 != -0.0013434548440675893`.
@@ -303,9 +307,10 @@ failure, so the entire integration transaction must not be called all-pass.
 ## Independent regression behavior
 
 `chunk_tests.rs` uses a separate small, non-normalized arithmetic fixture
-(B2/T5/H2/K3/V4), not the saved trigonometric fixture. It covers both KronLSTM
-and GDN-2, chunk sizes 1/2/5/16, a reset on padding between active tokens,
+(B2/T5/H2/K3/V4), not the saved trigonometric fixture. Current coverage uses
+KronLSTM, chunk sizes 1/2/5/16, a reset on padding between active tokens,
 a subsequent valid reset, channel-zero decay, zero write, and signed updates.
+The original matrix also included the former reference mixer: GDN-2 removed on 2026-10-28 by user decision.
 The independent sequential f64 oracle supplies output, key VJP and initial-state
 VJP expectations. The fixture also asserts nonzero initial-state influence on
 the first key gradient, zero input/output effect on padding, and discarded

@@ -1,7 +1,7 @@
 //! Clean-prefix snapshots for SBD recurrence, frozen HOLA reads, and wavelet history.
 use burn::{prelude::*, tensor::activation::softmax};
 
-use crate::{Mixer, MixerKind, chunk, hola};
+use crate::{Mixer, chunk, hola};
 use burn::tensor::activation::{sigmoid,silu};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -184,13 +184,11 @@ impl Mixer {
         let rv = convolve(self,raw[2].clone(),self.v_conv.val());
         let q = self.normalization_backend.l2(rq);
         let k = self.normalization_backend.l2(rk.clone());
-        let v = if self.kind == MixerKind::KronLstm {self.normalization_backend.l2(rv.clone())} else {rv.clone()};
+        let v = self.normalization_backend.l2(rv.clone());
         let decay=projected[3].take().unwrap_or_else(||self.decay.forward(input.clone()));
         let alpha = self.normalization_backend.decay(decay.reshape([b,t,self.heads,self.key_dim]),self.decay_bias.val(),self.decay_scale.val());
-        let ew = if self.kind == MixerKind::Gdn2 {self.key_dim} else {1};
-        let ww = if self.kind == MixerKind::Gdn2 {self.value_dim} else {1};
-        let erase = sigmoid(projected[4].take().unwrap_or_else(||self.erase.forward(input.clone()))).reshape([b,t,self.heads,ew]);
-        let write = sigmoid(projected[5].take().unwrap_or_else(||self.write.forward(input))).reshape([b,t,self.heads,ww]);
+        let erase = sigmoid(projected[4].take().unwrap_or_else(||self.erase.forward(input.clone()))).reshape([b,t,self.heads,1]);
+        let write = sigmoid(projected[5].take().unwrap_or_else(||self.write.forward(input))).reshape([b,t,self.heads,1]);
         let scan=chunk::ScanInput {q,k,v,alpha,erase,write};
         let valid=Tensor::ones([b,t],&device);
         let reset=Tensor::zeros([b,t],&device);
@@ -351,9 +349,7 @@ impl Mixer {
         let rv = project(projected[2].take().unwrap_or_else(||self.v.forward(input.clone())),2,self.v_conv.val());
         let q = self.normalization_backend.l2(rq.clone());
         let k = self.normalization_backend.l2(rk.clone());
-        let v = if self.kind==MixerKind::KronLstm {self.normalization_backend.l2(rv.clone())} else {rv.clone()};
-        let ew = if self.kind==MixerKind::Gdn2 {self.key_dim} else {1};
-        let ww = if self.kind==MixerKind::Gdn2 {self.value_dim} else {1};
+        let v = self.normalization_backend.l2(rv.clone());
         let initial = clean.state.clone().unsqueeze_dim::<5>(1)
             .expand([b,n,self.heads,self.key_dim,self.value_dim])
             .reshape([b*n,self.heads,self.key_dim,self.value_dim]);
@@ -361,8 +357,8 @@ impl Mixer {
         let alpha = self.normalization_backend.decay(
             projected[3].take().unwrap_or_else(||self.decay.forward(input.clone())).reshape([b,n,self.heads,self.key_dim]),
             self.decay_bias.val(),self.decay_scale.val());
-        let erase = sigmoid(projected[4].take().unwrap_or_else(||self.erase.forward(input.clone()))).reshape([b,n,self.heads,ew]);
-        let write = sigmoid(projected[5].take().unwrap_or_else(||self.write.forward(input.clone()))).reshape([b,n,self.heads,ww]);
+        let erase = sigmoid(projected[4].take().unwrap_or_else(||self.erase.forward(input.clone()))).reshape([b,n,self.heads,1]);
+        let write = sigmoid(projected[5].take().unwrap_or_else(||self.write.forward(input.clone()))).reshape([b,n,self.heads,1]);
         let recurrent = chunk::scan_selected(self.scan_backend,self.kind,chunk::ScanInput {
             q:single(q),k:single(k),v:single(v),alpha:single(alpha),erase:single(erase),write:single(write),
         },valid.clone().reshape([b*n,1]),Tensor::zeros([b*n,1],&device),self.chunk_size,Some(initial));
@@ -417,16 +413,14 @@ impl Mixer {
         let rv = project(projected[2].take().unwrap_or_else(||self.v.forward(input.clone())),2,self.v_conv.val());
         let q = self.normalization_backend.l2(rq.clone());
         let k = self.normalization_backend.l2(rk.clone());
-        let v = if self.kind == MixerKind::KronLstm {self.normalization_backend.l2(rv.clone())} else {rv.clone()};
-        let ew = if self.kind == MixerKind::Gdn2 {self.key_dim} else {1};
-        let ww = if self.kind == MixerKind::Gdn2 {self.value_dim} else {1};
+        let v = self.normalization_backend.l2(rv.clone());
         let initial = clean.states[block].clone().unsqueeze_dim::<5>(1).expand([b,n,self.heads,self.key_dim,self.value_dim])
             .reshape([b*n,self.heads,self.key_dim,self.value_dim]);
         let single = |x: Tensor<4>| {let width = x.dims()[3]; x.reshape([b*n,1,self.heads,width])};
         let decay=projected[3].take().unwrap_or_else(||self.decay.forward(input.clone()));
         let alpha = self.normalization_backend.decay(decay.reshape([b,n,self.heads,self.key_dim]),self.decay_bias.val(),self.decay_scale.val());
-        let erase = sigmoid(projected[4].take().unwrap_or_else(||self.erase.forward(input.clone()))).reshape([b,n,self.heads,ew]);
-        let write = sigmoid(projected[5].take().unwrap_or_else(||self.write.forward(input.clone()))).reshape([b,n,self.heads,ww]);
+        let erase = sigmoid(projected[4].take().unwrap_or_else(||self.erase.forward(input.clone()))).reshape([b,n,self.heads,1]);
+        let write = sigmoid(projected[5].take().unwrap_or_else(||self.write.forward(input.clone()))).reshape([b,n,self.heads,1]);
         let recurrent = chunk::scan_selected(self.scan_backend,self.kind,chunk::ScanInput {
             q:single(q),k:single(k),v:single(v),alpha:single(alpha),erase:single(erase),write:single(write),
         },valid.clone().reshape([b*n,1]),Tensor::zeros([b*n,1],&device),self.chunk_size,Some(initial));

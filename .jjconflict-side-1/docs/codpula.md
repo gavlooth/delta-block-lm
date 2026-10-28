@@ -578,6 +578,8 @@ The independent references are `codpula_reference.rs` and `codpula_model_checks.
 | CPU complete-model gates | 1.908e-6 | 0.09537 |
 | Fused Vulkan complete-model gates versus CPU | 2.385e-6 | 0.04744 |
 
+**Historical model matrix — GDN-2 removed on 2026-10-28 by user decision.** The following original mixed-mixer results are retained as evidence only; current complete-model checks use KronLSTM.
+
 The model matrix covers GDN-2 and KronLSTM, each with ordinary features and with oHC/wavelet/Lngram/retrieval. Cached/reconstructed and per-block/batched outputs, losses, all neural gradients and circuit flows agree. The exact L1 bypass, immutable observations, future/hidden-target exclusion, dirty padding, final-norm provenance, teacher detachment, selected-embedding gradients and observed-feature gate gradients pass. Fixed-uniform multi-call rollouts preserve absorbing commitments, clean caches and the next device RNG value.
 
 Checkpoint continuation passes two further complete neural/circuit updates, including exact circuit histories/step and canonical AdamW state. The pinned historical causal checkpoint remains loadable with identity `c7eca1dace65f65fea8db186a6c0cc5427a320f4bf89f76a4ea0482c86dc42ca`; the obsolete dense-attention Step-8 checkpoint remains rejected. Omitted/explicit factorized serialization, initialization and fingerprints agree. Historical payloads are not modified.
