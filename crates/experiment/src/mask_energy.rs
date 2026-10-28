@@ -489,7 +489,8 @@ impl Dataset {
 /// a fresh fit; its separate fit record explicitly records that no resume is used.
 pub fn fit(c: &Config, device: &Device) -> Result<Value> {
     let refinement = c.sbd.as_ref().and_then(|s| s.refinement.as_ref()).context("energy-fit requires sbd.refinement")?;
-    ensure!(refinement.policy != MaskPolicy::Uniform, "uniform remasking has no trainable energy");
+    ensure!(matches!(refinement.policy,MaskPolicy::Unary | MaskPolicy::Pairwise),
+        "energy fitting requires unary or pairwise remasking");
     ensure!(refinement.fit_steps > 0 && refinement.fit_batch > 0, "energy fit counts must be positive");
     let bytes = std::fs::read(&refinement.data_path).with_context(|| format!("reading {}", refinement.data_path.display()))?;
     let dataset: Dataset = serde_json::from_slice(&bytes)?;

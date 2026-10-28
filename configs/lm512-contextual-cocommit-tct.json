@@ -50,18 +50,12 @@
     "noisy_read_backend": "fused_gpu",
     "feedback": "soft_feedback",
     "candidate_width": 4,
-    "commit_count": 2,
-    "entropy_threshold": null,
     "generate_tokens": 32,
     "joint_output": "codpula_contextual",
-    "commitment": "dependence",
-    "dependence_threshold": 0.05,
-    "rows_per_pass": 4,
+    "announcement": {"dependence_threshold": 0.05},
     "cocommit": {
       "tail_layers": 1,
-      "rounds": 1,
-      "training_bundle_max": 16,
-      "visible_loss_weight": 0.2
+      "training_bundle_max": 16
     },
     "refinement": {
       "policy": "pairwise",

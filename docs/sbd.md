@@ -23,6 +23,33 @@ gradient still stops the update. No zero-weight parameter terms are inserted
 into losses, and these counts do not assert that every parameter learned.
 
 Enabled-SBD training and pilot fingerprints retain the semantic revision introduced after dense attention removal. Selecting `hola_read` additionally changes the serialized model identity; omitted/explicit `none` keeps the previous SBD identity. Old dense-SBD checkpoints remain incompatible. Configurations without `sbd` retain their hashes.
+### Configuration controls and validation
+
+`crates/experiment/src/config.rs::Config::validate` rejects controls that the
+selected execution path does not consume:
+
+- Refinement configs omit `commit_count`, `commitment`, `dependence_threshold`
+  and `entropy_threshold`. Those names describe permanent SBD commitments, not
+  temporary CoCommit marks. Refinement with CoCommit can instead select
+  `sbd.announcement`: `count` defaults to 2; `dependence_threshold` selects
+  dependence-based announcements; `entropy_threshold` selects entropy-based
+  announcements. The two thresholds are mutually exclusive. For example,
+  `"announcement": {"dependence_threshold": 0.05}` marks candidates without
+  claiming they are permanent observations.
+- `sbd.cocommit.rounds` is removed: the implementation has one marked tail call,
+  not a configurable round count.
+- `sbd.cocommit.visible_loss_weight` is accepted only with factorized output;
+  omission there uses 0.2. Codpula configs omit it.
+- TCT configs use `tct.rows_per_pass` and omit `sbd.rows_per_pass`.
+  TCT is a training mode; inference keeps the selected ordinary SBD or R²D
+  uniform/learned-remasking operator rather than adopting confidence reveals.
+- Codpula and contextual Codpula require `soft_temperature: 1`, matching their
+  training potentials.
+
+Outside refinement, omitted commit controls retain fixed-count decoding with
+count 2 and dependence threshold 0.05. Explicit fields remain distinguishable
+from omission during validation, including explicit default values.
+
 
 The optional model selector `prefix_block_retrieval` extends HOLA's single
 softmax with the always-visible own-block clean prefix plus top-k completed
