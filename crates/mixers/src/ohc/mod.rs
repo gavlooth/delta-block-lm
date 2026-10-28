@@ -71,34 +71,30 @@ impl OhcBackend {
             }
         }
         let [b, t, _, d] = streams.dims();
-        projected
-            * (streams.reshape([b, t, 4 * d]).square().mean_dim(2) + stage::GATE_NORM_EPSILON)
-                .sqrt()
-                .recip()
+        let square_mean = streams.reshape([b, t, 4 * d]).square().mean_dim(2);
+        // Mask before sqrt, not after an infinite sqrt derivative: this gives the
+        // exact nonzero formula and a finite zero norm derivative at padded rows.
+        let zero = square_mean.clone().equal_elem(0.0);
+        let rms = square_mean.mask_fill(zero.clone(), 1.0).sqrt().mask_fill(zero, 0.0);
+        projected * (rms + stage::GATE_NORM_EPSILON).recip()
     }
     pub fn weighted_read(
         &self,
         streams: Tensor<4>,
         weights: Tensor<3>,
-        norm: &burn::nn::RmsNorm,
     ) -> Tensor<3> {
         if self.fused_read() {
             #[cfg(any(feature = "vulkan", feature = "cuda"))]
             {
-                return delta_kernels::ohc_weighted_read(
-                    streams,
-                    weights,
-                    norm.gamma.val(),
-                    norm.epsilon,
-                );
+                return delta_kernels::ohc_weighted_read(streams, weights);
             }
             #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
             {
-                let _ = (streams, weights, norm);
+                let _ = (streams, weights);
                 panic!("fused oHC has no CPU fallback");
             }
         }
-        (norm.forward(streams) * weights.unsqueeze_dim::<4>(3))
+        (streams * weights.unsqueeze_dim::<4>(3))
             .sum_dim(2)
             .squeeze_dim::<3>(2)
     }
@@ -108,9 +104,7 @@ impl OhcBackend {
         rotation: Tensor<4>,
         gates: Tensor<3>,
         update: Tensor<3>,
-        scale: Tensor<1>,
     ) -> Tensor<4> {
-        let gates = gates * scale.unsqueeze::<3>();
         match self {
             Self::Tensor => {
                 rotation.matmul(streams)

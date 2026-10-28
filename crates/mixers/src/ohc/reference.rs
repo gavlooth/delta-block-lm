@@ -54,6 +54,18 @@ impl Tape {
         let s = self.bias(s, eps);
         self.rsqrt(s)
     }
+    // Pinned upstream gate denominator: sqrt(mean(x²)) + epsilon.
+    // Norm's zero subgradient gives the exact finite composite projection VJP at zero.
+    fn gate_inverse(&mut self, x: &[usize]) -> usize {
+        let rms = (x.iter().map(|&i| self.v[i] * self.v[i]).sum::<f64>() / x.len() as f64).sqrt();
+        let inv = (rms + 1e-6).recip();
+        let edges = if rms == 0. {
+            vec![]
+        } else {
+            x.iter().map(|&i| (i, -self.v[i] * inv * inv / (x.len() as f64 * rms))).collect()
+        };
+        self.node(inv, edges)
+    }
     fn gradients(&self, loss: usize) -> Vec<f64> {
         let mut g = vec![0.; self.v.len()];
         g[loss] = 1.;
@@ -112,22 +124,18 @@ fn compare(label: &str, a: &[f32], e: &[f64]) -> Result<f64, String> {
     }
     Ok(max)
 }
-fn parameters(init: &StreamInit, s: &OhcStage, h: &OhcReadout) -> Vec<Vec<f32>> {
+fn parameters(s: &OhcStage, h: &OhcReadout, norm: &burn::nn::RmsNorm) -> Vec<Vec<f32>> {
     vec![
-        values(init.scales.val()),
-        values(init.offsets.val()),
         values(s.gate_projection.weight.val()),
         values(s.read_bias.val()),
         values(s.write_bias.val()),
         values(s.mix_bias.val()),
         values(s.read_scale.val()),
         values(s.write_gate_scale.val()),
-        values(s.write_scale.val()),
-        values(s.stream_norm.gamma.val()),
         values(h.gate_projection.weight.val()),
         values(h.gate_bias.val()),
         values(h.gate_scale.val()),
-        values(h.norm.gamma.val()),
+        values(norm.gamma.val()),
     ]
 }
 fn oracle(
@@ -152,16 +160,15 @@ fn oracle(
         if valid[n] != 0. {
             for s in 0..4 {
                 for c in 0..d {
-                    let v = t.mul(xi[n * d + c], pi[0][s * d + c]);
-                    streams[s * d + c] = t.add(v, pi[1][s * d + c]);
+                    streams[s * d + c] = xi[n * d + c];
                 }
             }
         }
-        let inv = t.inv_norm(&streams, 1. / (4 * d) as f64, 1e-6);
+        let inv = t.gate_inverse(&streams);
         let mut projected = Vec::new();
         for k in 0..16 {
             let terms: Vec<_> = (0..4 * d)
-                .map(|j| t.mul(streams[j], pi[2][j * 16 + k]))
+                .map(|j| t.mul(streams[j], pi[0][j * 16 + k]))
                 .collect();
             let v = t.sum(&terms);
             projected.push(t.mul(v, inv));
@@ -170,35 +177,28 @@ fn oracle(
         let mut b = Vec::new();
         let mut logits = Vec::new();
         for s in 0..4 {
-            let v = t.mul(projected[s], pi[6][0]);
-            let v = t.add(v, pi[3][s]);
+            let v = t.mul(projected[s], pi[4][0]);
+            let v = t.add(v, pi[1][s]);
             let v = t.sigmoid(v);
             a.push(t.bias(v, 1e-6));
-            let v = t.mul(projected[4 + s], pi[7][0]);
-            let v = t.add(v, pi[4][s]);
+            let v = t.mul(projected[4 + s], pi[5][0]);
+            let v = t.add(v, pi[2][s]);
             let v = t.sigmoid(v);
             b.push(t.scale(v, 2.));
         }
         for k in 0..8 {
             let v = t.scale(projected[8 + k], 0.01);
-            let v = t.add(v, pi[5][k]);
+            let v = t.add(v, pi[3][k]);
             logits.push(t.bias(v, if k % 4 == 0 { 1. } else { 0. }));
         }
         let iq = t.inv_norm(&logits[..4], 1., 1e-12);
         let ir = t.inv_norm(&logits[4..], 1., 1e-12);
         let q: Vec<_> = logits[..4].iter().map(|&v| t.mul(v, iq)).collect();
         let r: Vec<_> = logits[4..].iter().map(|&v| t.mul(v, ir)).collect();
-        let norms: Vec<_> = (0..4)
-            .map(|s| t.inv_norm(&streams[s * d..(s + 1) * d], 1. / d as f64, 1e-5))
-            .collect();
         let mut work = Vec::new();
         for c in 0..d {
             let terms: Vec<_> = (0..4)
-                .map(|s| {
-                    let v = t.mul(streams[s * d + c], norms[s]);
-                    let v = t.mul(v, pi[9][c]);
-                    t.mul(v, a[s])
-                })
+                .map(|s| t.mul(streams[s * d + c], a[s]))
                 .collect();
             work.push(t.sum(&terms));
         }
@@ -210,8 +210,7 @@ fn oracle(
             let f = t.add(f, fi[n * d + c]);
             for s in 0..4 {
                 if valid[n] != 0. {
-                    let v = t.mul(b[s], pi[8][0]);
-                    let v = t.mul(v, f);
+                    let v = t.mul(b[s], f);
                     written[s * d + c] = t.add(mixed[s], v);
                 }
             }
@@ -220,12 +219,12 @@ fn oracle(
         let mut weights = Vec::new();
         for s in 0..4 {
             let terms: Vec<_> = (0..4 * d)
-                .map(|j| t.mul(written[j], pi[10][j * 4 + s]))
+                .map(|j| t.mul(written[j], pi[6][j * 4 + s]))
                 .collect();
             let v = t.sum(&terms);
             let v = t.mul(v, inv);
-            let v = t.mul(v, pi[12][0]);
-            let v = t.add(v, pi[11][s]);
+            let v = t.mul(v, pi[8][0]);
+            let v = t.add(v, pi[7][s]);
             let v = t.sigmoid(v);
             weights.push(t.bias(v, 1e-5));
         }
@@ -240,7 +239,7 @@ fn oracle(
         let inv = t.inv_norm(&combined, 1. / d as f64, 1e-5);
         for c in 0..d {
             let y = t.mul(combined[c], inv);
-            let y = t.mul(y, pi[13][c]);
+            let y = t.mul(y, pi[9][c]);
             out.push(t.v[y]);
             let z = t.scale(y, ((n * d + c + 1) as f64 * 0.37).sin());
             loss = t.add(loss, z);
@@ -292,6 +291,7 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
         vec![OhcBackend::Tensor]
     };
     let write_cases = write_checks(&device, &modes)?;
+    let contraction_cases = contraction_checks(&device)?;
     let read_cases = read_component_checks(&device, &modes)?;
     let projection_cases = projection_checks(&device, &modes)?;
     let mut cases = Vec::new();
@@ -301,15 +301,10 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
                 let batch = 2;
                 let n = batch * tokens;
                 device.seed(1771 + tokens as u64);
-                let mut init = StreamInitConfig::new().with_d_model(d).init(&device);
-                if zero {
-                    init.offsets = init
-                        .offsets
-                        .map(|v| Tensor::zeros(v.dims(), &v.device()))
-                        .set_require_grad(true);
-                }
+                let init = StreamInitConfig::new().with_d_model(d).init(&device);
                 let stage = OhcStageConfig::new().with_d_model(d).init(&device);
                 let head = OhcReadoutConfig::new().with_d_model(d).init(&device);
+                let final_norm = burn::nn::RmsNormConfig::new(d).with_epsilon(1e-5).init(&device);
                 let raw: Vec<f32> = (0..n * d)
                     .map(|i| {
                         if zero {
@@ -355,7 +350,7 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
                     TensorData::new(valid.clone(), [batch, tokens]),
                     &device,
                 );
-                let params = parameters(&init, &stage, &head);
+                let params = parameters(&stage, &head, &final_norm);
                 let (expected, dx, df, dp) = oracle(
                     &values(x.clone()),
                     &values(extra.clone()),
@@ -396,7 +391,7 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
                     let work = read.work.clone();
                     let update = work.clone() * 0.2 + extra.clone();
                     let written = stage.write(read, update, mask.clone(), backend);
-                    let y = head.readout(written.clone());
+                    let y = final_norm.forward(head.readout(written.clone()));
                     let mut max = compare("readout", &values(y.clone()), &expected)?;
                     let g = ((y * adj.clone()).sum()
                         + (work * work_adj.clone()).sum()
@@ -425,26 +420,22 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
                             )?)
                         };
                     }
-                    check!(0, init.scales);
-                    check!(1, init.offsets);
-                    check!(2, stage.gate_projection.weight);
-                    check!(3, stage.read_bias);
-                    check!(4, stage.write_bias);
-                    check!(5, stage.mix_bias);
-                    check!(6, stage.read_scale);
-                    check!(7, stage.write_gate_scale);
-                    check!(8, stage.write_scale);
-                    check!(9, stage.stream_norm.gamma);
-                    check!(10, head.gate_projection.weight);
-                    check!(11, head.gate_bias);
-                    check!(12, head.gate_scale);
-                    check!(13, head.norm.gamma);
+                    check!(0, stage.gate_projection.weight);
+                    check!(1, stage.read_bias);
+                    check!(2, stage.write_bias);
+                    check!(3, stage.mix_bias);
+                    check!(4, stage.read_scale);
+                    check!(5, stage.write_gate_scale);
+                    check!(6, head.gate_projection.weight);
+                    check!(7, head.gate_bias);
+                    check!(8, head.gate_scale);
+                    check!(9, final_norm.gamma);
                     // Every operation is token-local: changing one position cannot affect any other position,
                     // including positions across resets. Test actual production paths rather than the oracle.
                     let run = |z: Tensor<3>| {
                         let r = stage.read_selected(init.forward(z, mask.clone()), backend);
                         let f = r.work.clone() * 0.2 + extra.clone();
-                        head.readout(stage.write(r, f, mask.clone(), backend))
+                        final_norm.forward(head.readout(stage.write(r, f, mask.clone(), backend)))
                     };
                     let original = values(run(x.clone()));
                     let changed = x
@@ -456,7 +447,7 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
                             return Err(format!("oHC crossed token/document boundary at {i}"));
                         }
                     }
-                    cases.push(serde_json::json!({"backend":backend,"batch":batch,"tokens":tokens,"width":d,"zero_features_operator":zero,"strided_features":strided,"padding_and_short_documents":true,"all_14_parameter_gradients":true,"causality_max_abs":0,"max_abs_error":max}));
+                    cases.push(serde_json::json!({"backend":backend,"batch":batch,"tokens":tokens,"width":d,"zero_features_operator":zero,"strided_features":strided,"padding_and_short_documents":true,"all_10_parameter_gradients_including_model_final_norm":true,"causality_max_abs":0,"max_abs_error":max}));
                 }
             }
         }
@@ -542,23 +533,34 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
     );
     let read = s.read(init.forward(x.clone(), v.clone()));
     let initial_matrix = values(read.mix.clone());
-    let near_identity = initial_matrix
+    let initial_identity = initial_matrix
         .chunks_exact(16)
         .flat_map(|m| {
             (0..16).map(move |i| (m[i] as f64 - if i / 4 == i % 4 { 1. } else { 0. }).abs())
         })
         .fold(0., f64::max);
-    if near_identity > 0.2 {
-        return Err(format!(
-            "initial rotation not near identity: {near_identity}"
-        ));
+    if initial_identity != 0. {
+        return Err(format!("ordinary initial rotation not exact identity: {initial_identity}"));
     }
-    let s = s.identity_init();
-    let streams = init.forward(x, v.clone());
-    let y = s.forward(streams.clone(), v, OhcBackend::Tensor, |u| u * 0.2);
-    let identity = values((streams - y).abs().max())[0];
-    if identity != 0. {
-        return Err(format!("identity initialization: {identity}"));
+    let streams = init.forward(x.clone(), v.clone());
+    let replicated = values(streams.clone());
+    let features = values(x);
+    for (row, feature) in replicated.chunks_exact(4 * 7).zip(features.chunks_exact(7)) {
+        for stream in row.chunks_exact(7) {
+            if stream != feature { return Err("stream expansion is not exact replication".into()); }
+        }
+    }
+    let mut write_error = 0.0f64;
+    for &backend in &modes {
+        let read = s.read_selected(streams.clone(), backend);
+        let original = values(streams.clone());
+        let gates = values(read.write_weights.clone());
+        let update = Tensor::<3>::full([1, 5, 7], 0.25, &device);
+        let output = values(s.write(read, update, v.clone(), backend));
+        let expected: Vec<f64> = original.iter().enumerate()
+            .map(|(i, &x)| x as f64 + 0.25 * gates[i / 7] as f64).collect();
+        write_error = write_error.max(compare("identity transport with active branch write", &output, &expected)?);
+        if output == original { return Err("identity initialization suppressed branch write".into()); }
     }
     let mask_values = vec![1., 0., 1., 0., 0., 0.];
     let valid = Tensor::<2>::from_data(TensorData::new(mask_values.clone(), [2, 3]), &device);
@@ -596,16 +598,6 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
             values(clean.grad(&ga).ok_or("clean dx")?),
             values(dirty.grad(&gb).ok_or("dirty dx")?),
         ),
-        (
-            "dirty scale",
-            values(init.scales.val().grad(&ga).ok_or("clean scales")?),
-            values(init.scales.val().grad(&gb).ok_or("dirty scales")?),
-        ),
-        (
-            "dirty offset",
-            values(init.offsets.val().grad(&ga).ok_or("clean offsets")?),
-            values(init.offsets.val().grad(&gb).ok_or("dirty offsets")?),
-        ),
     ] {
         let expected: Vec<f64> = a.iter().map(|&v| v as f64).collect();
         padding_error = padding_error.max(compare(label, &b, &expected)?);
@@ -615,8 +607,8 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
         passed: true,
         absolute_tolerance: 2e-5,
         relative_tolerance: 3e-4,
-        cases: [cases, write_cases, read_cases, projection_cases].concat(),
-        so4: serde_json::json!({"qtq_max_abs":worst,"determinant_error":det_error,"squared_norm_error":norm_error,"initial_q_minus_i_max_abs":near_identity,"identity_init_max_abs":identity}),
+        cases: [cases, write_cases, read_cases, projection_cases, contraction_cases].concat(),
+        so4: serde_json::json!({"qtq_max_abs":worst,"determinant_error":det_error,"squared_norm_error":norm_error,"initial_q_minus_i_max_abs":initial_identity,"identity_active_write_max_abs_error":write_error,"exact_stream_replication":true}),
     })
 }
 #[cfg(test)]
@@ -716,7 +708,6 @@ fn write_checks(device: &Device, modes: &[OhcBackend]) -> Result<Vec<serde_json:
                 q.clone(),
                 w.clone(),
                 f.clone(),
-                Tensor::ones([1], device),
             );
             let mut max = compare("write", &values(out.clone()), &y)?;
             let g = (out * u.clone()).sum().backward();
@@ -770,14 +761,6 @@ fn read_component_checks(
         let p = tensor3(16, 0.17).require_grad();
         let a = tensor3(4, 0.19).require_grad();
         let logits = tensor3(8, 0.23).require_grad();
-        let gamma = if strided {
-            Tensor::<2>::from_data(TensorData::new(raw(2 * d, 0.29), [d, 2]), device)
-                .narrow(1, 0, 1)
-                .squeeze_dim::<1>(1)
-        } else {
-            Tensor::<1>::from_data(TensorData::new(raw(d, 0.29), [d]), device)
-        }
-        .require_grad();
         let (ug, ur, uq) = (tensor3(16, 0.31), tensor3(d, 0.37), tensor3(16, 0.41));
         let (ugv, urv, uqv) = (values(ug.clone()), values(ur.clone()), values(uq.clone()));
         let mut tape = Tape::default();
@@ -785,7 +768,6 @@ fn read_component_checks(
             values(x.clone()),
             values(p.clone()),
             values(a.clone()),
-            values(gamma.clone()),
             values(logits.clone()),
         ]
         .iter()
@@ -793,34 +775,26 @@ fn read_component_checks(
         .collect();
         let mut expected = [Vec::new(), Vec::new(), Vec::new()];
         let mut loss = tape.constant(0.);
-        let epsilon = 0.00023;
         for n in 0..b * t {
             let xs = &inputs[0][n * 4 * d..(n + 1) * 4 * d];
-            let inv = tape.inv_norm(xs, 1. / (4 * d) as f64, 1e-6);
+            let inv = tape.gate_inverse(xs);
             for k in 0..16 {
                 let y = tape.mul(inputs[1][n * 16 + k], inv);
                 expected[0].push(tape.v[y]);
                 let v = tape.scale(y, ugv[n * 16 + k] as f64);
                 loss = tape.add(loss, v);
             }
-            let norms: Vec<_> = (0..4)
-                .map(|s| tape.inv_norm(&xs[s * d..(s + 1) * d], 1. / d as f64, epsilon))
-                .collect();
             for c in 0..d {
                 let terms: Vec<_> = (0..4)
-                    .map(|s| {
-                        let v = tape.mul(xs[s * d + c], norms[s]);
-                        tape.mul(v, inputs[2][n * 4 + s])
-                    })
+                    .map(|s| tape.mul(xs[s * d + c], inputs[2][n * 4 + s]))
                     .collect();
                 let y = tape.sum(&terms);
-                let y = tape.mul(y, inputs[3][c]);
                 expected[1].push(tape.v[y]);
                 let v = tape.scale(y, urv[n * d + c] as f64);
                 loss = tape.add(loss, v);
             }
             let raw: Vec<_> = (0..8)
-                .map(|k| tape.bias(inputs[4][n * 8 + k], if k % 4 == 0 { 1. } else { 0. }))
+                .map(|k| tape.bias(inputs[3][n * 8 + k], if k % 4 == 0 { 1. } else { 0. }))
                 .collect();
             let iq = tape.inv_norm(&raw[..4], 1., 1e-12);
             let ir = tape.inv_norm(&raw[4..], 1., 1e-12);
@@ -848,14 +822,10 @@ fn read_component_checks(
             .iter()
             .map(|v| v.iter().map(|&i| grads[i]).collect())
             .collect();
-        let mut norm = burn::nn::RmsNormConfig::new(d)
-            .with_epsilon(epsilon)
-            .init(device);
-        norm.gamma = burn::module::Param::from_tensor(gamma.clone());
         let rotation = rotation::QuaternionPair::new(device);
         for &backend in modes {
             let gate = backend.gate_norm(x.clone(), p.clone());
-            let read = backend.weighted_read(x.clone(), a.clone(), &norm);
+            let read = backend.weighted_read(x.clone(), a.clone());
             let matrix = rotation
                 .rotation_selected(logits.clone(), backend.fused_read())
                 .reshape([b, t, 16]);
@@ -875,13 +845,12 @@ fn read_component_checks(
                 values(x.grad(&g).ok_or("read dx")?),
                 values(p.grad(&g).ok_or("read dp")?),
                 values(a.grad(&g).ok_or("read da")?),
-                values(gamma.grad(&g).ok_or("read dgamma")?),
                 values(logits.grad(&g).ok_or("read dlogits")?),
             ];
             for (actual, expected) in actual.iter().zip(&expected_grads) {
                 max = max.max(compare("read all input gradients", actual, expected)?);
             }
-            cases.push(serde_json::json!({"read_primitives_independent_f64":true,"backend":backend,"strided_streams_projected_gates_weights_gamma_logits_adjoints":strided,"custom_norm_epsilon":epsilon,"max_abs_error":max}));
+            cases.push(serde_json::json!({"read_primitives_independent_f64":true,"raw_stream_aggregation":true,"backend":backend,"strided_streams_projected_gates_weights_logits_adjoints":strided,"max_abs_error":max}));
         }
     }
     Ok(cases)
@@ -894,28 +863,22 @@ fn projection_checks(
 ) -> Result<Vec<serde_json::Value>, String> {
     let mut cases = Vec::new();
     let (b, t, d) = (2, 129, 7);
-    for zero in [false, true] {
+    for scale in [0.0f32, 1e-8, 0.3] {
         for strided in [false, true] {
             let raw = |n: usize, a: f32| {
                 (0..n)
-                    .map(|i| {
-                        if zero {
-                            0.
-                        } else {
-                            ((i + 1) as f32 * a).sin() * 0.3
-                        }
-                    })
+                    .map(|i| ((i + 1) as f32 * a).sin() * 0.3)
                     .collect::<Vec<_>>()
             };
             let x = if strided {
                 Tensor::<4>::from_data(
-                    TensorData::new(raw(b * t * 4 * d, 0.13), [b, t, d, 4]),
+                    TensorData::new(raw(b * t * 4 * d, 0.13).into_iter().map(|v| v * (scale / 0.3)).collect::<Vec<_>>(), [b, t, d, 4]),
                     device,
                 )
                 .swap_dims(2, 3)
             } else {
                 Tensor::<4>::from_data(
-                    TensorData::new(raw(b * t * 4 * d, 0.13), [b, t, 4, d]),
+                    TensorData::new(raw(b * t * 4 * d, 0.13).into_iter().map(|v| v * (scale / 0.3)).collect::<Vec<_>>(), [b, t, 4, d]),
                     device,
                 )
             }
@@ -945,7 +908,7 @@ fn projection_checks(
             let mut loss = tape.constant(0.);
             for n in 0..b * t {
                 let row = &xi[n * 4 * d..(n + 1) * 4 * d];
-                let inv = tape.inv_norm(row, 1. / (4 * d) as f64, 1e-6);
+                let inv = tape.gate_inverse(row);
                 for j in 0..16 {
                     let terms: Vec<_> = (0..4 * d)
                         .map(|k| tape.mul(row[k], wi[k * 16 + j]))
@@ -960,7 +923,7 @@ fn projection_checks(
             let grads = tape.gradients(loss);
             let dx: Vec<_> = xi.iter().map(|&i| grads[i]).collect();
             let dw: Vec<_> = wi.iter().map(|&i| grads[i]).collect();
-            for &backend in modes.iter().filter(|m| m.fused_read()) {
+            for &backend in modes {
                 let run = || backend.project_gate(x.clone(), w.clone());
                 let y = run();
                 let mut error = compare("projected gate", &values(y.clone()), &expected)?;
@@ -985,9 +948,31 @@ fn projection_checks(
                         ));
                     }
                 }
-                cases.push(serde_json::json!({"projection_independent_f64":true,"backend":backend,"batch":b,"tokens":t,"width":d,"zeros":zero,"strided_streams_weights_adjoints":strided,"weight_gradient_bitwise_repeats":3,"max_abs_error":error}));
+                cases.push(serde_json::json!({"projection_independent_f64":true,"backend":backend,"batch":b,"tokens":t,"width":d,"input_scale":scale,"nonzero_weights_at_zero_input":true,"strided_streams_weights_adjoints":strided,"weight_gradient_bitwise_repeats":3,"max_abs_error":error}));
             }
         }
     }
     Ok(cases)
+}
+
+/// Makes the contraction amplitude observable before the model's one final norm.
+/// Non-unit final gains distinguish one normalization from a hidden extra norm.
+fn contraction_checks(device: &Device) -> Result<Vec<serde_json::Value>, String> {
+    let mut head = OhcReadoutConfig::new().with_d_model(3).init(device);
+    head.gate_projection.weight = head.gate_projection.weight
+        .map(|v| Tensor::zeros(v.dims(), &v.device())).set_require_grad(true);
+    let raw = vec![1.0f32, -2.0, 0.5, 3.0, -0.5, 2.0, -1.0, 4.0, 1.5, 2.0, 0.25, -3.0];
+    let streams = Tensor::<4>::from_data(TensorData::new(raw.clone(), [1, 1, 4, 3]), device);
+    let combined = head.readout(streams);
+    let expected: Vec<f64> = (0..3).map(|c| (0..4)
+        .map(|s| raw[s * 3 + c] as f64 * (0.5 + 1e-5)).sum()).collect();
+    let mut max = compare("raw learned contraction", &values(combined.clone()), &expected)?;
+    let gain = vec![0.7f32, -1.2, 1.7];
+    let mut final_norm = burn::nn::RmsNormConfig::new(3).with_epsilon(1e-5).init(device);
+    final_norm.gamma = burn::module::Param::from_tensor(Tensor::from_data(
+        TensorData::new(gain.clone(), [3]), device));
+    let inverse = (expected.iter().map(|x| x*x).sum::<f64>() / 3.0 + 1e-5).sqrt().recip();
+    let normalized: Vec<f64> = expected.iter().zip(gain).map(|(x, g)| x * inverse * g as f64).collect();
+    max = max.max(compare("exactly one model final norm", &values(final_norm.forward(combined)), &normalized)?);
+    Ok(vec![serde_json::json!({"raw_learned_contraction":true,"single_model_final_norm_nonunit_gain":true,"max_abs_error":max})])
 }

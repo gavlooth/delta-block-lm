@@ -1,18 +1,18 @@
 //! Four streams to one `[B, T, d]` bank (spec §4: `H_early` after stage 5, `H_final` after stage 15).
 //!
-//! Follows the readout of the reference implementation the oHC paper builds on (Megatron-LM hybrid stack,
-//! `learned_output_contract` followed by the final norm):
+//! Learned output contraction from the pinned Megatron-LM hybrid stack.
+//! Returns the raw sum; the model owns the single subsequent final norm.
 //!
 //! ```text
 //! x'_t = vec(X_t) / sqrt(mean(vec(X_t)²) + ε)         [4d]
 //! c_t  = σ(s · x'_t W_c + β_c) + ε                    [4]    (W_c: [4d, 4])
-//! H_t  = RMSNorm(Σ_s c_ts X_ts)                       [d]
+//! H_t  = Σ_s c_ts X_ts                                [d]
 //! ```
 //!
 //! A zero (padded) position reads out as exactly `0`.
 
 use burn::module::Param;
-use burn::nn::{Initializer, Linear, LinearConfig, RmsNorm, RmsNormConfig};
+use burn::nn::{Initializer, Linear, LinearConfig};
 use burn::prelude::*;
 use burn::tensor::activation::sigmoid;
 
@@ -22,7 +22,7 @@ use super::STREAMS;
 pub struct OhcReadoutConfig {
     #[config(default = 512)]
     pub d_model: usize,
-    /// `ε` of the gate RMS, the gate floor and the output RMSNorm (reference `layernorm_epsilon`).
+    /// `ε` of the contraction gate RMS and gate floor (reference `layernorm_epsilon`).
     #[config(default = 1e-5)]
     pub epsilon: f64,
 }
@@ -44,14 +44,11 @@ impl OhcReadoutConfig {
                 .init(device),
             gate_bias: Initializer::Zeros.init([STREAMS], device),
             gate_scale: Initializer::Ones.init([1], device),
-            norm: RmsNormConfig::new(self.d_model)
-                .with_epsilon(self.epsilon)
-                .init(device),
         }
     }
 }
 
-/// Learned contraction of the four streams followed by RMSNorm.
+/// Learned weighted contraction of the four raw streams.
 #[derive(Module, Debug)]
 pub struct OhcReadout {
     pub d_model: usize,
@@ -62,7 +59,6 @@ pub struct OhcReadout {
     pub gate_bias: Param<Tensor<1>>,
     /// `s`, `[1]`.
     pub gate_scale: Param<Tensor<1>>,
-    pub norm: RmsNorm,
 }
 
 impl OhcReadout {
@@ -90,9 +86,8 @@ impl OhcReadout {
                 * self.gate_scale.val().unsqueeze::<3>()
                 + self.gate_bias.val().unsqueeze::<3>(),
         ) + self.epsilon;
-        let combined = (streams * weights.unsqueeze_dim::<4>(3))
+        (streams * weights.unsqueeze_dim::<4>(3))
             .sum_dim(2)
-            .squeeze_dim::<3>(2);
-        self.norm.forward(combined)
+            .squeeze_dim::<3>(2)
     }
 }

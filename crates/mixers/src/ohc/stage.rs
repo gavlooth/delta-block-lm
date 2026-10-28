@@ -4,7 +4,7 @@
 //! streams (mHC Eq. 4 as used by oHC §5), three input-dependent maps:
 //!
 //! ```text
-//! x'_t   = vec(X_t) / sqrt(mean(vec(X_t)²) + 1e-6)                      [4d]
+//! x'_t   = vec(X_t) / (sqrt(mean(vec(X_t)²)) + 1e-6)                    [4d]
 //! p_t    = x'_t W                                                       [16]  (W: [4d, 16])
 //! a_t    = σ(α_read · p_t[0..4] + β_read) + 1e-6                         read weights
 //! b_t    = 2 σ(α_write · p_t[4..8] + β_write)                            write weights
@@ -14,25 +14,24 @@
 //! and the stage computes
 //!
 //! ```text
-//! u_t      = Σ_s a_ts RMSNorm(X_ts)            (read, spec §2.1)
+//! u_t      = Σ_s a_ts X_ts                     (raw weighted read, Eq. 1)
 //! f_t      = F(u)_t                            (the stage operator, outside this crate)
-//! X'_t     = Q_t X_t + γ b_t f_tᵀ              (write, spec §2.1)
+//! X'_t     = Q_t X_t + b_t f_tᵀ                (write, Eq. 1)
 //! ```
 //!
-//! `α_mix` is fixed at its initial value (oHC §5 "Implementation"); `α_read`, `α_write`, `γ` and the biases
+//! `α_mix` is fixed at its initial value (oHC §5 "Implementation"); `α_read`, `α_write` and the biases
 //! are trainable. Every map is per position, so documents and padding stay separate: a zero position reads
 //! `u = 0`, and writes `0` whenever the operator output is `0` there.
 
 use burn::module::Param;
-use burn::nn::{Initializer, Linear, LinearConfig, RmsNorm, RmsNormConfig};
+use burn::nn::{Initializer, Linear, LinearConfig};
 use burn::prelude::*;
 use burn::tensor::activation::sigmoid;
 
 use super::rotation::{QuaternionPair, ROTATION_LOGITS};
 use super::{OhcBackend, STREAMS};
 
-/// `ε` inside the RMS of the flattened streams that feed the gate projection (value of the reference's
-/// `norm_eps`; placed under the square root so the gradient stays finite at zero (padded) positions).
+/// `ε` outside the flattened-stream RMS, matching pinned upstream `native_proj_rms`.
 pub const GATE_NORM_EPSILON: f64 = 1e-6;
 
 /// Lower limit added to the read weights, as in the reference's `h_pre = σ(·) + 1e-6`.
@@ -49,12 +48,6 @@ pub struct OhcStageConfig {
     /// Initial `α_read`, `α_write` and the fixed `α_mix` (reference `mhc_init_gating_factor`).
     #[config(default = 0.01)]
     pub gate_scale_init: f64,
-    /// Initial residual-write scale `γ` (spec §2.1: conservative; LayerScale value for depth ≤ 18).
-    #[config(default = 0.1)]
-    pub write_scale_init: f64,
-    /// `ε` of the per-stream RMSNorm in the read.
-    #[config(default = 1e-5)]
-    pub norm_epsilon: f64,
 }
 
 impl OhcStageConfig {
@@ -84,15 +77,9 @@ impl OhcStageConfig {
             }
             .init([1], device),
             mix_scale: self.gate_scale_init,
-            write_scale: Initializer::Constant {
-                value: self.write_scale_init,
-            }
-            .init([1], device),
-            stream_norm: RmsNormConfig::new(self.d_model)
-                .with_epsilon(self.norm_epsilon)
-                .init(device),
             rotation: QuaternionPair::new(device),
         }
+        .identity_init()
     }
 }
 
@@ -112,10 +99,6 @@ pub struct OhcStage {
     pub write_gate_scale: Param<Tensor<1>>,
     /// `α_mix`, fixed (oHC §5: frozen at its initial value for orthogonal mixers).
     pub mix_scale: f64,
-    /// Residual-write scale `γ`, `[1]`.
-    pub write_scale: Param<Tensor<1>>,
-    /// RMSNorm applied to each stream before the weighted read.
-    pub stream_norm: RmsNorm,
     pub rotation: QuaternionPair,
 }
 
@@ -135,16 +118,10 @@ pub struct OhcRead {
 }
 
 impl OhcStage {
-    /// Initializes a newly inserted wrapper as an FP32 identity without disabling learning.
-    ///
-    /// Only the residual-write scale and mixer channels are zeroed. Read/write gates and
-    /// stream normalization keep their normal initialization, and `mix_scale` stays nonzero.
-    /// The operator must still run: its output supplies the first write-scale gradient.
+    /// Starts residual transport at exactly the FP32 identity, without suppressing branch writes.
+    /// Rotation columns and bias are zero; read/write gates retain their normal initialization.
+    /// The fixed nonzero `mix_scale` lets rotation columns learn from the first update.
     pub fn identity_init(mut self) -> Self {
-        self.write_scale = self
-            .write_scale
-            .map(|value| Tensor::zeros(value.dims(), &value.device()))
-            .set_require_grad(true);
         self.mix_bias = self
             .mix_bias
             .map(|value| Tensor::zeros(value.dims(), &value.device()))
@@ -163,7 +140,7 @@ impl OhcStage {
         self
     }
 
-    /// Gates from the streams and the operator input `u_t = Σ_s a_ts RMSNorm(X_ts)`.
+    /// Gates from the streams and the raw operator input `u_t = Σ_s a_ts X_ts`.
     pub fn read(&self, streams: Tensor<4>) -> OhcRead {
         self.read_selected(streams, OhcBackend::Tensor)
     }
@@ -204,7 +181,7 @@ impl OhcStage {
         let mix = self
             .rotation
             .rotation_selected(mix_logits, backend.fused_read());
-        let work = backend.weighted_read(streams.clone(), read_weights.clone(), &self.stream_norm);
+        let work = backend.weighted_read(streams.clone(), read_weights.clone());
         OhcRead {
             work,
             streams,
@@ -214,7 +191,7 @@ impl OhcStage {
         }
     }
 
-    /// `X' = Q X + γ b fᵀ` with `f` the operator output `[B, T, d]` for `read.work`.
+    /// `X' = Q X + b fᵀ` with `f` the operator output `[B, T, d]` for `read.work`.
     pub fn write(
         &self,
         read: OhcRead,
@@ -233,7 +210,6 @@ impl OhcStage {
             read.mix,
             read.write_weights,
             operator_output,
-            self.write_scale.val(),
         );
         streams.mask_fill(
             valid

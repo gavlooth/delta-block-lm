@@ -524,7 +524,7 @@ pub fn attribution(c: &Config, device: &Device) -> Result<Value> {
         "stream_init",
         "gate_GEMM_4d_to_16",
         "gate_RMS_and_sigmoid_epilogue",
-        "stream_RMS_and_weighted_read",
+        "raw_weighted_read",
         "quaternion_to_SO4",
         "write_tensor",
         "write_fused",
@@ -532,7 +532,7 @@ pub fn attribution(c: &Config, device: &Device) -> Result<Value> {
         "readout",
         "four_stream_memory_traffic_proxy",
         "gate_RMS_fused_only",
-        "stream_RMS_weighted_read_fused",
+        "raw_weighted_read_fused",
         "quaternion_to_SO4_fused",
         "read_complete_fused",
         "read_complete_fused_gate",
@@ -550,9 +550,7 @@ pub fn attribution(c: &Config, device: &Device) -> Result<Value> {
                 .forward(streams.clone().reshape([b, t, 4 * d]))
                 .reshape([b * t * 16]),
             2 => {
-                let flat = streams.clone().reshape([b, t, 4 * d]);
-                let inverse = (flat.square().mean_dim(2) + 1e-6).sqrt().recip();
-                let z = p.clone() * inverse;
+                let z = OhcBackend::Tensor.gate_norm(streams.clone(), p.clone());
                 let a = sigmoid(
                     z.clone().narrow(2, 0, 4) * stage.read_scale.val().unsqueeze::<3>()
                         + stage.read_bias.val().unsqueeze::<3>(),
@@ -564,7 +562,7 @@ pub fn attribution(c: &Config, device: &Device) -> Result<Value> {
                 let q = z.narrow(2, 8, 8) * stage.mix_scale + stage.mix_bias.val().unsqueeze::<3>();
                 Tensor::cat(vec![a, w, q], 2).reshape([b * t * 16])
             }
-            3 => (stage.stream_norm.forward(streams.clone()) * a.clone().unsqueeze_dim::<4>(3))
+            3 => (streams.clone() * a.clone().unsqueeze_dim::<4>(3))
                 .sum_dim(2)
                 .reshape([b * t * d]),
             4 => stage
@@ -581,7 +579,6 @@ pub fn attribution(c: &Config, device: &Device) -> Result<Value> {
                 q.clone(),
                 w.clone(),
                 update.clone(),
-                stage.write_scale.val(),
             )
             .reshape([b * t * 4 * d]),
             7 | 13 | 14 | 15 => {
@@ -608,7 +605,7 @@ pub fn attribution(c: &Config, device: &Device) -> Result<Value> {
                 .gate_norm(streams.clone(), p.clone())
                 .reshape([b * t * 16]),
             11 => OhcBackend::FusedReadWrite
-                .weighted_read(streams.clone(), a.clone(), &stage.stream_norm)
+                .weighted_read(streams.clone(), a.clone())
                 .reshape([b * t * d]),
             12 => stage
                 .rotation

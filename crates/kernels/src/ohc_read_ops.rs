@@ -23,21 +23,14 @@ pub trait OhcReadOps: Backend {
         p: FloatTensor<Self>,
         dy: FloatTensor<Self>,
     ) -> (FloatTensor<Self>, FloatTensor<Self>);
-    #[fusion(meta=|x:&TensorSpec,a:&TensorSpec,_g,_epsilon|{let[b,t,_,d]=x.shape.dims::<4>();(TensorSpec::new([b,t,d].into(),x.dtype),a.clone())})]
-    fn ohc_weighted_read(
-        x: FloatTensor<Self>,
-        a: FloatTensor<Self>,
-        g: FloatTensor<Self>,
-        epsilon: f32,
-    ) -> (FloatTensor<Self>, FloatTensor<Self>);
-    #[fusion(meta=|x:&TensorSpec,a:&TensorSpec,g:&TensorSpec,_inv,_dy|(x.clone(),a.clone(),g.clone()))]
+    #[fusion(meta=|x:&TensorSpec,_a|{let[b,t,_,d]=x.shape.dims::<4>();TensorSpec::new([b,t,d].into(),x.dtype)})]
+    fn ohc_weighted_read(x: FloatTensor<Self>, a: FloatTensor<Self>) -> FloatTensor<Self>;
+    #[fusion(meta=|x:&TensorSpec,a:&TensorSpec,_dy|(x.clone(),a.clone()))]
     fn ohc_weighted_vjp(
         x: FloatTensor<Self>,
         a: FloatTensor<Self>,
-        g: FloatTensor<Self>,
-        inv: FloatTensor<Self>,
         dy: FloatTensor<Self>,
-    ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>);
+    ) -> (FloatTensor<Self>, FloatTensor<Self>);
     #[fusion(meta=|x:&TensorSpec,_pattern|{let[b,t,_]=x.shape.dims::<3>();TensorSpec::new([b,t,16].into(),x.dtype)})]
     fn ohc_quaternion(x: FloatTensor<Self>, pattern: FloatTensor<Self>) -> FloatTensor<Self>;
     #[fusion(meta=|x:&TensorSpec,_pattern,_dy|x.clone())]
@@ -59,22 +52,15 @@ impl OhcReadOps for CubeBackend {
         let (dp, dx) = crate::ohc_read::gate(x, p, Some(dy));
         (dx, dp)
     }
-    fn ohc_weighted_read(
-        x: FloatTensor<Self>,
-        a: FloatTensor<Self>,
-        g: FloatTensor<Self>,
-        epsilon: f32,
-    ) -> (FloatTensor<Self>, FloatTensor<Self>) {
-        crate::ohc_read::weighted(x, a, g, epsilon)
+    fn ohc_weighted_read(x: FloatTensor<Self>, a: FloatTensor<Self>) -> FloatTensor<Self> {
+        crate::ohc_read::weighted(x, a)
     }
     fn ohc_weighted_vjp(
         x: FloatTensor<Self>,
         a: FloatTensor<Self>,
-        g: FloatTensor<Self>,
-        inv: FloatTensor<Self>,
         dy: FloatTensor<Self>,
-    ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
-        crate::ohc_read::weighted_backward(x, a, g, inv, dy)
+    ) -> (FloatTensor<Self>, FloatTensor<Self>) {
+        crate::ohc_read::weighted_backward(x, a, dy)
     }
     fn ohc_quaternion(x: FloatTensor<Self>, pattern: FloatTensor<Self>) -> FloatTensor<Self> {
         crate::ohc_read::rotation(x, pattern, None)
@@ -129,70 +115,46 @@ impl<B: Backend + OhcReadOps, C: CheckpointStrategy> OhcReadOps for Autodiff<B, 
         let (dx, dp) = B::ohc_gate_vjp(x.into_primitive(), p.into_primitive(), dy.into_primitive());
         (Self::from_inner(dx), Self::from_inner(dp))
     }
-    fn ohc_weighted_read(
-        x: FloatTensor<Self>,
-        a: FloatTensor<Self>,
-        g: FloatTensor<Self>,
-        epsilon: f32,
-    ) -> (FloatTensor<Self>, FloatTensor<Self>) {
+    fn ohc_weighted_read(x: FloatTensor<Self>, a: FloatTensor<Self>) -> FloatTensor<Self> {
         #[derive(Debug)]
         struct ReadBackward;
-        impl<B: Backend + OhcReadOps> Backward<B, 3> for ReadBackward {
-            type State = (
-                FloatTensor<B>,
-                FloatTensor<B>,
-                FloatTensor<B>,
-                FloatTensor<B>,
-            );
+        impl<B: Backend + OhcReadOps> Backward<B, 2> for ReadBackward {
+            type State = (FloatTensor<B>, FloatTensor<B>);
             fn backward(
                 self,
-                ops: Ops<Self::State, 3>,
+                ops: Ops<Self::State, 2>,
                 grads: &mut Gradients,
                 _: &mut Checkpointer,
             ) {
                 let dy = grads.consume::<B>(&ops.node);
-                let (x, a, g, inv) = ops.state;
-                let (dx, da, dg) = B::ohc_weighted_vjp(x, a, g, inv, dy);
-                for (node, g) in ops.parents.into_iter().zip([dx, da, dg]) {
+                let (x, a) = ops.state;
+                let (dx, da) = B::ohc_weighted_vjp(x, a, dy);
+                for (node, g) in ops.parents.into_iter().zip([dx, da]) {
                     if let Some(node) = node {
                         grads.register::<B>(node.id, g);
                     }
                 }
             }
         }
-        let parents = [x.node(), a.node(), g.node()];
-        let (x, a, g) = (x.into_primitive(), a.into_primitive(), g.into_primitive());
-        let (y, inv) = B::ohc_weighted_read(x.clone(), a.clone(), g.clone(), epsilon);
-        let aux = Self::from_inner(inv.clone());
-        let y = match ReadBackward
-            .prepare::<C>(parents)
-            .compute_bound()
-            .stateful()
-        {
-            OpsKind::Tracked(prep) => prep.finish((x, a, g, inv), y),
+        let parents = [x.node(), a.node()];
+        let (x, a) = (x.into_primitive(), a.into_primitive());
+        let y = B::ohc_weighted_read(x.clone(), a.clone());
+        match ReadBackward.prepare::<C>(parents).compute_bound().stateful() {
+            OpsKind::Tracked(prep) => prep.finish((x, a), y),
             OpsKind::UnTracked(prep) => prep.finish(y),
-        };
-        (y, aux)
+        }
     }
     fn ohc_weighted_vjp(
         x: FloatTensor<Self>,
         a: FloatTensor<Self>,
-        g: FloatTensor<Self>,
-        inv: FloatTensor<Self>,
         dy: FloatTensor<Self>,
-    ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
-        let (dx, da, dg) = B::ohc_weighted_vjp(
+    ) -> (FloatTensor<Self>, FloatTensor<Self>) {
+        let (dx, da) = B::ohc_weighted_vjp(
             x.into_primitive(),
             a.into_primitive(),
-            g.into_primitive(),
-            inv.into_primitive(),
             dy.into_primitive(),
         );
-        (
-            Self::from_inner(dx),
-            Self::from_inner(da),
-            Self::from_inner(dg),
-        )
+        (Self::from_inner(dx), Self::from_inner(da))
     }
     fn ohc_quaternion(x: FloatTensor<Self>, pattern: FloatTensor<Self>) -> FloatTensor<Self> {
         #[derive(Debug)]
@@ -242,14 +204,11 @@ pub fn ohc_gate_norm(x: Tensor<4>, p: Tensor<3>) -> Tensor<3> {
         p.into_dispatch(),
     ))
 }
-pub fn ohc_weighted_read(x: Tensor<4>, a: Tensor<3>, g: Tensor<1>, epsilon: f64) -> Tensor<3> {
-    let (y, _) = <Dispatch as OhcReadOps>::ohc_weighted_read(
+pub fn ohc_weighted_read(x: Tensor<4>, a: Tensor<3>) -> Tensor<3> {
+    Tensor::from_dispatch(<Dispatch as OhcReadOps>::ohc_weighted_read(
         x.into_dispatch(),
         a.into_dispatch(),
-        g.into_dispatch(),
-        epsilon as f32,
-    );
-    Tensor::from_dispatch(y)
+    ))
 }
 pub fn ohc_quaternion(x: Tensor<3>, pattern: Tensor<2>) -> Tensor<4> {
     let [b, t, _] = x.dims();

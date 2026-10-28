@@ -47,7 +47,7 @@ fn project(x: &View<f32>, w: &View<f32>, y: &mut View<f32>) {
         offset /= 2;
     }
     if r == 0 {
-        let inv = 1.0f32 / f32::sqrt(squares[j] / (4 * x.shape(3)) as f32 + 1e-6f32);
+        let inv = 1.0f32 / (f32::sqrt(squares[j] / (4 * x.shape(3)) as f32) + 1e-6f32);
         y[n * 16 + j] = sums[j] * inv;
     }
 }
@@ -92,8 +92,12 @@ fn input_vjp(
         sync_cube();
         offset /= 2;
     }
-    let inv = 1.0f32 / f32::sqrt(sums[0] / width as f32 + 1e-6f32);
-    let correction = dots[0] * inv * inv / width as f32;
+    let rms = f32::sqrt(sums[0] / width as f32);
+    let inv = 1.0f32 / (rms + 1e-6f32);
+    let mut correction = 0.0f32;
+    if rms > 0.0f32 {
+        correction = dots[0] * inv / (width as f32 * rms);
+    }
     if lane < 16 {
         adj[lane] *= inv;
         dp[n * 16 + lane] = adj[lane];
