@@ -286,10 +286,10 @@ pub(crate) fn training_loss_sampled_profiled<P:delta_mixers::profile::Sections>(
     }
 }
 
-pub fn evaluate(model: &LanguageModel, c: &Config, examples: &[Example], device: &Device) -> Result<Value> {
+fn teacher_prefix_evaluate(model: &LanguageModel, c: &Config, examples: &[Example], device: &Device) -> Result<Value> {
     let s = c.sbd.as_ref().context("SBD config is required")?;
     if s.cocommit.is_some() {
-        return crate::cocommit::evaluate(model,c,examples,device);
+        return crate::cocommit::teacher_prefix_evaluate(model,c,examples,device);
     }
     if s.joint_output.is_codpula() {
         ensure!(examples.iter().all(|row|row.weight.iter().all(|&weight|weight == 1.0)),
@@ -330,6 +330,45 @@ pub fn evaluate(model: &LanguageModel, c: &Config, examples: &[Example], device:
     }
     ensure!(count > 0,"SBD evaluation needs targets");
     Ok(json!({"block_nll":nll/count as f64,"block_accuracy":hits as f64/count as f64,"predicted_tokens":count,"conditioning":"all targets masked initially; detached soft first pass when configured; every configured length evaluated on every example","block_lengths":s.block_lengths,"joint_output":s.joint_output,"nll_reduction":"sum block event NLL / valid targets"}))
+}
+
+#[derive(Default,Clone)]
+pub(crate) struct DecodeScore {
+    pub nll: f64,
+    pub hits: usize,
+    pub count: usize,
+}
+impl DecodeScore {
+    pub(crate) fn observe(&mut self, logs: &[f32], proposals: &[usize], writes: &[usize], targets: &[i32], weights: &[f32], vocab: usize) {
+        for &position in writes {
+            if weights[position]==0.0 {continue;}
+            self.nll-=f64::from(logs[position*vocab+targets[position] as usize]);
+            self.hits+=usize::from(proposals[position]==targets[position] as usize);
+            self.count+=1;
+        }
+    }
+    pub(crate) fn report(&self) -> Value {json!({"nll":self.nll,"hits":self.hits,"count":self.count})}
+}
+pub fn evaluate(model: &LanguageModel, c: &Config, examples: &[Example], device: &Device) -> Result<Value> {
+    let s=c.sbd.as_ref().context("SBD config is required")?;
+    let mut score=DecodeScore::default();
+    for &length in &s.block_lengths {
+        let mut execution=c.clone();
+        execution.sbd.as_mut().unwrap().block_lengths=vec![length];
+        for row in examples {
+            execution.sbd.as_mut().unwrap().generate_tokens=row.target.len();
+            let report=generate_scored(model,&execution,&row.input[..1],Some((&row.target,&row.weight)),device)?;
+            score.nll+=report["decode_score"]["nll"].as_f64().context("decode NLL is missing or nonfinite")?;
+            score.hits+=report["decode_score"]["hits"].as_u64().context("decode hits missing")? as usize;
+            score.count+=report["decode_score"]["count"].as_u64().context("decode token count missing")? as usize;
+        }
+    }
+    ensure!(score.count>0,"SBD decode evaluation needs targets");
+    Ok(json!({"block_nll":score.nll/score.count as f64,"block_accuracy":score.hits as f64/score.count as f64,
+        "predicted_tokens":score.count,"block_lengths":s.block_lengths,"joint_output":s.joint_output,
+        "conditioning":"actual decoder transitions, generated prefix and self-generated block inputs",
+        "nll_reduction":"sum token marginal NLL at each final write / valid output tokens",
+        "teacher_prefix_diagnostic":teacher_prefix_evaluate(model,c,examples,device)?}))
 }
 
 #[derive(Default)]
@@ -413,9 +452,12 @@ pub(super) fn advance_generation_state(
 }
 
 pub fn generate(model: &LanguageModel, c: &Config, prompt: &[i32], device: &Device) -> Result<Value> {
+    generate_scored(model,c,prompt,None,device)
+}
+pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32], targets: Option<(&[i32],&[f32])>, device: &Device) -> Result<Value> {
     let s = c.sbd.as_ref().context("SBD config is required")?;
     if s.refinement.is_some() {
-        return crate::remask::generate(model,c,prompt,device);
+        return crate::remask::generate_scored(model,c,prompt,targets,device);
     }
     ensure!(!prompt.is_empty(),"generation requires a clean prefix");
     let model = model.valid();
@@ -424,6 +466,7 @@ pub fn generate(model: &LanguageModel, c: &Config, prompt: &[i32], device: &Devi
     let clock = Instant::now();
     let mut passes = 0;
     let mut generated = Vec::new();
+    let mut score=DecodeScore::default();
     let mut blocks = 0;
     let mut coordinated_passes = 0usize;
     let mut coordinated_blocks = 0usize;
@@ -447,6 +490,11 @@ pub fn generate(model: &LanguageModel, c: &Config, prompt: &[i32], device: &Devi
                 coordinated_passes+=1;
                 let seed = if model.codpula.is_some() {proposal_rng.next()} else {0};
                 let assignment = crate::cocommit::assign(&model,c,coordination_cache.as_ref().unwrap(),&soft,block_passes,seed,device)?;
+                if let Some((targets,weights))=targets {
+                    let start=generated.len();
+                    score.observe(&assignment.host_logs,&assignment.proposals,&assignment.commits,
+                        &targets[start..start+n],&weights[start..start+n],c.vocab());
+                }
                 advance_generation_state(c,&mut soft,&assignment.proposals,&assignment.commits,
                     assignment.feedback,assignment.feedback_temperature,device)?;
                 final_values=soft.observed.clone();
@@ -500,6 +548,10 @@ pub fn generate(model: &LanguageModel, c: &Config, prompt: &[i32], device: &Devi
                 for &(i,_,id) in &order { values[i] = id; }
                 values
             });
+            if let Some((targets,weights))=targets {
+                let start=generated.len();
+                score.observe(&logs,&proposal_values,&commits,&targets[start..start+n],&weights[start..start+n],c.vocab());
+            }
             advance_generation_state(c,&mut soft,&proposal_values,&commits,
                 feedback_logits.reshape([n,c.vocab()]),feedback_temperature,device)?;
             final_values = soft.observed.clone();
@@ -513,6 +565,7 @@ pub fn generate(model: &LanguageModel, c: &Config, prompt: &[i32], device: &Devi
     runtime::sync(device)?;
     let seconds = clock.elapsed().as_secs_f64();
     let mut report = json!({"tokens":generated,"text":String::from_utf8_lossy(&generated.iter().map(|&x| x as u8).collect::<Vec<_>>()),"finalized_tokens":generated.len(),"finalized_tokens_per_second":generated.len() as f64/seconds,"seconds":seconds,"denoising_passes":passes,"blocks":blocks,"causally_replayed_tokens":clean.replayed,"includes_replay":true,"prefill_included":false,"replay_implementation":"full clean-prefix reconstruction once per finalized block; no incremental optimization","commit_rule":if s.commitment == SbdCommitment::Dependence {"dependence"} else if s.entropy_threshold.is_some() {"sbd_entropy_eq8"} else {"fixed_count"},"joint_output":s.joint_output,"joint_execution":s.joint_execution,"proposal_seed":c.seed,"potential_temperature":c.soft_temperature,"dependence_threshold":s.dependence_threshold,"maximum_passes_per_block":"actual block length"});
+    if targets.is_some() {report["decode_score"]=score.report();}
     if let Some(options) = &s.cocommit {
         report["cocommit"] = json!({"config":options,"shared_noisy_prefix_calls":coordinated_passes,
             "unmarked_tail_calls":coordinated_passes,"marked_tail_calls":coordinated_passes,
@@ -866,5 +919,32 @@ mod tests {
         advance_generation_state(&c,&mut generation,&[3;4],&[0],logits,1.0,&device).unwrap();
         let visibility=values(generation.visibility);
         assert_eq!(visibility,vec![1.0,0.25,0.25,0.25]);
+    }
+    #[test]
+    fn decoder_fix_validation_nll_follows_generated_prefix_float64_reference() {
+        let device=Device::ndarray();
+        device.seed(281);
+        let c=Config {task:"lm".into(),d_model:16,layers:1,
+            sbd:Some(crate::config::SbdConfig {block_lengths:vec![1],..Default::default()}),..Config::default()};
+        let arm=Arm {name:"decode-score".into(),mixer:"gdn2".into(),cache:"none".into()};
+        let model=LanguageModel::new(&c,&arm,&device).unwrap();
+        let mut prefix=vec![256];
+        let mut targets=Vec::new();
+        let mut expected_nll=0.0;
+        for position in 0..3 {
+            let soft=state(&c,vec![None],&device).unwrap();
+            let logits=values(block_forward(&model,&prefix,&soft,false,&device).logits);
+            let best=(0..c.vocab()).max_by(|&a,&b|logits[a].total_cmp(&logits[b]).then(b.cmp(&a))).unwrap();
+            let gold=(best+position+1)%c.vocab();
+            let maximum=logits.iter().map(|&x|f64::from(x)).fold(f64::NEG_INFINITY,f64::max);
+            expected_nll+=maximum+logits.iter().map(|&x|(f64::from(x)-maximum).exp()).sum::<f64>().ln()-f64::from(logits[gold]);
+            targets.push(gold as i32);
+            prefix.push(best as i32);
+        }
+        let row=Example {input:std::iter::once(256).chain(targets[..2].iter().copied()).collect(),
+            target:targets,weight:vec![1.0;3],groups:vec![None;3]};
+        let report=evaluate(&model,&c,&[row],&device).unwrap();
+        compare(&[report["block_nll"].as_f64().unwrap()],&[expected_nll/3.0]).unwrap();
+        assert!((report["block_nll"].as_f64().unwrap()-report["teacher_prefix_diagnostic"]["block_nll"].as_f64().unwrap()).abs()>1e-6);
     }
 }
