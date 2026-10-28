@@ -102,6 +102,8 @@ Final numerical results:
 
 Causality differences are exactly zero for both reports. The f64 oracle's central-difference errors are at most 2.219e-11 in the observed directional checks. The GPU tensor/fused CPU-model gates cover 27 parameter tensors. Fused maxima versus the CPU model are 1.937e-7 for logits, 2.384e-7 for all parameter gradients and 8.941e-7 for the AdamW-updated parameters; all pass the unchanged tolerance. CPU self-comparison is exactly zero.
 
+**Historical learning smoke — GDN-2 removed on 2026-10-28 by user decision.** The original training budget and loss measurements below are retained unchanged, not reassigned to KronLSTM.
+
 The matched-budget tiny byte-LM smoke uses D16/L1/B2/T32, GDN-2, no HOLA, one wavelet injection, seed 1, and learning rate 0.001. Both off and fused-wavelet models run **200 steps / 12,800 training tokens**, with identical common initial weights and training row indices. Every step checks scalar loss and all trainable gradients before AdamW. Mean training loss over the first/last 20 steps:
 
 | Mode | First 20 | Last 20 |

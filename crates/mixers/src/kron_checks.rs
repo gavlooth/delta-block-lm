@@ -85,41 +85,6 @@ pub fn kron_numerical_checks_selected(
     Ok(reports)
 }
 
-/// Independent GDN-2 output/state/score/initial VJPs at the original tolerances.
-pub fn gdn_numerical_checks_selected(
-    device: &Device,
-    backend: ScanBackend,
-    tokens: Option<usize>,
-    objective: Option<usize>,
-) -> Result<Vec<KronCheck>, String> {
-    if !backend.supports(MixerKind::Gdn2) {
-        return Err("GDN-2 requires tensor_solver or fused_gdn2".into());
-    }
-    if tokens.is_some_and(|n| !(1..=512).contains(&n)) || objective.is_some_and(|mode| mode > 3) {
-        return Err("GDN-2 reference expects tokens 1..=512 and objective 0..=3".into());
-    }
-    let device = device.clone().autodiff();
-    if backend.is_fused() {
-        chunk::assert_fused_device(&device);
-    }
-    let mut reports = Vec::new();
-    for time in tokens.map_or_else(|| vec![1, 7, 35], |n| vec![n]) {
-        for mode in 0..4 {
-            if objective.is_some_and(|selected| selected != mode) {
-                continue;
-            }
-            reports.push(
-                check(&device, backend, MixerKind::Gdn2, time, mode, false).map_err(|error| {
-                    format!("GDN-2 {backend:?} T{time} objective={mode}: {error}")
-                })?,
-            );
-        }
-    }
-    if tokens.is_none() && objective.is_none() {
-        reports.push(check(&device, backend, MixerKind::Gdn2, 35, 0, true)?);
-    }
-    Ok(reports)
-}
 
 fn check(
     device: &Device,

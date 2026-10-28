@@ -112,6 +112,8 @@ and checks the production table optimizer group's fresh-state row support.
 
 ### Tensor duplicate-index raw-gradient determinism
 
+**Historical failure evidence — GDN-2 removed on 2026-10-28 by user decision.** The original fixture below identifies the discovered shared Lngram defect; current model fixtures use KronLSTM.
+
 The retained GDN2 extended full-model Vulkan fixture exposed an exact L1
 common-gradient mismatch at `blocks.0.lngram.tables.0.weight`. Loss and logits
 had already passed. The failure was in the **raw gradient before any optimizer

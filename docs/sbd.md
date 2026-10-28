@@ -188,11 +188,13 @@ flock /tmp/delta-block-lm-gpu.lock flock /tmp/delta-block-lm-build.lock timeout 
 flock /tmp/delta-block-lm-gpu.lock timeout 900s /tmp/delta-bins/s8/delta-experiment sbd-evaluate artifacts/step8/pilot-variable.json --resume artifacts/step8/pilot-variable/kronlstm-hola-seed1/checkpoint-4
 ```
 
-The current `sbd-reference` command includes an independent scalar f64 noisy-HOLA forward/full-VJP oracle and checks both the tensor and explicit fused GPU read. GDN-2 on GPU uses `fused_gdn2` with the arm mixer set to `gdn2`. CPU uses tensor execution selectors. Autotuned matmul is not part of this variable-shape path. The historical commands above do not authorize new comparisons or sweeps.
+The current `sbd-reference` command includes an independent scalar f64 noisy-HOLA forward/full-VJP oracle and checks both the tensor and explicit fused GPU read for KronLSTM. CPU uses tensor execution selectors; supported GPU scans use `fused_gpu`, `fused_parallel128` or `fused_parallel256`. Autotuned matmul is not part of this variable-shape path. The historical commands above do not authorize new comparisons or sweeps.
 
 ## Verification and measurement scope
 
-Existing sequential f64 references cover recurrence, short convolution, HOLA, wavelet, Lngram and oHC. The noisy-read oracle covers derivatives of queries, cache/clean-chunk/block keys and values, sink and sigmoid gate, with central finite differences on the oracle. Fixtures include padding, empty cache, a chunk-aligned start and an unfinished chunk. Complete-model checks cover both mixers, HOLA on/off and Step-7 on/off; `hola_read` is rejected without HOLA, and `none` still runs. A prefix of length 19 puts the block start inside chunk 16. The checks include CPU/Vulkan logits and all-parameter gradients, cached/reconstructed logits and gradients, lengths 1/4/8/16, future-token perturbations, intended observed-token communication, padding, frozen snapshots and replay. Tolerance remains `2e-5 + 3e-4*abs(reference)`.
+Existing sequential f64 references cover recurrence, short convolution, HOLA, wavelet, Lngram and oHC. The noisy-read oracle covers derivatives of queries, cache/clean-chunk/block keys and values, sink and sigmoid gate, with central finite differences on the oracle. Fixtures include padding, empty cache, a chunk-aligned start and an unfinished chunk. Current complete-model checks cover KronLSTM, HOLA on/off and Step-7 on/off; `hola_read` is rejected without HOLA, and `none` still runs. A prefix of length 19 puts the block start inside chunk 16. The checks include CPU/Vulkan logits and all-parameter gradients, cached/reconstructed logits and gradients, lengths 1/4/8/16, future-token perturbations, intended observed-token communication, padding, frozen snapshots and replay. Tolerance remains `2e-5 + 3e-4*abs(reference)`.
+
+Historical mixed-mixer measurements below retain their original scope: GDN-2 removed on 2026-10-28 by user decision.
 
 Clean and noisy execution share one per-layer operation: optional wavelet, optional
 Lngram, mixer, then MLP. The same operation handles ordinary residuals and oHC

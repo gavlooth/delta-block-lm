@@ -637,7 +637,7 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
     let read_oracle = crate::sbd_read_reference::run(device,c.backend != "cpu")?;
     let cpu = Device::ndarray().autodiff();
     let gpu = device.clone().autodiff();
-    for mixer in ["gdn2","kronlstm"] {
+    for mixer in ["kronlstm"] {
         for cache in ["none","surprise"] {
             for step7 in [false,true] {
               for reads in [delta_mixers::sbd::InBlockReads::None,delta_mixers::sbd::InBlockReads::HolaRead] {
@@ -686,7 +686,7 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
                 let base = LanguageModel::new(&cfg,&arm,&cpu)?;
                 let mut tested = base.clone().fork(&gpu);
                 if c.backend != "cpu" {
-                    tested.set_scan_backend(if mixer == "gdn2" {delta_mixers::ScanBackend::FusedGdn2} else {delta_mixers::ScanBackend::FusedGpu});
+                    tested.set_scan_backend(delta_mixers::ScanBackend::FusedGpu);
                     tested.set_hola_backend(delta_mixers::HolaBackend::FusedGpu);
                     tested.set_noisy_read_backend(if reads.is_none() {delta_mixers::sbd::NoisyReadBackend::Tensor} else {delta_mixers::sbd::NoisyReadBackend::FusedGpu});
                     if let Some(retrieval) = &cfg.prefix_block_retrieval {
@@ -955,7 +955,7 @@ mod tests {
         device.seed(13);
         let mut c = Config { task:"lm".into(),d_model:16,layers:1,..Config::default() };
         c.sbd = Some(crate::config::SbdConfig {block_lengths:vec![1,4],..Default::default()});
-        let arm = Arm {name:"gdn2".into(),mixer:"gdn2".into(),cache:"none".into()};
+        let arm = Arm {name:"kronlstm".into(),mixer:"kronlstm".into(),cache:"none".into()};
         let model = LanguageModel::new(&c,&arm,&device).unwrap();
         let example = Example {input:vec![256,65,66,67],target:vec![65,66,67,68],weight:vec![1.0;4],groups:vec![None;4]};
         let report = evaluate(&model,&c,&[example],&device).unwrap();
@@ -967,7 +967,7 @@ mod tests {
         device.seed(281);
         let c=Config {task:"lm".into(),d_model:16,layers:1,
             sbd:Some(crate::config::SbdConfig {block_lengths:vec![1],..Default::default()}),..Config::default()};
-        let arm=Arm {name:"decode-score".into(),mixer:"gdn2".into(),cache:"none".into()};
+        let arm=Arm {name:"decode-score".into(),mixer:"kronlstm".into(),cache:"none".into()};
         let model=LanguageModel::new(&c,&arm,&device).unwrap();
         let mut prefix=vec![256];
         let mut targets=Vec::new();

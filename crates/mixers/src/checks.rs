@@ -10,7 +10,7 @@ use std::time::Instant;
 #[path = "kron_checks.rs"]
 mod kron;
 pub use kron::{
-    KronCheck, gdn_numerical_checks_selected, kron_numerical_checks, kron_numerical_checks_selected,
+    KronCheck, kron_numerical_checks, kron_numerical_checks_selected,
 };
 #[path = "hola_checks.rs"]
 mod hola;
@@ -29,7 +29,6 @@ pub struct NumericalReport {
     pub layer: Vec<LayerCheck>,
     pub fused_kron: Vec<KronCheck>,
     pub fused_hola: Vec<HolaCheck>,
-    pub fused_gdn: Vec<KronCheck>,
 }
 #[derive(Debug, Serialize)]
 pub struct RecurrenceCheck {
@@ -117,16 +116,9 @@ struct Fixture {
     final_adjoint: Vec<f32>,
 }
 impl Fixture {
-    fn new(kind: MixerKind, t: usize) -> Self {
+    fn new(_kind: MixerKind, t: usize) -> Self {
         let (b, h, k, v) = (2, 4, 32, 64);
-        let widths = [
-            k,
-            k,
-            v,
-            k,
-            if kind == MixerKind::Gdn2 { k } else { 1 },
-            if kind == MixerKind::Gdn2 { v } else { 1 },
-        ];
+        let widths = [k, k, v, k, 1, 1];
         let data = widths
             .iter()
             .enumerate()
@@ -435,23 +427,10 @@ fn recurrence_check(
 pub fn numerical_checks(device: &Device) -> Result<NumericalReport, String> {
     let device = device.clone().autodiff();
     let mut recurrence = Vec::new();
-    for kind in [MixerKind::Gdn2, MixerKind::KronLstm] {
-        for t in [7, 35] {
-            recurrence.push(recurrence_check(&device, kind, t, false)?);
-        }
-        recurrence.push(recurrence_check(&device, kind, 35, true)?);
+    for t in [7, 35] {
+        recurrence.push(recurrence_check(&device, MixerKind::KronLstm, t, false)?);
     }
-    #[cfg(any(feature = "vulkan", feature = "cuda"))]
-    if matches!(
-        device.clone().inner().as_dispatch(),
-        burn::backend::DispatchDevice::Cube(_)
-    ) {
-        for t in [7, 35] {
-            for probes in [false, true] {
-                recurrence.push(custom_gdn_check(&device, t, probes)?);
-            }
-        }
-    }
+    recurrence.push(recurrence_check(&device, MixerKind::KronLstm, 35, true)?);
     let mut cache = Vec::new();
     for policy in [CachePolicy::Surprise, CachePolicy::Recency] {
         for capacity in [3, 16] {
@@ -459,49 +438,26 @@ pub fn numerical_checks(device: &Device) -> Result<NumericalReport, String> {
         }
     }
     let mut layer = Vec::new();
-    for kind in [MixerKind::Gdn2, MixerKind::KronLstm] {
-        for policy in [
-            CachePolicy::None,
-            CachePolicy::Surprise,
-            CachePolicy::Recency,
-        ] {
-            layer.push(layer_check(
-                &device,
-                kind,
-                policy,
-                ScanBackend::TensorSolver,
-                HolaBackend::Tensor,
-            )?);
-        }
+    for policy in [
+        CachePolicy::None,
+        CachePolicy::Surprise,
+        CachePolicy::Recency,
+    ] {
+        layer.push(layer_check(
+            &device,
+            MixerKind::KronLstm,
+            policy,
+            ScanBackend::TensorSolver,
+            HolaBackend::Tensor,
+        )?);
     }
     let fused_kron = kron_numerical_checks(&device)?;
-    let mut fused_gdn =
-        gdn_numerical_checks_selected(&device, ScanBackend::TensorSolver, None, None)?;
     let mut fused_hola = Vec::new();
     #[cfg(any(feature = "vulkan", feature = "cuda"))]
     if matches!(
         device.clone().inner().as_dispatch(),
         burn::backend::DispatchDevice::Cube(_)
     ) {
-        fused_gdn.extend(gdn_numerical_checks_selected(
-            &device,
-            ScanBackend::FusedGdn2,
-            None,
-            None,
-        )?);
-        for policy in [
-            CachePolicy::None,
-            CachePolicy::Surprise,
-            CachePolicy::Recency,
-        ] {
-            layer.push(layer_check(
-                &device,
-                MixerKind::Gdn2,
-                policy,
-                ScanBackend::FusedGdn2,
-                HolaBackend::Tensor,
-            )?);
-        }
         for policy in [
             CachePolicy::None,
             CachePolicy::Surprise,
@@ -516,16 +472,14 @@ pub fn numerical_checks(device: &Device) -> Result<NumericalReport, String> {
             )?);
         }
         fused_hola = hola_numerical_checks(&device)?;
-        for kind in [MixerKind::Gdn2, MixerKind::KronLstm] {
-            for policy in [CachePolicy::Surprise, CachePolicy::Recency] {
-                layer.push(layer_check(
-                    &device,
-                    kind,
-                    policy,
-                    ScanBackend::TensorSolver,
-                    HolaBackend::FusedGpu,
-                )?);
-            }
+        for policy in [CachePolicy::Surprise, CachePolicy::Recency] {
+            layer.push(layer_check(
+                &device,
+                MixerKind::KronLstm,
+                policy,
+                ScanBackend::TensorSolver,
+                HolaBackend::FusedGpu,
+            )?);
         }
         for policy in [CachePolicy::Surprise, CachePolicy::Recency] {
             layer.push(layer_check(
@@ -546,7 +500,6 @@ pub fn numerical_checks(device: &Device) -> Result<NumericalReport, String> {
         layer,
         fused_kron,
         fused_hola,
-        fused_gdn,
     })
 }
 
@@ -848,181 +801,6 @@ fn layer_check(
     })
 }
 
-#[cfg(any(feature = "vulkan", feature = "cuda"))]
-fn custom_gdn_check(
-    device: &Device,
-    time: usize,
-    include_state: bool,
-) -> Result<RecurrenceCheck, String> {
-    let fixture = Fixture::new(MixerKind::Gdn2, time);
-    let expected = fixture.oracle(MixerKind::Gdn2, include_state);
-    // Read every final-state row with identity queries and zero updates. These
-    // 32 diagnostic tokens expose the custom operator's state without a second
-    // implementation reconstructing it from the tensor solver's intermediates.
-    let extended = time + if include_state { fixture.k } else { 0 };
-    let mut starts = vec![1i32; fixture.b * extended];
-    let mut ends = vec![0i32; fixture.b * extended];
-    for row in 0..fixture.b {
-        let mut start = 0;
-        for p in 0..time {
-            if !fixture.valid[row * time + p] {
-                continue;
-            }
-            if fixture.reset[row * time + p] {
-                start = p;
-            }
-            starts[row * extended + p] = start as i32;
-            let next = (p + 1..time)
-                .find(|&n| fixture.valid[row * time + n] && fixture.reset[row * time + n]);
-            ends[row * extended + p] = match next {
-                Some(next) => (p..next)
-                    .rev()
-                    .find(|&n| fixture.valid[row * time + n])
-                    .unwrap() as i32,
-                None => (extended - 1) as i32,
-            };
-        }
-        for p in time..extended {
-            starts[row * extended + p] = start as i32;
-            ends[row * extended + p] = (extended - 1) as i32;
-        }
-    }
-    let mut probes = vec![
-        0.0f32;
-        if include_state {
-            fixture.b * fixture.k * fixture.h * fixture.k
-        } else {
-            0
-        }
-    ];
-    if include_state {
-        for row in 0..fixture.b {
-            for p in 0..fixture.k {
-                for head in 0..fixture.h {
-                    probes[((row * fixture.k + p) * fixture.h + head) * fixture.k + p] = 1.;
-                }
-            }
-        }
-    }
-    let run = || {
-        let x = fixture.inputs(device);
-        let padded = x
-            .iter()
-            .enumerate()
-            .map(|(f, x)| {
-                if !include_state {
-                    return x.clone();
-                }
-                let probe = if f == 0 {
-                    Tensor::from_data(
-                        TensorData::new(
-                            probes.clone(),
-                            [fixture.b, fixture.k, fixture.h, fixture.k],
-                        ),
-                        device,
-                    )
-                } else if f == 3 {
-                    Tensor::ones([fixture.b, fixture.k, fixture.h, fixture.widths[f]], device)
-                } else {
-                    Tensor::zeros([fixture.b, fixture.k, fixture.h, fixture.widths[f]], device)
-                };
-                Tensor::cat(vec![x.clone(), probe], 1)
-            })
-            .collect::<Vec<_>>();
-        let all = delta_kernels::gdn2_scan(
-            padded[0].clone(),
-            padded[1].clone(),
-            padded[2].clone(),
-            padded[3].clone(),
-            padded[4].clone(),
-            padded[5].clone(),
-            Tensor::from_data(
-                TensorData::new(starts.clone(), [fixture.b, extended]),
-                device,
-            ),
-            Tensor::from_data(TensorData::new(ends.clone(), [fixture.b, extended]), device),
-        );
-        let out = all
-            .clone()
-            .slice([0..fixture.b, 0..time, 0..fixture.h, 0..fixture.v]);
-        let state = include_state.then(|| {
-            all.slice([0..fixture.b, time..extended, 0..fixture.h, 0..fixture.v])
-                .swap_dims(1, 2)
-        });
-        let actual = values(out.clone());
-        let actual_state = state.as_ref().map(|state| values(state.clone()));
-        let mut loss = (out
-            * Tensor::from_data(
-                TensorData::new(
-                    fixture.upstream.clone(),
-                    [fixture.b, time, fixture.h, fixture.v],
-                ),
-                device,
-            ))
-        .sum();
-        if let Some(state) = state {
-            loss = loss
-                + (state
-                    * Tensor::from_data(
-                        TensorData::new(
-                            fixture.final_adjoint.clone(),
-                            [fixture.b, fixture.h, fixture.k, fixture.v],
-                        ),
-                        device,
-                    ))
-                .sum();
-        }
-        let gradients = loss.backward();
-        let grads = x
-            .iter()
-            .map(|x| values(x.grad(&gradients).expect("custom kernel input gradient")))
-            .collect::<Vec<_>>();
-        (actual, actual_state, grads)
-    };
-    let first = Instant::now();
-    let actual = run();
-    let first_ms = first.elapsed().as_secs_f64() * 1000.;
-    let warm = Instant::now();
-    let again = run();
-    let warm_ms = warm.elapsed().as_secs_f64() * 1000.;
-    let output = compare("custom CubeCL output", &actual.0, &expected.0, ATOL, RTOL)?;
-    let state = actual
-        .1
-        .as_ref()
-        .map(|state| compare("custom CubeCL final state", state, &expected.1, ATOL, RTOL))
-        .transpose()?;
-    compare(
-        "warm custom CubeCL output",
-        &again.0,
-        &expected.0,
-        ATOL,
-        RTOL,
-    )?;
-    let mut gradient = 0.0f64;
-    for f in 0..6 {
-        gradient = gradient.max(compare(
-            &format!("custom CubeCL gradient field {f}"),
-            &actual.2[f],
-            &expected.3[f],
-            ATOL,
-            RTOL,
-        )?);
-    }
-    Ok(RecurrenceCheck {
-        mixer: MixerKind::Gdn2,
-        implementation: "cubecl_chunk_wy",
-        fixture: "sinusoidal",
-        tokens: time,
-        final_state_probe_tokens: if include_state { fixture.k } else { 0 },
-        output_max_abs: output,
-        state_max_abs: state,
-        score_max_abs: None,
-        gradient_max_abs: gradient,
-        continuation_max_abs: None,
-        first_forward_backward_ms: first_ms,
-        warm_forward_backward_ms: warm_ms,
-    })
-}
 
 #[cfg(all(test, feature = "cpu"))]
 mod tests {

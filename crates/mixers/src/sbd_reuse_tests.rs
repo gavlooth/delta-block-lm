@@ -52,7 +52,7 @@ fn prepared_cache_retains_the_clean_projection_convolution_and_scan() {
 
 #[test]
 fn merged_noisy_projections_preserve_outputs_and_all_parameter_vjps() {
-    for kind in [MixerKind::Gdn2,MixerKind::KronLstm] {
+    let kind = crate::MixerKind::KronLstm;
         let device=Device::ndarray().autodiff();device.seed(8317);
         let separate=MixerConfig {kind,d_model:8,heads:2,key_dim:3,value_dim:5,chunk_size:4,..Default::default()}.init(&device);
         let mut merged=separate.clone();merged.set_projection_backend(ProjectionBackend::Merged);
@@ -83,5 +83,4 @@ fn merged_noisy_projections_preserve_outputs_and_all_parameter_vjps() {
             }
             let mut check=Compare(&a,&b,0);merged.visit(&mut check);assert!(check.2>=10);
         }
-    }
 }

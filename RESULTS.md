@@ -1,6 +1,8 @@
 # Implementation and measured results
 
-For the current optimized execution paths, measured speedups and known legacy GPU-solver limitation, see [Early GPU kernel optimization](#early-gpu-kernel-optimization). The current recommended batch-8 configuration and its combined measurements are in [Batch-8 component optimization round](#batch-8-component-optimization-round). Step 7 (oHC, wavelet mixer, three Lngram injections) is in [Step 7: oHC, wavelet and Lngram](#step-7-ohc-wavelet-and-lngram). The first sections retain the original pilot measurements.
+**Architecture history:** **GDN-2 removed on 2026-10-28 by user decision.** KronLSTM is the only supported mixer. All GDN-labelled arms, selectors, commands, parameter counts and timings below describe historical executions; they are not current run instructions. Historical numeric results remain unchanged and do not establish acceptance of later parameterization changes.
+
+For historical optimized execution paths, measured speedups and legacy GPU-solver limitations, see [Early GPU kernel optimization](#early-gpu-kernel-optimization). The earlier batch-8 configuration and its combined measurements are in [Batch-8 component optimization round](#batch-8-component-optimization-round). Step 7 (oHC, wavelet mixer, three Lngram injections) is in [Step 7: oHC, wavelet and Lngram](#step-7-ohc-wavelet-and-lngram). The first sections retain the original pilot measurements.
 
 ## Scope and stopping point
 
@@ -9,7 +11,7 @@ Implemented and exercised the active Burn workspace, causal GDN-2 and KronLSTM, 
 All runs used the local Intel Arc Graphics (MTL) through Vulkan, with float32 execution. No Spark or predecessor production process was used or modified.
 Run artifacts report sampled backend-reserved memory and explicit recurrent/cache/convolution storage. Exact GPU peak memory is not available here; the integrated GPU shares system memory, so reserved-pool samples must not be presented as exact physical-device peaks.
 
-## Implementation and numerical evidence
+## Historical implementation and numerical evidence
 
 - `crates/kernels`: migrated CubeCL GDN-2 forward/backward operator, separately exercised against the float64 reference.
 - `crates/mixers`: causal GDN-2 and KronLSTM chunk solvers, sequential float64 references, short causal convolutions, optional HOLA with surprise or matched recency selection, learned cache normalization/gate/sink.
@@ -1398,7 +1400,7 @@ projection backward (dX/dW) and the scan before anything smaller.
 | MLP SiLU | `epilogue_backend: analytic_backward` | Residual adds stay native; no fusion across norms or matmuls | `epilogues.md` |
 | Matrix multiplies | guarded autotune, heuristic head and output projection | Rank-3 F/dX/dW preflight on every active GEMM shape before training | `gemm-efficiency.md` |
 | Soft top-k selection | `soft_selection_backend: gpu` | B8×512/k16 feedback round 8.64× (V257), 24.44× (V32k); inactive in the causal LM | `soft-topk.md` |
-| GDN-2 training | `scan_backend: fused_gdn2` (comparison arm) | Recurrence F+B 245.35 → 93.04 ms at B8/T512; full step with HOLA 2,609.6 → 1,710.9 ms (1.53×), see below | `gdn.md` |
+| GDN-2 training (historical; removed on 2026-10-28 by user decision) | Former `scan_backend: fused_gdn2` | Recurrence F+B 245.35 → 93.04 ms at B8/T512; full step with HOLA 2,609.6 → 1,710.9 ms (1.53×), see below | Historical results below; implementation document removed |
 
 ### Correctness gates on the integrated tree
 
@@ -1459,7 +1461,9 @@ With membership fixed every case passes at every ε by a wide margin, which
 confirms the analytic gradients; the earlier failures came from the
 selection jumps.
 
-### GDN-2 fused training scan
+### Historical GDN-2 fused training scan
+
+GDN-2 removed on 2026-10-28 by user decision. The following command and selector names identify the original experiment only; the script and implementation are no longer available.
 
 `bun scripts/benchmark-gdn.ts vulkan BINARY 2 5`, B8, five interleaved
 trials after two warmups, every path first checked against the CPU oracle
@@ -1475,8 +1479,7 @@ directional check passes with fixed selection). Median complete step, ms:
 
 These are medians of five samples, not paired bootstrap intervals; every
 trial of the fused path was faster. Isolated recurrence F+B at B8/T512:
-245.35 → 93.04 ms. GDN-2 remains a comparison arm; use `fused_gdn2` with a
-GPU backend when it is trained. Report:
+245.35 → 93.04 ms. This former comparison arm is no longer supported. Historical report:
 `artifacts/gdn/benchmark-1792873067810-3535974/`.
 
 ### Open findings

@@ -1,5 +1,7 @@
 # Architecture implementation and optimization plan
 
+**Current backbone decision:** KronLSTM only. **GDN-2 removed on 2026-10-28 by user decision.** Earlier comparison results remain historical evidence, not supported configurations or instructions to restore the removed mixer.
+
 Status: Steps 1–11 have separate implemented/correctness-gated profiles on CPU and local Intel Vulkan; their contextual/coordination/refinement composition was published on main as `9e67b7ac` before combined acceptance completed. The separate Step 5/6 quality gates were waived, not passed. Current Step 8 uses the explicitly selected HOLA in-block read and optional prefix retrieval; earlier removed dense-attention measurements remain historical only. The Step 7 quality ablation is cancelled, not pending. Step 12 has not started and is not authorized by this integration. Measured results and the exact partial integration command ledger are in [RESULTS.md](RESULTS.md#integrated11-publication-checkpoint).
 
 **Scope override — explicit user instruction:** implement and optimize the given architecture. Its components are requirements, not candidates that must win architecture-selection experiments. Correctness checks and focused runtime/memory measurements may verify an implementation optimization. Do not launch quality ablations, architecture comparisons, candidate sweeps, alternative-mechanism studies or research training runs unless the user explicitly requests them. This overrides experimental comparisons, sweeps and quality-adoption gates elsewhere in this document; those passages are historical proposals, not executable tasks. Steps 9–12 are implementation/optimization work only where they implement the specified architecture, not authorization to add alternatives.
@@ -9,7 +11,7 @@ Status: Steps 1–11 have separate implemented/correctness-gated profiles on CPU
 Build and optimize the specified semi-autoregressive block-denoising language model. The predecessor is `diffusion-relation-extractor`; its relation-specific output heads and ontology constraints are not requirements for this LLM.
 
 - Rust, Burn and custom CubeCL kernels. Intel Arc/Vulkan locally; DGX Spark/CUDA for larger runs after arranging GPU access. Follow `AGENTS.md` for build limits, mold, debug-free tests and experiment records.
-- Gated DeltaNet-2 (GDN-2) is the reference mixer. KronLSTM + HOLA is the principal challenger against GDN-2 + HOLA, not an assumed winner.
+- KronLSTM with optional HOLA is the only recurrent mixer. Preserve its shared scan, chunking, convolution and exact-memory machinery.
 - Keep wavelet token mixing, orthogonal hyper-connections (oHC) and three Lngram orders in the target design. Isolate their costs and contributions rather than enabling everything in the first run.
 - Use Set Block Decoding (SBD) as the initial semi-autoregressive recipe. Block length, computational chunk length and tokens committed per denoising step are separate variables.
 - Preserve the predecessor's soft top-k diffusion mechanism as the block-denoising baseline: probability-weighted candidate feedback, separate visibility, and revisable proposals. Hard-mask-only feedback is an ablation, not a replacement. Add joint token prediction, coordination before writes, and revision after provisional writes on this foundation.
@@ -20,9 +22,9 @@ Build and optimize the specified semi-autoregressive block-denoising language mo
 
 | Mechanism | Primary source | What the source establishes |
 |---|---|---|
-| GDN-2 | [2605.22791](https://arxiv.org/abs/2605.22791) | Channel-wise decay and separate channel-wise erase/write gates; chunkwise training |
-| KronLSTM | [2610.26834](https://arxiv.org/abs/2610.26834) | A different associative-memory update using a scalar bilinear correction; a candidate replacement, not a drop-in extra gate |
-| HOLA | [2607.02303](https://arxiv.org/abs/2607.02303) | GDN recurrent state plus a limited exact KV cache selected by committed update magnitude; sharpened cache read |
+| GDN-2 (historical only; removed on 2026-10-28 by user decision) | [2605.22791](https://arxiv.org/abs/2605.22791) | Former channel-wise reference; no active implementation or comparison arm remains |
+| KronLSTM | [2610.26834](https://arxiv.org/abs/2610.26834) | Selected associative-memory update using a scalar bilinear correction |
+| HOLA | [2607.02303](https://arxiv.org/abs/2607.02303) | Selective exact KV memory and sharpened cache read, adapted to KronLSTM's committed update magnitude |
 | Wavelet mixer | [2610.04720](https://arxiv.org/abs/2610.04720) | WNet token mixing; causal and SBD visibility verified on reference fixtures |
 | oHC | [2609.02672](https://arxiv.org/abs/2609.02672) | Orthogonal mixing of residual streams |
 | Lngram | [2605.24869](https://arxiv.org/abs/2605.24869) | N-gram conditional memory in latent space |
@@ -39,28 +41,26 @@ No cited result establishes the complete proposed combination. Exact circuit inf
 
 ## 3. Recurrent backbone and memory
 
-### Primary comparison
+### Selected backbone
 
-Use GDN-2 + HOLA and KronLSTM + HOLA with the same embedding, head dimensions where applicable, training data, precision, optimizer and token schedule. Report actual parameter counts and recurrent-state memory; equal width alone does not imply equal capacity or equal cost.
+Use KronLSTM with the configured embedding, head dimensions, training data, precision, optimizer and token schedule. Report actual parameter counts and recurrent-state memory; no cross-mixer comparison is part of the current architecture.
 
-Include GDN-2 and KronLSTM without HOLA as the controls needed to isolate the cache contribution. Start on multi-query associative recall, then use a tiny causal language model before adding block denoising.
+Keep the existing KronLSTM configurations with no cache, HOLA surprise selection and matched-size recency selection. These isolate cache behavior without maintaining a second mixer.
 
 HOLA retains original KV pairs, not the gated/preconditioned update factors. Its cache-read Q/K normalization is separate from recurrent-update normalization. Compare surprise selection with a matched-size recency cache. The local current-chunk attention supplied by HOLA must be counted in memory and work.
 
 Proposed surprise scores, requiring implementation checks:
-- GDN-2: norm of the active rank-one state change after decay, not the total difference including decay.
 - KronLSTM: absolute scalar correction multiplied by key and value norms.
 
 A cache may not be updated from noisy or bidirectional block representations. After completing a block, causally replay its final tokens to update recurrent states, HOLA entries and convolution histories exactly once.
 
 ### Compatible additions and alternatives
 
-- Preconditioned write keys: optional GDN-2 experiment after the base comparison. Preserve separate erase/read and write factors and include gradients through preconditioner statistics.
-- Exact Flow Linear Attention ([2512.12602](https://arxiv.org/abs/2512.12602)): optional gate/update parameterization. Its exact solution applies to its specified continuous-time dynamics; it is not an exact solution of the full GDN-2 + channel-wise decay + SBD model. Any extension needs a derivation and recurrent/chunked gradient checks. It has nonzero arithmetic cost, even if small.
-- GSA-2 ([2610.02816](https://arxiv.org/abs/2610.02816)): later alternative two-memory architecture. Do not label it a free GDN-2 add-on.
+- Exact Flow Linear Attention ([2512.12602](https://arxiv.org/abs/2512.12602)): historical optional gate/update reference, not an exact solution of the selected KronLSTM + SBD model. Any extension needs a derivation and recurrent/chunked gradient checks.
+- GSA-2 ([2610.02816](https://arxiv.org/abs/2610.02816)): historical alternative two-memory reference, not part of the selected architecture.
 - Erase-then-Delta ([2606.26560](https://arxiv.org/abs/2606.26560)): later independent erase-address experiment; account for its extra recurrent work.
 - Dynamic Linear Attention ([2606.10650](https://arxiv.org/abs/2606.10650)): later multi-state research, not exact concatenation of delta-rule states by addition.
-- A layer-interleaved GDN-2/KronLSTM hybrid is conditional on evidence of complementary strengths. Do not start with a KronLSTM/GSA-2 hybrid or an all-mechanism combination.
+- Hybrid recurrent backbones are not part of the KronLSTM-only architecture.
 
 HOLA is the first selective exact-attention mechanism to test, not proof that all separate sparse/local attention is unnecessary. Keep sliding-window attention as a comparison. MSA, NSA/MoBA, CSA/HCA, BA-Att, SparseD and LoSA remain later sparse-attention references; their published kernels and settings do not establish speedups for this model. LoSA is especially relevant to repeated block denoising. Add an alternative only when a measured failure motivates it.
 
@@ -70,7 +70,6 @@ The predecessor sources needed for these components are copied under `reuse/crat
 
 | Copied source | Reuse target and necessary adaptation |
 |---|---|
-| `dre-gdn2/` | Existing CubeCL chunked scan, forward/backward operators, sequential reference and tests; adapt bidirectional encoder use to causal-prefix/block semantics |
 | `dre-core/` | Sequence layout, mixed-precision helpers and profiling; keep only dependencies needed by the new components |
 | `dre-attention/` | Existing attention kernels and reference checks for exact-cache reads; any sparse/within-block attention reuse awaits explicit user selection |
 | `dre-wavelet/`, `dre-ohc/`, `dre-lngram/` | Existing implementations and tests; preserve the three Lngram components and verify causal/block visibility before training |
@@ -171,13 +170,15 @@ Historical earlier pilot: Steps 1–7 numerical, soft-feedback, build and checkp
 - Configure CPU checks without GPU features, opt-in Vulkan/CUDA runs, mold locally, debug=false for dev/test, and one integration-test binary per crate.
 - Check actual Cargo profile inheritance: optimize external dependencies without accidentally optimizing every local workspace crate.
 - Add file-based experiment configuration and machine-readable results from the first runnable experiment. Configurations select mixer, dimensions, cache size, seed and backend without recompilation.
-- Start by preserving the copied GDN kernel dimensions (four heads, key width 32, value width 64, computational chunk 16). Projection/model width is a separate choice.
+- Preserve the supported kernel dimensions initially (four heads, key width 32, value width 64, computational chunk 16). Projection/model width is a separate choice.
 
 **Deliverable:** a runnable CPU reference command and a minimal Vulkan command using the same input fixture.
 
 **Gate:** CPU command runs, Vulkan reports the intended device, and build/rebuild times are recorded. Use a 120-second limit on the first cold build; if it expires, report that outcome rather than extending the wait silently. Warm model rebuild target is <=10 seconds; test rebuild target is <=60 seconds. Do not trigger a full-workspace test build to measure one component.
 
-### Step 2 — Migrate and verify GDN-2 before changing its recurrence
+### Historical Step 2 — Former reference migration
+
+GDN-2 removed on 2026-10-28 by user decision. The following checklist records the former migration only; its implementation, commands and copied crate have been removed.
 
 - Copy useful reference, forward/backward and CubeCL code from `reuse/` into the active crates, keeping source provenance.
 - Separate the causal recurrence needed by the LLM from the predecessor's bidirectional encoder wrapper.
@@ -185,7 +186,7 @@ Historical earlier pilot: Steps 1–7 numerical, soft-feedback, build and checkp
 - Cover a sequence shorter than one chunk, multiple chunks, padding, packed-document resets, and block starts inside a chunk.
 - Exercise actual GPU forward and backward on a small fixture. Record first-use compilation separately from warm execution.
 
-**Deliverable:** a numerically checked GDN-2 implementation plus a short CPU/GPU benchmark.
+**Historical deliverable:** a numerically checked former reference implementation and short CPU/GPU benchmark; retained measurements are in RESULTS.
 
 **Gate:** tolerances are specified by precision, gradient checks pass, and no document/padding information crosses its allowed boundary. Preserve finite-input failures rather than suppressing them.
 
@@ -201,29 +202,29 @@ Historical earlier pilot: Steps 1–7 numerical, soft-feedback, build and checkp
 
 **Gate:** sparse/full-support feedback agrees with the dense reference where their support matches; embedding/weight gradients, retained mass, zero-mass behavior and visibility transitions are checked. A hard-mask-only path exists solely as a comparison.
 
-### Step 4 — Implement the KronLSTM challenger and HOLA memory
+### Step 4 — Implement KronLSTM and HOLA memory
 
 - Implement KronLSTM's sequential float64 recurrence first, then its chunked forward/backward and GPU path.
 - Implement HOLA's exact KV cache and sharpened read as shared model components where semantics allow, with mixer-specific update-magnitude scores.
-- For GDN-2, derive scores from the active edit after decay; for KronLSTM, derive them from its scalar correction. Verify both rather than assuming the same residual formula.
+- Derive KronLSTM cache-selection scores from its scalar correction and verify them against the independent reference.
 - Compare surprise-based selection with a cache of the same capacity using recency selection. Count HOLA's current-chunk attention work.
 - Start cache capacity at 16; measure 64 after the first pilot.
 
-**Deliverable:** GDN-2 and KronLSTM, each runnable with and without HOLA.
+**Deliverable:** KronLSTM runnable with and without HOLA.
 
-**Gate:** recurrence/chunk agreement and gradient checks pass; causal cache membership and padding are correct; both mixers execute forward/backward on the local GPU.
+**Gate:** recurrence/chunk agreement and gradient checks pass; causal cache membership and padding are correct; KronLSTM executes forward/backward on the local GPU.
 
 ### Step 5 — Run the first controlled associative-recall experiment
 
 - Start with two mixer layers, model width 128 and contexts 128/512. Keep the inherited kernel key/value widths initially.
 - Generate deterministic training examples and a disjoint fixed evaluation set. Sweep the number of key/value associations to expose memory interference.
-- Run four arms: GDN-2, GDN-2+HOLA, KronLSTM, KronLSTM+HOLA. Add the matched recency-cache comparison without scaling the entire grid.
+- Current configurations run KronLSTM and KronLSTM+HOLA, with the matched recency-cache option retained. Earlier four-arm results are historical: GDN-2 removed on 2026-10-28 by user decision.
 - Run one seed as a smoke, then three paired seeds for an architectural decision. Use a short throughput pilot to choose and record a fixed training-token budget for the comparison.
 - Report recall by association count and distance, actual parameter count, recurrent/cache memory, peak GPU memory, training throughput and warm decode latency.
 
 **Deliverable:** one comparison report with the configurations and raw metrics.
 
-**Gate:** choose a quality/cost Pareto shortlist, not a winner from training loss or a single seed. Keep both leading cache-equipped mixers if neither dominates. A synthetic recall win does not establish better language modeling.
+**Historical gate:** choose a quality/cost Pareto shortlist rather than a winner from training loss or one seed. This earlier cross-mixer selection gate does not apply to the current user-selected backbone.
 
 **Recorded outcome:** this quality gate was waived, not passed. The certified
 `artifacts/recall{128,512}-vulkan/certified-evaluations/` comparisons summarized
@@ -234,7 +235,7 @@ in RESULTS remain near chance; they do not justify a quality shortlist.
 - Start with four layers, model width 256 and context 512, retaining supported kernel widths. These are pilot sizes, not final architecture decisions.
 - Pin a small, legally usable text corpus and tokenizer; split by document before packing or sampling. Record source/version and split hashes.
 - Fix optimizer, data order, token budget, precision and output head across mixer arms. Report actual parameter/state differences.
-- Measure held-out next-token loss/perplexity, throughput, memory and retrieval diagnostics. Select a baseline for the denoising experiments while retaining the challenger configuration.
+- Measure held-out next-token loss/perplexity, throughput, memory and retrieval diagnostics for the selected KronLSTM configurations.
 
 **Deliverable:** a resumable tiny LM checkpoint and held-out comparison.
 

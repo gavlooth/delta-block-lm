@@ -1,36 +1,19 @@
-# Causal GDN-2 and KronLSTM kernels
+# KronLSTM and supporting kernels
 
-## GDN-2 chunk-WY
-
-This crate ports the causal chunked CubeCL forward and backward operators from
-`reuse/crates/dre-gdn2`. Key width 32, value width 64 and computational chunk
-length 16 are preserved; batch, sequence length and head count are dynamic.
-Gate accumulation and recurrent state use f32. Packed-document limits are
-inclusive token indices; `doc_end < doc_start` marks padding. Valid tokens whose
-`doc_start == token_index` reset before the update. Padding has identity decay
-and zero update. Direct products handle reset zeros without inverse cumulative
-decays.
+KronLSTM is the crate's only recurrent scan. HOLA selection/read, normalization,
+convolution, projections, optimizer updates, wavelet, oHC, Lngram and joint
+inference kernels remain available to the model.
 
 The default build has no CubeCL runtime dependencies. `vulkan` or `cuda` enables
-the selected runtime and the custom operator. Fusion and autotune are not
-implicitly enabled. The optional `fusion` feature registers deferred forward
-and backward operations for Burn's fusion backend, with exact output metadata
-and the same CubeCL kernels. The hand-written six-input VJP remains attached to
-Burn's runtime autodiff dispatch; there is no fallback to an unrelated CPU operator.
-CUDA support is only a Cargo feature and is not a claim of remote execution.
+the selected runtime and custom operators. Fusion and autotune are not
+implicitly enabled. The optional `fusion` feature registers supported deferred
+forward and backward operations for Burn's fusion backend, with exact output
+metadata and the same CubeCL kernels. Analytic VJPs remain attached to Burn's
+runtime autodiff dispatch; there is no fallback to an unrelated CPU operator.
+CUDA support is only a Cargo feature and is not evidence of remote execution.
 
-`gdn2_scan(q,k,v,alpha,erase,write,doc_start,doc_end)` accepts tensor shapes
-`[batch,time,head,key/value]` and returns token outputs. The recurrence is causal;
-the predecessor's bidirectional encoder and serial-backend switch are deliberately
-not part of this crate. Fusion metadata describes the active causal operator.
-
-The experiment `reference` command calls `delta_mixers::numerical_checks` and,
-on GPU, executes this operator's actual forward/backward against the f64 oracle.
-Final states are read using 32 diagnostic identity queries with zero updates;
-those tokens' cost is recorded separately in report metadata. The GDN-2 training
-path uses the common differentiable chunk tensor solver, not this custom operator.
-See `../mixers/README.md` for runnable bounded commands, error tolerances and the
-boundary between implemented checks and observed validation.
+See `../mixers/README.md` for runnable commands, error tolerances and the
+distinction between implemented checks and observed validation.
 
 ## Fused KronLSTM
 
@@ -143,20 +126,6 @@ The two candidate scopes and bounded numerical/paired full-step commands are
 documented in the mixer and experiment READMEs. `RESULTS.md` records the actual
 adoption decision; kernel-count reduction alone does not establish a win.
 
-## Source provenance
-
-| New file | Migration input | Input SHA-256 |
-|---|---|---|
-| `src/gdn2.rs` | `reuse/crates/dre-gdn2/src/chunked.rs` | `4e247d18965603e0bf061381a7fc2a8f43a2f224402e60e67f5f4f39e49e575e` |
-| `src/ops.rs` | `reuse/crates/dre-gdn2/src/ops.rs` | `d63d378ac8e144218fdf84ad759b4be2c367d42ddbf705d191e352638e69a154` |
-
-The arithmetic kernels are unchanged; imports use runtime-neutral CubeCL types. The
-custom dispatch wrapper removes the obsolete serial branch while preserving
-the source's analytic backward implementation. Fusion uses Burn 0.22's deferred
-extension registration for the active operators, rather than predecessor metadata.
-Source provenance,
-copy date and inherited MIT OR Apache-2.0 license remain recorded in
-`reuse/PROVENANCE.json`.
 
 ## Causal Lngram memory
 

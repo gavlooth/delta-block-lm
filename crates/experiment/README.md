@@ -1,5 +1,7 @@
 # Small causal experiments (plan steps 1, 3, 5, 6 and 7)
 
+**Current mixer:** KronLSTM only. **GDN-2 removed on 2026-10-28 by user decision.** Historical measurements below retain their original scope; checkpoint loading requires the current model-parameterization identity.
+
 ## Measured optimized local path
 
 Use `configs/lm512-kron-fused.json` for explicit fused KronLSTM and HOLA on the supported local Vulkan workload. Historical omitted selectors remain unchanged. The paired context-512, four-layer/width-256 guarded AdamW benchmark measured 2,322.06 ms/step for tensor/tensor versus 601.02 ms with both fused (3.86x). See the root `RESULTS.md` for scope, samples and limits; isolated operator gains are not whole-model gains.
@@ -53,7 +55,7 @@ timeout 90s target/debug/delta-experiment reference configs/reference-vulkan.jso
 
 A timeout is a result; do not replace it with an unbounded build. Every GPU-enabled invocation installs a persistent CubeCL compilation cache under the configured `cache_dir` (default `.cache/cubecl`) before creating a device. Vulkan requires the actual reported adapter identity to contain Intel. Device identity and the resolved configuration are saved in JSON.
 
-`reference` delegates to the mixer crate's float64/CPU/GPU fixture; its report identifies the algorithms actually exercised. Historical and omitted selectors remain `scan_backend: "tensor_solver"` and `hola_backend: "tensor"`. Explicit `scan_backend: "fused_gpu"` selects KronLSTM's custom scan; explicit `hola_backend: "fused_gpu"` independently selects custom HOLA. Unsupported devices/shapes fail without fallback. Selecting the fused scan for GDN-2 fails. Configuration fingerprints include nondefault selectors; omitted historical defaults serialize identically so old solver checkpoints remain readable. Training metrics record the actual arm's execution algorithm and custom-kernel use, not just its device. Do not change a selector inside an existing run directory.
+`reference` delegates to the KronLSTM float64/CPU/GPU fixture; its report identifies the algorithms exercised. Omitted selectors remain `scan_backend: "tensor_solver"` and `hola_backend: "tensor"`. Explicit `scan_backend: "fused_gpu"` selects KronLSTM's custom scan; explicit `hola_backend: "fused_gpu"` independently selects custom HOLA. Unsupported devices/shapes fail without fallback. Configuration fingerprints include nondefault selectors and the model-parameterization revision. Training metrics record the actual arm's execution algorithm and custom-kernel use, not just its device. Do not change a selector inside an existing run directory.
 
 Burn automatic fusion is a separate execution choice from the custom `fused_gpu`
 operators. The `fusion` Cargo feature changes Burn 0.22's Cube backend globally
@@ -65,7 +67,7 @@ serialization, preserving historical fingerprints and checkpoint loading.
 Use a fresh artifact directory and regenerate any pilot budget when selecting
 fusion. `delta-experiment/fusion` forwards through mixers to the kernels crate.
 
-The custom KronLSTM, HOLA and GDN-2 extensions register deferred opaque
+The custom KronLSTM and HOLA extensions register deferred opaque
 operations with shape/dtype metadata for every forward/backward result. Burn
 resolves their GPU input handles, executes the existing CubeCL kernels and
 publishes the output handles on the same device. Their handwritten VJPs remain
@@ -328,7 +330,7 @@ comparisons should archive a config with a larger `max_seconds` (at most 300)
 and retain the external hard timeout.
 
 The command first checks an independent scalar-f64 projection oracle, including
-every original weight/input VJP, both mixer gate widths, strided inputs, zero
+every original weight/input VJP, KronLSTM scalar gate widths, strided inputs, zero
 values and tail widths. It then checks full-model logits, every parameter
 gradient and one AdamW update against separate projections at unchanged
 2e-5/3e-4 tolerances. Resident isolated forward and forward/backward measurements
@@ -406,7 +408,7 @@ The planned recall files use two layers, width 128, contexts 128/512 and the inh
 
 Each example stores distinct random keys and values, inserts distractor filler, then asks multiple queries in shuffled order. Loss is applied only to answer positions, whose answers occur later than the query input. Association count and query-to-write distance are reported separately and jointly. A hash partition of the complete input/label sequence prevents **any** example collision from crossing training/evaluation splits. Evaluation has its own fixed seed and recorded fixture hash, independent of training seeds. Training example index is a pure function of seed and step, so resume preserves data order.
 
-`benchmark CONFIG` measures first-use forward/backward/AdamW separately, then a short warm full-model training pilot for every arm. It writes `budget.json`: slowest measured arm throughput times `comparison_seconds`, rounded down to complete batches (at least one). Both mixer families, with/without HOLA, receive exactly that fixed token budget. The budget loader requires a SHA256 identity of the entire resolved configuration plus optimizer, precision and training-path identity; changing cache capacity or optimizer settings invalidates an existing pilot as surely as changing dimensions or arms. The runner preserves an existing budget, but stale identities fail before training and require a fresh pilot/artifact directory. Hyperparameters and arms live in files, not code.
+`benchmark CONFIG` measures first-use forward/backward/AdamW separately, then a short warm full-model training pilot for every configured KronLSTM cache arm. It writes `budget.json`: slowest measured arm throughput times `comparison_seconds`, rounded down to complete batches (at least one). The configured no-cache/HOLA/recency arms receive that fixed token budget. The budget loader requires a SHA256 identity of the entire resolved configuration plus optimizer, precision and training-path identity; changing cache capacity or optimizer settings invalidates an existing pilot as surely as changing dimensions or arms. The runner preserves an existing budget, but stale identities fail before training and require a fresh pilot/artifact directory. Hyperparameters and arms live in files, not code.
 
 `compare CONFIG` runs one paired seed; `decision CONFIG` runs exactly three distinct paired seeds. Results include actual parameter counts, recurrent-state bytes, HOLA plus current-chunk memory, convolution-state bytes, training throughput, held-out losses, recall breakdowns and warm next-token latency. `hola_work_per_model_forward` counts allocated history, current-chunk and sink attention pairs across all layers, plus exact pairwise-rank comparisons and sort input elements; it includes masked/unfilled slots and does not pretend sort elements are sort comparisons or infer backward FLOPs. Decode timing is explicitly full-prefix recomputation, not an unimplemented incremental cache benchmark. The decision summary reports paired seed values, seed standard deviation and a quality/throughput/state-memory Pareto screen, not a single-seed winner. It withholds decision eligibility unless all budgets finish and each arm improves mean held-out NLL. A recall improvement is not a language-modeling result.
 
@@ -435,8 +437,8 @@ Each `ARM-seedN/` directory contains `training.jsonl`, `metrics.json`, `latest.j
 
 ```sh
 timeout 180s target/debug/delta-experiment train configs/lm-smoke.json \
-  --arm gdn2-hola --seed 1 \
-  --resume artifacts/lm-smoke/gdn2-hola-seed1/checkpoint-4
+  --arm kronlstm-hola --seed 1 \
+  --resume artifacts/lm-smoke/kronlstm-hola-seed1/checkpoint-4
 ```
 
 Use the actual checkpoint path in `latest.json`, not the example's number. Do not change configuration midway through a resumed run. Atomic JSON publication means a missing checkpoint `state.json` is not a complete checkpoint. Final evaluation and metrics are outside the training-loop soft deadline; the enclosing `timeout` remains the absolute deadline.
@@ -453,6 +455,8 @@ timeout 90s cargo test -p delta-experiment
 The test suite and experiment commands must be run by the integration owner; implementation alone does not claim measured results.
 
 ## Isolated repeat/save-load diagnostics
+
+**Historical checkpoint investigation — GDN-2 removed on 2026-10-28 by user decision.** The observations below describe the old parameterization, not current checkpoint compatibility.
 
 Local integration observed intermittent disagreement in tiny-LM evaluation after checkpoint reload. For KronLSTM seed 1 the live run's NLL was about 3.15003937, a first reload reported 7.58646894, and a later reload reported 3.15003914; smaller GDN drift was also observed. Follow-up Vulkan diagnostics proved changed parameter values on fresh unique save/load for the no-cache GDN-2 and KronLSTM arms, while the tested same-model repeats were bitwise equal and HOLA arms passed. Independent host decoding of all eight source/scratch checkpoint files matched every pre-save parameter hash exactly. One changed decay-bias tensor exactly matched its `-4` initializer. A subsequent synchronized-target A/B run on the original four Intel Vulkan LM arms passed all source/scratch model roundtrip checks and produced bitwise-equal next-AdamW-step parameters and logits. The measured fix is to keep each constructed load target alive across a device synchronization before applying record uploads, then synchronize afterward. A queued initializer/upload race is the inferred mechanism, not a fully established upstream backend defect. The original failed measurements and diagnostic directories remain evidence rather than being relabeled as reliable.
 
