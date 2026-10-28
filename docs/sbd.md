@@ -190,6 +190,12 @@ The current `sbd-reference` command includes an independent scalar f64 noisy-HOL
 
 Existing sequential f64 references cover recurrence, short convolution, HOLA, wavelet, Lngram and oHC. The noisy-read oracle covers derivatives of queries, cache/clean-chunk/block keys and values, sink and sigmoid gate, with central finite differences on the oracle. Fixtures include padding, empty cache, a chunk-aligned start and an unfinished chunk. Complete-model checks cover both mixers, HOLA on/off and Step-7 on/off; `hola_read` is rejected without HOLA, and `none` still runs. A prefix of length 19 puts the block start inside chunk 16. The checks include CPU/Vulkan logits and all-parameter gradients, cached/reconstructed logits and gradients, lengths 1/4/8/16, future-token perturbations, intended observed-token communication, padding, frozen snapshots and replay. Tolerance remains `2e-5 + 3e-4*abs(reference)`.
 
+Clean and noisy execution share one per-layer operation: optional wavelet, optional
+Lngram, mixer, then MLP. The same operation handles ordinary residuals and oHC
+reads/writes, including cached per-block/batched calls and the marked CoCommit
+tail. CPU regression compares outputs and parameter VJPs with the pre-refactor
+residual equations on both stream layouts; this is not a performance claim.
+
 ## Verification after attention removal
 
 The Vulkan-enabled workspace build and 44 experiment + 7 kernel + 16 mixer tests passed; one GPU-only test was ignored. The CPU `sbd-reference` executable passed the retained model checks at unchanged tolerances: `artifacts/step8/no-block-attention-cpu/sbd-reference.json`. Compatibility tests reject historical dense-attention SBD checkpoint identities while preserving omitted-SBD fingerprints. No GPU benchmark or training study was run for this removal.
