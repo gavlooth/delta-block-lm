@@ -27,7 +27,7 @@ pub(crate) fn optimizer_config(c: &Config) -> AdamWConfig {
 pub(crate) fn optimizer(c: &Config) -> ModuleOptimizer {
     optimizer_with_steps(c, c.resolved_tokens().expect("resolved optimizer token budget")/c.tokens_per_step())
 }
-fn optimizer_with_steps(c: &Config, steps: usize) -> ModuleOptimizer {
+pub(crate) fn optimizer_with_steps(c: &Config, steps: usize) -> ModuleOptimizer {
     let optimizer = burn::optim::ModuleOptimizer::from(crate::update::AdamW::new(c, c.weight_decay, 1.0))
         .with_group(
             burn::module::ParamGroup::from_regex(crate::update::NO_DECAY_PARAMETERS)

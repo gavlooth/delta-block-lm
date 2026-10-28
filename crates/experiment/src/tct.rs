@@ -12,14 +12,15 @@ use crate::{
     train,
 };
 use anyhow::{Context, Result, ensure};
-use burn::{optim::{GradientsAccumulator, GradientsParams, ModuleOptimizer}, prelude::*, tensor::activation::log_softmax};
+use burn::{optim::{GradientsAccumulator, GradientsParams}, prelude::*, tensor::activation::log_softmax};
+use crate::update::NeuralOptimizer as ModuleOptimizer;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{io::Write, path::Path, time::Instant};
 
 pub const TRAIN_ROUNDS: usize = 4;
 pub const REVEAL_THRESHOLD: f32 = 0.9;
-const CHAIN_SCHEMA: u32 = 2;
+const CHAIN_SCHEMA: u32 = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -53,6 +54,8 @@ struct Chain {
     candidate_weights: Vec<f32>,
     retained_mass: Vec<f32>,
     visibility: Vec<f32>,
+    negative_entropy: Vec<f32>,
+    prediction_available: Vec<bool>,
 }
 impl Chain {
     fn new(start: usize, length: usize, width: usize, vocab: usize) -> Self {
@@ -62,6 +65,7 @@ impl Chain {
             candidate_ids: (0..length).flat_map(|_| (0..width).map(|x| x as i32)).collect(),
             candidate_weights: vec![1.0 / vocab as f32; length * width],
             retained_mass: vec![width as f32 / vocab as f32; length], visibility: vec![0.0; length],
+            negative_entropy:vec![0.0;length],prediction_available:vec![false;length],
         }
     }
     fn len(&self) -> usize { self.permanent.len() }
@@ -100,6 +104,8 @@ pub struct TrainingState {
     rng: u64,
     next_example: usize,
     steps: usize,
+    optimizer_start_step: usize,
+    optimizer_schedule_steps: usize,
     unique_target_bytes: usize,
     scored_target_visits: usize,
     noisy_forward_calls: usize,
@@ -129,6 +135,7 @@ impl TrainingState {
         validate_config(c)?;
         let mut state = Self {schema: CHAIN_SCHEMA, seed, rng: seed ^ 0x746374636861696e, next_example: 0, steps: 0,
             unique_target_bytes: 0, scored_target_visits: 0, noisy_forward_calls: 0, noisy_block_evaluations: 0,
+            optimizer_start_step:0,optimizer_schedule_steps:c.resolved_tokens()?.div_ceil(c.tokens_per_step()),
             completed_chains: 0, rows: Vec::with_capacity(c.batch_size), source_checkpoint: None, source_training_identity: None};
         for _ in 0..c.batch_size {
             let row = state.load_row(c, corpus)?;
@@ -177,15 +184,17 @@ impl TrainingState {
                 let n = chain.len();
                 ensure!(n > 0 && chain.start == start && start+n <= c.context && chain.round <= TRAIN_ROUNDS, "invalid saved TCT chain layout/counter");
                 ensure!(chain.values.len() == n && chain.revealed.len() == n && chain.retained_mass.len() == n && chain.visibility.len() == n
-                    && chain.candidate_ids.len() == n*k && chain.candidate_weights.len() == n*k, "invalid saved TCT feedback dimensions");
+                    && chain.candidate_ids.len() == n*k && chain.candidate_weights.len() == n*k
+                    && chain.negative_entropy.len()==n && chain.prediction_available.len()==n, "invalid saved TCT feedback dimensions");
                 ensure!(chain.values.iter().all(|&x| x < c.vocab()) && chain.candidate_ids.iter().all(|&x| x >= 0 && (x as usize) < c.vocab()), "saved TCT candidate outside vocabulary");
                 ensure!(chain.candidate_weights.iter().all(|x| x.is_finite() && *x >= 0.0) && chain.visibility.iter().all(|x| x.is_finite() && (0.0..=1.0).contains(x)), "invalid saved TCT feedback values");
+                ensure!(chain.negative_entropy.iter().all(|x|x.is_finite() && *x<=0.0),"invalid saved TCT negative entropy");
                 for i in 0..n {
                     ensure!(chain.permanent[i].is_none_or(|x| x == row.target[start+i] as usize), "permanent TCT evidence differs from target");
                     let mass = chain.candidate_weights[i*k..(i+1)*k].iter().sum::<f32>();
                     ensure!(chain.retained_mass[i].is_finite() && (mass-chain.retained_mass[i]).abs() <= 2e-6 && mass <= 1.00001, "saved TCT retained mass differs from weights");
                 }
-                if n > 1 && chain.round == TRAIN_ROUNDS {
+                if chain.round == TRAIN_ROUNDS {
                     ensure!((0..n).all(|i| chain.permanent[i].is_some() || chain.revealed[i]), "TCT endpoint still has masked positions");
                 }
                 start += n;
@@ -200,11 +209,11 @@ fn validate_config(c: &Config) -> Result<()> {
     let s = c.sbd.as_ref().context("TCT requires SBD configuration")?;
     ensure!(s.training_mode == TrainingMode::Tct && !s.joint_output.is_factorized() && c.task == "lm", "TCT is the explicit joint LM training mode");
     ensure!(s.feedback == SbdFeedback::SoftFeedback && !c.hard_mask_only, "TCT requires retained soft feedback on unresolved masks");
-    ensure!(!s.block_lengths.is_empty() && s.block_lengths.iter().all(|&n| n > 0) && c.soft_steps > 0 && s.candidate_width > 0, "invalid TCT lengths or feedback settings");
+    ensure!(!s.block_lengths.is_empty() && s.block_lengths.iter().all(|&n| n > 0) && s.candidate_width > 0, "invalid TCT lengths or feedback settings");
     Ok(())
 }
 
-fn input_state(c: &Config, state: &TrainingState, blocks: &[(usize, usize)], width: usize, device: &Device) -> Result<SoftState> {
+fn input_state(model:&LanguageModel, c: &Config, state: &TrainingState, blocks: &[(usize, usize)], width: usize, device: &Device) -> Result<SoftState> {
     let k = c.sbd.as_ref().unwrap().candidate_width.min(c.vocab());
     let count = blocks.len()*width;
     let mut permanent = Vec::with_capacity(count);
@@ -250,6 +259,11 @@ fn input_state(c: &Config, state: &TrainingState, blocks: &[(usize, usize)], wid
         retained_mass: Tensor::from_data(TensorData::new(mass, [count,1]), device),
     };
     soft.visibility = Tensor::from_data(TensorData::new(visibility, [count,1]), device);
+    let entropy=blocks.iter().flat_map(|&(r,j)|(0..width).map(move |i|state.rows[r].chains[j].negative_entropy.get(i).copied().unwrap_or(0.0))).collect::<Vec<_>>();
+    let available=blocks.iter().flat_map(|&(r,j)|(0..width).map(move |i|state.rows[r].chains[j].prediction_available.get(i).copied().unwrap_or(false))).collect::<Vec<_>>();
+    soft.negative_entropy=Tensor::from_data(TensorData::new(entropy,[count,1]),device);
+    soft.prediction_available=Tensor::from_data(TensorData::new(available,[count,1]),device);
+    soft.refresh_feedback(model.soft_confidence.as_ref().context("soft feedback head missing")?);
     crate::remask::provisional_input(&soft, &values, &revealed, device)
 }
 
@@ -268,167 +282,106 @@ struct Loss {
 }
 
 /// Both execution layouts share the exact same neural inputs, O-only evidence and loss.
-fn training_loss(c: &Config, model: &LanguageModel, state: &mut TrainingState, device: &Device, layout: SbdBlockExecution, proposal: Option<(u64,usize)>, bundles: Option<&[Vec<bool>]>) -> Result<Loss> {
-    let batch = state.batch(device);
-    let mut trace = CleanInputs::new(state.rows.iter().flat_map(|row|row.chains.iter()
-        .filter(|chain|chain.len()>1).map(|chain|chain.start+1)));
-    let logits = model.forward_profiled(&batch, &mut trace);
-    let clean_loss = model.loss(logits.clone(), &batch);
-    let clean = model::scalar(clean_loss.clone())?;
-    let mut loss = clean_loss;
-    let codpula = model.codpula.as_ref().context("joint TCT requires Codpula")?;
-    let denominator = c.tokens_per_step() as f64;
-    let mut joint = 0.0;
-    let mut blocks = Vec::new();
-    let mut chain_count = 0;
-    let mut causal_positions = Vec::new();
-    let mut causal_targets = Vec::new();
-    for (row, saved) in state.rows.iter_mut().enumerate() {
-        for (index, chain) in saved.chains.iter_mut().enumerate() {
-            chain_count += 1;
-            if chain.len() == 1 {
-                // L1 never consumes the current target or provisional input.
-                if chain.permanent[0].is_none() {
-                    causal_positions.push((row*c.context+chain.start) as i32);
-                    causal_targets.push(saved.target[chain.start]);
-                }
-                chain.round += 1;
-            } else {
-                blocks.push((row,index));
-            }
-        }
+fn training_loss(c: &Config, model: &LanguageModel, state: &mut TrainingState, device: &Device, layout: SbdBlockExecution, bundles: Option<&[Vec<bool>]>) -> Result<Loss> {
+    let chains=state.rows.iter().map(|row|row.chains.len()).sum::<usize>();
+    training_loss_reduced(c,model,state,device,layout,bundles,chains as f64)
+}
+fn training_loss_reduced(c:&Config,model:&LanguageModel,state:&mut TrainingState,device:&Device,layout:SbdBlockExecution,bundles:Option<&[Vec<bool>]>,denominator:f64)->Result<Loss> {
+    let batch=state.batch(device);
+    let mut trace=CleanInputs::new(state.rows.iter().flat_map(|row|row.chains.iter().map(|chain|chain.start+1)));
+    let logits=model.forward_profiled(&batch,&mut trace);
+    let clean_loss=model.loss(logits,&batch);
+    let clean=model::scalar(clean_loss.clone())?;
+    let mut loss=clean_loss;
+    let blocks=state.rows.iter().enumerate().flat_map(|(r,row)|(0..row.chains.len()).map(move |i|(r,i))).collect::<Vec<_>>();
+    let count=blocks.len();
+    let width=blocks.iter().map(|&(r,i)|state.rows[r].chains[i].len()).max().context("TCT requires chains")?;
+    let soft=input_state(model,c,state,&blocks,width,device)?;
+    let lengths=blocks.iter().map(|&(r,i)|state.rows[r].chains[i].len()).collect::<Vec<_>>();
+    let mut targets=Vec::with_capacity(count*width);
+    for &(r,i) in &blocks {
+        let chain=&state.rows[r].chains[i];
+        targets.extend((0..width).map(|j|if j<chain.len(){state.rows[r].target[chain.start+j]}else{0}));
     }
-    if !causal_positions.is_empty() {
-        let n = causal_positions.len();
-        let selected = logits.reshape([c.tokens_per_step(),c.vocab()])
-            .select(0,Tensor::<1,Int>::from_data(TensorData::new(causal_positions,[n]),device));
-        let causal = log_softmax(selected,1).gather(1,Tensor::<2,Int>::from_data(TensorData::new(causal_targets,[n,1]),device)).sum().neg()/denominator;
-        joint += model::scalar(causal.clone())?;
-        loss = loss + causal;
-    }
-    if blocks.is_empty() { return Ok(Loss {loss, flows: None, clean, joint, chains: chain_count, noisy_blocks: 0, work: Default::default()}); }
-    let count = blocks.len();
-    let width=blocks.iter().map(|&(r,i)|state.rows[r].chains[i].len()).max().unwrap();
-    let soft=input_state(c,state,&blocks,width,device)?;
-    let lengths = blocks.iter().map(|&(r,i)| state.rows[r].chains[i].len()).collect::<Vec<_>>();
-    // This mask is intentionally not derived from visibility or provisional reveals.
-    let observed = Tensor::<2,Bool>::from_data(TensorData::new(soft.observed.iter().map(Option::is_some).collect::<Vec<_>>(),[count,width]),device);
-    let cocommit=c.sbd.as_ref().unwrap().cocommit.is_some();
-    let mut clean_tokens=Vec::with_capacity(count*width);
-    let mut target_weights=if cocommit {Vec::with_capacity(count*width)} else {Vec::new()};
-    for &(row,index) in &blocks {
-        let chain=&state.rows[row].chains[index];
-        clean_tokens.extend((0..width).map(|i|if i<chain.len(){state.rows[row].target[chain.start+i]}else{0}));
-        if cocommit {target_weights.extend((0..width).map(|i|if i<chain.len(){1.0}else{0.0}));}
-    }
-    let targets=Tensor::<2,Int>::from_data(TensorData::new(clean_tokens,[count,width]),device);
-    let mut work = crate::cocommit::CoordinationWork::default();
-    let mut feedback_circuit = None;
-    let flows = if cocommit {
-        ensure!(layout == SbdBlockExecution::Batched,"TCT CoCommit requires the batched saved-prefix execution");
-        let bundles=bundles.context("TCT CoCommit announcement bundle missing")?;
-        ensure!(bundles.len()==count && bundles.iter().zip(&lengths).all(|(bundle,&n)|bundle.len()==n),
-            "TCT CoCommit announcement layout differs from active chains");
-        let padded_bundles=bundles.iter().map(|bundle| {
-            bundle.iter().copied().chain(std::iter::repeat_n(false,width-bundle.len())).collect::<Vec<_>>()
-        }).collect::<Vec<_>>();
-        let locations=blocks.iter().map(|&(r,i)|(r,state.rows[r].chains[i].start+1)).collect::<Vec<_>>();
+    let targets=Tensor::<2,Int>::from_data(TensorData::new(targets,[count,width]),device);
+    let observed=Tensor::<2,Bool>::from_data(TensorData::new(soft.observed.iter().map(Option::is_some).collect::<Vec<_>>(),[count,width]),device);
+    let locations=blocks.iter().map(|&(r,i)|(r,state.rows[r].chains[i].start+1)).collect::<Vec<_>>();
+    let mut work=crate::cocommit::CoordinationWork::default();
+    let mut selected_marks=vec![false;count*width];
+    let (a,b)=if c.sbd.as_ref().unwrap().cocommit.is_some() {
+        ensure!(layout==SbdBlockExecution::Batched,"TCT CoCommit requires batched execution");
+        let bundles=bundles.context("TCT CoCommit bundle missing")?;
+        ensure!(bundles.len()==count,"TCT bundle count differs");
+        let padded=bundles.iter().zip(&lengths).map(|(bundle,&n)|{
+            ensure!(bundle.len()==n,"TCT bundle width differs");
+            Ok(bundle.iter().copied().chain(std::iter::repeat_n(false,width-n)).collect::<Vec<_>>())
+        }).collect::<Result<Vec<_>>>()?;
+        selected_marks=padded.iter().flatten().copied().collect();
         let cache=model.training_cache_batched(&trace,&locations);
-        let (a,b,pair_work)=crate::cocommit::training_pair_profiled(model,c,&cache,&soft,&padded_bundles,&mut delta_mixers::profile::Unprofiled)?;
+        let (a,b,pair_work)=crate::cocommit::training_pair_profiled(model,c,&cache,&soft,&padded,&mut delta_mixers::profile::Unprofiled)?;
         work=pair_work;
-        let mut branch=SbdTrainingResult {loss:Tensor::zeros([1],device),circuit_flows:None,unused_parameters:Vec::new()};
-        let prepared=crate::cocommit::add_branch_losses(model,c,a,b,&soft,targets.clone(),
-            &padded_bundles.iter().flat_map(|x|x.iter().copied()).collect::<Vec<_>>(),&target_weights,denominator,&mut branch)?;
-        feedback_circuit=Some(prepared.context("TCT CoCommit joint B circuit was not prepared")?.detached());
-        let used_b=padded_bundles.iter().filter(|marks|marks.iter().any(|&mark|mark)).count();
-        work.circuit_preparations+=1+usize::from(used_b>0);
-        work.message_passes+=3+3*usize::from(used_b>0);
-        work.evidence_queries+=1+usize::from(used_b>0);
-        work.circuit_query_dispatched_rows+=count*(1+usize::from(used_b>0));
-        work.circuit_query_used_rows+=count+used_b;
-        work.b_circuit_used_rows+=used_b;
-        if blocks.iter().any(|&(r,i)|state.rows[r].chains[i].round<TRAIN_ROUNDS) {
-            work.message_passes+=2;
-            work.evidence_queries+=1;
-            work.ffbs_passes+=1;
-            work.circuit_query_dispatched_rows+=count;
-            work.circuit_query_used_rows+=count;
-            work.ffbs_dispatched_rows+=count;
-            work.ffbs_used_rows+=count;
-            work.b_circuit_used_rows+=used_b;
-        }
-        let branch_loss=branch.loss;
-        joint+=model::scalar(branch_loss.clone())?;
-        loss=loss+branch_loss;
-        branch.circuit_flows
-    } else {
-        let output = match layout {
-            SbdBlockExecution::Batched => {
-                let locations = blocks.iter().map(|&(r,i)|(r,state.rows[r].chains[i].start+1)).collect::<Vec<_>>();
-                let cache = model.training_cache_batched(&trace,&locations);
-                model.cached_blocks(&cache,&soft,false)
-            }
-            SbdBlockExecution::PerBlock => {
-                let mut outputs = Vec::with_capacity(count);
-                for row in 0..state.rows.len() {
-                    let selected = blocks.iter().copied().filter(|&(r,_)|r == row).collect::<Vec<_>>();
-                    if selected.is_empty() { continue; }
-                    let starts = selected.iter().map(|&(_,i)|state.rows[row].chains[i].start+1).collect::<Vec<_>>();
-                    let cache = model.training_cache(&trace,row,&starts);
-                    for (index,&block) in selected.iter().enumerate() {
-                        let input = input_state(c,state,&[block],width,device)?;
-                        outputs.push(model.cached_block(&cache,index,&input,false));
-                    }
+        (a,Some(b))
+    }else{
+        let output=match layout {
+            SbdBlockExecution::Batched=>model.cached_blocks(&model.training_cache_batched(&trace,&locations),&soft,false),
+            SbdBlockExecution::PerBlock=>{
+                let mut outputs=Vec::with_capacity(count);
+                for &(r,i) in &blocks {
+                    let cache=model.training_cache(&trace,r,&[state.rows[r].chains[i].start+1]);
+                    outputs.push(model.cached_block(&cache,0,&input_state(model,c,state,&[(r,i)],width,device)?,false));
                 }
-                DenoisingOutput {
-                    logits:Tensor::cat(outputs.iter().map(|x|x.logits.clone()).collect(),0),
-                    features:Tensor::cat(outputs.into_iter().map(|x|x.features).collect(),0),
-                }
+                DenoisingOutput{logits:Tensor::cat(outputs.iter().map(|o|o.logits.clone()).collect(),0),features:Tensor::cat(outputs.into_iter().map(|o|o.features).collect(),0)}
             }
         };
-        let circuit = codpula.prepare(output.logits,output.features,&lengths,observed.clone(),1.0)?;
-        let scored = circuit.conditional_nll(targets.clone(),observed.clone(),denominator)?;
-        joint += model::scalar(scored.loss.clone())?;
-        loss = loss + scored.loss;
-        let flows = scored.flows;
-        feedback_circuit = Some(circuit);
-        Some(flows)
+        (output,None)
     };
-    if blocks.iter().any(|&(r,i)|state.rows[r].chains[i].round < TRAIN_ROUNDS) {
-        // Sampling and feedback use the same pre-update prepared distribution as the objective.
-        let (seed,row_offset)=proposal.unwrap_or_else(||(state.next_random(),0));
-        let mut uniforms=Vec::with_capacity(count*width*2);
-        for &(row,index) in &blocks {
-            let chain=&state.rows[row].chains[index];
-            let mut rng=Rng(seed ^ ((row+row_offset) as u64).wrapping_mul(0x9e3779b97f4a7c15)
-                ^ (chain.start as u64).wrapping_mul(0xbf58476d1ce4e5b9));
-            uniforms.extend((0..width*2).map(|_|((rng.next()>>40) as u32) as f32/16777216.0));
-        }
-        let circuit=feedback_circuit.as_ref().context("TCT feedback circuit missing")?;
-        let proposals=circuit.sample_with_uniforms(targets.clone(),observed.clone(),
-            Tensor::from_data(TensorData::new(uniforms,[count,width,2]),device))?;
-        let marginals=circuit.marginals(targets,observed)?.detach();
-        let confidence=host(marginals.clone().max_dim(2).reshape([count*width]))?;
-        let k=c.sbd.as_ref().unwrap().candidate_width.min(c.vocab());
-        let candidates=Candidates::select(marginals.reshape([count*width,c.vocab()]),k,c.soft_selection_backend)?;
-        let ids=candidates.ids.into_data().try_to_vec_as::<i32>().map_err(|e|anyhow::anyhow!("TCT candidate IDs: {e:?}"))?;
-        let weights=host(candidates.weights)?;
-        let mass=host(candidates.retained_mass)?;
-        for (block,&(row,index)) in blocks.iter().enumerate() {
-            let chain=&mut state.rows[row].chains[index];
-            if chain.round==TRAIN_ROUNDS {chain.round+=1;continue;}
-            let n=chain.len();
-            chain.reveal(&proposals[block],&confidence[block*width..block*width+n])?;
-            chain.candidate_ids.copy_from_slice(&ids[block*width*k..block*width*k+n*k]);
-            chain.candidate_weights.copy_from_slice(&weights[block*width*k..block*width*k+n*k]);
-            chain.retained_mass.copy_from_slice(&mass[block*width..block*width+n]);
-            for i in 0..n {chain.visibility[i]=if chain.permanent[i].is_some()||chain.revealed[i] {1.0}else{1.0/c.soft_steps as f32};}
-        }
-    } else {
-        // The fully revealed input is supervised once before its chain is refilled.
-        for &(row,index) in &blocks {state.rows[row].chains[index].round+=1;}
+    let (circuit,_)=crate::sbd::prepare_distribution(model,a,&soft,1.0)?;
+    let weights=Tensor::from_data(TensorData::new(soft.active.iter().zip(&soft.observed).map(|(&active,o)|if active&&o.is_none(){1.0f32}else{0.0}).collect::<Vec<_>>(),[count,width]),device);
+    let correction=circuit.marginal_ce(targets.clone(),targets.clone(),observed.clone(),weights,denominator)?;
+    let mut joint=model::scalar(correction.loss.clone())?;
+    loss=loss+correction.loss;
+    let mut flows=correction.flows;
+    let mut probabilities=circuit.marginals(targets.clone(),observed.clone())?.detach();
+    if let Some(b)=b {
+        let use_b=blocks.iter().enumerate().flat_map(|(block,&(r,i))|{
+            let marks=&selected_marks[block*width..(block+1)*width];
+            let used=marks.iter().any(|&m|m);
+            let chain=&state.rows[r].chains[i];
+            (0..width).map(move |j|used && j<chain.len() && (marks[j]||chain.revealed[j]))
+        }).collect::<Vec<_>>();
+        let (b_circuit,_)=crate::sbd::prepare_distribution(model,b,&soft,1.0)?;
+        let weights=Tensor::from_data(TensorData::new(use_b.iter().map(|&used|if used{1.0f32}else{0.0}).collect::<Vec<_>>(),[count,width]),device);
+        let auxiliary=b_circuit.marginal_ce(targets.clone(),targets.clone(),observed.clone(),weights,denominator)?;
+        joint+=model::scalar(auxiliary.loss.clone())?;
+        loss=loss+auxiliary.loss;
+        flows.add(auxiliary.flows);
+        let selected=Tensor::<2,Bool>::from_data(TensorData::new(use_b,[count,width]),device).unsqueeze_dim::<3>(2).expand([count,width,c.vocab()]);
+        probabilities=probabilities.mask_where(selected,b_circuit.marginals(targets,observed)?.detach());
     }
-    Ok(Loss {loss,flows,clean,joint,chains:chain_count,noisy_blocks:count,work})
+    let confidence=host(probabilities.clone().max_dim(2).reshape([count*width]))?;
+    let proposals=crate::soft::ids_host(probabilities.clone().reshape([count*width,c.vocab()]).argmax(1));
+    let mut feedback=soft;
+    feedback.update(probabilities.reshape([count*width,c.vocab()]).log(),1.0,c.sbd.as_ref().unwrap().candidate_width,
+        model.soft_confidence.as_ref().context("soft feedback head missing")?)?;
+    let k=c.sbd.as_ref().unwrap().candidate_width.min(c.vocab());
+    let ids=feedback.candidates.ids.into_data().try_to_vec_as::<i32>().map_err(|e|anyhow::anyhow!("TCT candidate IDs: {e:?}"))?;
+    let weights=host(feedback.candidates.weights)?;
+    let mass=host(feedback.candidates.retained_mass)?;
+    let entropy=host(feedback.negative_entropy)?;
+    let visibility=host(feedback.visibility)?;
+    for (block,&(r,i)) in blocks.iter().enumerate() {
+        let chain=&mut state.rows[r].chains[i];
+        let n=chain.len();
+        if chain.round==TRAIN_ROUNDS {chain.round+=1;continue;}
+        chain.reveal(&proposals[block*width..block*width+n].iter().map(|&id|id as usize).collect::<Vec<_>>(),&confidence[block*width..block*width+n])?;
+        chain.candidate_ids.copy_from_slice(&ids[block*width*k..block*width*k+n*k]);
+        chain.candidate_weights.copy_from_slice(&weights[block*width*k..block*width*k+n*k]);
+        chain.retained_mass.copy_from_slice(&mass[block*width..block*width+n]);
+        chain.negative_entropy.copy_from_slice(&entropy[block*width..block*width+n]);
+        chain.visibility.copy_from_slice(&visibility[block*width..block*width+n]);
+        chain.prediction_available.fill(true);
+    }
+    Ok(Loss{loss,flows:Some(flows),clean,joint,chains:count,noisy_blocks:count,work})
 }
 
 struct Backward {
@@ -446,13 +399,12 @@ struct Backward {
 }
 fn sample_announcements(c:&Config,state:&mut TrainingState)->Option<Vec<Vec<Vec<bool>>>> {
     let options=c.sbd.as_ref().unwrap().cocommit.as_ref()?;
-    let has_joint=state.rows.iter().flat_map(|row|&row.chains).any(|chain|chain.len()>1);
-    let seed=if has_joint {state.next_random()} else {0};
+    let seed=state.next_random();
     let mut blocks=Vec::new();
     for (row,saved) in state.rows.iter().enumerate() {
-        for chain in saved.chains.iter().filter(|chain|chain.len()>1) {
+        for chain in &saved.chains {
             blocks.push(TrainingBlock {row,start:chain.start,length:chain.len(),
-                masked:chain.permanent.iter().map(Option::is_none).collect()});
+                masked:chain.permanent.iter().zip(&chain.revealed).map(|(o,&r)|o.is_none()&&!r).collect()});
         }
     }
     let selected=crate::cocommit::sample_bundles(&blocks,options.training_bundle_max,seed);
@@ -466,22 +418,23 @@ fn sample_announcements(c:&Config,state:&mut TrainingState)->Option<Vec<Vec<Vec<
 fn backward_passes(c:&Config,model:&LanguageModel,state:&mut TrainingState,device:&Device,layout:SbdBlockExecution)->Result<Backward> {
     let rows_per_pass=c.tct.as_ref().map_or(c.batch_size,|tct|tct.rows_per_pass).min(c.batch_size);
     ensure!(rows_per_pass>0 && state.rows.len()==c.batch_size,"invalid TCT row accumulation shape");
+    let confidence_used=state.rows.iter().flat_map(|row|&row.chains).any(|chain|
+        (0..chain.len()).any(|i|chain.permanent[i].is_none() && !chain.revealed[i] && chain.prediction_available[i]));
     let sampled_bundles=sample_announcements(c,state);
+    let logical_chains=state.rows.iter().map(|row|row.chains.len()).sum::<usize>();
     if rows_per_pass==c.batch_size {
         let bundles=sampled_bundles.as_ref().map(|all|state.rows.iter().enumerate().flat_map(|(row,saved)|
-            saved.chains.iter().enumerate().filter(|(_,chain)|chain.len()>1).map(move |(index,_)|all[row][index].clone())).collect::<Vec<_>>());
-        let result=training_loss(c,model,state,device,layout,None,bundles.as_deref())?;
+            saved.chains.iter().enumerate().map(move |(index,_)|all[row][index].clone())).collect::<Vec<_>>());
+        let result=training_loss(c,model,state,device,layout,bundles.as_deref())?;
         let loss=model::scalar(result.loss.clone())?;
-        let unused = model::unused_denoising_parameters(result.noisy_blocks > 0, result.work.b_tail_used_rows > 0);
+        let mut unused = model::unused_denoising_parameters(result.noisy_blocks > 0, result.work.b_tail_used_rows > 0);
+        if !confidence_used {unused.extend(model::unused_soft_parameters());}
         let (gradients, gradient_report)=model::checked_gradients_with_unused(model,result.loss,&unused,&mut delta_mixers::profile::Unprofiled)?;
         return Ok(Backward {gradients,flows:result.flows,loss,clean:result.clean,joint:result.joint,
             chains:result.chains,noisy_blocks:result.noisy_blocks,clean_calls:1,
             noisy_calls:match layout {SbdBlockExecution::Batched=>usize::from(result.noisy_blocks>0),SbdBlockExecution::PerBlock=>result.noisy_blocks},
             work:result.work,gradient_report});
     }
-    let proposal_seed=if state.rows.iter().flat_map(|row|&row.chains).any(|chain|chain.len()>1 && chain.round<TRAIN_ROUNDS) {
-        Some(state.next_random())
-    } else {None};
     let mut rows=std::mem::take(&mut state.rows).into_iter();
     let mut returned=Vec::with_capacity(c.batch_size);
     let mut accumulator=GradientsAccumulator::<LanguageModel>::new();
@@ -500,12 +453,12 @@ fn backward_passes(c:&Config,model:&LanguageModel,state:&mut TrainingState,devic
         let scale=pass_config.batch_size as f64/c.batch_size as f64;
         let pass_bundles=sampled_bundles.as_ref().map(|all| {
             pass_state.rows.iter().enumerate().flat_map(|(local,row)| {
-                row.chains.iter().enumerate().filter(|(_,chain)|chain.len()>1)
+                row.chains.iter().enumerate()
                     .map(move |(index,_)|all[row_offset+local][index].clone())
             }).collect::<Vec<_>>()
         });
-        let result=training_loss(&pass_config,model,&mut pass_state,device,layout,
-            if rows_per_pass==c.batch_size {None} else {Some((proposal_seed.unwrap_or(0),row_offset))},pass_bundles.as_deref())?;
+        let result=training_loss_reduced(&pass_config,model,&mut pass_state,device,layout,
+            pass_bundles.as_deref(),logical_chains as f64*scale)?;
         loss+=model::scalar(result.loss.clone())?*scale;
         clean+=result.clean*scale;
         joint+=result.joint*scale;
@@ -520,7 +473,8 @@ fn backward_passes(c:&Config,model:&LanguageModel,state:&mut TrainingState,devic
     }
     state.rows=returned;
     let gradients=accumulator.grads();
-    let unused = model::unused_denoising_parameters(noisy_blocks > 0, work.b_tail_used_rows > 0);
+    let mut unused = model::unused_denoising_parameters(noisy_blocks > 0, work.b_tail_used_rows > 0);
+    if !confidence_used {unused.extend(model::unused_soft_parameters());}
     let gradient_report=model::check_parameter_gradients_with_unused(model,&gradients,&unused,&mut delta_mixers::profile::Unprofiled)?;
     Ok(Backward {gradients,flows,loss,clean,joint,chains,noisy_blocks,clean_calls,noisy_calls,work,gradient_report})
 }
@@ -538,9 +492,10 @@ fn step_layout(c: &Config, model: LanguageModel, optim: &mut ModuleOptimizer, st
     state.noisy_forward_calls += result.noisy_calls;
     state.noisy_block_evaluations += result.noisy_blocks;
     state.refill(c,corpus)?;
-    Ok((model,json!({"loss":result.loss,"clean_causal_nll_per_token":result.clean,"joint_correction_nll_per_token":result.joint,
+    Ok((model,json!({"loss":result.loss,"clean_causal_nll_per_token":result.clean,
         "gradient_counts":result.gradient_report,
-        "joint_correction_nll_chain_mean_token_sum":result.joint*c.tokens_per_step() as f64/result.chains as f64,
+        "correction_and_coordination_ce_chain_mean_token_sum":result.joint,
+        "correction_objective":"A token CE over all mutable positions; optional B coordination CE on masked S and visible mutable positions",
         "chain_count":result.chains,"steps":state.steps,"unique_target_bytes_loaded":state.unique_target_bytes,
         "scored_target_visits":state.scored_target_visits,"completed_chains":state.completed_chains,"next_loader_example":state.next_example,
         "clean_forward_calls":state.steps*result.clean_calls,"row_accumulation_passes":result.clean_calls,
@@ -618,7 +573,19 @@ pub fn run(c: &Config, arm: &Arm, seed: u64, device: &Device, resume: Option<&Pa
             chains.source_training_identity = Some(source_identity);
         }
         model = checkpoint::load_model(model,path.join("model.burnpack"),&target)?;
-        optim = checkpoint::load_optimizer(c,path.join("optimizer.burnpack"))?;
+        optim=if chains.source_checkpoint.is_some() {
+            checkpoint::load_optimizer_for_continuation(c,path.join("optimizer.burnpack"))?
+        }else{checkpoint::load_optimizer(c,path.join("optimizer.burnpack"))?};
+        if !path.join("tct.json").exists() {
+            chains.optimizer_start_step=optim.completed_steps();
+            chains.optimizer_schedule_steps=optim.schedule_steps();
+            if let Some(identity)=&mut chains.source_training_identity {
+                identity["optimizer_start_step"]=json!(chains.optimizer_start_step);
+                identity["optimizer_source_schedule_steps"]=json!(chains.optimizer_schedule_steps);
+            }
+        }
+        ensure!(optim.completed_steps()==chains.optimizer_start_step+chains.steps
+            && optim.schedule_steps()==chains.optimizer_schedule_steps,"TCT optimizer/chain schedule or counters disagree");
     } else {
         chains = TrainingState::new(c,corpus.as_ref(),seed)?;
     }
@@ -665,10 +632,10 @@ pub fn run(c: &Config, arm: &Arm, seed: u64, device: &Device, resume: Option<&Pa
         "unique_target_bytes_note":"counts each loaded training window once, not repeated chain visits; corpus byte offsets are not deduplicated",
         "last_training_loss":last_loss,"source_sbd_checkpoint":chains.source_checkpoint,"rounds":TRAIN_ROUNDS,"input_visits_per_chain":TRAIN_ROUNDS+1,
         "source_training_identity":chains.source_training_identity,
-        "threshold":REVEAL_THRESHOLD,"proposal":"seeded_exact_joint_ffbs","evidence":"permanent_O_only",
-        "inputs":"hard_provisional_reveals_and_retained_top_k_soft_mask_feedback",
-        "objective":if c.sbd.as_ref().unwrap().cocommit.is_some() {"clean causal plus token-normalized all-free A correction NLL and announced-subset B event NLL"}
-            else {"unchanged_clean_causal_plus_token-normalized_conditional_joint_all_free_position_nll"},
+        "threshold":REVEAL_THRESHOLD,"proposal":"greedy_conditional_marginal_argmax","evidence":"permanent_O_only",
+        "inputs":"hard_provisional_reveals_and_retained_normalized_top_k_soft_feedback",
+        "objective":"clean causal mean plus logical-chain-mean token-sum A correction CE; optional B coordination CE on masked S and visible mutable positions",
+        "optimizer_start_step":chains.optimizer_start_step,"optimizer_source_schedule_steps":chains.optimizer_schedule_steps,
         "quality_evaluation_performed":false});
     runtime::write_json(&run_dir.join("metrics.json"),&report)?;
     Ok(report)
@@ -716,7 +683,7 @@ pub fn benchmark(c: &Config, arm: &Arm, seed: u64, device: &Device) -> Result<Va
             "precision":"float32","batch":8,"context":512,"warmups":1,"samples":1,
             "diagnostic_only":true,"batched_samples_ms":[measured],"batched_median_ms":measured,
             "last_loss":loss,"sampled_peak_reserved_bytes":peak,
-            "method":"one warm and one synchronized complete batched optimizer step; clean forward, fresh prefix cache, joint loss/flows, FFBS/feedback, full backward/checks, optimizer and chain update included",
+            "method":"one warm and one synchronized complete batched optimizer step; clean forward, fresh prefix cache, marginal token CE/flows, greedy feedback, backward/checks, optimizer and chain update included",
             "memory_note":"reservation sampled after complete steps, not a physical peak"}));
     }
     let mut models = [Some(base.clone()),Some(base)];
@@ -745,7 +712,7 @@ pub fn benchmark(c: &Config, arm: &Arm, seed: u64, device: &Device) -> Result<Va
         "warmups":warmups,"pairs":trials,"diagnostic_only":c.batch_size==8,"per_block_samples_ms":samples[0],"batched_samples_ms":samples[1],
         "per_block_median_ms":crate::profile::median(&samples[0]),"batched_median_ms":crate::profile::median(&samples[1]),
         "paired":if trials>1 {paired(&samples[0],&samples[1])} else {Value::Null},"last_losses":losses,"sampled_peak_reserved_bytes":peak,
-        "method":"alternating interleaved complete optimizer steps, identical initial model, chain values, loader and RNG; independent optimizer trajectories; clean forward and parameter-fresh prefix cache, joint correction loss/flows, FFBS/soft feedback, readback, full backward/checks, original optimizer and refill included; warmups/JIT excluded; no evaluation/checkpoint IO",
+        "method":"alternating complete optimizer steps with identical initial models/chains; clean forward, fresh prefix cache, marginal correction CE/flows, greedy soft feedback, backward/checks, optimizer and refill; no evaluation/checkpoint IO",
         "memory_note":"device reservation sampled after each complete step; both runners coexist; not a physical peak"}))
 }
 
@@ -814,10 +781,28 @@ impl Reference {
         out
     }
     fn nll(&self, evidence: &[Option<usize>], target: &[usize], denominator: f64) -> f64 {
-        (self.query(evidence,None).mass.ln()-self.query(evidence,Some(target)).mass.ln())/denominator
+        let base=self.query(evidence,None).mass.ln();
+        (0..target.len()).filter(|&i|evidence[i].is_none()).map(|i|{
+            let mut singleton=evidence.to_vec();singleton[i]=Some(target[i]);
+            base-self.query(&singleton,None).mass.ln()
+        }).sum::<f64>()/denominator
     }
-    fn flows(&self, evidence: &[Option<usize>], target: &[usize]) -> Vec<(&'static str,Vec<f64>)> {
-        let plus = self.query(evidence,Some(target));
+    fn flows(&self,evidence:&[Option<usize>],target:&[usize])->Vec<(&'static str,Vec<f64>)> {
+        let mut result=None::<Vec<(&'static str,Vec<f64>)>>;
+        for i in 0..target.len() {
+            if evidence[i].is_some(){continue;}
+            let mut singleton=evidence.to_vec();singleton[i]=Some(target[i]);
+            let part=self.event_flows(evidence,&singleton);
+            if let Some(total)=&mut result {
+                for (sum,(_,values)) in total.iter_mut().take(6).zip(part) {
+                    for (a,b) in sum.1.iter_mut().zip(values){*a+=b;}
+                }
+            }else{result=Some(part);}
+        }
+        result.unwrap()
+    }
+    fn event_flows(&self, evidence: &[Option<usize>], numerator: &[Option<usize>]) -> Vec<(&'static str,Vec<f64>)> {
+        let plus = self.query(numerator,None);
         let minus = self.query(evidence,None);
         let prior = self.query(&[None;3],None);
         let (leaf,a,root) = self.tables();
@@ -884,13 +869,13 @@ fn joint_checks(device: &Device, execution: CodpulaExecution) -> Result<Value> {
     let logits = potentials.clone().mask_where(observed.clone().reshape([1,3,1]).expand([1,3,3]),potentials.clone().detach());
     let circuit = crate::codpula::PreparedCircuit::prepare_with_execution(pi.clone(),a.clone(),rho.clone(),logits,gates.clone(),vec![3],1,execution)?;
     let gold = Tensor::<2,Int>::from_data([[0,1,2]],&target_device);
-    let result = circuit.conditional_nll(gold.clone(),observed.clone(),2.0)?;
-    let nll = errors(&host(result.loss.clone())?,&[reference.nll(&evidence,&target,2.0)],"TCT all-free conditional joint NLL")?;
+    let result=circuit.marginal_ce(gold.clone(),gold.clone(),observed.clone(),Tensor::<2>::from_data([[0.0,1.0,1.0]],&target_device),1.0)?;
+    let nll=errors(&host(result.loss.clone())?,&[reference.nll(&evidence,&target,1.0)],"TCT all-mutable marginal CE with chain denominator")?;
     let marked=Tensor::<2,Bool>::from_data([[false,true,false]],&target_device);
-    let event=circuit.event_nll(gold,observed.clone(),marked,2.0)?;
+    let event=circuit.marginal_ce(gold.clone(),gold,observed.clone(),marked.float(),1.0)?;
     let marked_evidence=[Some(0),Some(1),None];
-    let expected_event=(reference.query(&evidence,None).mass.ln()-reference.query(&marked_evidence,None).mass.ln())/2.0;
-    let event_nll=errors(&host(event.loss.clone())?,&[expected_event],"TCT marked-subset event NLL with other free positions marginalized")?;
+    let expected_event=reference.query(&evidence,None).mass.ln()-reference.query(&marked_evidence,None).mass.ln();
+    let event_nll=errors(&host(event.loss.clone())?,&[expected_event],"TCT marked marginal token CE")?;
     ensure!(event.flows.active_blocks==1,"TCT marked event flow count differs");
     ensure!(result.flows.active_blocks == 1,"joint TCT active block count differs");
     let expected_flows = reference.flows(&evidence,&target);
@@ -914,7 +899,7 @@ fn joint_checks(device: &Device, execution: CodpulaExecution) -> Result<Value> {
             if field == 3 && i<3 {expected.push(0.0);continue;}
             let mut plus = reference.clone(); let mut minus = reference.clone();
             plus.fields[field][i] += 1e-5; minus.fields[field][i] -= 1e-5;
-            expected.push((plus.nll(&evidence,&target,2.0)-minus.nll(&evidence,&target,2.0))/2e-5);
+            expected.push((plus.nll(&evidence,&target,1.0)-minus.nll(&evidence,&target,1.0))/2e-5);
         }
         derivatives.push(json!({"field":field,"errors":errors(&actual[field],&expected,"TCT central-difference gradient")?}));
     }
@@ -923,7 +908,7 @@ fn joint_checks(device: &Device, execution: CodpulaExecution) -> Result<Value> {
     let wrong_evidence = [Some(0),Some(2),None];
     ensure!(reference.query(&wrong_evidence,None).mass > 0.0 && reference.query(&wrong_evidence,Some(&target)).mass == 0.0,
         "wrong provisional evidence must reject the gold correction event");
-    Ok(json!({"passed":true,"device":runtime::identity(device),"execution":execution,"joint_nll":nll,"marked_subset_event_nll":event_nll,"flows":flows,"gradients":derivatives,
+    Ok(json!({"passed":true,"device":runtime::identity(device),"execution":execution,"marginal_token_ce":nll,"marked_subset_token_ce":event_nll,"flows":flows,"gradients":derivatives,
         "reference":"independent exhaustive f64 sum over 8 latent paths and 27 token assignments; all-coordinate f64 central differences",
         "wrong_provisional_value":2,"gold_correction_value":1,"wrong_reveal_correction_gradient_nonzero":true,
         "permanent_token_potential_gradient_zero":true,"incorrectly_conditioned_gold_event_probability":0.0,
@@ -964,7 +949,7 @@ impl Drop for TemporaryDirectory {
 }
 fn restart_fixture() -> (Config,Arm,Corpus) {
     use crate::config::{SbdConfig,SbdFeedback};
-    let arm = Arm {name:"tct-restart".into(),mixer:"kronlstm".into(),cache:"none".into()};
+    let arm = Arm {name:"tct-restart".into(),mixer:"kronlstm".into(),cache:"surprise".into()};
     let c = Config {task:"lm".into(),context:32,batch_size:1,d_model:16,layers:1,heads:4,key_dim:32,value_dim:64,
         chunk_size:16,cache_capacity:4,train_tokens:32*8,checkpoint_every:2,
         sbd:Some(SbdConfig {block_lengths:vec![8],block_execution:SbdBlockExecution::Batched,joint_output:SbdJointOutput::Codpula,
@@ -1058,7 +1043,7 @@ fn layout_checks(device: &Device, execution: CodpulaExecution) -> Result<Value> 
     target.seed(173);
     let model = LanguageModel::new(&c,&arm,&target)?;
     let mut initial = TrainingState::new(&c,Some(&corpus),173)?;
-    let _ = training_loss(&c,&model,&mut initial,&target,SbdBlockExecution::Batched,None,None)?;
+    let _ = training_loss(&c,&model,&mut initial,&target,SbdBlockExecution::Batched,None)?;
     let mut wrong_revealed_inputs = 0;
     let mut soft_positions = 0;
     for row in &mut initial.rows {for chain in &mut row.chains {for i in 0..chain.len() {
@@ -1071,7 +1056,7 @@ fn layout_checks(device: &Device, execution: CodpulaExecution) -> Result<Value> 
     }}}
     ensure!(wrong_revealed_inputs > 0 && soft_positions > 0,"TCT fixture needs both wrong revealed inputs and unresolved soft feedback");
     let locations = initial.rows.iter().enumerate().flat_map(|(r,row)|(0..row.chains.len()).map(move |i|(r,i))).collect::<Vec<_>>();
-    let input = input_state(&c,&initial,&locations,7,&target)?;
+    let input = input_state(&model,&c,&initial,&locations,7,&target)?;
     ensure!(input.observed.iter().all(Option::is_none),"provisional reveals entered permanent circuit evidence");
     let embeddings = host(model.embedding.weight.val())?;
     let mask = host(model.sbd_mask.as_ref().unwrap().val())?;
@@ -1094,8 +1079,8 @@ fn layout_checks(device: &Device, execution: CodpulaExecution) -> Result<Value> 
     }
     let input_composition = errors(&actual_inputs,&expected_inputs,"TCT hard-reveal and retained-soft input embeddings")?;
     let mut a = initial.clone(); let mut b = initial;
-    let per_block = training_loss(&c,&model,&mut a,&target,SbdBlockExecution::PerBlock,None,None)?;
-    let batched = training_loss(&c,&model,&mut b,&target,SbdBlockExecution::Batched,None,None)?;
+    let per_block = training_loss(&c,&model,&mut a,&target,SbdBlockExecution::PerBlock,None)?;
+    let batched = training_loss(&c,&model,&mut b,&target,SbdBlockExecution::Batched,None)?;
     let loss = errors(&host(batched.loss.clone())?,&[model::scalar(per_block.loss.clone())?],"TCT cache layouts loss")?;
     let expected_gradients = model::checked_gradients(&model,per_block.loss)?;
     let actual_gradients = model::checked_gradients(&model,batched.loss)?;
@@ -1117,15 +1102,25 @@ fn layout_checks(device: &Device, execution: CodpulaExecution) -> Result<Value> 
             "TCT layout changed supplied-randomness proposals or reveals");
         errors(&cb.candidate_weights,&ca.candidate_weights.iter().map(|&x|f64::from(x)).collect::<Vec<_>>(),"TCT layout feedback")?;
     }}
-    c.sbd.as_mut().unwrap().block_lengths = vec![1];
-    let mut causal_state = TrainingState::new(&c,Some(&corpus),173)?;
-    let batch = causal_state.batch(&target);
-    let clean = model.loss(model.forward(&batch),&batch);
-    let causal = training_loss(&c,&model,&mut causal_state,&target,SbdBlockExecution::Batched,None,None)?;
-    let causal_identity = errors(&host(causal.loss)?,&[2.0*model::scalar(clean)?],"TCT L1 exact causal objective")?;
-    ensure!(causal.flows.is_none() && causal_state.rows.iter().flat_map(|row|&row.chains).all(|chain|!chain.revealed[0]),
-        "L1 TCT consumed provisional current-token inputs");
-    Ok(json!({"passed":true,"loss":loss,"gradients":gradients,"flows":flows,"tail_block_length":4,"length_one_causal_identity":causal_identity,
+    c.sbd.as_mut().unwrap().block_lengths=vec![1];
+    let mut singleton_state=TrainingState::new(&c,Some(&corpus),173)?;
+    let batch=singleton_state.batch(&target);
+    let clean_value=model::scalar(model.loss(model.forward(&batch),&batch))?;
+    let before=singleton_state.clone();
+    let singleton=training_loss(&c,&model,&mut singleton_state,&target,SbdBlockExecution::Batched,None)?;
+    let mut expected=0.0;
+    let chain_count=before.rows.iter().map(|row|row.chains.len()).sum::<usize>();
+    for row in &before.rows {for chain in &row.chains {
+        let soft=crate::sbd::state(&c,vec![None],&target)?;
+        let output=crate::sbd::block_forward(&model,&row.input[..chain.start+1],&soft,false,&target);
+        let (circuit,tokens,observed)=crate::sbd::prepare_circuit(&model,output,&soft,1.0)?;
+        let probability=host(circuit.marginals(tokens,observed)?)?;
+        expected-=f64::from(probability[row.target[chain.start] as usize]).ln()/chain_count as f64;
+    }}
+    let singleton_objective=errors(&host(singleton.loss)?,&[clean_value+expected],"TCT singleton noisy marginal CE")?;
+    ensure!(singleton.flows.is_some() && singleton_state.rows.iter().flat_map(|row|&row.chains).all(|chain|chain.revealed[0]),
+        "singleton did not consume noisy denoiser or reveal its argmax");
+    Ok(json!({"passed":true,"loss":loss,"gradients":gradients,"flows":flows,"tail_block_length":4,"length_one_noisy_objective":singleton_objective,
         "input_composition":input_composition,"wrong_revealed_inputs":wrong_revealed_inputs,"unresolved_soft_positions":soft_positions,"provisional_inputs_never_evidence":true}))
 }
 

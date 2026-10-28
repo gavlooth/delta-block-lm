@@ -512,8 +512,8 @@ pub fn fit(c: &Config, device: &Device) -> Result<Value> {
     fit_config.warmup_fraction = 0.0;
     fit_config.min_learning_rate_ratio = 1.0;
     fit_config.sbd = None;
-    let mut optimizer = crate::train::optimizer(&fit_config);
     let parts = if pairwise { 2 } else { 1 };
+    let mut optimizer = crate::train::optimizer_with_steps(&fit_config, parts*refinement.fit_steps);
     let mut losses = Vec::with_capacity(parts * refinement.fit_steps);
     let mut part_reports = Vec::with_capacity(parts);
     let mut updates = 0;
@@ -594,7 +594,7 @@ pub fn fit(c: &Config, device: &Device) -> Result<Value> {
         "steps":parts*refinement.fit_steps,"steps_per_part":refinement.fit_steps,"parts":part_reports,
         "optimizer_updates":updates,"batch_pairs":refinement.fit_batch,
         "eligible_weight_seen":eligible_weight,"margin":MARGIN,"losses":losses,
-        "optimizer":crate::train::optimizer_config(c),"learning_rate":c.learning_rate,
+        "optimizer":optimizer.configuration(),"learning_rate":fit_config.learning_rate,
         "energy_path":path,"energy_sha256":crate::checkpoint::file_sha256(&path)?,
         "optimizer_path":optimizer_path,"optimizer_sha256":crate::checkpoint::file_sha256(&optimizer_path)?,
         "continuation_supported":false,"frozen_denoiser":true,"feature_gradients":false,

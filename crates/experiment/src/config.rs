@@ -216,14 +216,12 @@ impl CocommitExecution {
 pub struct CocommitConfig {
     pub tail_layers: usize,
     pub training_bundle_max: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub visible_loss_weight: Option<f64>,
     #[serde(skip_serializing_if = "CocommitExecution::is_separate")]
     pub execution: CocommitExecution,
 }
 impl Default for CocommitConfig {
     fn default() -> Self {
-        Self { tail_layers: 1, training_bundle_max: 16, visible_loss_weight: None,
+        Self { tail_layers: 1, training_bundle_max: 16,
             execution: CocommitExecution::Separate }
     }
 }
@@ -285,8 +283,8 @@ impl Default for SbdConfig {
             joint_output: SbdJointOutput::Factorized,
             joint_execution: crate::codpula::CodpulaExecution::Tensor,
             commitment: None, dependence_threshold: None,
-            candidate_width: 3, commit_count: None, entropy_threshold: None, generate_tokens: 32,
-            in_block_reads: delta_mixers::sbd::InBlockReads::None,
+            candidate_width: 3, commit_count: None, entropy_threshold: Some(0.1), generate_tokens: 32,
+            in_block_reads: delta_mixers::sbd::InBlockReads::HolaRead,
             noisy_read_backend: delta_mixers::sbd::NoisyReadBackend::Tensor,
             cocommit: None, announcement: None, rows_per_pass: None,
             refinement: None, training_mode: crate::tct::TrainingMode::Sbd }
@@ -563,9 +561,9 @@ impl Config {
                     "choose dependence or entropy announcements, not both");
             }
             if let Some(refinement) = &sbd.refinement {
-                ensure!(sbd.commit_count.is_none() && sbd.commitment.is_none()
-                    && sbd.dependence_threshold.is_none() && sbd.entropy_threshold.is_none(),
-                    "refinement does not use SBD commit rules; omit commit_count, commitment, dependence_threshold and entropy_threshold");
+                ensure!(sbd.commit_count.is_none() && sbd.commitment.is_none() && sbd.dependence_threshold.is_none()
+                    && sbd.entropy_threshold.is_none_or(|gamma|gamma==0.1),
+                    "refinement does not use SBD commit rules; leave the plain default or omit it");
                 ensure!(sbd.block_lengths.iter().all(|&n| n <= 16),
                     "remasking supports block lengths at most 16");
                 ensure!(sbd.feedback == SbdFeedback::SoftFeedback && !self.hard_mask_only,
@@ -591,14 +589,13 @@ impl Config {
                 "sbd.noisy_read_backend=fused_gpu requires explicit non-fusion GPU execution, key32/value64, chunk/query count <=16 and capacity <=64"
             );
             if let Some(cocommit) = &sbd.cocommit {
+                ensure!(sbd.commit_count.is_none() && sbd.commitment.is_none() && sbd.dependence_threshold.is_none()
+                    && sbd.entropy_threshold.is_none_or(|gamma|gamma==0.1),
+                    "CoCommit uses confidence bundles, not SBD commit rules");
                 ensure!((1..=self.layers).contains(&cocommit.tail_layers),
                     "sbd.cocommit.tail_layers must be within 1..=layers");
                 ensure!(cocommit.training_bundle_max > 0,
                     "sbd.cocommit.training_bundle_max must be positive");
-                ensure!(!sbd.joint_output.is_codpula() || cocommit.visible_loss_weight.is_none(),
-                    "Codpula ignores sbd.cocommit.visible_loss_weight; omit it");
-                ensure!(cocommit.visible_loss_weight.is_none_or(|weight| weight.is_finite() && weight >= 0.0),
-                    "sbd.cocommit.visible_loss_weight must be finite and nonnegative");
                 ensure!(sbd.in_block_reads == delta_mixers::sbd::InBlockReads::HolaRead,
                     "sbd.cocommit requires in_block_reads=hola_read");
                 ensure!(self.cache_capacity > 0 && self.arms.iter().all(|arm| arm.cache != "none"),
@@ -1399,12 +1396,12 @@ mod tests {
     fn in_block_read_default_identity_and_hola_requirement() {
         let mut c = Config {task:"lm".into(),sbd:Some(SbdConfig::default()),..Config::default()};
         let omitted = serde_json::to_value(&c).unwrap();
-        assert!(omitted["sbd"].get("in_block_reads").is_none());
+        assert_eq!(omitted["sbd"]["in_block_reads"],"hola_read");
         assert!(omitted["sbd"].get("noisy_read_backend").is_none());
         let old_training = c.training_fingerprint(c.train_tokens).unwrap();
         let old_pilot = c.pilot_fingerprint().unwrap();
         let mut explicit = omitted.clone();
-        explicit["sbd"]["in_block_reads"] = "none".into();
+        explicit["sbd"]["in_block_reads"] = "hola_read".into();
         explicit["sbd"]["noisy_read_backend"] = "tensor".into();
         let explicit: Config = serde_json::from_value(explicit).unwrap();
         assert_eq!(serde_json::to_value(&explicit).unwrap(),omitted);
@@ -1598,11 +1595,9 @@ mod tests {
             let invalid: Config = serde_json::from_value(encoded).unwrap();
             assert!(invalid.validate().unwrap_err().to_string().contains("commit rules"),"{key}");
         }
-        let mut invalid = ordinary.clone();
-        invalid.sbd.as_mut().unwrap().cocommit.as_mut().unwrap().visible_loss_weight = Some(0.2);
-        assert!(invalid.validate().unwrap_err().to_string().contains("visible_loss_weight"));
-        invalid.sbd.as_mut().unwrap().joint_output = SbdJointOutput::Factorized;
-        invalid.validate().unwrap();
+        let mut invalid=serde_json::to_value(&ordinary).unwrap();
+        invalid["sbd"]["cocommit"]["visible_loss_weight"]=0.2.into();
+        assert!(serde_json::from_value::<Config>(invalid).unwrap_err().to_string().contains("visible_loss_weight"));
         let mut encoded = serde_json::to_value(&ordinary).unwrap();
         encoded["sbd"]["cocommit"]["rounds"] = 1.into();
         assert!(serde_json::from_value::<Config>(encoded).unwrap_err().to_string().contains("rounds"));
@@ -1610,7 +1605,7 @@ mod tests {
             let mut invalid = ordinary.clone();
             invalid.sbd.as_mut().unwrap().joint_output = output;
             invalid.soft_temperature = 0.8;
-            assert!(invalid.validate().unwrap_err().to_string().contains("soft_temperature=1"));
+            invalid.validate().unwrap();
         }
         let mut trajectory = refined;
         trajectory.sbd.as_mut().unwrap().training_mode = crate::tct::TrainingMode::Tct;

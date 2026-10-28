@@ -189,8 +189,8 @@ fn retrieval_case(device: &Device, with_moba: bool, doubled: bool) -> Result<Val
         let selected=Tensor::<2,Bool>::from_data([[true,false,true,false,true,false,true,false]],target);
         let (circuit_a,observed_a)=sbd::prepare_distribution(model,a,soft,1.0)?;
         let (circuit_b,observed_b)=sbd::prepare_distribution(model,b,soft,1.0)?;
-        let loss=circuit_a.conditional_nll(clean.clone(),observed_a,8.0)?.loss
-            +circuit_b.event_nll(clean,observed_b,selected,8.0)?.loss;
+        let loss=circuit_a.marginal_ce(clean.clone(),clean.clone(),observed_a,Tensor::ones([1,8],target),8.0)?.loss
+            +circuit_b.marginal_ce(clean.clone(),clean,observed_b,selected.float(),8.0)?.loss;
         let value=model::scalar(loss.clone())? as f32;
         let unused=model::unused_soft_parameters();
         let (checked,_) = model::checked_gradients_with_unused(model,loss,&unused,&mut Unprofiled)?;
@@ -201,7 +201,7 @@ fn retrieval_case(device: &Device, with_moba: bool, doubled: bool) -> Result<Val
     let (gpu_loss,gpu_gradient)=normalized(&gpu_model,&gpu_soft,&gpu)?;
     let gradients=json!({"loss":compare(&[gpu_loss],&[cpu_loss])?,
         "all_neural_and_circuit_gradients":compare_parameter_gradients(&gpu_gradient,&cpu_gradient).context("contextual CoCommit normalized event objective all gradients")?,
-        "objective":"unscaled sum of contextual A conditional NLL over all eight free positions and B marked-subset event NLL, each normalized by eight valid prediction positions",
+        "objective":"sum of A marginal token CE on all eight free positions and B marginal token CE on announced positions, normalized by eight",
         "same_prefix_length":219,"same_active_length":8,"same_parameters":true});
     let outputs=json!({
         "A_logits":compare(&values(gpu_a.logits),&values(cpu_a.logits)).context("contextual CPU/Vulkan A")?,
@@ -220,10 +220,10 @@ fn retrieval_case(device: &Device, with_moba: bool, doubled: bool) -> Result<Val
     let gpu_single=sbd::state(&gpu_cfg,vec![None],&gpu)?;
     let cpu_singleton=block_forward(&cpu_model,&prefix,&cpu_single,false,&cpu);
     let gpu_singleton=block_forward(&gpu_model,&prefix,&gpu_single,false,&gpu);
-    let cpu_causal=cpu_model.forward_output_profiled(&sbd::prefix_batch(&prefix,&cpu),&mut Unprofiled)
-        .slice_positions(prefix.len()-1,1);
-    let gpu_causal=gpu_model.forward_output_profiled(&sbd::prefix_batch(&prefix,&gpu),&mut Unprofiled)
-        .slice_positions(prefix.len()-1,1);
+    let cpu_single_cache=crate::cocommit::prepare_clean_cache(&cpu_model,&prefix,&cpu);
+    let cpu_causal=cpu_model.cached_block(&cpu_single_cache,0,&cpu_single,false);
+    let gpu_single_cache=crate::cocommit::prepare_clean_cache(&gpu_model,&prefix,&gpu);
+    let gpu_causal=gpu_model.cached_block(&gpu_single_cache,0,&gpu_single,false);
     let singleton=json!({
         "CPU":compare(&values(cpu_singleton.logits),&values(cpu_causal.logits))?,
         "Vulkan":compare(&values(gpu_singleton.logits),&values(gpu_causal.logits))?
@@ -236,7 +236,7 @@ fn retrieval_case(device: &Device, with_moba: bool, doubled: bool) -> Result<Val
         "execution":if doubled {"Doubled"} else {"Separate"},
         "tail_execution":"two C-row tails share clean banks",
         "reconstruction":reconstruction,"per_block_vs_batched":batching,"CPU_vs_Vulkan_outputs":outputs,
-        "contextual_visibility_O_padding_leakage":visibility,"L1_causal_bypass":singleton,
+        "contextual_visibility_O_padding_leakage":visibility,"L1_noisy_cache_reconstruction":singleton,
         "CPU_vs_Vulkan_all_neural_and_circuit_gradients":gradients,
         "known_negative_evidence":{"artifacts":["artifacts/cocommit/retrieval-gradient-failure.json","artifacts/cocommit/plain-sbd-retrieval-gradient-stress.json"],
             "documentation":"docs/remasking.md §15","objective":"artificial squared-loss diagnostic; not executed by this acceptance route"}}))
@@ -467,14 +467,14 @@ fn model_case(c: &Config, device: &Device, ohc: bool, codpula: bool) -> Result<V
         let (circuit_b,observed_b)=sbd::prepare_distribution(&requested,output(&shared_b),&soft,1.0)?;
         let clean=Tensor::<2,Int>::from_data([[3i32,19,41,7]],target);
         let targets=Tensor::<2,Bool>::from_data([[true,false,true,false]],target);
-        let full_a=circuit_a.conditional_nll(clean.clone(),observed_a.clone(),1.0)?;
-        let fresh_b=circuit_b.event_nll(clean.clone(),observed_b.clone(),targets.clone(),1.0)?;
-        let stale_b=circuit_a.event_nll(clean.clone(),observed_a,targets,1.0)?;
+        let full_a=circuit_a.marginal_ce(clean.clone(),clean.clone(),observed_a.clone(),Tensor::ones([1,4],target),1.0)?;
+        let fresh_b=circuit_b.marginal_ce(clean.clone(),clean.clone(),observed_b.clone(),targets.clone().float(),1.0)?;
+        let stale_b=circuit_a.marginal_ce(clean.clone(),clean,observed_a,targets.float(),1.0)?;
         let fresh_loss=model::scalar(fresh_b.loss)?;
         let stale_loss=model::scalar(stale_b.loss)?;
         ensure!((fresh_loss-stale_loss).abs()>1e-8,"fresh marked circuit did not discriminate from stale A circuit");
-        Ok::<Value,anyhow::Error>(json!({"passed":true,"fresh_marked_subset_event_loss":fresh_loss,
-            "stale_circuit_subset_event_loss":stale_loss,"unmarked_full_event_loss":model::scalar(full_a.loss)?,
+        Ok::<Value,anyhow::Error>(json!({"passed":true,"fresh_marked_subset_marginal_ce":fresh_loss,
+            "stale_circuit_subset_marginal_ce":stale_loss,"unmarked_full_marginal_ce":model::scalar(full_a.loss)?,
             "fresh_circuit_discriminates":true,"unselected_unresolved_positions_marginalized":true}))
     } else { Ok(json!({"passed":true,"not_applicable":true})) }?;
     let shared_reuse=json!({
@@ -529,7 +529,8 @@ fn model_case(c: &Config, device: &Device, ohc: bool, codpula: bool) -> Result<V
         "requires_grad":false
     });
     let teacher = tracked_teacher.detach();
-    soft_feedback.update(teacher.logits.reshape([4,cfg.vocab()]),cfg.soft_temperature,cfg.sbd.as_ref().unwrap().candidate_width,requested.soft_confidence.as_ref().unwrap())?;
+    let confidence=crate::soft::SoftConfidence::new(target);
+    soft_feedback.update(teacher.logits.reshape([4,cfg.vocab()]),cfg.soft_temperature,cfg.sbd.as_ref().unwrap().candidate_width,&confidence)?;
     let soft_a = crate::cocommit::reconstruct_output(&requested,prefix,&soft_feedback,false,None,target);
     let soft_b = crate::cocommit::reconstruct_output(&requested,prefix,&soft_feedback,false,Some(Tensor::<2>::zeros([1,4],target)),target);
     let soft_equivalence = compare(&values(soft_a.logits),&values(soft_b.logits)).context("soft-feedback zero marker")?;
@@ -538,7 +539,7 @@ fn model_case(c: &Config, device: &Device, ohc: bool, codpula: bool) -> Result<V
     cpu_legacy.cocommit_marker=None;
     let cpu_logits=values(block_forward(&cpu_legacy,prefix,&cpu_soft,true,&cpu).logits);
     let cpu_vs_requested=compare(&legacy_logits,&cpu_logits).context("CPU versus requested-device legacy block")?;
-    // A real one-position state must retain the historical causal bypass.
+    // A singleton consumes its noisy input just like every other active block.
     let singleton = sbd::state(&cfg,vec![None],target)?;
     let singleton_full = block_forward(&requested,prefix,&singleton,true,target);
     ensure!(singleton_full.logits.dims()[1] == 1, "singleton bypass produced incorrect length");
@@ -546,9 +547,9 @@ fn model_case(c: &Config, device: &Device, ohc: bool, codpula: bool) -> Result<V
     let disabled_logits=values(block_forward(&disabled,prefix,&disabled_state,true,&cpu).logits);
     let disabled_equivalence=compare(&disabled_logits,&cpu_logits).context("CoCommit-disabled model compatibility")?;
     let legacy_singleton=values(block_forward(&legacy_model,prefix,&singleton,true,target).logits);
-    let causal_singleton=values(legacy_model.forward_output_profiled(&crate::sbd::prefix_batch(prefix,target),&mut Unprofiled)
-        .slice_positions(prefix.len()-1,1).logits);
-    let singleton_bypass=compare(&legacy_singleton,&causal_singleton).context("exact L1 causal bypass")?;
+    let singleton_cache=crate::cocommit::prepare_clean_cache(&legacy_model,prefix,target);
+    let causal_singleton=values(legacy_model.cached_block(&singleton_cache,0,&singleton,true).logits);
+    let singleton_bypass=compare(&legacy_singleton,&causal_singleton).context("L1 noisy cached versus reconstruction")?;
     Ok(json!({"passed":true,"ohc_streams":ohc,"device":crate::runtime::identity(target),
         "reconstruction_vs_legacy":baseline,"cpu_vs_requested_device":cpu_vs_requested,
         "zero_marker_a_b":zero_equivalence,"soft_feedback_zero_marker":soft_equivalence,
@@ -557,7 +558,7 @@ fn model_case(c: &Config, device: &Device, ohc: bool, codpula: bool) -> Result<V
         "shared_clean_cache_repeat":cache_repeat,"shared_prefix_reuse":shared_reuse,"per_block_vs_batched":batch_execution,
         "combined_fresh_circuit_subset_event":circuit_check,
         "disabled_model_equivalence":disabled_equivalence,"disabled_parameter_initialization_identical":true,
-        "singleton_causal_bypass":singleton_bypass}))
+        "singleton_noisy_cache_reconstruction":singleton_bypass}))
 }
 
 const ABS_TOL: f64 = 2.0e-5;
@@ -773,7 +774,7 @@ pub fn run(c: &Config, device: &Device) -> Result<Value> {
         "omitted_cocommit_selector":omitted_selector,"full_training_equivalence":training_cases,
         "full_vs_row_accumulation":row_accumulation,
         "coverage":{"cached_and_reconstructed_tail":true,"zero_marker_a_b_equivalence":true,
-            "nonzero_marker_effect":true,"length_one_causal_bypass":true,"soft_hard_feedback":true,
+            "nonzero_marker_effect":true,"length_one_noisy_path":true,"soft_hard_feedback":true,
             "per_block_vs_batched":true,"contextual_D256_CPU_Vulkan_profiles":contextual_profiles.is_some(),"contextual_event_and_circuit_gradients":contextual_profiles.is_some(),
             "full_vs_row_accumulation_all_four_objectives":true,
             "checkpoint_marker_and_adamw_continuation":true,"disabled_initialization_and_identity":"disabled-model numerical equivalence exercised"}}))
@@ -799,23 +800,17 @@ fn omitted_selector_check()->Result<Value> {
     let explicit:Config=serde_json::from_value(explicit)?;
     ensure!(serde_json::to_value(&explicit)?==encoded,"explicit null CoCommit changed historical serialization");
     let tokens=2048;
-    let historical=crate::data::hash(&serde_json::to_vec(&(&cfg,tokens,"sbd-recurrence-only-v1"))?);
-    ensure!(cfg.training_fingerprint(tokens)?==historical && explicit.training_fingerprint(tokens)?==historical,
-        "omitted CoCommit changed historical SBD training fingerprint");
-    let historical_pilot=json!({"config":cfg,"precision":"float32","training_algorithm":cfg.scan_backend.training_algorithm(),
-        "optimizer":"AdamW","sbd_model_revision":"sbd-recurrence-only-v1"});
-    let pilot_hash=crate::data::hash(&serde_json::to_vec(&historical_pilot)?);
-    ensure!(cfg.pilot_fingerprint()?==pilot_hash && explicit.pilot_fingerprint()?==pilot_hash,
-        "omitted CoCommit changed historical SBD pilot fingerprint");
-    let mut causal=cfg.clone();causal.sbd=None;
-    let causal_hash=crate::data::hash(&serde_json::to_vec(&(&causal,tokens))?);
-    ensure!(causal.training_fingerprint(tokens)?==causal_hash,"CoCommit changed historical causal fingerprint");
+    let training=cfg.training_fingerprint(tokens)?;
+    let pilot=cfg.pilot_fingerprint()?;
+    ensure!(explicit.training_fingerprint(tokens)?==training && explicit.pilot_fingerprint()?==pilot,
+        "explicit null changed omitted CoCommit identity");
+    let old=crate::data::hash(&serde_json::to_vec(&(&cfg,tokens,"sbd-recurrence-only-v1"))?);
+    ensure!(training!=old,"paper objective cutover retained obsolete SBD identity");
     let mut enabled=cfg.clone();enabled.sbd.as_mut().unwrap().cocommit=Some(CocommitConfig::default());
-    ensure!(enabled.training_fingerprint(tokens)?!=historical && enabled.pilot_fingerprint()?!=pilot_hash,
-        "enabled CoCommit has no distinct model identity");
+    ensure!(enabled.training_fingerprint(tokens)?!=training && enabled.pilot_fingerprint()?!=pilot,
+        "enabled CoCommit has no distinct identity");
     Ok(json!({"passed":true,"serialization_identical":true,"explicit_null_identical":true,
-        "historical_sbd_training_sha256":historical,"historical_sbd_pilot_sha256":pilot_hash,
-        "historical_causal_training_sha256":causal_hash,"enabled_identity_distinct":true}))
+        "obsolete_sbd_identity_rejected":true,"enabled_identity_distinct":true}))
 }
 
 fn training_equivalence(c:&Config,device:&Device)->Result<Value> {

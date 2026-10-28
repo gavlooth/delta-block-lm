@@ -312,14 +312,19 @@ Current relevant sources:
 
 The feedback quantity for a joint-trained denoiser is its **conditional token marginals**, not independent softmaxes of its raw token potentials. The existing feedback mechanism remains sparse even though circuit inference uses full support.
 
-For an unresolved active position, let `p_i(v)=p(X_i=v|observed block evidence)` from the teacher circuit. After any approved feedback-temperature operation, retain the top-k IDs and their **original probability weights**, not weights renormalized to sum to one. With retained mass `m_i=sum_{v in topk}p_i(v)` and visibility `r_i`, the existing embedding rule is
-
-\[
-E_i=r_i\sum_{v\in\operatorname{topk}}p_i(v)\operatorname{embed}(v)
-       +(1-r_i m_i)\operatorname{mask\_embed}.
-\]
-
-For training, the first pass and its marginal probabilities are detached. Its update uses interpolation coefficient one, and increases unresolved visibility by `1/soft_steps`, capped at one. Discrete IDs remain discrete; the selected embedding table values in the student pass remain differentiable. The student backbone produces **new** potentials and gates; the teacher circuit is not reused as the student's output. Train on the student's conditional joint NLL. Hard-mask training skips the detached teacher exactly as now.
+For an unresolved active position, let `p_i(v)` be its conditional circuit
+marginal. Apply configured positive inference temperature once to neural token
+potentials **before** local leaf normalization. Marginals already include that
+temperature; pass `log(p_i)` to feedback with temperature one, never temper them
+again. Keep latest top-k IDs with weights renormalized to sum to one. The
+embedding is `lambda_i * sum_v topk_weight_i(v) embed(v) +
+(1-lambda_i) * mask_embed`, where the learned coefficient uses negative entropy.
+Soft feedback detaches the probability calculation while retaining live
+confidence-head and selected embedding gradients. Binary ordinary-training
+draws skip the optional feedback teacher. See the current [SBD](sbd.md) contract
+for the pre-teacher draw. CoCommit additionally uses required detached own-draft
+corruption; its and TCT's objectives are weighted marginal token CE, not this
+standalone module's conditional joint NLL.
 
 At generation, each pass similarly uses full joint marginals for the soft belief update; committed tokens become immutable observations, while deferred positions retain soft beliefs and do not become hard evidence. The categorical proposal selected for a commitment is separate from its marginal feedback distribution. Append/replay the completed block into clean recurrence only after all positions are committed, as now. A partially visible soft embedding does **not** imply a fractional observed token in `Z_e`: only explicit observations supply evidence indicators. Conditioning the circuit a second time on its own soft beliefs would define another model and is not implied by this mapping.
 

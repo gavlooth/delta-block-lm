@@ -1,5 +1,70 @@
 # Step 11: stochastic remasking inside the active block
 
+## Current paper contract (2026-10-28)
+
+[R²D Algorithm 1 and TCT Eq. (2)/Algorithm 2](https://arxiv.org/html/2610.30744)
+use greedy denoiser predictions. Circuit-backed R²D and TCT now use argmax and
+maximum probability from the **same conditional marginal row**. They no longer
+reveal an FFBS-sampled token under a different token's maximum confidence.
+Standalone Codpula sampling remains available for its own algorithm.
+
+R²D still runs at inference. TCT is training only; it does not replace inference
+with confidence-only selection. The fixed-cardinality remasking support includes
+every valid nonpermanent position in the active block, including earlier reveals.
+The descending count schedule, uniform reference, learned set-energy distribution
+and epsilon=0.1 uniform mixture are unchanged. Completed prefix and prompt remain
+immutable; every noisy attempt uses frozen clean snapshots and only finalized
+tokens enter causal replay.
+
+CoCommit marks only currently masked S, using confidence >0.7 and most-confident
+fallback. Greedy A proposals remain outside S; B proposals apply on S and the
+paper's separate visible-edit positions. Feedback, features, proposal confidence
+and generated-token scoring use that same branch at each position. No full-row B
+masked writes or visible-token announcements remain. Current-block visible edits
+can settle without reopening a completed block.
+
+TCT A correction is token CE on all mutable positions, including wrong reveals:
+token losses sum within a chain and average over the **full logical batch's
+chain count**, not B*T. Row accumulation uses that same denominator through every
+pass, including short final passes. A separate clean causal SBD term remains.
+When CoCommit is enabled, B adds a named auxiliary coordination CE on masked S
+and visible mutable positions; it is not presented as TCT Eq. (2) alone. Circuit
+CE uses conditional marginals and weighted nonzero manual probability flows,
+while standalone Codpula retains its joint objective.
+
+Soft feedback uses latest normalized top-k predictions and a learned entropy
+coefficient, retained across remasking. TCT checkpoints store detached entropy
+and prediction availability and reconstruct the live coefficient at each student
+input. Provisional hard embeddings are temporary and never permanent circuit
+evidence. The old `soft_eta`/`soft_steps` schedule is removed.
+
+Warm-starting TCT retains source optimizer moments, resolved schedule horizon and
+global learning-rate clock. The new target budget limits additional TCT updates;
+it does not retime the source cosine schedule. Continuation metadata stores the
+source schedule and optimizer-start offset, and resume checks
+`completed_steps = optimizer_start_step + chain_steps`. At the source horizon the
+published floor remains in effect. Other optimizer recipe mismatches still
+reject the checkpoint; no moment-reset or new-schedule option is inferred.
+
+Energy collection endpoints use **O-only denoiser reconstruction marginal CE**,
+with provisional neural inputs and per-position A/B probabilities. This is a
+finite reconstruction surrogate, not the likelihood of a deterministic/carry
+write event and not a single circuit joint-event likelihood. Both forks use the
+same scorer; targets enter only the CE gather. Feature/scorer version
+`remask-2d12-greedy-marginal-v2` rejects old collected labels and fitted energies.
+Actual generated-token validation remains separate.
+
+No worker tests/builds/formatting or quality runs were executed for this change.
+The integrator owns final reference, restart and CLI acceptance.
+
+## Historical design and execution record
+
+The following sections preserve prior decisions and measured/failed runs.
+Descriptions of FFBS R²D/TCT proposals, token-mean correction, full-row B output,
+visible announcements, joint-event endpoint labels or scheduled feedback weights
+describe the earlier implementation, not the current contract above.
+
+
 ## Status, scope and sources
 
 **Standalone profile implemented, 2026-10-25.** R²D, stochastic mask-set energy training and TCT are implemented behind explicit selectors. Section9 records the decisions; section14 records standalone numerical gates, command smokes and costs in `artifacts/remasking/`. Composition with contextual Codpula and CoCommit was published on main as `9e67b7ac` with partial acceptance. Its actual collection failed, and fitting/guided/TCT CLI/B8 checks were not executed; see [RESULTS: integrated11 publication checkpoint](../RESULTS.md#integrated11-publication-checkpoint) and `artifacts/integrated11/commands/`. Earlier arithmetic estimates are not measurements.

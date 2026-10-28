@@ -154,6 +154,9 @@ impl NeuralOptimizer {
     }
     pub fn completed_steps(&self) -> usize { self.completed_steps }
     pub fn schedule_steps(&self) -> usize { self.recipe.steps }
+    pub fn configuration(&self) -> serde_json::Value {
+        serde_json::to_value(&self.recipe).expect("serializable optimizer recipe")
+    }
     pub fn step<M: Module>(&mut self, peak: f64, model: M, mut gradients: GradientsParams) -> M {
         global_clip(&model, &mut gradients, self.recipe.clip, self.fused)
             .expect("finite neural gradients required before optimizer update");
