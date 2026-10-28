@@ -192,6 +192,11 @@ reads/writes, including cached per-block/batched calls and the marked CoCommit
 tail. CPU regression compares outputs and parameter VJPs with the pre-refactor
 residual equations on both stream layouts; this is not a performance claim.
 
+Plain SBD generation prepares the same clean-prefix cache used by training and
+reuses `cached_block` for every denoising assignment. The length-one causal
+special case is unchanged. The reconstructed `forward_sbd` path remains a
+diagnostic comparison, not the multi-token generation implementation.
+
 ## Verification after attention removal
 
 The Vulkan-enabled workspace build and 44 experiment + 7 kernel + 16 mixer tests passed; one GPU-only test was ignored. The CPU `sbd-reference` executable passed the retained model checks at unchanged tolerances: `artifacts/step8/no-block-attention-cpu/sbd-reference.json`. Compatibility tests reject historical dense-attention SBD checkpoint identities while preserving omitted-SBD fingerprints. No GPU benchmark or training study was run for this removal.
