@@ -19,9 +19,15 @@ fn compare(actual: &[f32], reference: &[f32]) -> Result<Value> {
     crate::sbd::compare(actual, &reference.iter().map(|&x| f64::from(x)).collect::<Vec<_>>())
 }
 
-fn gradient_snapshot(model: &LanguageModel, loss: Tensor<1>) -> Result<ParameterSnapshot> {
-    let gradients = model::checked_gradients(model, loss)?;
-    parameters(model, Some(&gradients))
+fn gradient_snapshot(model: &LanguageModel, loss: Tensor<1>, noisy: bool) -> Result<ParameterSnapshot> {
+    let unused = model::unused_denoising_parameters(noisy, false);
+    let (gradients, report) = model::checked_gradients_with_unused(model, loss, &unused, &mut delta_mixers::profile::Unprofiled)?;
+    let mut visited = model.clone();
+    if !noisy {
+        ensure!(report.get("sbd_mask").is_some_and(|count| count.missing_steps == 1), "causal draw fabricated a mask gradient");
+        visited.sbd_mask = None;
+    }
+    parameters(&visited, Some(&gradients))
 }
 
 fn compare_gradients(actual: &ParameterSnapshot, reference: &ParameterSnapshot) -> Result<Value> {
@@ -224,7 +230,7 @@ enum CausalExpectation { None, AllObserved, LengthOne }
 
 fn causal_objective(model: &LanguageModel, c: &Config, rows: &[Example], batch: &Batch, blocks: &[TrainingBlock]) -> Result<(Tensor<1>, Vec<Value>)> {
     let logits = model.forward(batch);
-    let mut loss = model.loss(logits.clone(), batch) + model.sbd_mask.as_ref().unwrap().val().sum() * 0.0;
+    let mut loss = model.loss(logits.clone(), batch);
     let device = batch.input.device();
     let mut logits_reports = Vec::with_capacity(blocks.len());
     for block in blocks {
@@ -249,12 +255,13 @@ fn loss_case(model: &LanguageModel, c: &Config, rows: &[Example], seed: u64, blo
     per_block.sbd.as_mut().unwrap().block_execution = SbdBlockExecution::PerBlock;
     let mut batched = per_block.clone();
     batched.sbd.as_mut().unwrap().block_execution = SbdBlockExecution::Batched;
+    let noisy = blocks.iter().any(|block| block.masked.len() > 1);
     let reference_loss = crate::sbd::training_loss(model, &per_block, rows, &batch, seed)?.loss;
     let reference_value = values(reference_loss.clone());
-    let reference_gradients = gradient_snapshot(model, reference_loss)?;
+    let reference_gradients = gradient_snapshot(model, reference_loss, noisy)?;
     let actual_loss = crate::sbd::training_loss(model, &batched, rows, &batch, seed)?.loss;
     let actual_value = values(actual_loss.clone());
-    let actual_gradients = gradient_snapshot(model, actual_loss)?;
+    let actual_gradients = gradient_snapshot(model, actual_loss, noisy)?;
     let loss_report = compare(&actual_value, &reference_value).context("batched SBD total training loss")?;
     let gradient_report = compare_gradients(&actual_gradients, &reference_gradients)?;
     let causal = match expectation {
@@ -265,7 +272,7 @@ fn loss_case(model: &LanguageModel, c: &Config, rows: &[Example], seed: u64, blo
             }
             let (expected_loss, logits_reports) = causal_objective(model, c, rows, &batch, blocks)?;
             let expected_value = values(expected_loss.clone());
-            let expected_gradients = gradient_snapshot(model, expected_loss)?;
+            let expected_gradients = gradient_snapshot(model, expected_loss, false)?;
             let bit_identical = reference_value.iter().zip(&actual_value).zip(&expected_value).all(|((&a, &b), &e)| a.to_bits() == b.to_bits() && a.to_bits() == e.to_bits());
             if matches!(expectation, CausalExpectation::AllObserved) {
                 ensure!(bit_identical, "all-observed loss must be exactly clean NTP in both execution modes");

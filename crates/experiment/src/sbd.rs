@@ -107,6 +107,7 @@ pub(super) fn prepare_training_feedback(model: &LanguageModel, c: &Config, teach
 pub struct SbdTrainingResult {
     pub loss: Tensor<1>,
     pub circuit_flows: Option<CircuitFlows>,
+    pub(crate) unused_parameters: Vec<&'static str>,
 }
 impl SbdTrainingResult {
     pub(super) fn add_circuit_loss(&mut self, loss: crate::codpula::CircuitLoss) {
@@ -272,14 +273,9 @@ pub(crate) fn training_loss_sampled_profiled<P:delta_mixers::profile::Sections>(
     }
     let mut trace = crate::sbd_training::CleanInputs::default();
     let clean_logits = model.forward_profiled(batch,&mut trace);
-    let mut loss = model.loss(clean_logits.clone(), batch);
-    // In L=1 or an all-observed draw the mask has an exactly zero derivative.
-    loss = loss + model.sbd_mask.as_ref().unwrap().val().sum() * 0.0;
-    if let Some(circuit) = &model.codpula {
-        loss = loss + circuit.gate_head.weight.val().sum()*0.0;
-        if let Some(bias) = &circuit.gate_head.bias { loss = loss + bias.val().sum()*0.0; }
-    }
-    let result = SbdTrainingResult {loss,circuit_flows:None};
+    let loss = model.loss(clean_logits.clone(), batch);
+    let result = SbdTrainingResult {loss,circuit_flows:None,
+        unused_parameters: model::unused_denoising_parameters(blocks.iter().any(|b| b.masked.len() > 1), false)};
     match s.block_execution {
         SbdBlockExecution::PerBlock => training_loss_per_block(model,c,rows,clean_logits,&trace,blocks,result,profile),
         SbdBlockExecution::Batched => training_loss_batched(model,c,rows,clean_logits,&trace,blocks,result,profile),
@@ -738,10 +734,9 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
                 let snapshot = tested.training_cache(&trace,0,&[1,9,17,prefix.len()]);
                 let cached = tested.cached_block(&snapshot,3,&soft_gpu,false).logits;
                 let cached_report = compare(&values(cached.clone()),&values(actual_logits.clone()).iter().map(|&x|x as f64).collect::<Vec<_>>())?;
-                let objective = |model: &LanguageModel, logits: Tensor<3>| logits.square().mean() + model.sbd_mask.as_ref().unwrap().val().sum()*0.0;
-                let ref_grads = model::checked_gradients(&base,objective(&base,ref_logits))?;
-                let actual_grads = model::checked_gradients(&tested,objective(&tested,actual_logits))?;
-                let cached_grads = model::checked_gradients(&tested,objective(&tested,cached))?;
+                let ref_grads = model::checked_gradients(&base,ref_logits.square().mean())?;
+                let actual_grads = model::checked_gradients(&tested,actual_logits.square().mean())?;
+                let cached_grads = model::checked_gradients(&tested,cached.square().mean())?;
                 let cached_gradient_error = crate::kron_benchmark::compare_parameters("cached vs reconstructed SBD gradients",
                     &crate::kron_benchmark::parameters(&tested,Some(&cached_grads))?,
                     &crate::kron_benchmark::parameters(&tested,Some(&actual_grads))?)?;

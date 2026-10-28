@@ -49,6 +49,7 @@ struct Parameters<'a> {
     gradients: Option<&'a GradientsParams>,
     snapshot: Snapshot,
     errors: Vec<String>,
+    unused: Vec<String>,
 }
 impl ModuleVisitor for Parameters<'_> {
     fn enter_module(&mut self, name: &str, _: &str) { self.path.push(name.to_owned()); }
@@ -65,6 +66,7 @@ impl ModuleVisitor for Parameters<'_> {
                 }
                 match gradient {
                     Some(value) => value,
+                    None if self.unused.contains(&name) => return,
                     None => { self.errors.push(format!("missing neural gradient {name}")); return; }
                 }
             }
@@ -76,7 +78,11 @@ impl ModuleVisitor for Parameters<'_> {
     }
 }
 fn snapshot(model: &impl Module, gradients: Option<&GradientsParams>) -> Result<Snapshot> {
-    let mut visitor = Parameters { path: Vec::new(), gradients, snapshot: BTreeMap::new(), errors: Vec::new() };
+    snapshot_with_unused(model, gradients, &[])
+}
+fn snapshot_with_unused(model: &impl Module, gradients: Option<&GradientsParams>, unused: &[&str]) -> Result<Snapshot> {
+    let mut visitor = Parameters { path: Vec::new(), gradients, snapshot: BTreeMap::new(), errors: Vec::new(),
+        unused: unused.iter().map(|name| (*name).to_owned()).collect() };
     model.visit(&mut visitor);
     ensure!(visitor.errors.is_empty(), "{}", visitor.errors.join("; "));
     ensure!(!visitor.snapshot.is_empty(), "empty model parameter snapshot");
@@ -662,8 +668,10 @@ fn training_paths(model: &LanguageModel, cfg: &Config, device: &Device) -> Resul
     causal.codpula = None;
     let baseline = sbd::training_loss(&causal,&factorized,&examples,&batch,1)?;
     let singleton_loss = identical(&values(result.loss.clone()),&values(baseline.loss.clone()),"L1 joint/factorized loss")?;
-    let singleton_gradients = snapshot(model,Some(&model::checked_gradients(model,result.loss)?))?;
-    let singleton_common_gradients = compare_snapshots(&common(&singleton_gradients),&snapshot(&causal,Some(&model::checked_gradients(&causal,baseline.loss)?))?,true)?;
+    let (singleton_grads, _) = model::checked_gradients_with_unused(model,result.loss,&result.unused_parameters,&mut delta_mixers::profile::Unprofiled)?;
+    let singleton_gradients = snapshot_with_unused(model,Some(&singleton_grads),&result.unused_parameters)?;
+    let (baseline_grads, _) = model::checked_gradients_with_unused(&causal,baseline.loss,&baseline.unused_parameters,&mut delta_mixers::profile::Unprofiled)?;
+    let singleton_common_gradients = compare_snapshots(&common(&singleton_gradients),&snapshot_with_unused(&causal,Some(&baseline_grads),&baseline.unused_parameters)?,true)?;
     for (name,gradient) in &singleton_gradients {
         if name.split('.').any(|part|part == "codpula") { ensure!(gradient.values.iter().all(|&x|x == 0.0),"L1 bypass trains context head {name}"); }
     }
@@ -676,8 +684,10 @@ fn training_paths(model: &LanguageModel, cfg: &Config, device: &Device) -> Resul
     ensure!(result.circuit_flows.is_none(), "all-observed draw produces circuit updates");
     let clean = model.loss(model.forward(&batch),&batch);
     let clean_report = identical(&values(result.loss.clone()),&values(clean),"all-observed training loss is not causal loss")?;
-    let _ = snapshot(model,Some(&model::checked_gradients(model,result.loss)?))?;
-    Ok(json!({"passed":true,"mixed_mask_seed":mixed_seed,"sampled_blocks":sbd::sample_training_blocks(cfg,&examples,mixed_seed)?.iter().map(|block|json!({"row":block.row,"start":block.start,"length":block.length,"masked":block.masked})).collect::<Vec<_>>(),"execution_paths":reports,"fractional_weight_rejection":error.to_string(),"length_one_no_circuit_update":true,"length_one_factorized_loss":singleton_loss,"length_one_factorized_common_gradients":singleton_common_gradients,"length_one_head_gradients_exact_zero":true,"all_observed_seed":seed,"all_observed_loss":clean_report,"bypass_neural_gradients_present_and_finite":true}))
+    let (gradients, report) = model::checked_gradients_with_unused(model,result.loss,&result.unused_parameters,&mut delta_mixers::profile::Unprofiled)?;
+    let _ = snapshot_with_unused(model,Some(&gradients),&result.unused_parameters)?;
+    ensure!(report.get("sbd_mask").is_some_and(|count| count.missing_steps == 1), "all-observed draw fabricated a mask gradient");
+    Ok(json!({"passed":true,"mixed_mask_seed":mixed_seed,"sampled_blocks":sbd::sample_training_blocks(cfg,&examples,mixed_seed)?.iter().map(|block|json!({"row":block.row,"start":block.start,"length":block.length,"masked":block.masked})).collect::<Vec<_>>(),"execution_paths":reports,"fractional_weight_rejection":error.to_string(),"length_one_no_circuit_update":true,"length_one_factorized_loss":singleton_loss,"length_one_factorized_common_gradients":singleton_common_gradients,"length_one_head_gradients_absent":true,"all_observed_seed":seed,"all_observed_loss":clean_report,"bypass_gradients_finite_except_named_unused_parameters":true}))
 }
 
 fn circuit_state(model: &LanguageModel) -> Result<Value> {

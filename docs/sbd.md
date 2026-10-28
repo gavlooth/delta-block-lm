@@ -14,6 +14,14 @@ The optional `sbd.cocommit` adds one learned marker over the full saved hidden r
 
 The optional execution setting `sbd.rows_per_pass` processes every full-batch row in explicit groups, sums scaled gradients and unscaled circuit flows/counts, then performs one clipping/AdamW/circuit update. Full-batch mask and CoCommit-bundle sampling occurs before partitioning. Omission preserves the historical one-pass path and serialization. The CoCommit B8 profile uses two four-row groups; this is exact gradient accumulation, not fewer examples or a hidden allocation fallback.
 
+Training reports `gradient_counts_this_invocation` per trainable parameter
+tensor: optimizer steps with nonzero squared gradient norm, zero norm, or no
+gradient. The last case is allowed only by an exact, draw-specific parameter
+list: `sbd_mask` and the Codpula gate head when no multi-token noisy block is
+scored, and `cocommit_marker` when no marked branch is used. Every other missing
+gradient still stops the update. No zero-weight parameter terms are inserted
+into losses, and these counts do not assert that every parameter learned.
+
 Enabled-SBD training and pilot fingerprints retain the semantic revision introduced after dense attention removal. Selecting `hola_read` additionally changes the serialized model identity; omitted/explicit `none` keeps the previous SBD identity. Old dense-SBD checkpoints remain incompatible. Configurations without `sbd` retain their hashes.
 
 The optional model selector `prefix_block_retrieval` extends HOLA's single
