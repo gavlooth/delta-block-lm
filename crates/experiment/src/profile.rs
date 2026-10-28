@@ -7,9 +7,10 @@ use crate::{
 use anyhow::{Result, ensure};
 use burn::{
     module::{ModuleVisitor, Param},
-    optim::{GradientsParams, ModuleOptimizer},
+    optim::GradientsParams,
     prelude::*,
 };
+use crate::update::NeuralOptimizer as ModuleOptimizer;
 use delta_mixers::profile::{Sections, Unprofiled};
 use serde_json::{Value, json};
 use std::{

@@ -4,7 +4,80 @@
 
 **Adopt `update_backend: "fused_gpu"` explicitly for the realistic B8/context512 pilot; keep `loss_backend: "tensor"` (or omit it).** The final isolated B8/context512 session saves31.005ms per paired complete step (1.739%;95% paired-median bootstrap interval22.088–49.058ms), while complete resident checks+clipping+AdamW falls35.122→13.685ms. Both fused loss designs pass correctness but fail the beyond-noise integrated-speed gate; the combined update+loss gain does not establish an independent loss benefit.
 
-Historical/default selectors, fingerprints, parameter layout and native optimizer-state layout remain unchanged. The suggested component budget before scaling is **15ms for complete checks/clipping/update at B8/context512 and the current2,379,568 parameters**, rather than assuming dispatch reduction equals model speedup. The short-context B8 timing anomaly below does not satisfy that budget and is not generalized into a stable speedup claim. Larger K/V widths, contexts beyond512 and other devices/dtypes are not certified by this evaluation.
+The measurements below are historical evidence for the former optimizer recipe, not acceptance evidence for the paper corrections described next. Tensor/moment parameter layout remains native, but optimizer recipe and global schedule-counter metadata are now required; regenerate budgets and start a fresh run. The historical component budget was **15ms for complete checks/clipping/update at B8/context512 and 2,379,568 parameters**. Its short-context anomaly does not establish a stable speedup.
+
+## Kron paper correction (2026-10-28)
+
+[KronLSTM Appendix A7](https://arxiv.org/html/2610.26834#A7) specifies AdamW
+betas `(0.9, 0.95)`, epsilon `1e-10`, decay `0.1`, global gradient-norm clipping
+at `1.0`, and a 10%-warmup cosine schedule ending at 0.1 times peak.
+The selected from-scratch neural model now uses those defaults in both native
+and fused updates. Existing explicit JSON learning rates and decay values remain
+overrides; `learning_rate` is the peak, not a constant step rate. The configurable
+fields are `optimizer_beta1`, `optimizer_beta2`, `optimizer_epsilon`,
+`warmup_fraction`, and `min_learning_rate_ratio`. Setting warmup to zero and the
+minimum ratio to one explicitly selects a constant schedule.
+
+Three implementations were considered: clipping each tensor (wrong direction),
+packing the whole model into a new multi-tensor optimizer (unnecessary storage
+and state-layout changes), and a single module-level clipping/schedule boundary
+around the existing per-tensor AdamW operations. The third keeps the existing
+moment formulas and grouping while fixing every production and reference caller.
+It sums squared norms over present, trainable neural gradients, derives one
+coefficient, and scales every such gradient by that coefficient exactly once.
+Frozen circuit probabilities do not participate. Explicit draw-specific missing
+gradient allowances and per-parameter finite/nonzero/zero reporting remain in
+the backward guards; NaN, infinity and squared-norm overflow still reject before
+parameter writes. There is no second tensor-local clip in either update kernel.
+
+Norm parameters, affine biases, learned Kron gate biases, `A_log`/`decay_scale`,
+and `b_delta`/`decay_bias` have zero decay. The additive HOLA gate bias is also
+excluded. Lngram tables retain their distinct five-times-scheduled-base-rate,
+zero-decay group. The learned `soft_confidence` scalars have a separate absolute
+rate: [SM Appendix B.1](https://arxiv.org/html/2510.17206v2#A2.SS1) specifies
+`eta_sm=0.01`, linearly warmed over 2,500 updates and then constant;
+the [official trainer](https://github.com/IBM/soft-masked-diffusion-language-models/blob/8c3ec65872f6943ad366ffac877a0d6d8cffe29e/coding/train/components/trainer.py)
+puts the entire head in a zero-decay group. This direct head recipe is selected
+without replacing Kron's backbone rate/schedule or importing the standalone
+pretrained-backbone recipe. Overrides are `soft_confidence_learning_rate` and
+`soft_confidence_warmup_steps`. The head uses the saved **global** update clock
+for its schedule, including binary/no-active draws, but its Adam moments/counter
+advance only when its gradient exists. Missing gradients stay absent; there is
+no stale-moment aging or synthesized zero gradient. The 2,500-update warmup is
+not shortened to fit a tiny smoke; a smoke does not demonstrate learned head
+usefulness. Codpula's circuit-flow optimizer and its law are unchanged; the
+from-scratch neural backbone is not frozen. The auxiliary mask-energy fitter
+remains native and constant-rate.
+
+Schedule updates are one-based. The warmup length is the ceiling of 10% of the
+resolved update budget, capped below the whole budget so a final cosine endpoint
+exists; its last warmup update reaches peak. The final budgeted update reaches
+the minimum rate, and subsequent diagnostic updates stay at that floor. A
+one-update budget has no warmup and uses the final floor. No token or model budget
+is increased. The optimizer stores a single completed-update counter independently
+of per-parameter Adam counters (which can lag for legitimately absent gradients).
+It also saves the exact recipe and schedule length in `optimizer.burnpack`.
+Ordinary resume rejects missing/changed recipes and schedule lengths and checks
+the optimizer counter against the training step. Explicit TCT warm-start imports
+the saved source horizon, recipe and global clock together with the moments;
+the target budget controls only additional chain updates. It does not restart
+or stretch the source cosine, which stays at its floor past the source horizon.
+TCT persists its source-step offset and validates the resulting global clock
+on subsequent resume. Other optimizer hyperparameter changes remain errors.
+Old optimizer records cannot silently resume changed clipping/schedule semantics.
+
+New, **not executed by the implementation worker**, acceptance cases cover the
+`.8 + .8` global-clipping counterexample, unequal tensor directions, finite guards,
+numeric decay exclusions (including `wavelet_norm.gamma`/`beta`, nonzero Kron
+gate-bias vectors and the separate soft-confidence group), the Lngram rate, moment-level clipping checks,
+native/fused updates against scalar float64, exact checkpoint continuation across
+the schedule with an intermittently absent gradient, changed-target TCT horizon
+import, and skip-draw→soft-draw head restart using global LR/local Adam counters.
+Run the integrated
+CPU test suite and `update-loss-reference` without an obsolete historical
+`--resume` checkpoint. No tolerance was loosened. Historical timings and passes
+below do not certify this changed recipe.
+
 
 ## Scope and baseline
 
@@ -16,14 +89,21 @@ The existing batch-8/context-512 attribution is 37.967 ms for all non-autodiff c
 
 ### Update
 
-1. **Existing Burn primitives:** all-parameter squared-norm safety check and readback, then Burn's AdamW plus configured norm clipping.
-2. **Explicit `update_backend: "fused_gpu"`:** bounded square-sum kernels without a full squared-gradient tensor, the same missing-gradient check and one aggregate scalar safety readback, and one elementwise clipping/moment/bias-correction/decay/update kernel per parameter. The first prototype allocated each output/moment result; the final path reuses uniquely owned contiguous parameter/moment buffers using CubeCL output aliases. Shared or strided buffers receive independent outputs, with no copies just to make inputs contiguous.
+The historical evaluation compared ordinary Burn primitives against an explicit
+per-parameter fused implementation with bounded square-sum reductions and buffer
+reuse. Both originally applied tensor-local clipping. That historical clipping
+rule and constants `(0.9, 0.999), epsilon=1e-5` are superseded by the correction
+above; the retained numerical/timing reports below describe their original recipe.
 
-This is **per-parameter fusion, not a claimed multi-tensor optimizer**. Burn's ModuleOptimizer exposes a per-parameter `Optimizer` extension, which permits using the exact existing `AdamWState` record and checkpoint validator. A packed multi-tensor alternative would require packing all 2,379,568 parameter/gradient/moment elements (or replacing the module state/serialization interface). The implemented primitive-reuse and per-parameter designs establish the attainable return without claiming an unimplemented dispatch architecture or changing storage. Check and clipping reductions remain separate: the optimizer cannot borrow the earlier check's per-parameter norm through Burn's extension interface. Launch counts expose that duplication rather than hiding it.
-
-**Clipping is per parameter, not a global model norm.** Burn0.22 computes `min(threshold / (sqrt(sum(g*g)) + f32::MIN_POSITIVE), 1)` for each parameter. The all-model sum is a safety check only. Missing gradients still abort before any optimizer write; squared-sum NaN, infinity and overflow still abort via the mandatory readback. A checked loss does not replace checked gradients.
-
-AdamW preserves Burn's f32 beta constants 0.9/0.999, factors `1-beta`, host f32 `1-beta.powi(time)` bias corrections, epsilon **1e-5**, and `parameter*(1-lr*weight_decay) - lr*((m/correction1)/(sqrt(v/correction2)+epsilon))`, without moving epsilon or folding the learning rate into bias correction. The optional AMSGrad state is not silently discarded. Parameter IDs, names/shapes, first/second moments and per-parameter time counters retain the native record layout. Omitted `update_backend` means the original implementation and serialized identity.
+The current fused element update receives already globally clipped gradients and
+explicit beta/epsilon constants; it no longer launches its own norm reduction.
+It retains
+`parameter*(1-lr*weight_decay) - lr*((m/correction1)/(sqrt(v/correction2)+epsilon))`,
+host f32 `1-beta.powi(time)` corrections, and optional AMSGrad maximum state
+without using that maximum in ordinary AdamW's denominator. Unique contiguous
+buffers can still be reused; shared/strided buffers receive independent outputs.
+Clipping's active coefficient is applied once before per-parameter updates, not
+folded into the learning rate or moment bias corrections.
 
 ### Loss
 
@@ -33,7 +113,7 @@ AdamW preserves Burn's f32 beta constants 0.9/0.999, factors `1-beta`, host f32 
 
 Both candidates eliminate the vocabulary-sized log-softmax and its generic backward graph. They retain the real logits/vocabulary matmul and weighted-mean primitives: this is not an assertion that a custom GEMM, fused final RMSNorm, or custom weight-gradient reduction was implemented. Keeping the mean in ordinary differentiable primitives preserves gradients to floating loss weights as well as logits, including fractional and zero weights. There is no padding special case or all-zero-weight fallback. Reset/validity handling in the model is untouched. Labels are exact f32 casts of the existing integer targets; supported vocabulary indices fit the exact integer range. Kernels validate f32/device/32-bit spans and support strided inputs. Omitted `loss_backend` preserves the historical implementation/fingerprint.
 
-All production, evaluation, diagnostics, profiling and model-check callsites select loss through the model. The CPU model oracle explicitly keeps tensor update/loss, rather than accidentally certifying a GPU candidate against itself. No new optimizer-state layout or historical config migration is needed.
+All production, evaluation, diagnostics, profiling and model-check callsites select loss through the model. The CPU oracle keeps tensor execution rather than certifying a GPU path against itself. The current optimizer keeps native parameter/moment tensors but requires the new recipe and global counter metadata described above; historical optimizer checkpoints must not be resumed.
 
 ## Provisional numerical and checkpoint evidence
 

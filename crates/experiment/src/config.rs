@@ -390,6 +390,13 @@ pub struct Config {
     pub learning_rate: f64,
     pub weight_decay: f32,
     pub gradient_clip: f32,
+    pub optimizer_beta1: f32,
+    pub optimizer_beta2: f32,
+    pub optimizer_epsilon: f32,
+    pub warmup_fraction: f64,
+    pub min_learning_rate_ratio: f64,
+    pub soft_confidence_learning_rate: f64,
+    pub soft_confidence_warmup_steps: usize,
     pub train_tokens: usize,
     pub budget_file: Option<PathBuf>,
     pub eval_examples: usize,
@@ -462,8 +469,15 @@ impl Default for Config {
             context: 128,
             batch_size: 1,
             learning_rate: 0.001,
-            weight_decay: 0.01,
+            weight_decay: 0.1,
             gradient_clip: 1.0,
+            optimizer_beta1: 0.9,
+            optimizer_beta2: 0.95,
+            optimizer_epsilon: 1e-10,
+            warmup_fraction: 0.1,
+            min_learning_rate_ratio: 0.1,
+            soft_confidence_learning_rate: 0.01,
+            soft_confidence_warmup_steps: 2500,
             train_tokens: 2048,
             budget_file: None,
             eval_examples: 16,
@@ -717,8 +731,18 @@ impl Config {
             "counts must be positive"
         );
         ensure!(
-            self.learning_rate.is_finite() && self.learning_rate > 0.0 && self.gradient_clip > 0.0,
-            "invalid optimizer"
+            self.learning_rate.is_finite() && self.learning_rate > 0.0
+                && self.gradient_clip.is_finite() && self.gradient_clip > 0.0
+                && self.weight_decay.is_finite() && self.weight_decay >= 0.0
+                && self.optimizer_beta1.is_finite() && (0.0..1.0).contains(&self.optimizer_beta1)
+                && self.optimizer_beta2.is_finite() && (0.0..1.0).contains(&self.optimizer_beta2)
+                && self.optimizer_epsilon.is_finite() && self.optimizer_epsilon > 0.0
+                && self.warmup_fraction.is_finite() && (0.0..1.0).contains(&self.warmup_fraction)
+                && self.min_learning_rate_ratio.is_finite()
+                && (0.0..=1.0).contains(&self.min_learning_rate_ratio)
+                && self.soft_confidence_learning_rate.is_finite()
+                && self.soft_confidence_learning_rate > 0.0,
+            "invalid optimizer or learning-rate schedule"
         );
         ensure!(
             self.max_seconds.is_finite()

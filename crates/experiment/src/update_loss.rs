@@ -121,7 +121,7 @@ pub fn reference(
     let mut optimizer_cases = Vec::new();
     for strided in [false, true] {
         for scale in [0., 0.02, 2., 100.] {
-            for decay in [0., 0.01] {
+            for decay in [0., 0.1] {
                 let rows = 7;
                 let width = 35;
                 let input = (0..rows * width)
@@ -131,8 +131,12 @@ pub fn reference(
                 let mut reference = fused.clone();
                 let mut state = None;
                 let mut ref_state = None;
-                let native = AdamWConfig::new().with_weight_decay(decay).build();
-                let fused_optim = crate::update::FusedAdamW { decay, clip: 1. };
+                let native = AdamWConfig::new().with_weight_decay(decay)
+                    .with_beta_1(c.optimizer_beta1).with_beta_2(c.optimizer_beta2)
+                    .with_epsilon(c.optimizer_epsilon).build();
+                let mut fused_config = c.clone();
+                fused_config.update_backend = UpdateBackend::FusedGpu;
+                let fused_optim = crate::update::AdamW::new(&fused_config, decay, 1.0);
                 let mut scalar_x = input.iter().map(|&v| v as f64).collect::<Vec<_>>();
                 let mut m = vec![0f64; rows * width];
                 let mut v = m.clone();
@@ -151,17 +155,16 @@ pub fn reference(
                     for i in 0..gradient.len() {
                         let g = gradient[i] as f64 * coefficient;
                         // Match Burn's f32 hyperparameter constants, not decimal-f64 substitutes.
-                        m[i] = m[i] * 0.9f32 as f64 + g * (1f32 - 0.9f32) as f64;
-                        v[i] = v[i] * 0.999f32 as f64 + g * g * (1f32 - 0.999f32) as f64;
-                        let delta = (m[i] / (1f32 - 0.9f32.powi(step as i32)) as f64)
-                            / ((v[i] / (1f32 - 0.999f32.powi(step as i32)) as f64).sqrt()
-                                + 1e-5f32 as f64);
+                        m[i] = m[i] * c.optimizer_beta1 as f64 + g * (1f32 - c.optimizer_beta1) as f64;
+                        v[i] = v[i] * c.optimizer_beta2 as f64 + g * g * (1f32 - c.optimizer_beta2) as f64;
+                        let delta = (m[i] / (1f32 - c.optimizer_beta1.powi(step as i32)) as f64)
+                            / ((v[i] / (1f32 - c.optimizer_beta2.powi(step as i32)) as f64).sqrt()
+                                + c.optimizer_epsilon as f64);
                         scalar_x[i] = scalar_x[i] * (1. - 0.001 * decay as f64) - delta * 0.001;
                     }
-                    (fused, state) = fused_optim.step(0.001, fused, g.clone(), state);
-                    let clipped = burn::grad_clipping::GradientClippingConfig::Norm(1.)
-                        .init()
-                        .clip_gradient(g);
+                    // This single-tensor oracle supplies an already globally clipped gradient.
+                    let clipped = g*coefficient;
+                    (fused, state) = fused_optim.step(0.001, fused, clipped.clone(), state);
                     (reference, ref_state) = native.step(0.001, reference, clipped, ref_state);
                     error = error.max(compare("optimizer f64", &values(fused.clone()), &scalar_x)?);
                     compare(
@@ -253,12 +256,116 @@ pub fn reference(
         Vec::new()
     };
     let optional_maximum_continuation = optional_maximum_checkpoint(c, &device)?;
+    let global_clipping = crate::update::clipping_checks(&device)?;
+    let mut native_groups = c.clone(); native_groups.update_backend = UpdateBackend::Tensor;
+    let mut fused_groups = c.clone(); fused_groups.update_backend = UpdateBackend::FusedGpu;
+    let groups = json!({"native":crate::update::optimizer_group_checks(&native_groups,&device)?,
+        "fused":crate::update::optimizer_group_checks(&fused_groups,&device)?});
+    let module_updates = module_update_checks(c, &device)?;
     let report = json!({"passed":true,"loss_cases":loss_cases,"optimizer_cases":optimizer_cases,"nonfinite_rejections":bad,"missing_gradient_rejected":true,"historical_checkpoint":historical,"historical_three_step_continuation":continuation,"optional_maximum_checkpoint_continuation":optional_maximum_continuation,"absolute_tolerance":2e-5,"relative_tolerance":3e-4});
+    let mut report = report;
+    report["global_clipping"] = global_clipping;
+    report["parameter_groups"] = groups;
+    report["global_native_fused_schedule_resume"] = module_updates;
+    report["soft_head_sparse_clock_restart"] = json!({
+        "native":crate::update::soft_head_checks(&native_groups,&device)?,
+        "fused":crate::update::soft_head_checks(&fused_groups,&device)?});
     Ok(report)
 }
 #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
 pub fn reference(_: &Config, _: &Device, _: Option<&std::path::Path>) -> Result<Value> {
     anyhow::bail!("GPU feature required")
+}
+
+/// Multi-tensor oracle: a subthreshold pair, unequal large tensors, sign changes,
+/// and zero gradients; moments expose clipping errors hidden by Adam's first update.
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
+fn module_update_checks(c: &Config, device: &Device) -> Result<Value> {
+    let mut native_config = c.clone();
+    native_config.update_backend = UpdateBackend::Tensor;
+    native_config.train_tokens = c.tokens_per_step()*20;
+    native_config.budget_file = None;
+    native_config.gradient_clip = 1.0;
+    native_config.warmup_fraction = 0.1;
+    native_config.min_learning_rate_ratio = 0.1;
+    let mut fused_config = native_config.clone();
+    fused_config.update_backend = UpdateBackend::FusedGpu;
+    let mut native = burn::nn::LinearConfig::new(1,1).init(device);
+    let mut fused = native.clone();
+    let mut native_optimizer = train::optimizer(&native_config);
+    let mut fused_optimizer = train::optimizer(&fused_config);
+    let mut scalar = [f64::from(values(native.weight.val())[0]),
+        f64::from(values(native.bias.as_ref().unwrap().val())[0])];
+    let mut first = [0.0f64;2]; let mut second = [0.0f64;2];
+    let directory = c.artifact_dir.join(format!("global-optimizer-{}-{}",std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()));
+    std::fs::create_dir_all(&directory)?;
+    let mut resumed = None::<(burn::nn::Linear,crate::update::NeuralOptimizer)>;
+    let mut maximum = 0.0f64;
+    let mut schedule = Vec::new();
+    for completed in 0..20usize {
+        let raw = [[0.8f32,0.8], [4.0,2.0], [-0.2,0.5], [0.0,0.0]][completed%4];
+        let norm = raw.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+        let coefficient = (1.0/norm).min(1.0);
+        // Independent one-based Appendix A7 schedule for this 20-update fixture.
+        let factor = if completed < 2 {(completed+1) as f64/2.0}
+            else {0.1+0.9*0.5*(1.0+(std::f64::consts::PI*(completed-1) as f64/18.0).cos())};
+        let lr = c.learning_rate*factor;
+        schedule.push(lr);
+        let gradient = |layer: &burn::nn::Linear| {
+            let mut gradients = GradientsParams::new();
+            gradients.register(layer.weight.id,Tensor::<2>::from_data([[raw[0]]],device));
+            gradients.register(layer.bias.as_ref().unwrap().id,Tensor::<1>::from_data([raw[1]],device));
+            gradients
+        };
+        let a = gradient(&native); let b = gradient(&fused);
+        native = native_optimizer.step(c.learning_rate,native,a);
+        fused = fused_optimizer.step(c.learning_rate,fused,b);
+        for index in 0..2 {
+            let g = f64::from(raw[index])*coefficient;
+            first[index] = first[index]*f64::from(c.optimizer_beta1)+g*f64::from(1.0-c.optimizer_beta1);
+            second[index] = second[index]*f64::from(c.optimizer_beta2)+g*g*f64::from(1.0-c.optimizer_beta2);
+            let update = (first[index]/f64::from(1.0-c.optimizer_beta1.powi((completed+1) as i32)))
+                / ((second[index]/f64::from(1.0-c.optimizer_beta2.powi((completed+1) as i32))).sqrt()
+                    +f64::from(c.optimizer_epsilon));
+            scalar[index] = scalar[index]*(if index==0 {1.0-lr*f64::from(c.weight_decay)} else {1.0})-lr*update;
+        }
+        let pair = |layer: &burn::nn::Linear| [values(layer.weight.val())[0],
+            values(layer.bias.as_ref().unwrap().val())[0]];
+        maximum = maximum.max(compare("global module f64",&pair(&fused),&scalar)?);
+        compare("global module native",&pair(&native),&pair(&fused).map(f64::from))?;
+        let signature = checkpoint::optimizer_signature(&fused_config,fused_optimizer.into_bytes()?)?;
+        for (field,expected) in [("moment_1",first),("moment_2",second)] {
+            let reader = burn_pack::Reader::from_bytes(fused_optimizer.into_bytes()?)?;
+            let mut checked = 0;
+            for tensor in reader.into_tensors()? {
+                let (name,dtype,shape,id,bytes) = tensor.into_parts()?;
+                if !name.ends_with(field) {continue;}
+                let index = if id == Some(fused.weight.id.val()) {0}else{1};
+                let data = TensorData::from_bytes(bytes,shape,dtype).try_to_vec::<f32>()
+                    .map_err(|e|anyhow::anyhow!("global moment readback: {e:?}"))?;
+                compare(field,&data,&[expected[index]])?;
+                checked += 1;
+            }
+            ensure!(checked==2,"global module moment check omitted a tensor");
+        }
+        if let Some((model,mut optimizer)) = resumed.take() {
+            let g = gradient(&model);
+            let continued = optimizer.step(c.learning_rate,model,g);
+            ensure!(pair(&continued)==pair(&fused),"resumed optimizer parameters differ");
+            ensure!(checkpoint::optimizer_signature(&fused_config,optimizer.into_bytes()?)?==signature,
+                "resumed schedule/moments differ");
+            resumed = Some((continued,optimizer));
+        }
+        if completed == 6 {
+            let path = directory.join("optimizer.burnpack");
+            fused_optimizer.save(&path)?;
+            resumed = Some((fused.clone(),checkpoint::load_optimizer(&fused_config,&path)?));
+        }
+    }
+    Ok(json!({"passed":true,"steps":20,"resume_after":7,"learning_rates":schedule,
+        "global_counter":fused_optimizer.completed_steps(),"f64_maximum_error":maximum,
+        "native_fused_equal_within_unchanged_tolerance":true,"resumed_exact":true,"directory":directory}))
 }
 
 /// A valid native AMSGrad checkpoint can be consumed by the configured ordinary AdamW.
@@ -277,7 +384,8 @@ fn optional_maximum_checkpoint(c: &Config, device: &Device) -> Result<Value> {
     let gradients = |layer: &burn::nn::Linear, input: Tensor<2>| {
         GradientsParams::from_grads(layer.forward(input).square().sum().backward(), layer)
     };
-    let mut producer = train::optimizer_config(c).with_amsgrad(true).init();
+    let mut producer = crate::update::NeuralOptimizer::new(c,
+        train::optimizer_config(c).with_amsgrad(true).init());
     let gradient = gradients(&layer, input);
     layer = producer.step(c.learning_rate, layer, gradient);
     let model_path = directory.join("model.burnpack");
@@ -304,7 +412,7 @@ fn optional_maximum_checkpoint(c: &Config, device: &Device) -> Result<Value> {
     fused_config.update_backend = UpdateBackend::FusedGpu;
     let mut native_optimizer = checkpoint::load_optimizer(&native_config, &optimizer_path)?;
     let mut fused_optimizer = checkpoint::load_optimizer(&fused_config, &optimizer_path)?;
-    let maxima = |optimizer: &burn::optim::ModuleOptimizer| -> Result<Value> {
+    let maxima = |optimizer: &crate::update::NeuralOptimizer| -> Result<Value> {
         let signature = checkpoint::optimizer_signature(&native_config, optimizer.into_bytes()?)?;
         let tensors = signature["tensors"]
             .as_object()

@@ -429,6 +429,32 @@ timeout 1500s bun scripts/run-experiments.ts lm512 vulkan
 
 The LM is a full trainable causal model: embedding, residual mixer blocks, RMS norms, SiLU feed-forward layers and vocabulary head. AdamW updates all model parameters; missing or nonfinite gradients are fatal before optimizer writes. Mixer shape/cache differences are reported instead of pretending equal width means equal capacity. The LM retains the same tokenizer, data order, float32 precision, optimizer, output-head architecture and budget across arms. Outputs include initial/final held-out NLL/perplexity and an explicitly synthetic byte-vocabulary associative retrieval diagnostic.
 
+The Kron from-scratch optimizer defaults follow [Appendix A7](https://arxiv.org/html/2610.26834#A7):
+AdamW betas `(0.9,0.95)`, epsilon `1e-10`, weight decay `0.1`, one global
+gradient-norm clip at `1.0`, and 10% linear warmup followed by cosine decay to
+0.1 times peak. `learning_rate` is the peak; explicit JSON settings are preserved.
+Overrides are `optimizer_beta1`, `optimizer_beta2`, `optimizer_epsilon`,
+`weight_decay`, `gradient_clip`, `warmup_fraction`, and `min_learning_rate_ratio`.
+Norms, biases and learned decay/gate biases have zero decay; Lngram tables retain
+their separate five-times-rate, zero-decay group. Native and fused paths share
+this grouping and schedule. Codpula probability-flow updates remain separate.
+See `../../docs/optimization/update-and-loss.md` for rounding conventions and
+the reference checks awaiting integrated acceptance.
+The learned `soft_confidence` head instead uses the directly selected SM recipe:
+absolute peak `soft_confidence_learning_rate: 0.01`, linear warmup for
+`soft_confidence_warmup_steps: 2500`, then constant, with zero decay. Its LR uses
+global logical optimizer time even on binary draws; its Adam moments/time advance
+only when gradients exist. The head warmup is not compressed to fit tiny runs,
+and a short smoke is not evidence that this head learned to improve feedback.
+
+Optimizer checkpoints now require recipe metadata and a single global completed-step
+counter in addition to per-parameter Adam moments/counters. The counter advances even
+when a draw legitimately omits a neural gradient, and it must match the saved training
+step on ordinary resume. Explicit TCT warm-start retains the source schedule horizon,
+moments and clock, recording a source-step offset from new TCT chain time; the new
+target budget does not retime cosine. Older optimizer records or incompatible recipes
+are rejected; there is no tensor-local-clipping compatibility mode.
+
 A completed short command is not proof that held-out learning or architectural gates passed. Read `completed`, `heldout_learning_demonstrated`, `recall_skill_demonstrated`, `random_accuracy_baseline`, `decision_eligible`, per-seed uncertainty diagnostics and the reference numerical report. In particular, near-chance recall accuracy must not be promoted to architectural evidence merely because NLL improved. Insufficient learning requires another explicitly chosen **file-configured** budget and fresh artifact directory; do not relabel a smoke as an architectural decision.
 
 ## Checkpoint/resume and artifact contract
