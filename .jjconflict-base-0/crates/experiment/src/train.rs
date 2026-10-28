@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path, time::Instant};
 
-pub(crate) const MEASUREMENT_VERSION: &str = "guarded-validated-load-v2";
+pub(crate) const MEASUREMENT_VERSION: &str = "per-parameter-gradient-counts-v3";
 pub(crate) fn optimizer_config(c: &Config) -> AdamWConfig {
     AdamWConfig::new()
         .with_weight_decay(c.weight_decay)
@@ -324,6 +324,7 @@ pub fn run(
     let parameters = model.num_params();
     let start_tokens = tokens;
     let mut last_loss = None;
+    let mut gradient_counts = model::GradientReport::new();
     let mut peak_reserved = runtime::sampled_reserved(device);
     let started = Instant::now();
     let mut log = std::fs::OpenOptions::new()
@@ -342,15 +343,16 @@ pub fn run(
             "train",
         )?;
         let batch = Batch::new(&rows, &train_device);
-        let (value, grads, circuit_flows, passes, rows_per_pass) = if c.sbd.is_some() {
+        let (value, grads, circuit_flows, passes, rows_per_pass, gradient_report) = if c.sbd.is_some() {
             let result = crate::sbd_step::backward(&model, c, &rows, &batch, seed.wrapping_add(step as u64))?;
-            (result.loss, result.gradients, result.circuit_flows, result.passes, result.rows_per_pass)
+            (result.loss, result.gradients, result.circuit_flows, result.passes, result.rows_per_pass, result.gradient_report)
         } else {
             let loss = model.loss(model.forward(&batch), &batch);
             let value = model::scalar(loss.clone())?;
-            let grads = model::checked_gradients(&model, loss)?;
-            (value, grads, None, 1, rows.len())
+            let (grads, report) = model::checked_gradients_with_unused(&model, loss, &[], &mut delta_mixers::profile::Unprofiled)?;
+            (value, grads, None, 1, rows.len(), report)
         };
+        model::accumulate_gradient_report(&mut gradient_counts, gradient_report);
         peak(&mut peak_reserved, device);
         model = optimizer_step(c, model, &mut optim, grads, circuit_flows)?;
         runtime::sync(device)?;
@@ -432,7 +434,8 @@ pub fn run(
     let decode_ms = clock.elapsed().as_secs_f64() * 1000.0 / 3.0;
     let mix = arm.mixer_config(c)?;
     let mut metrics = json!({"schema":1,"task":c.task,"arm":arm,"seed":seed,"config":c,"config_sha256":fingerprint,"data":data,
-        "device":runtime::identity(device),"precision":"float32","optimizer":"AdamW","all_model_parameters_trained":true,
+        "device":runtime::identity(device),"precision":"float32","optimizer":"AdamW",
+        "gradient_counts_this_invocation":gradient_counts,"gradient_counts_note":"per trainable parameter tensor: optimizer steps with nonzero squared norm, zero norm, or an explicitly allowed missing gradient; no assertion that every parameter learned",
         "measurement_implementation_version":MEASUREMENT_VERSION,
         "training_algorithm":arm.training_algorithm(c),"custom_gpu_kernel_proof":arm.uses_custom_gpu(c),
         "parameters":parameters,"recurrent_state_bytes":mix.recurrent_state_bytes(c.batch_size)*c.layers,"cache_including_current_chunk_bytes":mix.exact_memory_bytes(c.batch_size)*c.layers,
@@ -716,7 +719,7 @@ pub(crate) fn metrics_contract(
         json!({"schema":1,"measurement_implementation_version":MEASUREMENT_VERSION,"task":c.task,
         "config_sha256":c.training_fingerprint(target_tokens)?,"target_tokens":target_tokens,
         "data":data,"device":device,"precision":"float32","optimizer":"AdamW",
-        "all_model_parameters_trained":true,"training_algorithm":c.arms[0].training_algorithm(c),"custom_gpu_kernel_proof":c.arms[0].uses_custom_gpu(c)}),
+        "training_algorithm":c.arms[0].training_algorithm(c),"custom_gpu_kernel_proof":c.arms[0].uses_custom_gpu(c)}),
     )
 }
 

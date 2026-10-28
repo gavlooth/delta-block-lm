@@ -973,9 +973,10 @@ fn row_accumulation_equivalence(device:&Device)->Result<Value> {
         let sampled=sbd::training_loss_sampled_profiled(&reference,&cfg,&examples,&cpu_batch,
             &blocks,bundles.as_deref(),&mut Unprofiled)?;
         let sampled_loss=model::scalar(sampled.loss.clone())?;
+        let (sampled_gradients, gradient_report) = model::checked_gradients_with_unused(&reference,sampled.loss,&sampled.unused_parameters,&mut Unprofiled)?;
         let sampled=crate::sbd_step::Backward{loss:sampled_loss,
-            gradients:model::checked_gradients(&reference,sampled.loss)?,circuit_flows:sampled.circuit_flows,
-            passes:1,rows_per_pass:examples.len()};
+            gradients:sampled_gradients,circuit_flows:sampled.circuit_flows,
+            passes:1,rows_per_pass:examples.len(),gradient_report};
         let full=crate::sbd_step::backward(&reference,&cfg,&examples,&cpu_batch,seed)?;
         let split=crate::sbd_step::backward(&reference,&chunked,&examples,&cpu_batch,seed)?;
         ensure!(full.passes==1 && full.rows_per_pass==2,"omitted row selector did not retain a full-batch pass");

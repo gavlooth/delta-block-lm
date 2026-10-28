@@ -274,10 +274,8 @@ fn training_loss(c: &Config, model: &LanguageModel, state: &mut TrainingState, d
     let logits = model.forward_profiled(&batch, &mut trace);
     let clean_loss = model.loss(logits.clone(), &batch);
     let clean = model::scalar(clean_loss.clone())?;
-    let mut loss = clean_loss + model.sbd_mask.as_ref().context("TCT mask parameter")?.val().sum()*0.0;
+    let mut loss = clean_loss;
     let codpula = model.codpula.as_ref().context("joint TCT requires Codpula")?;
-    loss = loss + codpula.gate_head.weight.val().sum()*0.0;
-    if let Some(bias) = &codpula.gate_head.bias { loss = loss + bias.val().sum()*0.0; }
     let denominator = c.tokens_per_step() as f64;
     let mut joint = 0.0;
     let mut blocks = Vec::new();
@@ -337,7 +335,7 @@ fn training_loss(c: &Config, model: &LanguageModel, state: &mut TrainingState, d
         let cache=model.training_cache_batched(&trace,&locations);
         let (a,b,pair_work)=crate::cocommit::training_pair_profiled(model,c,&cache,&soft,&padded_bundles,&mut delta_mixers::profile::Unprofiled)?;
         work=pair_work;
-        let mut branch=SbdTrainingResult {loss:Tensor::zeros([1],device),circuit_flows:None};
+        let mut branch=SbdTrainingResult {loss:Tensor::zeros([1],device),circuit_flows:None,unused_parameters:Vec::new()};
         let prepared=crate::cocommit::add_branch_losses(model,c,a,b,&soft,targets.clone(),
             &padded_bundles.iter().flat_map(|x|x.iter().copied()).collect::<Vec<_>>(),&target_weights,denominator,&mut branch)?;
         feedback_circuit=Some(prepared.context("TCT CoCommit joint B circuit was not prepared")?.detached());
@@ -443,6 +441,7 @@ struct Backward {
     clean_calls: usize,
     noisy_calls: usize,
     work: crate::cocommit::CoordinationWork,
+    gradient_report: model::GradientReport,
 }
 fn sample_announcements(c:&Config,state:&mut TrainingState)->Option<Vec<Vec<Vec<bool>>>> {
     let options=c.sbd.as_ref().unwrap().cocommit.as_ref()?;
@@ -472,11 +471,12 @@ fn backward_passes(c:&Config,model:&LanguageModel,state:&mut TrainingState,devic
             saved.chains.iter().enumerate().filter(|(_,chain)|chain.len()>1).map(move |(index,_)|all[row][index].clone())).collect::<Vec<_>>());
         let result=training_loss(c,model,state,device,layout,None,bundles.as_deref())?;
         let loss=model::scalar(result.loss.clone())?;
-        let gradients=model::checked_gradients(model,result.loss)?;
+        let unused = model::unused_denoising_parameters(result.noisy_blocks > 0, result.work.b_tail_used_rows > 0);
+        let (gradients, gradient_report)=model::checked_gradients_with_unused(model,result.loss,&unused,&mut delta_mixers::profile::Unprofiled)?;
         return Ok(Backward {gradients,flows:result.flows,loss,clean:result.clean,joint:result.joint,
             chains:result.chains,noisy_blocks:result.noisy_blocks,clean_calls:1,
             noisy_calls:match layout {SbdBlockExecution::Batched=>usize::from(result.noisy_blocks>0),SbdBlockExecution::PerBlock=>result.noisy_blocks},
-            work:result.work});
+            work:result.work,gradient_report});
     }
     let proposal_seed=if state.rows.iter().flat_map(|row|&row.chains).any(|chain|chain.len()>1 && chain.round<TRAIN_ROUNDS) {
         Some(state.next_random())
@@ -519,8 +519,9 @@ fn backward_passes(c:&Config,model:&LanguageModel,state:&mut TrainingState,devic
     }
     state.rows=returned;
     let gradients=accumulator.grads();
-    model::check_parameter_gradients(model,&gradients,&mut delta_mixers::profile::Unprofiled)?;
-    Ok(Backward {gradients,flows,loss,clean,joint,chains,noisy_blocks,clean_calls,noisy_calls,work})
+    let unused = model::unused_denoising_parameters(noisy_blocks > 0, work.b_tail_used_rows > 0);
+    let gradient_report=model::check_parameter_gradients_with_unused(model,&gradients,&unused,&mut delta_mixers::profile::Unprofiled)?;
+    Ok(Backward {gradients,flows,loss,clean,joint,chains,noisy_blocks,clean_calls,noisy_calls,work,gradient_report})
 }
 
 /// One actual optimizer step, including detached pre-update chain advancement and refill.
@@ -537,6 +538,7 @@ fn step_layout(c: &Config, model: LanguageModel, optim: &mut ModuleOptimizer, st
     state.noisy_block_evaluations += result.noisy_blocks;
     state.refill(c,corpus)?;
     Ok((model,json!({"loss":result.loss,"clean_causal_nll_per_token":result.clean,"joint_correction_nll_per_token":result.joint,
+        "gradient_counts":result.gradient_report,
         "joint_correction_nll_chain_mean_token_sum":result.joint*c.tokens_per_step() as f64/result.chains as f64,
         "chain_count":result.chains,"steps":state.steps,"unique_target_bytes_loaded":state.unique_target_bytes,
         "scored_target_visits":state.scored_target_visits,"completed_chains":state.completed_chains,"next_loader_example":state.next_example,
@@ -622,11 +624,13 @@ pub fn run(c: &Config, arm: &Arm, seed: u64, device: &Device, resume: Option<&Pa
     let started = Instant::now();
     let mut last_loss = Value::Null;
     let mut work_this_invocation=crate::cocommit::CoordinationWork::default();
+    let mut gradient_counts = model::GradientReport::new();
     let mut log = std::fs::OpenOptions::new().create(true).write(true).append(resume.is_some()).truncate(resume.is_none()).open(run_dir.join("training.jsonl"))?;
     while chains.scored_target_visits < target_tokens && started.elapsed().as_secs_f64() < c.max_seconds {
         let result = step(c,model,&mut optim,&mut chains,corpus.as_ref(),&target)?;
         model = result.0;
         last_loss = result.1;
+        model::accumulate_gradient_report(&mut gradient_counts, serde_json::from_value(last_loss["gradient_counts"].clone())?);
         if let Some(work)=last_loss.get("coordination_work") {
             work_this_invocation.add(serde_json::from_value(work.clone())?);
         }
@@ -650,6 +654,7 @@ pub fn run(c: &Config, arm: &Arm, seed: u64, device: &Device, resume: Option<&Pa
         "unique_target_bytes_loaded":chains.unique_target_bytes,"completed_chains":chains.completed_chains,"training_seconds":seconds,
         "clean_forward_calls":chains.steps,"noisy_forward_calls":chains.noisy_forward_calls,"noisy_block_evaluations":chains.noisy_block_evaluations,
         "coordination_work_this_invocation":work_this_invocation,
+        "gradient_counts_this_invocation":gradient_counts,
         "coordination_work_units":{"dispatches":"physical neural/circuit dispatches","rows":"physical processed row units; paired tails count 2C for one doubled dispatch",
             "used_rows":"rows whose branch results are consumed by losses/feedback; query-dispatch and used rows are separately tracked",
             "logical_blocks":"logical TCT chains","prefix_batches":"batched saved-prefix cache calls","circuit_preparations":"prepared A/B circuits",

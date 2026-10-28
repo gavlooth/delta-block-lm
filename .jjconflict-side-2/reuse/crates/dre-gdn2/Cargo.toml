@@ -1,0 +1,22 @@
+[package]
+name = "dre-gdn2"
+description = "Bidirectional channel-wise Gated DeltaNet-2 with a custom CubeCL scan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+cuda = ["burn/cuda", "dre-core/cuda"]
+# Opt-in differentiable ndarray recurrence for dependent CPU tests.
+cpu-oracle = ["burn/ndarray"]
+
+[dependencies]
+burn.workspace = true
+burn-cubecl = "=0.22.0"
+cubecl = "=0.11.0"
+dre-core.workspace = true
+
+[dev-dependencies]
+burn = { workspace = true, features = ["ndarray"] }

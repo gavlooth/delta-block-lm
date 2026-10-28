@@ -386,7 +386,6 @@ fn cpu_reference(c: &Config, arm: &Arm, rows: &[Example]) -> Result<CpuReference
         let batch = Batch::new(rows, &device);
         let logits = base.forward(&batch);
         let objective = base.loss(logits.clone(), &batch);
-        let objective = if let Some(mask) = &base.sbd_mask {objective+mask.val().sum()*0.0} else {objective};
         let loss = model::scalar(objective.clone())?;
         let gradients = model::checked_gradients(&base, objective)?;
         let gradient_values = parameters(&base, Some(&gradients))?;
@@ -549,7 +548,6 @@ fn prepare_model_case_kind(
         let clock = Instant::now();
         let logits = model.forward(&batch);
         let objective = model.loss(logits.clone(), &batch);
-        let objective = if let Some(mask) = &model.sbd_mask {objective+mask.val().sum()*0.0} else {objective};
         let loss = model::scalar(objective.clone())?;
         let grads = model::checked_gradients(&model, objective)?;
         runtime::sync(device)?;
