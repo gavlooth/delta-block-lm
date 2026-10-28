@@ -4,6 +4,14 @@
 
 **Implementation decisions adopted 2026-10-25; numerical and cost evidence is recorded below after execution.** Q1–Q16 follow the highest-ROI recommendations; Q17 is a saved-input zero-marker correctness gate only. No quality study, trained comparison arm or sweep is authorized.
 
+The contextual+CoCommit+refinement integration was published on main as
+`9e67b7ac` with partial combined acceptance. The original rank-lookup and
+outside-S consumer fixture failures, their focused reruns, and failed real
+collection are preserved in `artifacts/integrated11/commands/` and catalogued
+in [RESULTS](../RESULTS.md#integrated11-publication-checkpoint).
+Standalone performance and correctness below do not substitute for unexecuted
+combined fitting/guided/TCT CLI/B8 checks.
+
 Source: Lin Yao, [Don't Commit Alone: Joint Token Commitment in Diffusion Language Models, arXiv:2607.04469v2](https://arxiv.org/html/2607.04469v2), especially §§3–5, Figures 1–2, Eqs. (1)–(4), Tables 1–3 and §6 Limitations. The complete HTML and [13-page PDF](https://arxiv.org/pdf/2607.04469v2) were read through the references. **This version contains no appendices.** There is no extra appendix recipe to fill its unspecified training reductions or short-mask cases.
 
 Repository requirements: [PLAN §5.2, §5.3 and Step 10](../PLAN.md), [SBD](sbd.md), [Codpula](codpula.md), and [predecessor inventory §1.2](predecessor-inventory.md#12-step-10--cocommit-coordination). Source line references below describe the inspected working tree and will move when code changes.
@@ -235,7 +243,7 @@ Predecessor reuse is limited to the cached-input/multiple-pass pattern documente
 
 ## 4. Proposed configuration and repeatable draws
 
-The implemented profile is `sbd.cocommit` absent by default, otherwise an object with `tail_layers: 1`, `rounds: 1`, `training_bundle_max: 16`, `visible_loss_weight: 0.2` and optional `execution: "separate"` (the selected default). The explicit `"doubled"` fitting-tail alternative is supported only without prefix retrieval in the marked tail; retrieval in earlier saved-prefix layers is compatible. Tail retrieval requires explicit/default separate execution and shares banks; an explicit unsupported doubled request is rejected rather than overridden. Marker shape, masks-only corruption, branch-loss sum and write semantics remain fixed by the named CoCommit revision. Visible weight applies only to factorized output. Invalid/unknown fields, nonfinite/negative visible weight, zero bundle maximum, tail depth outside `1..=layers` and enabled CoCommit without `hola_read`/HOLA are rejected. Only one round is supported; larger K requires its own approved recipe.
+The implemented profile is `sbd.cocommit` absent by default, otherwise an object with `tail_layers: 1`, `training_bundle_max: 16` and optional `execution: "separate"` (the selected default). The old unused `rounds` field is rejected. `visible_loss_weight` is optional only for factorized output, with omission using 0.2; Codpula rejects the field because it does not consume it (`config.rs::Config::validate`, `cocommit.rs::add_branch_losses`). The explicit `"doubled"` alternative is supported only without prefix retrieval in the marked tail; earlier saved-prefix retrieval is compatible. Unsupported doubled requests are rejected rather than overridden. Invalid/unknown fields, nonfinite/negative visible weight, zero bundle maximum, tail depth outside `1..=layers` and enabled CoCommit without `hola_read`/HOLA are rejected. Refinement marks use the explicitly named `sbd.announcement` setting, not SBD commit-rule fields; see [SBD configuration controls](sbd.md#configuration-controls-and-validation).
 
 Use a separate host `Rng(seed ^ 0x434F434F4D4D4954)` for bundle draws, never the mask sampler's stream. Traverse the already-sampled active training blocks in row/start order, independent of per-block/batched execution. For `m` unresolved positions, draw `s=1+rng.index(min(m,training_bundle_max))`, then use a partial Fisher–Yates shuffle of ascending unresolved indices: for `j=0..s-1`, swap with index `j+rng.index(m-j)`; select the first `s`. Singleton bypasses and skipped all-observed blocks draw nothing. Build the device indicator from those positions once. This specifies a uniform size over the feasible range and a uniform subset conditional on that size, with repeatable CPU/GPU and batching behavior. It does not change existing length/mask draws.
 

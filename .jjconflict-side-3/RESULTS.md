@@ -4,7 +4,7 @@ For the current optimized execution paths, measured speedups and known legacy GP
 
 ## Scope and stopping point
 
-Implemented and exercised the active Burn workspace, causal GDN-2 and KronLSTM, optional HOLA/recency memory, soft top-k feedback, paired associative-recall experiments, and a tiny causal language-model comparison. The Steps 1–6 sections below predate Step 7, which is reported separately at the end. Step 8 includes user-selected in-block reads through HOLA. Step 9 adds Codpula joint output and dependence-adaptive commitment. Step 10 adds CoCommit's shared-prefix unmarked/marked tails, including a fresh marked circuit. These additions are evaluated for numerical correctness, execution cost and a tiny smoke, not a quality study. Earlier dense-attention measurements remain historical. Energy-guided remasking remains later work.
+Implemented and exercised the active Burn workspace, causal GDN-2 and KronLSTM, optional HOLA/recency memory, soft top-k feedback, paired associative-recall experiments, and a tiny causal language-model comparison. The Steps 1–6 sections below predate Step 7. Step 8 includes selected HOLA in-block reads; Step 9 adds Codpula joint output; Step 10 adds CoCommit; Step 11 implements remasking, energy fitting and TCT with separate standalone evidence in `artifacts/remasking/`. Composition was published on main as `9e67b7ac` before full combined acceptance. Its actual failed collection and unexecuted fitting/guided/TCT/B8 commands are recorded in [integrated11 publication checkpoint](#integrated11-publication-checkpoint). No quality conclusion follows from any command smoke. Earlier dense-attention measurements remain historical.
 
 All runs used the local Intel Arc Graphics (MTL) through Vulkan, with float32 execution. No Spark or predecessor production process was used or modified.
 Run artifacts report sampled backend-reserved memory and explicit recurrent/cache/convolution storage. Exact GPU peak memory is not available here; the integrated GPU shares system memory, so reserved-pool samples must not be presented as exact physical-device peaks.
@@ -53,6 +53,10 @@ Context 128 used 11,136 training tokens per run; context 512 used 11,264. Unifor
 
 Held-out NLL can improve simply by suppressing symbols that are never valid answers. Accordingly, NLL improvement is kept separate from demonstrated retrieval. Both HOLA candidates were retained for the independent tiny-LM comparison rather than selecting an architecture from chance-level accuracy.
 
+The Step 5 architecture-selection gate was **waived, not passed**. The
+certified comparisons below contain only 112–248 recall queries per seed;
+their near-chance outcomes do not establish a learned-memory advantage.
+
 ## Tiny causal language model
 
 Configuration: four layers, width 256, context 512, four heads, key width 32, value width 64, computational chunk 16, HOLA capacity 16, batch size 1, float32, AdamW, learning rate 0.001. Every arm/seed trained for **6,656 byte tokens, 13 optimizer steps**; seeds were 1/2/3. This is a learning/engineering pilot, not a useful pretrained language model or a scaling result.
@@ -75,6 +79,11 @@ Interpretation:
 - HOLA has no demonstrated quality gain at this short budget and makes training slower. Its two base mixers remain available; this is not evidence to discard HOLA for a genuinely learned long-range retrieval task.
 - Parameter counts differ, evaluation is narrow, and training is extremely short. These results do not prove one architecture is generally better. The program's empirical Pareto screen is descriptive, not statistical confirmation.
 - The trained LMs' byte-associative-retrieval diagnostics are retained separately; next-token learning alone is not evidence that they learned the synthetic memory task.
+
+The Step 6 quality/adoption gate was **waived, not passed**: 13 updates and
+2,048 validation bytes do not establish general quality or a surviving recall
+advantage. The KronLSTM+HOLA working choice is not a validated quality winner.
+Evidence for these limitations is the certified comparison JSON listed below.
 
 ## Checkpoint bug found and fixed
 
@@ -2085,11 +2094,11 @@ Optional `sbd.refinement` selects uniform R²D, unary or pairwise mask energies.
 
 The524->32 energy features reuse final hidden states and candidate embeddings/probabilities. Energies are factorized into unary local terms and symmetric bilinear selected-position pairs. Offline rank fitting freezes the denoiser and ports predecessor eligible-masked softplus-margin semantics. Actual trajectories fork identical states/draws for equal H2 work; half candidates are proposal-weighted swaps, half independent sets. Clean-target conditional joint NLL assigns preference. No relation ontology or token-logit gradient correction is ported.
 
-TCT is explicit `sbd.training_mode:tct`: streaming four-round chains, confidence0.9 plus scheduled minimum, self-generated provisional inputs, permanent-O-only circuit evidence, all-free-position conditional joint NLL plus clean causal loss. Its state/RNG/loader and candidate rows persist; no autograd or stale clean cache persists. `tct.rows_per_pass` accumulates batch-normalized neural gradients and unscaled circuit flows before one optimizer/EM update.
+TCT is explicit `sbd.training_mode:tct`: streaming four-round chains, confidence0.9 plus scheduled minimum, self-generated provisional inputs, permanent-O-only circuit evidence, all-free-position conditional joint NLL plus clean causal loss. Its state/RNG/loader and candidate rows persist; no autograd or stale clean cache persists. `tct.rows_per_pass` accumulates batch-normalized neural gradients and unscaled circuit flows before one neural optimizer and signed dual-flow circuit update, not an EM update (see `docs/codpula.md:211–222`).
 
 ### Correctness and compatibility
 
-- 85 workspace tests pass (62 experiment/7 kernel/16 mixer); one pre-existing GPU-sharing test is ignored.
+- The standalone Step 11 suite recorded85passes (62experiment/7kernel/16mixer), one ignored; it is historical profile-specific evidence (`artifacts/remasking/summary.json`). The later integrated11 suite recorded96passes (73experiment/7kernel/16mixer), one ignored (`artifacts/integrated11/commands/conditioned-build-tests-1792953155667.stdout`). Neither count represents post-fix acceptance.
 - 990 mask-law cases enumerate every n=0..16 and r across supported laws; max logZ error 1.13687e-13 and probability error 3.33067e-16. Fixed-seed 65,536-draw checks have max frequency error 0.00291679 below simultaneous limit 0.01355672.
 - CPU/Vulkan energy/features/rank max abs 3.305467803915718e-6, max tolerance ratio 0.00687248; joint TCT including chunking max 9.5367431640625e-7/ratio 0.00337868. Criterion remains **2e-5+3e-4*abs(ref)**.
 - Full-batch versus chunked tensor/fused gradients and all flow fields agree within tolerance; token decisions and indexed RNG agree. Exact restart traverses partial reveals, final fully revealed supervision and refill with identical neural/circuit/optimizer state.
@@ -2180,4 +2189,106 @@ Evidence: `artifacts/cocommit/paired/cocommit-benchmark.json`, `adoption.json`, 
 ### Tiny execution smoke
 
 Context32/B1 trained exactly96 target bytes in3 steps, then loaded its checkpoint for enabled block evaluation and generation. Eight tokens were finalized and causally replayed in one block/one denoising pass. This verifies execution, not quality. The unused recall association-count validation setting is[2] for this small context; the B8/T512 workload is unchanged. Smoke model/optimizer payloads and historical diagnostic copies were deleted after checks; small configs/state/metrics/reports remain (`checkpoint-cleanup.json`).
+
+## integrated11 publication checkpoint
+
+This is the **2026-10-25 pre-fix publication record**, not acceptance of the
+2026-10-28 repairs. Main contains the integration commit `9e67b7ac`; publishing
+it did not finish the command list in PLAN §9. Standalone evidence under
+`artifacts/{codpula,codpula-context,cocommit,remasking}/` is not a substitute.
+No integrated quality result or complete combined timing comparison exists.
+
+### Exact recorded commands and exit status
+
+The following ledger covers **all 20 process records** in
+`artifacts/integrated11/commands/`. Each row's record name identifies
+`<name>.process.json` (the exact argument vector, exit code, lock/deadline and
+execution time), `<name>.stdout`, and `<name>.stderr` in that directory.
+Commands below preserve the recorded paths, including the old shared target
+path; they are historical invocations, not instructions to recreate a deleted
+workspace. Every process had a 180-second execution deadline after acquiring
+the GPU/build locks. Empty stderr means zero bytes, not suppressed errors.
+
+For readability, the repeated shell argument strings are defined exactly:
+
+- **B** = `CARGO_TARGET_DIR=/home/heefoo/code/delta-block-lm/target cargo build -p delta-experiment --features vulkan && cp /home/heefoo/code/delta-block-lm/target/debug/delta-experiment .cache/delta-experiment`
+- **BT** = `CARGO_TARGET_DIR=/home/heefoo/code/delta-block-lm/target cargo build -p delta-experiment --features vulkan && CARGO_TARGET_DIR=/home/heefoo/code/delta-block-lm/target cargo test --workspace --features delta-experiment/vulkan && cp /home/heefoo/code/delta-block-lm/target/debug/delta-experiment .cache/delta-experiment`
+
+`sh -c B` / `sh -c BT` below mean `sh`, `-c`, followed by that entire string as
+one argument, not a separately executed command named B or BT.
+
+| Record name | Command | Exit | Stderr / actual outcome |
+|---|---|---:|---|
+| `pre-cocommit-build-1792947835899` | `sh -c B` | 0 | Compiler warnings; dev build finished in11.63s. This predates the final CoCommit merge. |
+| `merged-build-1792951994845` | `sh -c B` | 101 | Four `E0425` errors: `cannot find value last_loss in this scope`; executable copy was not reached. |
+| `merged-build-fixed-1792952078211` | `sh -c B` | 0 | Compiler warnings; dev build finished in6.90s after restoring the TCT reporting binding. |
+| `workspace-tests-1792952219041` | `env CARGO_TARGET_DIR=/home/heefoo/code/delta-block-lm/target cargo test --workspace --features delta-experiment/vulkan` | 101 | Warnings and `test failed`; stdout records72experiment passes and the TCT CoCommit marker-gradient fixture panic detailed below. |
+| `rebuilt-workspace-tests-1792952320219` | `sh -c BT` | 0 | Compiler warnings; build/tests/copy completed. Stdout records73experiment+7kernel+16mixer passes, one ignored. |
+| `codpula-cpu-1792952350370` | `.cache/delta-experiment codpula-reference artifacts/integrated11/cpu/config.json` | 0 | Empty; CPU reference completed. |
+| `codpula-vulkan-1792952365727` | `.cache/delta-experiment codpula-reference artifacts/integrated11/vulkan/config.json` | 0 | Empty; Vulkan reference completed. |
+| `cocommit-cpu-1792952385904` | `.cache/delta-experiment cocommit-reference artifacts/integrated11/cpu/config.json` | 0 | Empty; CPU reference completed. |
+| `cocommit-vulkan-1792952409158` | `.cache/delta-experiment cocommit-reference artifacts/integrated11/vulkan/config.json` | 0 | Empty; Vulkan reference completed. |
+| `remask-cpu-1792952543829` | `.cache/delta-experiment remask-reference artifacts/integrated11/cpu/config.json` | 0 | Empty; original CPU fixture completed. |
+| `remask-vulkan-1792952569071` | `.cache/delta-experiment remask-reference artifacts/integrated11/vulkan/config.json` | 1 | `fixture cannot reject per-token A/B splicing outside S`; no passing Vulkan consumer result from this invocation. |
+| `tct-cpu-1792952653535` | `.cache/delta-experiment tct-reference artifacts/integrated11/cpu/config.json` | 0 | Empty; CPU reference completed, not an actual TCT CLI training/resume run. |
+| `tct-vulkan-1792952706287` | `.cache/delta-experiment tct-reference artifacts/integrated11/vulkan/config.json` | 0 | Empty; Vulkan reference completed, not an actual TCT CLI training/resume run. |
+| `smoke-source-train-1792952935188` | `.cache/delta-experiment sbd-train artifacts/integrated11/smoke-source/config.json` | 0 | Empty; uniform-policy B1/context32 source trained96bytes/3updates and saved checkpoint-3. |
+| `smoke-source-evaluate-1792952977917` | `.cache/delta-experiment sbd-evaluate artifacts/integrated11/smoke-source/config.json --resume artifacts/integrated11/smoke-source/kronlstm-hola-seed1/checkpoint-3` | 0 | Empty; saved-model evaluation completed. |
+| `conditioned-build-tests-1792953155667` | `sh -c BT` | 0 | Compiler warnings; build/tests/copy completed after conditioning the consumer fixture. Stdout records73+7+16passes, one ignored. |
+| `remask-vulkan-conditioned-1792953425827` | `.cache/delta-experiment remask-reference artifacts/integrated11/vulkan/config.json` | 0 | Empty; conditioned Vulkan consumer reference completed. |
+| `remask-cpu-conditioned-1792953523676` | `.cache/delta-experiment remask-reference artifacts/integrated11/cpu/config.json` | 0 | Empty; conditioned CPU consumer reference completed. |
+| `smoke-source-generate-1792953542792` | `.cache/delta-experiment sbd-generate artifacts/integrated11/smoke-source/config.json --resume artifacts/integrated11/smoke-source/kronlstm-hola-seed1/checkpoint-3` | 0 | Empty; uniform-policy generation finalized/replayed8tokens. Not learned-energy guided generation. |
+| `collect-real-1792953578755` | `.cache/delta-experiment remask-collect artifacts/integrated11/collect/config.json --resume artifacts/integrated11/smoke-source/kronlstm-hola-seed1/checkpoint-3` | 1 | `recorded training source unexpectedly contains decoder refinement`; failed before collection, stdout empty. No real combined trajectory dataset resulted. |
+
+Successful reference JSON is under `artifacts/integrated11/{cpu,vulkan}/`.
+The source config, train/evaluate/generate reports and metrics/checkpoint
+evidence are under `artifacts/integrated11/smoke-source/`. Its config explicitly
+sets `refinement.policy: uniform`, B1/context32/seed1; it does not exercise the
+tracked pairwise train→collect→fit→guided chain. These are execution checks,
+not quality or equal-cost decoder comparisons.
+
+### Two fixture failures and what changed
+
+1. **TCT marker gradient rank.** `workspace-tests-1792952219041.stdout` records
+   `tct::row_accumulation_tests::cocommit_row_chunks_keep_markers_flows_and_chain_rng`
+   panicking in `TensorContainer::get::<Tensor<1>>` / `GradientsParams::get::<1>`
+   with `Option::unwrap()` on `None`. The fixture requested the two-dimensional
+   CoCommit marker gradient as rank one. The lookup was corrected to rank two;
+   the retained code is `tct.rs::row_accumulation_checks`, `get::<2>(marker.id)`.
+   `rebuilt-workspace-tests-1792952320219` then exited0. This was a fixture
+   lookup correction, not evidence of a model-gradient repair or a tolerance
+   change.
+2. **Outside-S splice discriminator.**
+   `remask-vulkan-1792952569071.stderr` preserves the failed assertion above.
+   The original fixture did not produce a distinguishable outside-S A/B
+   change on Vulkan. The later fixture used width4, a separate all-observed
+   row, and an active row with O={0}, R={1}, M={2,3}, exactly one marked M
+   position and one unmarked M position. It used nonzero nonradial markers,
+   active HOLA and strictly positive correlated circuit rows: transition
+   diagonal logit6/off0 and emission state-class logit4/off0. The construction
+   is retained in `remask.rs::numerical_checks` (the `co_check` fixture).
+   `conditioned-build-tests-1792953155667` rebuilt it; the subsequent
+   conditioned CPU/Vulkan reference records both exited0. Production defaults
+   and numerical tolerances were unchanged. These are different fixtures;
+   the original Vulkan failure was not rerun unchanged or relabelled passing.
+
+The failed collection was followed by a source-identity loader edit:
+`remask.rs::checkpoint_training_identity` restores the source's exact recorded
+refinement settings before comparing the full fingerprint. Publication
+occurred before a rebuilt binary or rerun established that correction. The
+20 process records contain no later collection, energy-fit or guided result;
+do not infer success from the edited code.
+
+### Not executed at this publication checkpoint
+
+No process record establishes combined `energy-fit` or learned-energy
+`remask-generate`, five-update TCT training followed by resume and source
+warm-start, the full B8/T512 rows4 diagnostic, or command reruns using
+`artifacts/integrated11/{historical,components-cpu,components-vulkan,vulkan-fused}/config.json`.
+The corresponding configs exist, but configs alone are not execution
+evidence. A successful `tct-reference` is not a TCT training smoke. Standalone
+timings remain scoped to their original profiles, not combined timings.
+
+Post-fix CPU/Vulkan gates, integrated command chain, and paired full-step/decode timings: **pending integrator rerun**.
+
 

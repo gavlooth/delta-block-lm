@@ -9,6 +9,11 @@ explicit serialized selector: omitted/`cpu` preserves historical selection;
 GPU design. Historical configurations, parameters, checkpoints and omitted
 selector fingerprints are unchanged. Fusion and matmul autotuning stay off.
 
+The 8.64×/24.44× figures below are isolated complete-feedback-round gains,
+not full-model training or decoder speedups. Their raw paired samples are
+`artifacts/soft-topk/selection-1792868611613-2908803/`; inclusion of the same
+selector in a later model config does not extend that measurement's scope.
+
 The CPU baseline remains the original full probability download, per-row
 `total_cmp`/ascending-ID sort, ID upload, differentiable gather and sum. Both
 GPU designs replace only discrete selection and state bookkeeping. Selected

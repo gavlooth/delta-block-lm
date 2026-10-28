@@ -7,6 +7,13 @@ vocabulary head, each forward/input-VJP/weight-VJP, at batch1/8/16 and context51
 The model is D256/L4/H4/K32/V64, chunk16, byte vocabulary257. SiLU/residual
 fusion, larger K/V, and scaling to larger contexts are separate work.
 
+All adoption/timing results here concern the pre-Step-7 causal configurations,
+not the later oHC/wavelet/Lngram SBD/Codpula/CoCommit/refinement composition.
+In particular, the 851.80→505.62ms (1.68×) result in RESULTS is not a current
+combined-model gain. `crates/experiment/src/config.rs::Config::validate`
+rejects SBD autotune because its variable-shape geometry is outside this
+preflight.
+
 Production source: `1d038db1e3c38fafb9958d0bcf19df05394ff668`.
 Diagnostic geometry correction: `7f8844f70f07205b9c51bb550ab021b0cbeac210`.
 The correction does not change model execution: native linear F/dX retain

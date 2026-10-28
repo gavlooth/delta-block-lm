@@ -1,6 +1,6 @@
 # Architecture implementation and optimization plan
 
-Status: Steps 1–11 have separate implemented/correctness-gated profiles on CPU and local Intel Vulkan; their contextual/coordination/refinement composition is the isolated integration in §9, not yet a main cutover. Current Step8 uses the explicitly selected HOLA in-block read and optional prefix retrieval; earlier removed dense-attention measurements remain historical only. The Step7 quality ablation is cancelled, not pending. Step12 has not started and is not authorized by this integration. Measured results are in [RESULTS.md](RESULTS.md).
+Status: Steps 1–11 have separate implemented/correctness-gated profiles on CPU and local Intel Vulkan; their contextual/coordination/refinement composition was published on main as `9e67b7ac` before combined acceptance completed. The separate Step 5/6 quality gates were waived, not passed. Current Step 8 uses the explicitly selected HOLA in-block read and optional prefix retrieval; earlier removed dense-attention measurements remain historical only. The Step 7 quality ablation is cancelled, not pending. Step 12 has not started and is not authorized by this integration. Measured results and the exact partial integration command ledger are in [RESULTS.md](RESULTS.md#integrated11-publication-checkpoint).
 
 **Scope override — explicit user instruction:** implement and optimize the given architecture. Its components are requirements, not candidates that must win architecture-selection experiments. Correctness checks and focused runtime/memory measurements may verify an implementation optimization. Do not launch quality ablations, architecture comparisons, candidate sweeps, alternative-mechanism studies or research training runs unless the user explicitly requests them. This overrides experimental comparisons, sweeps and quality-adoption gates elsewhere in this document; those passages are historical proposals, not executable tasks. Steps 9–12 are implementation/optimization work only where they implement the specified architecture, not authorization to add alternatives.
 
@@ -163,7 +163,7 @@ R²D's convergence results do not transfer automatically to state-dependent mask
 
 ## 7. Step-by-step execution checklist
 
-Historical earlier pilot stage: Steps1–7 numerical, soft-feedback, build and checkpoint-continuation checks passed; three-seed recall/tiny-LM experiments were independently reevaluated from validated checkpoints. Recall stayed near guessing and tiny-LM learning used a deliberately short budget, so neither establishes a quality winner. The Step7 quality ablation is cancelled and must not resume. The earlier partial-Step8/dense-attention status is superseded by the explicitly selected HOLA in-block read, optional prefix retrieval and separate Step9–11 implementations documented below. Removed dense-attention visibility/training results remain historical only. Current combined acceptance is §9; Step12 is not started or authorized. The scope override remains in force. See [RESULTS.md](RESULTS.md) and [docs/sbd.md](docs/sbd.md).
+Historical earlier pilot: Steps 1–7 numerical, soft-feedback, build and checkpoint-continuation checks passed; three-seed recall/tiny-LM experiments were independently reevaluated from validated checkpoints. The Step 5/6 quality gates were waived, not passed: recall was near chance on 112–248 queries per seed, and the tiny LM ran 13 updates with only 2,048 validation bytes. The KronLSTM+HOLA working baseline therefore is not a demonstrated quality winner (certified artifact paths are listed in RESULTS, Associative recall and Tiny causal language model). The Step 7 quality ablation is cancelled and must not resume. The earlier partial-Step-8/dense-attention status is superseded by the explicitly selected HOLA in-block read, optional prefix retrieval and separate Step 9–11 implementations below. Current combined acceptance is §9; Step 12 is not started or authorized.
 
 ### Step 1 — Create the small active Burn workspace
 
@@ -225,6 +225,10 @@ Historical earlier pilot stage: Steps1–7 numerical, soft-feedback, build and c
 
 **Gate:** choose a quality/cost Pareto shortlist, not a winner from training loss or a single seed. Keep both leading cache-equipped mixers if neither dominates. A synthetic recall win does not establish better language modeling.
 
+**Recorded outcome:** this quality gate was waived, not passed. The certified
+`artifacts/recall{128,512}-vulkan/certified-evaluations/` comparisons summarized
+in RESULTS remain near chance; they do not justify a quality shortlist.
+
 ### Step 6 — Check the shortlist on a tiny causal language model
 
 - Start with four layers, model width 256 and context 512, retaining supported kernel widths. These are pilot sizes, not final architecture decisions.
@@ -235,6 +239,11 @@ Historical earlier pilot stage: Steps1–7 numerical, soft-feedback, build and c
 **Deliverable:** a resumable tiny LM checkpoint and held-out comparison.
 
 **Gate:** the model learns on held-out data and the recall advantage survives enough to justify its cost. Resolve nonfinite states/gradients before adding mechanisms.
+
+**Recorded outcome:** this quality/cost adoption gate was waived, not passed.
+`artifacts/lm512-vulkan/certified-evaluations/vulkan-362617-1792846070036817669/comparison.json`
+covers 13 optimizer steps and four 512-byte validation windows, not established
+long-context learning or a surviving recall advantage.
 
 ### Step 7 — Add oHC, wavelet mixing and the three Lngram components
 
@@ -249,18 +258,18 @@ Historical earlier pilot stage: Steps1–7 numerical, soft-feedback, build and c
 
 ### Step 8 — Train the SBD-style block-denoising path
 
-Partially implemented: clean/masked objectives, soft feedback, frozen prefix reads and clean replay remain. The added dense active-block attention and its attention-only oracle are removed; sparse/within-block attention is undecided pending explicit user selection. Prior reference gates and context-32 fixed/variable-length and hard-mask training smokes are historical evidence for the removed implementation, not completion or verification of the current attention architecture. See [docs/sbd.md](docs/sbd.md). The scope override prohibits new comparisons and sweeps without explicit user instruction.
+Implemented with the explicitly selected HOLA in-block read (`sbd.in_block_reads: "hola_read"`) and optional prefix retrieval. `docs/sbd.md`, `crates/mixers/src/sbd.rs` and `artifacts/batching/` record the selected operator and its cached/batched numerical and execution evidence. The earlier dense active-block attention and its attention-only oracle were removed; their historical measurements are not verification of the selected operator. The scope override prohibits new comparisons and sweeps without explicit user instruction.
 
 - Add the clean causal objective plus masked future-block objective, retaining the soft top-k input/update mechanism from Step 3.
-- Noisy positions read the clean state before their block without advancing persistent state. Sparse/within-block attention is not yet selected or implemented; do not substitute dense attention or another mechanism.
+- Noisy positions read the clean state before their block without advancing persistent state. Selected HOLA in-block reads add active noisy keys/values to the existing HOLA softmax; optional prefix retrieval shares that read. There is no separate dense-attention operator.
 - Verify short convolutions, wavelet taps, Lngram routing and exact-memory reads obey this visibility rule.
 - Causally replay each finalized block exactly once before extending the prefix.
 - Compare fixed block lengths 4/8/16 with a variable-length training condition, keeping computational chunk length independent. Include length 1 as a causal limiting-case check.
 - Sweep candidate width separately. Add larger blocks and learned/adaptive boundaries only after measuring the fixed/variable references; do not impose 16 as a permanent limit.
 
-**Deliverable (partial):** training, soft top-k feedback and clean replay are implemented; the semi-autoregressive attention architecture remains incomplete pending explicit user selection.
+**Deliverable:** training, soft top-k feedback, selected HOLA in-block reads and clean replay are implemented; see `docs/sbd.md` and `artifacts/batching/` for profile-specific evidence.
 
-**Gate (partial):** retain checks for future-target leakage and agreement between prefix replay and causal execution. Prior block NLL/accuracy and finalized tokens/s are historical dense-attention measurements, not current-architecture results. The removed attention oracle does not cover any future selected operator. Hard-mask-only feedback remains a historical ablation, not the default or authorization for a new run.
+**Gate:** retain checks for future-target leakage and agreement between prefix replay and causal execution. The selected-operator references and block-axis checks are recorded in `docs/sbd.md`; earlier dense-attention block NLL/accuracy and tokens/s remain historical. Hard-mask-only feedback remains a historical ablation, not the default or authorization for a new run.
 
 ### Step 9 — Add Codpula's joint output and adaptive commitment
 
@@ -332,15 +341,17 @@ Step11 with correctness and execution-cost checks only.
 
 ## 9. Approved contextual, coordination and refinement composition
 
-Integration is isolated in `integrated11`, initially merging described parents
-`a0c173c5` and `b9e589b5`; clipping `64590d18` and deterministic Tensor Lngram
-`e50cc523` remain separate ancestors. The docs-only precision diagnosis
-`093d0085` (child of `b9e589b5`) and final described CoCommit parent join with
-another multi-parent change, without rebasing/squashing/abandoning described
-history. Preserve the original negative stress evidence and its independent
-primitive/cancellation diagnosis; it is not a production fix or a replacement
-for the unchanged actual-training objective gate. Main remains untouched until
-final gates and artifact review.
+The `integrated11` composition was published on main as **`9e67b7ac`**.
+Its described parents preserve contextual `a0c173c5`, remasking `b9e589b5`,
+documentation-only precision diagnosis `093d0085`, and final CoCommit
+`3c20ffc2`; clipping `64590d18` and deterministic Tensor Lngram `e50cc523`
+remain separate ancestors. Described history was not rebased or squashed.
+Publication preceded complete combined acceptance. Preserve the original
+negative stress evidence and its independent primitive/cancellation diagnosis;
+it is not a production fix or a replacement for the unchanged actual-training
+objective gate. Exact commands and partial outcomes are in
+[RESULTS: integrated11 publication checkpoint](RESULTS.md#integrated11-publication-checkpoint),
+grounded in `artifacts/integrated11/commands/`.
 
 The selected architecture and highest-return choices stand; this is composition
 of the approved features, not a new mechanism or a selection experiment:
@@ -386,15 +397,16 @@ of the approved features, not a new mechanism or a selection experiment:
    standalone timing tables remain historical for their own profiles and are
    not same-cost combined-model comparisons.
 
-Final acceptance waits for the final CoCommit parent: workspace tests and
-actual Vulkan CLI; independent contextual root/event/flow, noisy-HOLA,
-retrieval-active-K/V, exact mask/energy and TCT references; combined CPU/Vulkan
-fixtures with/without real layer-3 MoBA and all requested execution layouts;
-one-B-distribution/O-R-S/marker-gradient and exact full optimizer/chain restart
-checks; historical identities/checkpoints; actual context32 combined
-train/save/load/evaluate/generate, real collection/rank-fit/guided generation,
-five-update-plus-resumed-step TCT smokes; and one full B8/T512 accumulated
-training diagnostic. Keep negative radial-stress evidence separate from
-acceptance of the actual normalized objective. No quality study, sweep,
-calibration grid, OOM fallback, lower batch/context or extra training is
-authorized. Owned scratch payloads are removed only after their proof.
+The publication checkpoint completed only part of final acceptance:
+workspace tests, contextual/CoCommit/TCT CPU and Vulkan references, corrected
+consumer fixtures, and context32 combined uniform-policy train/save/load/
+evaluate/generate. The actual collection command failed before collecting;
+the subsequent loader change was not rebuilt or rerun before publication.
+Energy fitting/guided generation, five-update/resumed/warm-start TCT CLI,
+full B8/T512 rows4 training, and historical/component/`vulkan-fused` reruns
+were not executed. The complete command ledger and both original fixture
+failures are in RESULTS and `artifacts/integrated11/commands/`.
+These are execution proofs, not quality results. Keep negative radial-stress
+evidence separate from actual normalized-objective acceptance. No quality
+study, sweep, calibration grid, lower batch/context or extra training is
+authorized by this status correction.
