@@ -1,8 +1,9 @@
-# Causal recurrent mixers
+# Causal KronLSTM mixer
 
 Current local optimization results are in the root `RESULTS.md`. Fused KronLSTM and fused HOLA pass independent f64 operator checks, and the measured normalized models pass CPU parameter-gradient/update comparisons. A newly exposed legacy GPU TensorSolver gradient failure remains on the short nonzero-initial-state stress fixture; do not treat that path as an arbitrary-input numerical oracle. CPU remains the tensor reference. Explicit fused selection is recommended for new supported Vulkan experiments; historical defaults are unchanged.
 
 `delta-mixers` supplies a trainable Burn 0.22 module, not a frozen feature map.
+GDN-2 was removed on 2026-10-28 by user decision; KronLSTM is the only mixer.
 The default configuration preserves four heads, key width 32, value width 64,
 and computational chunk length 16. Model width is independently configurable.
 Supported computational chunk sizes are 1 through 16, checked before parameter
@@ -36,12 +37,6 @@ resuming `chunk::scan` is not a complete streaming-model/cache API.
 
 ## Recurrences and chunking
 
-States use `[key,value]` storage per head. GDN-2 uses
-
-- `B = diag(alpha) S`,
-- `d = write * v - (erase * k)^T B`,
-- `S' = B + k d^T`, `o = q^T S'`.
-
 KronLSTM implements [Eq. (10)](https://arxiv.org/html/2610.26834#S2.E10),
 with separately learned scalar gates per head:
 
@@ -49,15 +44,14 @@ with separately learned scalar gates per head:
 - `z = c - beta * k^T B v`,
 - `S' = B + z k v^T`, `o = q^T S'`.
 
-KronLSTM values and both mixers' recurrent queries/keys are L2-normalized.
-Both have learned Q/K/V projections, document-aware short convolutions of width
-four, channel-wise learned decay, output gating, head RMS normalization and an
-output projection. GDN-2 erase/write gates are channel-wise; KronLSTM beta/c
-are scalar per head. The wrapper uses identical output processing in both arms.
+KronLSTM recurrent queries, keys and values are L2-normalized. The mixer has
+learned Q/K/V projections, document-aware short convolutions of width four,
+channel-wise learned decay, scalar beta/c gates per head, sigmoid output gating,
+head RMS normalization and an output projection.
 
 `chunk::scan` derives a strictly lower-triangular correction system per chunk.
-For GDN-2 its unknowns are value-vector edits. For KronLSTM they are scalar
-bilinear corrections; its lower matrix is the product of decayed key overlap,
+Its unknowns are scalar bilinear corrections; the lower matrix is the product
+of decayed key overlap,
 value overlap and beta. A finite nilpotent polynomial solves each triangular
 system using batched matrix multiplications. Only boundary states recur across
 chunks. Direct decay products include reset zeros and padding identities;
@@ -66,32 +60,22 @@ handles the prefix products at resets.
 
 The default `ScanBackend::TensorSolver` runs the same differentiable tensor
 program on NdArray and Vulkan. `ScanBackend::FusedGpu` explicitly selects the
-KronLSTM CubeCL forward/backward scan at key32/value64; requesting it for GDN-2,
-a CPU device, or an unsupported shape fails instead of falling back. The
+KronLSTM CubeCL forward/backward scan at key32/value64; requesting it for
+a CPU device or an unsupported shape fails instead of falling back. The
 `chunk::scan_selected` API accepts the selector and otherwise preserves
 `chunk::scan`'s masks, initial/final state and physical edit scores. All three
 returned tensors retain derivatives, including the initial state and score
 objectives. At a zero physical edit both paths choose the norm's zero
 subgradient without changing nonzero scores or cache ordering.
 
-GDN-2 training can explicitly select `ScanBackend::FusedGdn2` (`fused_gdn2`).
-It requires a CubeCL GPU, f32, key32/value64 and chunk size 1..=16, and retains
-the same output, state, score and seven-input first-derivative contract.
-The historical omitted selector remains `TensorSolver`; all existing Kron
-selectors remain Kron-only. The older output-only GDN-2 chunk-WY operator has
-no initial-state or differentiable score interface and is not substituted into
-training. The stateful path instead uses an analytic VJP with bounded checkpoint
-replay, including reset/padding boundaries and zero physical edit subgradients.
 
 HOLA independently selects `HolaBackend::Tensor` (the historical default) or
 `HolaBackend::FusedGpu`. The latter requires a GPU, key32/value64, capacity
 1..=64 and chunk length 1..=16. It retains exact causal membership, original
 KV entries, earlier-position tie breaking, recency selection and gradients
 through cache reads/normalization/gate/sink. These execution selectors change
-no trainable parameter shapes or identities. The separate output-only GDN-2
-custom kernel remains independently checked. Implemented fused paths are not
-by themselves a measured speedup; see `docs/optimization/gdn.md` for the
-stateful GDN-2 design, strict checks and bounded measurement commands.
+no trainable parameter shapes or identities. Implemented fused paths are not
+by themselves a measured speedup; see the root `RESULTS.md` for measurements.
 
 `projection_backend` is independent of the recurrence/HOLA selectors:
 `separate` (the omitted historical default) executes the original seven input
@@ -130,16 +114,15 @@ dispatch savings, to choose the explicit selector.
 
 ## HOLA and matched recency control
 
-`None`, `Surprise`, and `Recency` are available for each recurrence. Cache-only
-parameters are absent in `None` arms. The cache retains original convolutional
+`None`, `Surprise`, and `Recency` are available. Cache-only parameters are absent
+in `None` configurations. The cache retains original convolutional
 K/V representations, not erase/write factors or normalized KronLSTM write
 values. Independent learned cache-path Q/K RMSNorm scales sharpen the exact
 softmax read; a learned per-head gate (initialized at -4) adds its result to the
 recurrent read, with a learned null-sink logit and exactly zero sink value.
 
 The persistent cache holds the top-capacity committed edits in the causal
-history. GDN-2 scores are `norm(k) * norm(d)` and KronLSTM scores are
-`abs(z) * norm(k) * norm(v)`. Neither score includes passive decay. Scores are
+history, scored by `abs(z) * norm(k) * norm(v)`, excluding passive decay. Scores are
 fixed at the original update. Selection is discrete, with exact ties resolved
 by earlier position; selected original K/V and cache-read parameters remain
 differentiable. Recency changes only selection to position order, preserving
@@ -189,12 +172,8 @@ failure, never a fabricated success. It covers:
   causal cache membership, resets and padding against an independent scalar
   f64 exact-attention/cache oracle;
 - full trainable-layer input directional derivatives and one Q-projection
-  parameter finite difference in all six mixer/cache arms. Cache arms additionally
+  parameter finite difference in all three cache configurations. Cache cases
   span a chunk without reset and check learned cache Q/K scales, gate and sink;
-- on GPU, actual custom GDN-2 forward/backward at unextended lengths 7 and 35,
-  including the true shorter-than-chunk case. Separate final-state passes add
-  thirty-two diagnostic zero-update identity-query tokens to read all state rows;
-  `final_state_probe_tokens` records their timing cost explicitly.
 - KronLSTM lengths 1/7/35 with nonzero initial state, channelwise zero decay,
   signed and exactly zero corrections, zero key/value norms, an all-padding
   chunk and reset-on-padding; output-only, final-state-only, score-only and
