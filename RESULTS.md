@@ -1528,7 +1528,9 @@ candidates waiting to earn inclusion through quality experiments.
 | Lngram | `lngram_layers: [0,1,2]`, orders `[2,3]`, 32 routes × 4 bits, memory dim 8 | Three injections as in the predecessor's three N stages; suffixes stop at the document start; three-tap smoothing → left-only | `lngram_backend: fused_gpu` |
 
 Lngram tables: 4.46 MB per injection, 13.37 MB total, in their own optimizer
-group; an AdamW step changes only indexed rows. Parameters: 2.38 M → 7.08 M
+group; with fresh optimizer state, an AdamW step changes only indexed rows.
+Rows indexed on earlier updates can continue moving through retained Adam
+moments even when the current update does not index them. Parameters: 2.38 M → 7.08 M
 with all three components.
 
 ### Correctness
@@ -2289,6 +2291,104 @@ The corresponding configs exist, but configs alone are not execution
 evidence. A successful `tct-reference` is not a TCT training smoke. Standalone
 timings remain scoped to their original profiles, not combined timings.
 
-Post-fix CPU/Vulkan gates, integrated command chain, and paired full-step/decode timings: **pending integrator rerun**.
+Post-review acceptance is recorded below; it stopped at a historical-identity assertion before Vulkan, integrated command chains or timings.
 
+
+## 2026-10-28 pre-decision review repairs: superseded verification
+
+The pre-decision repair series included proposed changes 2–4: all-free
+marked-B supervision, an extra initial teacher pass, and confidence-only TCT
+inference/provisional-input augmentation. The user subsequently rejected all
+three as unapproved departures from the papers' training/inference split.
+The following historical verification binary included those now-dropped
+changes; its passing tests are not evidence for the current post-drop tree.
+No bookmark was moved or pushed.
+
+### Exercised commands
+
+Every command below used the existing CPU+Vulkan feature combination and an
+explicit deadline. Raw commands, output and statuses are in
+`artifacts/review-fixes/commands/`.
+
+| Command | Exit | Result |
+|---|---:|---|
+| `cargo test -p delta-experiment --features vulkan pairwise_training_writes_source_metrics_without_an_energy -- --nocapture` | 0 | Real CPU train/checkpoint/source metrics with no energy; source generation explicitly skipped |
+| Same new source-metrics regression transplanted onto main | 101 | Fails in `remask::load_energy` before source metrics, as expected |
+| `cargo test -p delta-experiment --features vulkan model::tests:: -- --nocapture` | 0 | Four model tests, including disconnected-backbone rejection and genuine absent mask derivative |
+| Singleton absent-gradient regression transplanted onto main | 101 | Old zero-weight graph term manufactures a mask gradient |
+| `decoder_fix_` regressions transplanted onto main | 101 | Four expected failures: unmarked-B gradient, initial teacher state, provisional training inputs, marked-decoder metric sensitivity |
+| `cargo test --workspace --features delta-experiment/vulkan` (`workspace-gate`) | 0 | 88 experiment + 7 kernel + 18 mixer tests; two ignored tests, one the explicit cost sampler |
+| `cargo build -p delta-experiment --features vulkan` (`integrated-build`) | 0 | 10.078 s wall; experiment and mixer code rebuilt |
+| `current-experiment sbd-reference artifacts/review-fixes/cpu/config.json` | 0 | Existing CPU numerical/gradient gate, unchanged tolerances |
+| `current-experiment sbd-batching-reference artifacts/review-fixes/cpu/config.json` | 0 | Existing CPU batching/gradient gate, unchanged tolerances |
+| `current-experiment codpula-reference artifacts/review-fixes/cpu/config.json` | 0 | Existing scalar-f64 circuit/reference gate, unchanged tolerances |
+| `current-experiment codpula-model-reference artifacts/review-fixes/cpu/config.json` | 0 | Existing complete-model gradient/reference gate, unchanged tolerances |
+| `current-experiment cocommit-reference artifacts/review-fixes/cpu/config.json` | 1 | **STOP:** `omitted CoCommit changed historical SBD training fingerprint` |
+
+Here `current-experiment` is
+`artifacts/review-fixes/current-experiment`. Each reference command was wrapped
+by `flock` in GPU-then-build lock order and a 180-second timeout. The complete
+planned list and executed prefix are `gate-plan.json` and `gate-summary.json`.
+The failure is an identity assertion, not an observed numerical-tolerance
+failure: the integration changed the global SBD revision while this existing
+gate requires omitted-CoCommit historical SBD identity. Neither the assertion,
+the numerical inputs nor any tolerance was relaxed. The required stop rule
+was followed; the failed command was not rerun.
+
+Earlier integrated test invocations are retained, not hidden: the first
+did not compile because two merged test constructors needed the new optional
+config/result fields. The next exposed an invalid TCT config expectation and
+shared autodiff tapes in newly added layout tests. The final correction
+recomputes independent forward graphs for each backward, preserving every
+numerical input and tolerance. The resulting workspace gate passes.
+
+### Implementation coverage and remaining gates
+
+| Review item | Implementation / targeted CPU evidence |
+|---|---|
+| 1 | `train.rs`: source metrics precede optional diagnostics; no-energy CPU regression passes. Source decode validation explicitly reports uniform execution versus requested learned policy. |
+| 2, held | `cocommit.rs`: all-free marked-B loss; `decoder_fix_b_loss_trains_unmarked_free_outputs` passes for factorized and both circuit profiles. No paper-faithfulness conclusion. |
+| 3, held | `sbd.rs`, `soft.rs`, `remask.rs`: teacher-prepared first assignment and replacement schedule; first-state/schedule tests pass. |
+| 4, held | `sbd.rs`, `cocommit.rs`, `remask.rs`, `tct.rs`, config controls: provisional training and shared confidence rule; targeted state/loss/restart tests pass. |
+| 5 | `sbd.rs`, `cocommit.rs`, `remask.rs`: decode-write NLL, generated-prefix evaluation and separate teacher-prefix diagnostic; marker sensitivity and independent scalar-reference tests pass. |
+| 6 | `model.rs`, `sbd_step.rs`, `train.rs`, `tct.rs`: real nonzero/zero/missing gradient counts, exact draw-specific exceptions, no zero-weight graph terms; disconnected-backbone and singleton tests pass. |
+| 7 | `config.rs`, `mask_energy.rs`, tracked configs: ineffective controls rejected, announcement controls named, circuit temperature fixed to training; config tests pass. Confidence restrictions remain part of held item 4. |
+| 8 | `sbd.rs`: plain generation uses training caches; cached-assignment regression passes. |
+| 9 | `model.rs`, `sbd_training.rs`, `layer_reference_tests.rs`: shared per-layer operation; independent old equations match outputs and VJPs across layouts. This is equivalence, not an old-behavior failure. |
+| 10 | mixer clean capture and noisy projections, clean-prefix callers: reused clean tensors and removed discarded forwards; cache immutability and merged-projection/VJP tests pass. No speedup is reported. |
+| 11 | PLAN, RESULTS, OPTIMIZATION and component docs: publication status, historical failed commands, waived quality gates, measurement scope and stale wording corrected. |
+
+**Not executed after the stop:** remaining CPU references, all Vulkan
+references, pairwise train→collect→fit→guided generation, TCT five-update/
+resumed-update/warm-start CLI runs, B8/T512 rows4, historical/components/fused
+CLI reruns, and paired warm full-step/decode timings. Configuration files and
+an ignored full-step/full-generation cost sampler were prepared, but are not
+execution evidence. Baseline build time was 14.355 s after changing workspace
+source paths; the final workspace test command took 8.429 s. No dependency,
+profile or backend feature change was made.
+
+## 2026-10-28 user decision and model-cutover pause
+
+Proposed repairs 2–4 and their supporting confidence configuration,
+provisional-training, extra-teacher and all-free-B tests were dropped.
+Marked B retains its marked-subset objective. Ordinary training has no
+provisional-input augmentation. Generation assigns from its first all-mask
+pass. TCT remains a training mode and decodes with normal uniform/learned
+R²D remasking, not confidence reveals. Historical SBD/CoCommit revision
+constants were restored; no identity assertion was weakened.
+
+Remaining repairs are source-metrics ordering (1), decoder-path validation
+(5), real gradient accounting (6), effective configuration controls (7),
+cached plain generation (8), shared layer operation (9), clean-computation
+reuse/discarded-forward removal (10), and documentation corrections (11).
+The Lngram indexed-row statement now specifies fresh optimizer state; the
+x5 table learning rate is identified as the repository's own choice versus
+the official default multiplier of 3.0. PLAN now identifies the implemented
+bidirectional HOLA in-block read.
+
+Full numerical, Vulkan, integrated11 and paired timing reruns are paused by
+user instruction until the separate KronLSTM-only/bias changes are
+integrated. Only the explicitly requested post-drop CPU
+`cocommit-reference` recheck is authorized before that integration; its
+result is recorded in the session report and command artifacts.
 

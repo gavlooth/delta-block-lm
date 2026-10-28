@@ -58,9 +58,9 @@ fn merged_noisy_projections_preserve_outputs_and_all_parameter_vjps() {
         let mut merged=separate.clone();merged.set_projection_backend(ProjectionBackend::Merged);
         let clean_input=Tensor::<3>::random([1,9,8],burn::tensor::Distribution::Uniform(-0.5,0.5),&device).require_grad();
         let noisy=Tensor::<3>::random([1,3,8],burn::tensor::Distribution::Uniform(-0.5,0.5),&device).require_grad();
-        let separate_clean=capture(&separate,clean_input.clone(),&[5]);
-        let merged_clean=capture(&merged,clean_input.clone(),&[5]);
         for batched in [false,true] {
+            let separate_clean=capture(&separate,clean_input.clone(),&[5]);
+            let merged_clean=capture(&merged,clean_input.clone(),&[5]);
             let output=|mixer:&Mixer,clean:&CleanMixer| {
                 if batched {mixer.forward_sbd_batched_profiled(noisy.clone(),&mixer.prepare_sbd_batched_from_clean(clean,&[(0,5)]),Tensor::ones([1,3],&device),&mut Unprofiled)}
                 else {mixer.forward_sbd_cached(noisy.clone(),&mixer.prepare_sbd_from_clean(clean,&[5]),0,Tensor::ones([1,3],&device))}

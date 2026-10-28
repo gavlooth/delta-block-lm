@@ -92,7 +92,7 @@ Initial block lengths: fixed 4, 8 and 16 plus a variable-length condition. These
 
 Proposed recurrent adaptation:
 1. Compute clean-prefix states and exact-memory contents.
-2. Noisy positions read the clean state before their block. Sparse/within-block attention remains undecided pending explicit user selection. The added dense active-block path is removed; no new bidirectional attention path is currently implemented. HOLA's existing attention is unchanged.
+2. Noisy positions read the clean state before their block. Selected HOLA in-block reads are implemented and bidirectional over the active noisy block, sharing the existing HOLA softmax with immutable clean keys. The earlier separate dense active-block operator was removed.
 3. Repeated denoising and coordination passes use that same clean-prefix snapshot; they do not advance persistent state.
 4. Causally replay the finalized block before extending the prefix.
 

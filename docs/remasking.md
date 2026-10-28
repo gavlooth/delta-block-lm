@@ -9,6 +9,11 @@ End-of-training generation is explicitly skipped when refinement is selected:
 the energy must first be fitted to that checkpoint. Run `remask-collect`,
 `energy-fit`, then `remask-generate`; guided generation still rejects a missing
 energy rather than silently using uniform masks.
+Source training evaluates the actual decoder under an explicitly selected uniform
+policy when the requested learned energy cannot yet exist. The primary
+`sbd_validation.block_nll` records both requested and executed policies and the
+reason. `sbd-evaluate` after fitting uses the requested guided policy strictly;
+the nested teacher-prefix diagnostic remains separate.
 
 The research question is whether **learning where to perturb, while still sampling**, improves refinement at equal work. It is not whether token confidence predicts an error. A confident wrong token remains eligible. An energy head predicts the usefulness of a *set to remask*, not the probability of the current text, and not a deterministic token replacement score.
 

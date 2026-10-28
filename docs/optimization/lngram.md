@@ -59,8 +59,10 @@ The two dense Adam moments add 26,738,688 bytes for all tables; table gradients
 are dense too, although their nonzero support is only the indexed rows.
 
 Table parameters use their own production optimizer group, learning rate x5
-and weight decay zero, as in the predecessor. Both tensor and fused AdamW use
-that group. With fresh state, an unindexed row is unchanged even if its stored
+and weight decay zero. The x5 multiplier is this repository's choice inherited
+from its predecessor, not the official implementation's default multiplier
+of 3.0. Both tensor and fused AdamW use that group. With fresh state, an
+unindexed row is unchanged even if its stored
 value is nonzero. As with ordinary Adam, a row indexed on an earlier step can
 subsequently move through momentum; this is not a sparse-moment optimizer.
 `LanguageModel::lngram_table_ids` exposes the exact table parameter IDs.

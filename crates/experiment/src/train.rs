@@ -459,7 +459,19 @@ pub fn run(
     // Collection and warm-start consume this source record before an energy can exist.
     runtime::write_json(&run_dir.join("metrics.json"), &metrics)?;
     if let Some(sbd) = &c.sbd {
-        metrics["sbd_validation"] = crate::sbd::evaluate(&model,c,&validation,device)?;
+        let mut evaluation_config = c.clone();
+        let requested_policy = sbd.refinement.as_ref().map(|r| r.policy);
+        let needs_energy = matches!(requested_policy, Some(crate::mask_energy::MaskPolicy::Unary | crate::mask_energy::MaskPolicy::Pairwise));
+        if needs_energy {
+            evaluation_config.sbd.as_mut().unwrap().refinement.as_mut().unwrap().policy = crate::mask_energy::MaskPolicy::Uniform;
+        }
+        metrics["sbd_validation"] = crate::sbd::evaluate(&model,&evaluation_config,&validation,device)?;
+        metrics["sbd_validation"]["requested_decode_policy"] = json!(requested_policy);
+        metrics["sbd_validation"]["executed_decode_policy"] = json!(evaluation_config.sbd.as_ref().unwrap().refinement.as_ref().map(|r| r.policy));
+        if needs_energy {
+            metrics["sbd_validation"]["policy_reason"] = json!("explicit uniform-policy source evaluation; learned-energy evaluation requires energy-fit followed by sbd-evaluate");
+        }
+        metrics["primary_validation_metric"] = json!("sbd_validation.block_nll");
         metrics["sbd_generation"] = if sbd.refinement.is_some() {
             json!({"performed":false,"reason":"refinement generation is separate: run remask-collect, energy-fit, then remask-generate with this checkpoint"})
         } else {
@@ -857,6 +869,9 @@ mod summary_tests {
         let result = run(&c, &c.arms[0], 1, &Device::ndarray(), None).unwrap();
         assert_eq!(result["completed"], true);
         assert_eq!(result["sbd_generation"]["performed"], false);
+        assert_eq!(result["sbd_validation"]["requested_decode_policy"], "pairwise");
+        assert_eq!(result["sbd_validation"]["executed_decode_policy"], "uniform");
+        assert_eq!(result["primary_validation_metric"], "sbd_validation.block_nll");
         let source = root.join("runs").join(format!("{}-seed1", c.arms[0].name)).join("metrics.json");
         let saved: Value = serde_json::from_slice(&std::fs::read(source).unwrap()).unwrap();
         assert_eq!(saved["config"], serde_json::to_value(&c).unwrap());

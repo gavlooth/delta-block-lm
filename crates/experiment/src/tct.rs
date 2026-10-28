@@ -574,10 +574,11 @@ fn warm_start_identity(c: &Config, path: &Path, saved: &train::State, target_tok
     requested.train_tokens = source.train_tokens;
     requested.budget_file = source.budget_file.clone();
     requested.sbd.as_mut().unwrap().refinement = source.sbd.as_ref().unwrap().refinement.clone();
+    requested.sbd.as_mut().unwrap().rows_per_pass = source.sbd.as_ref().unwrap().rows_per_pass;
     ensure!(requested.training_fingerprint(source_tokens)? == saved.config_sha256,
-        "TCT warm-start differs from its verified source beyond training_mode, decoder refinement, token budget or artifact_dir");
+        "TCT warm-start differs from its verified source beyond training_mode, decoder refinement, row accumulation, token budget or artifact_dir");
     Ok(json!({"source_training_sha256":saved.config_sha256,"verified_source_config":source_path,
-        "allowed_changes":["training_mode","sbd.refinement","tct","train_tokens","budget_file","artifact_dir"]}))
+        "allowed_changes":["training_mode","sbd.refinement","sbd.rows_per_pass","tct","train_tokens","budget_file","artifact_dir"]}))
 }
 
 /// Actual joint TCT training only: no held-out evaluation or generation routine is called.

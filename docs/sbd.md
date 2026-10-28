@@ -10,7 +10,7 @@ With `sbd` absent, the architecture, config serialization, random initialization
 
 The optional `sbd.joint_output: "codpula"` replaces the multi-token noisy output with a 32-state joint HMM over the full 257-symbol vocabulary; omitted or `"factorized"` retains the behavior described here and its historical serialization. Codpula feeds joint token marginals into sparse feedback, trains conditional joint block NLL, and can use `commitment: "dependence"` with `dependence_threshold: 0.05` and seeded joint proposals. The exact causal length-one bypass is unchanged. Decisions, inference, optimizer, numerical checks and cost measurements are specified in [Codpula](codpula.md); `configs/lm512-codpula.json` enables the new model.
 
-The optional `sbd.cocommit` adds one learned marker over the full saved hidden representation and a shared marked-tail assignment pass; omission preserves historical model/config identity. `configs/lm512-cocommit.json` enables it with Codpula. The last complete block is the initial tail, and oHC uses independent marker entries for its four streams. Both branches share the differentiable pre-tail input and immutable clean-prefix snapshots. The marked branch is supervised on its sampled unresolved subset; factorized branches also preserve visible tokens with weight `.2`, while Codpula uses the exact marked-subset joint event and marginalizes unmarked unresolved positions. See [CoCommit](cocommit.md) for decisions, checks and measured execution cost.
+The optional `sbd.cocommit` adds one learned marker over the full saved hidden representation and a shared marked-tail assignment pass. `configs/lm512-cocommit.json` enables it with Codpula. The last complete block is the initial tail, and oHC uses independent marker entries for its four streams. Both branches share the differentiable pre-tail input and immutable clean-prefix snapshots. The marked branch is supervised only on its announced subset, as specified by CoCommit; factorized branches can preserve visible positions with an explicit loss weight. Codpula uses the marked-subset joint event and marginalizes unmarked free positions. See [CoCommit](cocommit.md) for decisions and historical execution costs.
 
 The optional execution setting `sbd.rows_per_pass` processes every full-batch row in explicit groups, sums scaled gradients and unscaled circuit flows/counts, then performs one clipping/AdamW/circuit update. Full-batch mask and CoCommit-bundle sampling occurs before partitioning. Omission preserves the historical one-pass path and serialization. The CoCommit B8 profile uses two four-row groups; this is exact gradient accumulation, not fewer examples or a hidden allocation fallback.
 
@@ -22,7 +22,15 @@ scored, and `cocommit_marker` when no marked branch is used. Every other missing
 gradient still stops the update. No zero-weight parameter terms are inserted
 into losses, and these counts do not assert that every parameter learned.
 
-Enabled-SBD training and pilot fingerprints retain the semantic revision introduced after dense attention removal. Selecting `hola_read` additionally changes the serialized model identity; omitted/explicit `none` keeps the previous SBD identity. Old dense-SBD checkpoints remain incompatible. Configurations without `sbd` retain their hashes.
+For paired execution measurements, the ignored
+`warm_complete_step_and_generation_cost_sample` test accepts a validated
+`DELTA_COST_CONFIG` path. It reports three synchronized complete optimizer steps
+and three complete generation calls from fixed initial inference parameters.
+Discard the first two samples of each kind; alternate historical/current test
+executables for paired measurements. The outer generation timer includes prompt
+preparation and final history handling, not checkpoint I/O or model creation.
+
+The historical SBD, CoCommit and combined-model semantic revisions remain unchanged. The rejected all-free-B, extra-teacher and provisional-training changes do not alter checkpoint interpretation. Configuration controls migrate explicitly; configurations without `sbd` retain their historical hashes.
 ### Configuration controls and validation
 
 `crates/experiment/src/config.rs::Config::validate` rejects controls that the
@@ -93,7 +101,7 @@ The public block-forward function accepts a clean prefix and explicit soft/obser
 
 Only after the entire block is finalized does the clean-prefix object append its tokens. The next multi-token block prepares one clean-prefix cache, reused by every noisy assignment; no separate discarded clean forward runs at initialization or replay, and no clean forward runs after the final block solely to discard its output. The length-one causal special case remains unchanged. Reported finalized tokens/s includes required clean-cache preparation from the initial prompt and from extended history, denoising, host selection, soft updates and synchronization. This is an execution change, not a measured decoding speedup; paired warm full-step and decode measurements are required separately.
 
-With CoCommit enabled, generation prepares the immutable clean layer cache once per active block and reuses it across denoising passes. Each pass still recomputes its changing noisy prefix, runs selection, then reruns only the marked tail. It writes only announced positions from the marked output and retains observation immutability. In the combined path, new token potentials and coupling gates create a new Codpula circuit; joint proposals, marginals and dependence scores are recomputed before writes. No pre-marker circuit values are used for assignment. Clean replay remains once per completed block.
+With CoCommit enabled, generation prepares the immutable clean layer cache once per active block and reuses it across denoising passes. Each pass recomputes its changing noisy prefix, runs selection, then reruns only the marked tail. Plain CoCommit commitment writes announced positions; refinement uses one coherent marked-B proposal over every free position. New token potentials and coupling gates create a new Codpula circuit; joint proposals, marginals and dependence scores are recomputed before writes. No pre-marker circuit values are used for assignment. Completed tokens are appended to history, with no discarded final clean forward.
 
 ## Work and retained tensors
 

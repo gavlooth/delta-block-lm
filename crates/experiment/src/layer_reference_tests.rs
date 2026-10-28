@@ -125,19 +125,32 @@ fn shared_layer_matches_previous_outputs_and_vjps_on_every_layout() {
         let soft=sbd::state(&c,vec![None;3],&device).unwrap();
         let hidden=Tensor::cat(vec![model.embedding.forward(batch.input.clone()),soft.embeddings(model.embedding.weight.val(),model.sbd_mask.as_ref().unwrap().val(),false).reshape([1,3,8])],1);
         let full=sbd::prefix_batch(&[256,11,23,37,41,53,61,0,0,0],&device);
-        let expected=reference_full(&model,hidden.clone(),&full,Some(prefix.len()));
+        let expected_hidden=Tensor::cat(vec![model.embedding.forward(batch.input.clone()),soft.embeddings(model.embedding.weight.val(),model.sbd_mask.as_ref().unwrap().val(),false).reshape([1,3,8])],1);
+        let expected=reference_full(&model,expected_hidden,&full,Some(prefix.len()));
         assert_output_and_gradients(&model,model.forward_noisy(hidden,&full,prefix.len()),expected);
-        let mut trace=CleanInputs::default();
-        let _=model.forward_profiled(&full,&mut trace);
-        let cache=model.training_cache(&trace,0,&[prefix.len()]);
-        let batched=model.training_cache_batched(&trace,&[(0,prefix.len())]);
-        assert_output_and_gradients(&model,model.cached_block(&cache,0,&soft,false),reference_cached(&model,&cache,&soft,false));
-        assert_output_and_gradients(&model,model.cached_blocks(&batched,&soft,false),reference_cached(&model,&cache,&soft,false));
-        let noisy=model.cached_block_prefix_profiled(&cache,0,&soft,false,&mut Unprofiled);
-        let marked=model.cached_block_tail_profiled(&cache,0,noisy,Some(Tensor::ones([1,3],&device)),&mut Unprofiled);
-        assert_output_and_gradients(&model,marked,reference_cached(&model,&cache,&soft,true));
-        let noisy=model.cached_blocks_prefix_profiled(&batched,&soft,false,&mut Unprofiled);
-        let marked=model.cached_blocks_tail_profiled(&batched,noisy,Some(Tensor::ones([1,3],&device)),&mut Unprofiled);
-        assert_output_and_gradients(&model,marked,reference_cached(&model,&cache,&soft,true));
+        // Each backward consumes its own cache graph; sharing tensor values would
+        // also share the clean-forward tape between the two compared objectives.
+        for layout in 0..4 {
+            let mut trace=CleanInputs::default();
+            let _=model.forward_profiled(&full,&mut trace);
+            let cache=model.training_cache(&trace,0,&[prefix.len()]);
+            let batched=model.training_cache_batched(&trace,&[(0,prefix.len())]);
+            let actual=match layout {
+                0=>model.cached_block(&cache,0,&soft,false),
+                1=>model.cached_blocks(&batched,&soft,false),
+                2=>{
+                    let noisy=model.cached_block_prefix_profiled(&cache,0,&soft,false,&mut Unprofiled);
+                    model.cached_block_tail_profiled(&cache,0,noisy,Some(Tensor::ones([1,3],&device)),&mut Unprofiled)
+                }
+                _=>{
+                    let noisy=model.cached_blocks_prefix_profiled(&batched,&soft,false,&mut Unprofiled);
+                    model.cached_blocks_tail_profiled(&batched,noisy,Some(Tensor::ones([1,3],&device)),&mut Unprofiled)
+                }
+            };
+            let mut reference_trace=CleanInputs::default();
+            let _=model.forward_profiled(&full,&mut reference_trace);
+            let reference_cache=model.training_cache(&reference_trace,0,&[prefix.len()]);
+            assert_output_and_gradients(&model,actual,reference_cached(&model,&reference_cache,&soft,layout>=2));
+        }
     }
 }

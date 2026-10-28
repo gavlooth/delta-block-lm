@@ -804,6 +804,51 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A single sample supports interleaving historical and current executables.
+    #[test]
+    #[ignore = "explicit cost run; set DELTA_COST_CONFIG to a CPU or GPU config"]
+    fn warm_complete_step_and_generation_cost_sample() {
+        let path = std::env::var("DELTA_COST_CONFIG").expect("DELTA_COST_CONFIG");
+        let c = Config::load(Path::new(&path)).unwrap();
+        let device = runtime::device(&c).unwrap();
+        device.seed(c.seed);
+        let target = device.clone().autodiff();
+        let mut model = LanguageModel::new(&c, &c.arms[0], &target).unwrap();
+        model.materialize_parameters();
+        let inference = model.valid();
+        let corpus = crate::train::loaded_corpus(&c).unwrap();
+        let rows = crate::data::examples(&c, corpus.as_ref(), c.seed, 0, c.batch_size, "train").unwrap();
+        let mut optimizer = crate::train::optimizer(&c);
+        let mut step_ms = Vec::new();
+        let mut loss = 0.0;
+        for _ in 0..3 {
+            runtime::sync(&target).unwrap();
+            let clock = Instant::now();
+            let batch = Batch::new(&rows, &target);
+            let result = crate::sbd_step::backward(&model,&c,&rows,&batch,c.seed).unwrap();
+            loss = result.loss;
+            model = crate::train::optimizer_step(&c,model,&mut optimizer,result.gradients,result.circuit_flows).unwrap();
+            runtime::sync(&target).unwrap();
+            step_ms.push(clock.elapsed().as_secs_f64()*1000.0);
+        }
+        let prompt = &rows[0].input;
+        let mut decode_ms = Vec::new();
+        let mut output = Value::Null;
+        for _ in 0..3 {
+            runtime::sync(&device).unwrap();
+            let clock = Instant::now();
+            output = generate(&inference,&c,prompt,&device).unwrap();
+            runtime::sync(&device).unwrap();
+            decode_ms.push(clock.elapsed().as_secs_f64()*1000.0);
+        }
+        println!("COST_SAMPLE {}", json!({"config":c,"device":runtime::identity(&device),
+            "seed":c.seed,"shape":{"batch":c.batch_size,"context":c.context,"model":c.d_model,"layers":c.layers},
+            "training_tokens":c.tokens_per_step(),"generated_tokens":output["finalized_tokens"],
+            "step_ms":step_ms,"decode_ms":decode_ms,"warmups":2,"measured_samples":1,
+            "last_loss":loss,"generation":output,
+            "method":"fixed fixture; complete upload/loss/backward/gradient checks/optimizer update and full generation including prompt preparation and history append; same fresh initial inference parameters; first two samples excluded"}));
+    }
     #[test]
     fn plain_generation_matches_cached_training_assignments() {
         for ohc in [false,true] {
@@ -812,7 +857,7 @@ mod tests {
             let c=Config {task:"lm".into(),d_model:8,layers:2,heads:2,key_dim:2,value_dim:2,chunk_size:4,cache_capacity:2,
                 ohc_streams:ohc,wavelet_layers:vec![0],lngram_layers:vec![0],lngram_routes:2,lngram_bits:1,lngram_memory_dim:2,lngram_orders:vec![2,3],
                 projection_backend:delta_mixers::ProjectionBackend::Merged,
-                sbd:Some(crate::config::SbdConfig {block_lengths:vec![3],generate_tokens:6,commit_count:3,feedback:SbdFeedback::HardMask,..Default::default()}),
+                sbd:Some(crate::config::SbdConfig {block_lengths:vec![3],generate_tokens:6,commit_count:Some(3),feedback:SbdFeedback::HardMask,..Default::default()}),
                 ..Default::default()};
             let arm=Arm {name:"kronlstm-hola".into(),mixer:"kronlstm".into(),cache:"surprise".into()};
             let model=LanguageModel::new(&c,&arm,&device).unwrap();
