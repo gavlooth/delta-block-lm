@@ -1,0 +1,44 @@
+{
+  "task": "lm",
+  "backend": "vulkan",
+  "artifact_dir": "artifacts/lm512-optimized-autotune",
+  "budget_file": "artifacts/lm512-optimized-autotune/budget.json",
+  "scan_backend": "fused_parallel256",
+  "hola_backend": "fused_gpu_pairs",
+  "projection_backend": "merged_heuristic_output",
+  "d_model": 256,
+  "layers": 4,
+  "heads": 4,
+  "key_dim": 32,
+  "value_dim": 64,
+  "chunk_size": 16,
+  "cache_capacity": 16,
+  "context": 512,
+  "batch_size": 8,
+  "eval_examples": 4,
+  "seed": 1,
+  "seeds": [
+    1,
+    2,
+    3
+  ],
+  "learning_rate": 0.001,
+  "checkpoint_every": 4,
+  "pilot_steps": 3,
+  "pilot_seconds": 10,
+  "comparison_seconds": 30,
+  "max_seconds": 90,
+  "arms": [
+    {
+      "name": "kronlstm-hola",
+      "mixer": "kronlstm",
+      "cache": "surprise"
+    }
+  ],
+  "convolution_backend": "fused_gpu",
+  "normalization_backend": "fused_norms_gates",
+  "update_backend": "fused_gpu",
+  "epilogue_backend": "analytic_backward",
+  "autotune": true,
+  "head_backend": "heuristic"
+}

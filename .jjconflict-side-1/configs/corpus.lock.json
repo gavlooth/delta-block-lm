@@ -1,0 +1,15 @@
+{
+  "name": "public-domain-books-six-v1",
+  "license": "Public-domain literary texts under US copyright law; original source files retain the Project Gutenberg license. Check local law outside the US.",
+  "license_url": "https://www.gutenberg.org/policy/license.html",
+  "tokenizer": "utf8-bytes-v1-bos256",
+  "extraction": "strip Gutenberg START/END wrapper, normalize CRLF to LF, trim, append LF; whole books assigned before tokenization",
+  "documents": [
+    {"id":"pg11","title":"Alice's Adventures in Wonderland","author":"Lewis Carroll","split":"train","url":"https://www.gutenberg.org/ebooks/11.txt.utf-8","sha256":"01b38ea4c710a84bc18d0bd41271a5a1a92b94e97b2812f4dece97d4a694725e"},
+    {"id":"pg84","title":"Frankenstein","author":"Mary Shelley","split":"train","url":"https://www.gutenberg.org/ebooks/84.txt.utf-8","sha256":"2b97b7f8aad508649481d8dd4f6b54f9b965ddb3ba634e9151c815f537b49e42"},
+    {"id":"pg1342","title":"Pride and Prejudice","author":"Jane Austen","split":"train","url":"https://www.gutenberg.org/ebooks/1342.txt.utf-8","sha256":"3f6bb9d6f78e0293b56acd4714dd68cb7d6d1d293402031ce9d5a216bcaf9d75"},
+    {"id":"pg1661","title":"The Adventures of Sherlock Holmes","author":"Arthur Conan Doyle","split":"train","url":"https://www.gutenberg.org/ebooks/1661.txt.utf-8","sha256":"922e2a12ccb43a4c9544c260b2166c6ad2097aeb5957faeee113f173bb857cd0"},
+    {"id":"pg74","title":"The Adventures of Tom Sawyer","author":"Mark Twain","split":"validation","url":"https://www.gutenberg.org/ebooks/74.txt.utf-8","sha256":"74d77384b123a6360db9ab58463cff8b38df8525fbdc6000c81ee388e1f3cf10"},
+    {"id":"pg2701","title":"Moby Dick","author":"Herman Melville","split":"test","url":"https://www.gutenberg.org/ebooks/2701.txt.utf-8","sha256":"b5e88b71a1cda068e9ab1d94344c9d932338ba6da1a66def97a1aecd9cfcc87d"}
+  ]
+}

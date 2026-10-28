@@ -1,0 +1,26 @@
+{
+  "task":"recall",
+  "backend":"vulkan",
+  "artifact_dir":"artifacts/recall512",
+  "budget_file":"artifacts/recall512/budget.json",
+  "d_model":128,
+  "layers":2,
+  "context":512,
+  "batch_size":1,
+  "eval_examples":10,
+  "association_counts":[4,8,16,32,64],
+  "seed":1,
+  "seeds":[1,2,3],
+  "learning_rate":0.001,
+  "checkpoint_every":4,
+  "pilot_steps":2,
+  "pilot_seconds":10,
+  "comparison_seconds":20,
+  "max_seconds":60,
+  "arms":[
+    {"name":"gdn2","mixer":"gdn2","cache":"none"},
+    {"name":"gdn2-hola","mixer":"gdn2","cache":"surprise"},
+    {"name":"kronlstm","mixer":"kronlstm","cache":"none"},
+    {"name":"kronlstm-hola","mixer":"kronlstm","cache":"surprise"}
+  ]
+}

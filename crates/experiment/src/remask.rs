@@ -96,6 +96,13 @@ pub(crate) fn provisional_input(soft: &SoftState, values: &[usize], revealed: &[
 }
 
 #[derive(Clone)]
+struct EpisodeScoring {
+    targets: Vec<i32>,
+    weights: Vec<f32>,
+    nll: Vec<f64>,
+    hits: Vec<bool>,
+}
+#[derive(Clone)]
 struct Episode {
     soft: SoftState,
     values: Vec<usize>,
@@ -104,6 +111,7 @@ struct Episode {
     previous_logs: Option<Tensor<2>>,
     previous_candidates: Option<Candidates>,
     previous_values: Option<Vec<usize>>,
+    scoring: Option<EpisodeScoring>,
 }
 impl Episode {
     fn new(c: &Config, lengths: Vec<usize>, width: usize, observed: Vec<Option<usize>>, device: &Device) -> Result<Self> {
@@ -114,7 +122,7 @@ impl Episode {
         let active = lengths.iter().flat_map(|&n| (0..width).map(move |i| i<n)).collect();
         let soft = SoftState::new(c.vocab(),c.sbd.as_ref().unwrap().candidate_width,observed,active,device,c.soft_selection_backend)?;
         let values = soft.observed.iter().map(|v|v.unwrap_or(0)).collect();
-        Ok(Self {soft,values,revealed:vec![false;rows],lengths,previous_logs:None,previous_candidates:None,previous_values:None})
+        Ok(Self {soft,values,revealed:vec![false;rows],lengths,previous_logs:None,previous_candidates:None,previous_values:None,scoring:None})
     }
     fn width(&self) -> usize { self.soft.active.len()/self.lengths.len() }
     fn eligible(&self, row: usize) -> Vec<usize> {
@@ -297,6 +305,7 @@ fn predict(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, stat
     } else {(model.cached_blocks(cache,&view,false).detach(),Vec::new(),crate::cocommit::CoordinationWork::default())};
     let used_b_count=marks.chunks_exact(width).filter(|marks|marks.iter().any(|&mark|mark)).count();
     let hidden=output.features.clone();
+    let mut write_logs=None;
     let logs = if model.codpula.is_some() {
         if marked {
             work.circuit_preparations += 1;
@@ -314,6 +323,9 @@ fn predict(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, stat
             state.values.iter().map(|&v|v as i32).collect::<Vec<_>>(),[rows,width]),device);
         let proposal_fixed = Tensor::<2,Bool>::from_data(TensorData::new(
             state.soft.observed.iter().zip(&revealed).map(|(value,&reveal)|value.is_some() || (!correction && reveal)).collect::<Vec<_>>(),[rows,width]),device);
+        if state.scoring.is_some() {
+            write_logs=Some(host(circuit.marginals(proposal_tokens.clone(),proposal_fixed.clone())?.reshape([rows*width,c.vocab()]).log())?);
+        }
         let proposals = circuit.sample_with_uniforms(proposal_tokens,proposal_fixed,token_uniforms(state,keys,seed,call,device))?;
         for (row,proposal) in proposals.into_iter().enumerate() {
             for (i,value) in proposal.into_iter().enumerate() { state.values[row*width+i] = value; }
@@ -323,12 +335,21 @@ fn predict(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, stat
         circuit.marginals(tokens,fixed)?.reshape([rows*width,c.vocab()]).log()
     } else {
         let logs = log_softmax(output.logits/c.soft_temperature,2).reshape([rows*width,c.vocab()]);
+        if state.scoring.is_some() {write_logs=Some(host(logs.clone())?);}
         let best = crate::soft::ids_host(logs.clone().argmax(1));
         for i in 0..state.values.len() {
             if state.soft.active[i] && state.soft.observed[i].is_none() && (correction || !revealed[i]) { state.values[i] = best[i] as usize; }
         }
         logs
     };
+    if let (Some(scoring),Some(write_logs))=(&mut state.scoring,write_logs) {
+        for i in 0..state.values.len() {
+            if state.soft.active[i] && state.soft.observed[i].is_none() && (correction || !revealed[i]) {
+                scoring.nll[i]=-f64::from(write_logs[i*c.vocab()+scoring.targets[i] as usize]);
+                scoring.hits[i]=state.values[i]==scoring.targets[i] as usize;
+            }
+        }
+    }
     let previous = state.soft.candidates.clone();
     state.soft.update(logs.clone().detach(),c.soft_eta,1.0,c.soft_steps,c.sbd.as_ref().unwrap().candidate_width)?;
     state.previous_candidates = Some(previous);
@@ -454,6 +475,10 @@ fn restore_row(state: &mut Episode, before: &Episode, row: usize, device: &Devic
     let range = row*width..(row+1)*width;
     state.values[range.clone()].copy_from_slice(&before.values[range.clone()]);
     state.revealed[range.clone()].copy_from_slice(&before.revealed[range.clone()]);
+    if let (Some(after),Some(old))=(&mut state.scoring,&before.scoring) {
+        after.nll[range.clone()].copy_from_slice(&old.nll[range.clone()]);
+        after.hits[range.clone()].copy_from_slice(&old.hits[range.clone()]);
+    }
     let rows = state.values.len();
     let selected = Tensor::<2,Bool>::from_data(TensorData::new((0..rows).map(|i|range.contains(&i)).collect::<Vec<_>>(),[rows,1]),device);
     let k = state.soft.candidates.ids.dims()[1];
@@ -500,6 +525,9 @@ fn load_energy(model: &LanguageModel, c: &Config, device: &Device) -> Result<Opt
 }
 
 pub fn generate(model: &LanguageModel, c: &Config, prompt: &[i32], device: &Device) -> Result<Value> {
+    generate_scored(model,c,prompt,None,device)
+}
+pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32], targets: Option<(&[i32],&[f32])>, device: &Device) -> Result<Value> {
     let s = c.sbd.as_ref().context("remasking requires SBD")?;
     settings(c)?;
     ensure!(!prompt.is_empty() && prompt.iter().all(|&v|v>=0 && (v as usize)<c.vocab()),"generation requires a valid clean prefix");
@@ -508,6 +536,7 @@ pub fn generate(model: &LanguageModel, c: &Config, prompt: &[i32], device: &Devi
     let energy = if s.block_lengths.iter().any(|&n|n>1) && s.generate_tokens>1 {load_energy(&model,c,device)?} else {None};
     let mut prefix = prompt.to_vec();
     let mut generated = Vec::with_capacity(s.generate_tokens);
+    let mut score=crate::sbd::DecodeScore::default();
     let mut blocks = 0;
     let mut calls = 0;
     let mut row_calls = 0;
@@ -523,14 +552,33 @@ pub fn generate(model: &LanguageModel, c: &Config, prompt: &[i32], device: &Devi
             let output = crate::sbd::block_forward(&model,&prefix,&soft,false,device);
             calls += 1;
             row_calls += 1;
-            vec![crate::soft::ids_host(output.logits.reshape([1,c.vocab()]).argmax(1))[0] as i32]
+            let logs=log_softmax(output.logits,2).reshape([1,c.vocab()]);
+            let proposal=crate::soft::ids_host(logs.clone().argmax(1))[0] as usize;
+            if let Some((targets,weights))=targets {
+                score.observe(&host(logs)?,&[proposal],&[0],&targets[generated.len()..generated.len()+1],&weights[generated.len()..generated.len()+1],c.vocab());
+            }
+            vec![proposal as i32]
         } else {
             if clean_cache.is_none() {clean_cache=Some(prefix_cache(&model,&[prefix.clone()],device)?);}
-            let state = Episode::new(c,vec![n],n,vec![None;n],device)?;
+            let mut state = Episode::new(c,vec![n],n,vec![None;n],device)?;
+            if let Some((targets,weights))=targets {
+                let range=generated.len()..generated.len()+n;
+                state.scoring=Some(EpisodeScoring {targets:targets[range.clone()].to_vec(),weights:weights[range].to_vec(),
+                    nll:vec![f64::NAN;n],hits:vec![false;n]});
+            }
             let result = episode(&model,c,clean_cache.as_ref().unwrap(),state,&[blocks as u64],c.seed,energy.as_ref(),true,device)?;
             coordination.add(result.work);
             calls += result.calls;
             row_calls += result.row_calls[0];
+            if let Some(scoring)=&result.state.scoring {
+                for i in 0..n {
+                    if scoring.weights[i]==0.0 {continue;}
+                    ensure!(scoring.nll[i].is_finite(),"decoder output has no finite write-time score");
+                    score.nll+=scoring.nll[i];
+                    score.hits+=usize::from(scoring.hits[i]);
+                    score.count+=1;
+                }
+            }
             result.state.values.into_iter().map(|v|v as i32).collect()
         };
         prefix.extend_from_slice(&values);
@@ -549,7 +597,7 @@ pub fn generate(model: &LanguageModel, c: &Config, prompt: &[i32], device: &Devi
     }
     runtime::sync(device)?;
     let seconds = clock.elapsed().as_secs_f64();
-    Ok(json!({"tokens":generated,"text":String::from_utf8_lossy(&generated.iter().map(|&v|v as u8).collect::<Vec<_>>()),
+    let mut report=json!({"tokens":generated,"text":String::from_utf8_lossy(&generated.iter().map(|&v|v as u8).collect::<Vec<_>>()),
         "seconds":seconds,"finalized_tokens":generated.len(),"finalized_tokens_per_second":generated.len() as f64/seconds,
         "coordination_work":coordination,
         "denoising_passes":calls,"active_row_calls":row_calls,"blocks":blocks,"causally_replayed_tokens":generated.len(),
@@ -560,7 +608,9 @@ pub fn generate(model: &LanguageModel, c: &Config, prompt: &[i32], device: &Devi
         "proposal_evidence":if s.training_mode == crate::tct::TrainingMode::Tct {"permanent_O_only"}else{"permanent_O_plus_provisional_reveals"},"feedback_and_feature_evidence":"permanent_O_only",
         "marginal_queries_per_joint_call":if model.cocommit_config.is_some(){None}else{Some(1usize)},
         "ffbs_queries_per_joint_call":if model.cocommit_config.is_some(){None}else{Some(1usize)},
-        "proposal_seed":c.seed,"potential_temperature":c.soft_temperature,"quality_evaluation":false}))
+        "proposal_seed":c.seed,"potential_temperature":c.soft_temperature,"quality_evaluation":targets.is_some()});
+    if targets.is_some() {report["decode_score"]=score.report();}
+    Ok(report)
 }
 
 fn repeat_state(c: &Config, source: &Episode, row_indices: &[usize], device: &Device) -> Result<Episode> {

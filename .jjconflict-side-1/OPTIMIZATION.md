@@ -1,0 +1,100 @@
+# Optimization checklist
+
+Each item follows the "Optimize components before scaling" rules in `AGENTS.md`. An item is done only when it has: a saved baseline, an independent numerical check, isolated and full-model timings, memory/work numbers, and an entry in `RESULTS.md`.
+
+Status: `[ ]` not started, `[~]` in progress, `[x]` done.
+
+## Done
+
+- [x] KronLSTM recurrence: fused GPU scan forward/backward (context 512 model step 3.05x without HOLA).
+- [x] HOLA cache selection and exact attention: fused GPU forward/backward (combined with fused KronLSTM 3.86x).
+- [x] HOLA and KronLSTM 32-bit address limits checked before launch.
+- [x] Profile the whole active model step: reusable bounded `profile` command, contexts 128/512, per-block forward attribution, total backward, transfers/checks/AdamW and launch counts (see `RESULTS.md`, Whole-model profile).
+- [x] Burn automatic kernel fusion: implemented fusion-aware custom-op registration and explicit execution selection, then evaluated and **rejected for this workload**. Launches fall 5,712→2,579, but ordinary steps are 13.3%/4.0% slower at contexts 128/512; strict Kron continuation and full-model CPU gates fail unchanged tolerances. See `RESULTS.md`, Burn automatic kernel fusion.
+- Dependency patch update: Burn 0.22.1, CubeCL facade 0.11.3 and CubeK 0.3.1. Includes upstream fusion and matmul fixes; existing fusion/autotune restrictions remain unchanged. Vulkan and Vulkan+autotune builds and workspace tests passed. No new performance or numerical-fix conclusion is established by this update.
+- [x] Q/K/V, decay, erase, write, output-gate and output projections: compared grouped and single-merged input contractions with unchanged parameter storage/IDs. Adopt explicit `projection_backend: "merged"`; omitted = historical separate. Paired full-step gains repeat at contexts128/512 despite more total launches; dependent output stays separate. See `RESULTS.md`, Mixer projection contraction merging. Activations remain unchanged and are covered by normalization/gating below.
+- [x] Normalization and gating: compared custom L2/all-RMS reductions against an expanded sigmoid-output/RMS + softplus/exp-decay scope, with analytic VJPs and explicit selectors. At B1/context512 the paired intervals include zero (not adopted there); at the B8 training workload `fused_norms_gates` saves 115.26 ms per step alone and is **adopted** in `configs/lm512-optimized.json`. See `RESULTS.md`, Batch-8 component optimization round.
+- [x] Attribute backward cost: bounded `backward-profile` command at the exact recommended model shapes and contexts128/512; isolated warm forward/forward+backward for every component, all four layers, real unmodified guarded steps, signed coverage/overlap gaps and scan batch/head launch/workgroup sweep. Context512 backward coverage98.98%; scan dominates at324.61ms forward+backward (62.68% of the step). See `RESULTS.md`, Backward attribution.
+- [x] Batch scaling at context512: allow positive configured training batches in `backward-profile` without relaxing other recommended shapes; attribute B1/4/8/16/32 complete guarded steps and report tokens/s/memory. B8 reaches2,538tokens/s vs916 at B1; scan share falls60.85%→21.06%, behind HOLA and MLP. B32 fits (2.76GB sampled pool) but reaches only2,433tokens/s. See `RESULTS.md`, Batch scaling.
+- [x] MLP matrix-multiply efficiency, broadened to merged-input, mixer-output and vocabulary-head projections: bounded actual F/dX/dW GEMMs at B1/8/16/context512, packing/layout comparison and Vulkan/autotune attribution. **Adopt an explicit guarded autotune option**, not bare autotune: keep MLP/merged inputs tuned, pin dependent output/head to the correct Cube heuristic, and refuse training on failed per-geometry f64 probes. Paired B8 step1619.76→1188.30ms (26.64% less time), B1 560.21→510.47ms (8.88%); both95% intervals exclude zero. All47 active-shape probes and configured T128/T512 full-model gates pass; legacy solver GEMMs remain unsafe/forbidden for autotuned training. Historical defaults unchanged. See `docs/optimization/gemm-efficiency.md` and `RESULTS.md`, Matrix-multiply efficiency; SiLU/residual epilogues remain separate below.
+
+## Batch-8 component optimization round (done)
+
+Adopted selectors are in `configs/lm512-optimized.json` (and
+`configs/lm512-optimized-autotune.json` for a `vulkan,autotune` build). Combined
+B8/context512 paired step 1,603.76 → 879.04 ms for scan/HOLA/convolution/
+normalization; fused update −21.08 ms and analytic SiLU −22.23 ms on top; guarded
+autotune 851.80 → 505.62 ms on top of `lm512-optimized`. See `RESULTS.md`,
+Batch-8 component optimization round, and `docs/optimization/*.md`.
+
+- [x] HOLA fused read backward: `fused_gpu_pairs` reuses query-VJP edge scalars; cache membership and exact attention unchanged. B8 full step −267.54 ms alone. `hola.md`.
+- [x] MLP SiLU and residual epilogues: `epilogue_backend: analytic_backward` (one-kernel SiLU VJP) −22.23 ms on the optimized base; fused-pointwise forward smaller gain; residual adds stay native (no algebra across norms or matmuls). `epilogues.md`.
+- [x] KronLSTM more-parallel scan: `fused_parallel256` key-shard partition, exact recurrence; B8 full step −17.10% alone. `scan.md`.
+- [x] Short causal convolutions: `convolution_backend: fused_gpu`, document-boundary aware depthwise kernel with analytic VJPs; B8 −69.93 ms alone; padded tensor rejected. `conv-and-norms.md`.
+- [x] AdamW and gradient checks: `update_backend: fused_gpu`, per-parameter fused clipping/AdamW with square-sum checks that keep at most 64 partials per tensor (Burn's per-parameter optimizer interface; not multi-tensor packing). −21.08 ms on the optimized base; AMSGrad state preserved through checkpoints. `update-and-loss.md`.
+- [x] Embedding, vocabulary head and loss: fused cross-entropy (`fused64`/`fused256`) implemented and **rejected**: B8 paired intervals include zero. Tensor loss retained. `update-and-loss.md`.
+
+Outside the resident step:
+
+- [x] Data pipeline: corpus rows + host packing + upload ≈1.3 ms of a ≈950 ms B8/T512 step (<0.2%); a resident-batch run shows no measurable step gain, so **no prefetch**. Exact-capacity host packing (1.18 → 0.90 ms) kept. `io.md`.
+- [x] Checkpoint save/load: measured with all integrity checks: 28.6 MB, atomic save ≈267 ms, validated model load ≈178 ms, validated optimizer load ≈187 ms at B8/T512. No code change: at `checkpoint_every: 4` and a 506 ms step the save adds ≈13% per step, so raise the cadence for long runs instead of adding an asynchronous writer. `io.md`.
+- [x] Soft top-k selection: `soft_selection_backend: gpu` keeps selection and feedback state on device; B8×512/k16 feedback 8.64× (V257), 24.44× (V32k). Tiled variant not adopted. `soft-topk.md`.
+- [x] GDN-2 training: `scan_backend: fused_gdn2` with full stateful analytic VJP passes independent f64 gates and the CPU model oracle; B8/T512 step with HOLA 2,609.6 → 1,710.9 ms (1.53×), without HOLA 2,095.5 → 1,296.2 ms. Comparison arm only. `gdn.md`, `RESULTS.md`.
+
+## Correctness
+
+- [x] Legacy GPU tensor solver key-gradient mismatch: **fixed**. The rank-4 row-dot `sum_dim(3)` VJP lost the initial-state erase adjoint on Vulkan; replaced by a row-wise dot `matmul`. New regression fails before and passes after; historical T7 fixtures pass. `tensor-solver.md`.
+- [x] CPU full-parameter directional check with HOLA: the perturbed forwards now replay the unperturbed forward's kept cache slots, so the difference matches the fixed-membership gradient; ε and tolerance unchanged. All GDN-2/Kron HOLA cases pass at every tested ε (errors ≤ 6.2e-4 vs limits ≥ 3.3e-3). `RESULTS.md`.
+
+## Later steps (optimize when each is built)
+
+- [x] oHC stream mixing (Step 7): fused write, fused read, then gate projection fused with its RMS (`ohc_backend: fused_gate`, deterministic weight-gradient reduction); −263 ms per step over the previous fused path inside the full Step 7 model. Still the largest Step 7 cost (14 stages per step). `ohc.md`.
+- [x] Wavelet mixer (Step 7): causal fixed-filter dilated kernel (`wavelet_backend: fused_gpu`); −756 ms per step against the tensor port inside the full Step 7 model. `wavelet.md`.
+- [x] Three Lngram components (Step 7): fused symbol cache, addressing, gather and on-the-fly OneBit counterfactual (`lngram_backend: fused_gpu`); −68 ms [49, 75] against the corrected tensor port; no expanded counterfactual tensors retained. `lngram.md`.
+- [x] SBD training and causal block replay (Step 8): O(T) clean preparation, immutable clean recurrence/cache snapshots and temporary bidirectional in-block reads through the existing HOLA softmax (`sbd.in_block_reads: hola_read`); no separate attention operator or new parameter. Adopted `sbd.noisy_read_backend: fused_gpu` from accepted B1/T512 complete-step pairs: median saving 2390 ms, 95% paired bootstrap [1668, 3176] ms, faster in 10/11 pairs; omitted selector stays tensor. The diagnostic counted 128 noisy block evaluations / 512 layer reads per B1/T512 step; noisy-HOLA forward sections were 9.18–11.74% of observed step time. That earlier B8/T512 session reached its 3100s deadline with no paired result and did not attempt loop optimization. Independent f64 and complete CPU/Vulkan/cached/reconstructed gates pass at unchanged tolerance. Full cost, launch and sampled-reservation tables: `RESULTS.md`, `docs/sbd.md`.
+- [x] Prefix block retrieval (Step 8): MoBA causal own-block coverage plus top-k earlier blocks in HOLA's single softmax, detached document-aware ranking and cache/current-chunk duplicate exclusion. Tensor and indexed CubeCL forward/VJP gates pass; fused saves paired 211.244 ms [197.175,218.854] over tensor in B8/T512 clean steps (11/11), while retrieval adds paired 139.102 ms versus off. Identity revision `prefix-block-moba-own-v1`; `configs/lm512-step8-retrieval.json`, `docs/optimization/prefix-block-retrieval.md`. Selected layers combine retrieval and active-block reads in one softmax; other layers retain the noisy HOLA kernel. No quality study or new timing comparison is included.
+- [x] SBD block-axis batching: explicit `sbd.block_execution: batched`, with omitted `per_block` serialization/fingerprints preserved and original RNG draws pinned. CPU and Vulkan logits/loss/every-parameter gradients pass unchanged tolerance across the architecture/read/feedback/retrieval matrix and mixed lengths/padding. Adopted in both Step-8 configs: B1/T512 complete-step medians 42,144.517→1,617.483 ms without retrieval, paired saving 40,568.800 ms [35,569.793,44,211.076]; retrieval 44,178.291→1,819.748 ms, saving 42,358.543 ms [39,231.935,43,705.788], both 11/11 faster. Matched launches 211,269→24,242 / 209,934→24,208. B8/T512 diagnostic: 8167.400 ms, 27,145 launches, 8,818,099,392 bytes sampled pool reservation; fits without chunking. The first B8 attempt hit the noisy-HOLA VJP's 65,535-workgroup grid limit, not memory; multidimensional dispatch reuses the same kernel/VJP and passes a 67,200-workgroup scalar-f64 case. See `RESULTS.md` for memory limitations and reproducible evidence.
+- Step12 is not started or authorized by this integration; learned/adaptive boundaries or other alternatives require a new explicit user request.
+- [x] Codpula circuit output, dual-flow training and dependence commitment (Step 9): homogeneous K32/full V257, b=4 context gates, log-domain rows, EMA0.9/alpha0.05 and all SBD callers integrated. CPU/f64/enumeration/full-VJP/flow/sampling/continuation and Vulkan model gates pass at unchanged tolerance; omitted factorized identity and exact L1 behavior remain. Fused leaf/chain/marginal/flow kernels are verified but **not adopted by default**: B1/T512 complete-step tensor/fused medians 1697.014/1631.830 ms, paired saving 60.951 ms with 95% interval [-23.545,84.668] (8/11 faster); isolated circuit saving 20.025 ms [16.577,23.311] is not sufficient. Tensor remains selected; factorized cost-reference median 1522.502 ms. Selected B8 diagnostic: 8000.071 ms, 30,745 launches, 8,826,550,976 bytes sampled pool reservation. Current-predecessor inference/sampling/commitment/rollout tests salvaged with provenance; no quality study. `docs/codpula.md`, `RESULTS.md`, `artifacts/codpula/`.
+- [x] CoCommit coordination passes (Step 10): saved oHC prefix, trainable marker and fresh marked circuit/event loss across SBD paths; full f64/CPU/Vulkan/all-gradient/leakage/restart gates pass at fixed tolerance. B1/T512 off/selected-separate/doubled medians 1286.855/1408.335/1393.231 ms, 11 paired trials after two warmups. Keep separate: doubled full-step saving24.124ms has95% interval[-23.326,49.555], despite isolated tail gain. Adopt exact position-only membership (99.272→1.038ms, paired98.227[91.325,104.213],90 exact oracle cases), frozen no-grad teachers and explicit two4-row gradient/flow accumulation for unchanged B8/T512/L8. Selected B8 diagnostic6893.824ms,49928 launches,3,951,724,736 sampled pool bytes; original allocation failures retained. No quality study. `docs/cocommit.md`, `RESULTS.md`, `artifacts/cocommit/`.
+- [x] R²D remasking and TCT training (Step11): immutable final commitments, retained soft feedback, indexed joint proposals, streaming chains and verified full-batch row accumulation; numerical gates and actual commands complete.
+- [x] Energy-guided stochastic remasking, unary then pairwise (Step11): batched contextual energy features, exact host-f64 sampling, offline rank fitting and streaming joint TCT; batched block execution and configurable row accumulation adopted. `docs/remasking.md`.
+
+## Cross-cutting
+
+- [x] BF16 / mixed precision: this Vulkan backend reports F16/F32/F64 but no BF16; f32 kept. FP16-with-f32-state remains a separate unimplemented experiment. `precision-and-shapes.md`.
+- [ ] CUDA benchmarks on the DGX Spark (needs an agreed GPU window).
+- [x] Larger training batch sizes at current K32/V64/chunk16/context512: B1/4/8/16/32 measured, largest tested B32 fits; full steps, component attribution and memory in Batch scaling.
+- [ ] Larger key/value widths and contexts beyond the current K32/V64/chunk16 pilot limits: custom kernels are specialized to K32/V64; storage scaling recorded in `precision-and-shapes.md`; no wider-state kernels or measurements yet.
+- [x] Re-profile after the batch-8 round: combined paired benchmark and per-increment sessions recorded; next bottleneck attribution should use `backward-profile` on `configs/lm512-optimized.json`.
+
+## Explicit contextual Codpula profile
+
+- [x] Approved routing/initialization revision: ordered valid mean/first/last,
+  one 768→96 zero head and normalized contextual root; fourteen other decisions
+  and old selectors/fingerprints remain. CPU/Vulkan tensor/fused, independent
+  f64/full-VJP/flow and strict full-optimizer restart gates pass unchanged
+  tolerances. Separate deterministic Tensor Lngram raw-gradient fix `e50cc523`
+  resolves the exposed duplicate-index atomic sum without changing clipping
+  `64590d18` or the adopted fused Lngram backend.
+- [x] Required cost accounting only: B1/T512 old/contextual medians
+  1713.161/1691.060 ms; contextual-minus-old paired median -42.608 ms,
+  95% interval [-138.390,15.668], so no resolved difference. Full B8/T512
+  diagnostic 8714.077 ms, 30,818 launches and 8,826,780,928-byte sampled pool;
+  no subdivision. Original Codpula figures above remain historical, not the
+  revision's measured cost. See `RESULTS.md`, `docs/codpula.md` and
+  `artifacts/codpula-context/`. No quality study or architecture sweep.
+
+## Step11: refinement and trajectory correction execution
+
+Implementation/evidence: `docs/remasking.md` §14 and `artifacts/remasking/summary.json`. These costs use the existing `codpula` profile, not the separately integrated contextual profile. No quality study, policy comparison, sweep or calibration grid was authorized.
+
+- **Energy path:** reuse final normalized hidden states and original candidate probabilities; one524->32 projection/position; scalar unary and all-pair terms are batched on GPU and read back together. Host-f64 unary DP retains a separate minimum-energy offset/residual log partition, preserving multiplicities at huge energy offsets. Pairwise exact subsets stop at L16; no MCMC or large edge/vocabulary expansion is introduced.
+- **Generation cost boundary:** a resident512-token prefix and one L8 active block/row; state initialization,38 adaptive noisy calls, energy work/readbacks and one completed520-position clean replay are timed. B1 two-warmup/11sample medians: refinement2641.888ms, replay98.867ms, complete2740.755ms. B8 one-warmup/one diagnostic:2912.708ms refinement +430.226ms replay =3342.933ms. Per noisy batch call69.523/76.650ms. First prefix preparation is separate and may include JIT; it is not silently removed from first-output estimates.
+- **Actual layout choice:** per-block versus batched block-cache execution computes the same TCT objective. At B1/T512/L8,2warmups/11alternating interleaved pairs give17562.660/1845.395ms medians. Paired median saving15711.721ms, bootstrap95% interval[15625.973,16349.399],11/11 faster. Retain batched blocks. The two-runner process sampled1,452,711,808bytes reservation, not a per-runner peak.
+- **B8 memory correction:** all-free-position TCT failed a2GiB allocation without row accumulation, even with the existing fused circuit backend. Therefore circuit fusion was not adopted as a memory remedy. With `tct.rows_per_pass`, full-batch-normalized neural gradients and unscaled dual flows accumulate before one update. Four rows/pass were the first requested candidate, fit immediately, and remain in `configs/lm512-tct.json`;2/1 were not run. Complete B8/T512 step7267.660ms, sampled pool4,399,520,256bytes after one warmup. This is not an exact physical/live peak.
+- **Equivalence:** full-batch versus chunks at a small shape matches all neural gradients and flow fields within2e-5+3e-4*abs(ref), tensor max2.38419e-7/fused max9.53674e-7. Indexed FFBS uniforms preserve original row/block coordinates across passes; chain/RNG/optimizer restart is exact. The batch is not shrunk and no update happens per chunk. Peak graph size scales with rows_per_pass and context; longer contexts are not asserted to fit.
+- **Separate correctness repair:**64590d18 fixes inherited native AdamW clipping's unordered scalar norm reduction. The adopted fused optimizer kernel is unchanged; its <=64 partials leave only one nonzero final-sum cube. Historical checkpoint13 and existing update/loss f64 reference still pass. Native energy fitting uses the same deterministic clipping helper.
+
+Numerical gates85passed/one pre-existing ignored; CPU/Vulkan energy/features/rank max3.30547e-6, TCT including chunks9.53674e-7. No tolerance relaxation, dependency/profile change, alternative target directory or additional integration-test executable. Smoke/diagnostic model/optimizer payloads were removed after the gates; JSON reports/data/hash evidence remains.
+
