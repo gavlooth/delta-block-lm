@@ -24,11 +24,6 @@ pub fn block_forward(model: &LanguageModel, prefix: &[i32], soft: &SoftState, ha
     let n = soft.observed.len();
     let p = prefix.len();
     let d = model.embedding.weight.val().dims()[1];
-    if n == 1 {
-        // Exact causal limiting case: the target is predicted from the last clean input.
-        return model.forward_output_profiled(&prefix_batch(prefix, device),&mut delta_mixers::profile::Unprofiled)
-            .slice_positions(p-1,1);
-    }
     if model.cocommit_marker.is_some() {
         return crate::cocommit::reconstruct_output(model,prefix,soft,hard,None,device);
     }
@@ -65,22 +60,23 @@ pub(super) fn prepare_circuit(model: &LanguageModel, output: DenoisingOutput, so
         soft.observed.iter().map(|value|value.unwrap_or(0) as i32).collect::<Vec<_>>(),[rows,width]),&device);
     Ok((circuit,tokens,observed))
 }
-pub(super) fn update_feedback(model: &LanguageModel, c: &Config, output: DenoisingOutput, soft: &mut SoftState, eta: f64) -> Result<()> {
+pub(super) fn update_feedback(model: &LanguageModel, c: &Config, output: DenoisingOutput, soft: &mut SoftState) -> Result<()> {
     let s = c.sbd.as_ref().context("SBD config is required")?;
-    let logits = if model.codpula.is_some() && output.logits.dims()[1] > 1 {
+    let logits = if model.codpula.is_some() {
         let (circuit,tokens,observed) = prepare_circuit(model,output.detach(),soft,c.soft_temperature)?;
         circuit.marginals(tokens,observed)?.detach().log()
     } else {
         return soft.update(output.logits.detach().reshape([soft.observed.len(),c.vocab()]),
-            eta,c.soft_temperature,c.soft_steps,s.candidate_width);
+            c.soft_temperature,s.candidate_width,model.soft_confidence.as_ref().context("soft feedback head missing")?);
     };
-    soft.update(logits.reshape([soft.observed.len(),c.vocab()]),eta,1.0,c.soft_steps,s.candidate_width)
+    soft.update(logits.reshape([soft.observed.len(),c.vocab()]),1.0,s.candidate_width,
+        model.soft_confidence.as_ref().context("soft feedback head missing")?)
 }
 fn feedback(model: &LanguageModel, c: &Config, prefix: &[i32], soft: &mut SoftState, device: &Device) -> Result<()> {
     let s = c.sbd.as_ref().context("SBD config is required")?;
     if s.feedback == SbdFeedback::SoftFeedback && soft.observed.len() > 1 {
         let first = block_forward(model,prefix,soft,false,device);
-        update_feedback(model,c,first,soft,1.0)?;
+        update_feedback(model,c,first,soft)?;
     }
     Ok(())
 }
@@ -112,12 +108,11 @@ pub fn sample_training_blocks(c: &Config, rows: &[Example], seed: u64) -> Result
     let s = c.sbd.as_ref().context("SBD config is required")?;
     let mut rng = Rng(seed);
     let mut blocks = Vec::new();
+    let length = s.training_block_lengths[rng.index(s.training_block_lengths.len())];
     for (row_index,row) in rows.iter().enumerate() {
-        let length = s.block_lengths[rng.index(s.block_lengths.len())];
         let eta = (rng.next() as f64 + 0.5) / (u64::MAX as f64 + 1.0);
-        for start in (0..row.target.len()).step_by(length) {
-            let n = length.min(row.target.len()-start);
-            let masked: Vec<bool> = (0..n).map(|_| (rng.next() as f64 / u64::MAX as f64) < eta).collect();
+        for start in (0..row.target.len()/length*length).step_by(length) {
+            let masked: Vec<bool> = (0..length).map(|_| (rng.next() as f64 / u64::MAX as f64) < eta).collect();
             if masked.iter().any(|&x| x) {
                 blocks.push(TrainingBlock {row:row_index,start,length,masked});
             }
@@ -139,20 +134,15 @@ fn training_loss_per_block<P: delta_mixers::profile::Sections>(model: &LanguageM
     let [batch_size,sequence_length,_] = clean_logits.dims();
     let denominator = (batch_size*sequence_length) as f64;
     let mut selected = blocks.iter().peekable();
-    let teacher_model=(s.feedback==SbdFeedback::SoftFeedback && blocks.iter().any(|block|block.masked.len()>1)).then(||model.valid());
+    let teacher_model=(s.feedback==SbdFeedback::SoftFeedback && !blocks.is_empty()).then(||model.valid());
     for (row_index,row) in rows.iter().enumerate() {
-        let Some(length) = selected.peek().filter(|block| block.row == row_index).map(|block| block.length) else {continue;};
-        let starts = blocks.iter().filter(|block|block.row==row_index && block.masked.len()>1).map(|block|block.start+1).collect::<Vec<_>>();
-        let cache = (length > 1).then(|| model.training_cache(trace,row_index,&starts));
+        if selected.peek().is_none_or(|block|block.row!=row_index) {continue;}
+        let starts = blocks.iter().filter(|block|block.row==row_index).map(|block|block.start+1).collect::<Vec<_>>();
+        let cache = Some(model.training_cache(trace,row_index,&starts));
         let teacher_cache=teacher_model.as_ref().and_then(|_|cache.as_ref().map(|cache|cache.detached()));
         while selected.peek().is_some_and(|block| block.row == row_index) {
             let block = selected.next().unwrap();
             let n = block.masked.len();
-            if n == 1 {
-                let logits = clean_logits.clone().slice([row_index..row_index+1,block.start..block.start+1,0..c.vocab()]);
-                result.loss = result.loss + masked_training_loss(logits,block,row,rows.len(),c.vocab(),&device);
-                continue;
-            }
             let observed = (0..n).map(|j| (!block.masked[j]).then_some(row.target[block.start+j] as usize)).collect();
             let mut soft = state(c,observed,&device)?;
             let cache = cache.as_ref().unwrap();
@@ -160,7 +150,7 @@ fn training_loss_per_block<P: delta_mixers::profile::Sections>(model: &LanguageM
             if s.feedback == SbdFeedback::SoftFeedback {
                 let teacher_model=teacher_model.as_ref().unwrap();
                 let teacher=teacher_model.cached_block_profiled(teacher_cache.as_ref().unwrap(),block_index,&soft,false,profile);
-                update_feedback(teacher_model,c,teacher,&mut soft,1.0)?;
+                update_feedback(model,c,teacher,&mut soft)?;
             }
             let output = model.cached_block_profiled(cache,block_index,&soft,s.feedback == SbdFeedback::HardMask,profile);
             if model.codpula.is_some() {
@@ -180,15 +170,11 @@ fn training_loss_batched<P: delta_mixers::profile::Sections>(model: &LanguageMod
     let device = clean_logits.device();
     let [batch_size,sequence_length,_] = clean_logits.dims();
     let denominator = (batch_size*sequence_length) as f64;
-    for block in blocks.iter().filter(|block| block.masked.len() == 1) {
-        let logits = clean_logits.clone().slice([block.row..block.row+1,block.start..block.start+1,0..c.vocab()]);
-        result.loss = result.loss + masked_training_loss(logits,block,&rows[block.row],rows.len(),c.vocab(),&device);
-    }
-    let count = blocks.iter().filter(|block| block.masked.len() > 1).count();
+    let count = blocks.len();
     if count == 0 {
         return Ok(result);
     }
-    let max_length = *s.block_lengths.iter().max().unwrap();
+    let max_length = blocks.iter().map(|block|block.masked.len()).max().unwrap();
     let mut cache_blocks = Vec::with_capacity(count);
     let mut observed = Vec::with_capacity(count*max_length);
     let mut active = Vec::with_capacity(count*max_length);
@@ -196,7 +182,7 @@ fn training_loss_batched<P: delta_mixers::profile::Sections>(model: &LanguageMod
     let factorized = model.codpula.is_none();
     let mut weights = Vec::with_capacity(if factorized {count*max_length} else {0});
     let mut denominators = Vec::with_capacity(if factorized {count} else {0});
-    for block in blocks.iter().filter(|block| block.masked.len() > 1) {
+    for block in blocks {
         cache_blocks.push((block.row,block.start+1));
         let row = &rows[block.row];
         let n = block.masked.len();
@@ -215,7 +201,7 @@ fn training_loss_batched<P: delta_mixers::profile::Sections>(model: &LanguageMod
         let teacher_model=model.valid();
         let teacher_cache=cache.detached();
         let teacher=teacher_model.cached_blocks_profiled(&teacher_cache,&soft,false,profile);
-        update_feedback(&teacher_model,c,teacher,&mut soft,1.0)?;
+        update_feedback(model,c,teacher,&mut soft)?;
     }
     let output = model.cached_blocks_profiled(&cache,&soft,s.feedback == SbdFeedback::HardMask,profile);
     if model.codpula.is_some() {
@@ -237,7 +223,18 @@ fn training_loss_batched<P: delta_mixers::profile::Sections>(model: &LanguageMod
 pub fn training_loss(model: &LanguageModel, c: &Config, rows: &[Example], batch: &Batch, seed: u64) -> Result<SbdTrainingResult> {
     training_loss_profiled(model,c,rows,batch,seed,&mut delta_mixers::profile::Unprofiled)
 }
+pub(crate) fn training_config(c:&Config,seed:u64)->Config {
+    let mut selected=c.clone();
+    let mut rng=Rng(seed ^ 0x534f46545f445241);
+    let draw=(rng.next()>>11) as f64/9007199254740992.0;
+    if draw>=c.soft_training_probability {
+        if let Some(s)=&mut selected.sbd {s.feedback=SbdFeedback::HardMask;}
+    }
+    selected
+}
 pub fn training_loss_profiled<P: delta_mixers::profile::Sections>(model: &LanguageModel, c: &Config, rows: &[Example], batch: &Batch, seed: u64, profile: &mut P) -> Result<SbdTrainingResult> {
+    let selected=training_config(c,seed);
+    let c=&selected;
     let blocks=sample_training_blocks(c,rows,seed)?;
     let bundles=c.sbd.as_ref().and_then(|s|s.cocommit.as_ref())
         .map(|options|crate::cocommit::sample_bundles(&blocks,options.training_bundle_max,seed));
@@ -252,11 +249,12 @@ pub(crate) fn training_loss_sampled_profiled<P:delta_mixers::profile::Sections>(
         ensure!(rows.iter().all(|row|row.weight.iter().all(|&weight|weight == 1.0)),
             "Codpula joint event loss requires unit valid target weights");
     }
-    let mut trace = crate::sbd_training::CleanInputs::new(blocks.iter().filter(|block|block.masked.len()>1).map(|block|block.start+1));
+    let mut trace = crate::sbd_training::CleanInputs::new(blocks.iter().map(|block|block.start+1));
     let clean_logits = model.forward_profiled(batch,&mut trace);
     let loss = model.loss(clean_logits.clone(), batch);
-    let result = SbdTrainingResult {loss,circuit_flows:None,
-        unused_parameters: model::unused_denoising_parameters(blocks.iter().any(|b| b.masked.len() > 1), false)};
+    let mut unused=model::unused_denoising_parameters(!blocks.is_empty(), false);
+    if s.feedback==SbdFeedback::HardMask || blocks.is_empty() {unused.extend(model::unused_soft_parameters());}
+    let result = SbdTrainingResult {loss,circuit_flows:None,unused_parameters:unused};
     match s.block_execution {
         SbdBlockExecution::PerBlock => training_loss_per_block(model,c,rows,clean_logits,&trace,blocks,result,profile),
         SbdBlockExecution::Batched => training_loss_batched(model,c,rows,clean_logits,&trace,blocks,result,profile),
@@ -408,6 +406,7 @@ pub(super) fn dependence_commits(unresolved: &[usize], scores: &[f64], threshold
 }
 
 pub(super) fn advance_generation_state(
+    model: &LanguageModel,
     c: &Config,
     soft: &mut SoftState,
     proposals: &[usize],
@@ -420,7 +419,8 @@ pub(super) fn advance_generation_state(
     let n = soft.observed.len();
     ensure!(proposals.len() == n && commits.iter().all(|&i| i < n), "invalid SBD proposal layout");
     if s.feedback == SbdFeedback::SoftFeedback {
-        soft.update(feedback_logits.detach(),c.soft_eta,feedback_temperature,c.soft_steps,s.candidate_width)?;
+        soft.update(feedback_logits.detach(),feedback_temperature,s.candidate_width,
+            model.soft_confidence.as_ref().context("soft feedback head missing")?)?;
     }
     let mut observed = soft.observed.clone();
     for &i in commits {
@@ -436,6 +436,8 @@ pub(super) fn advance_generation_state(
         + soft.candidates.dense(c.vocab()) * mutable.clone();
     next.candidates = crate::soft::Candidates::select(probabilities,s.candidate_width,c.soft_selection_backend)?;
     next.visibility = next.visibility.clone()*mutable.clone().neg().add_scalar(1.0)+soft.visibility.clone()*mutable;
+    next.negative_entropy=soft.negative_entropy.clone();
+    next.prediction_available=soft.prediction_available.clone();
     *soft = next;
     Ok(())
 }
@@ -465,25 +467,37 @@ pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32],
         let mut soft = state(c,vec![None;n],device)?;
         let mut final_values = vec![None;n];
         let mut block_passes = 0;
-        let coordination_cache = if s.cocommit.is_some() && n>1 {
-            coordinated_blocks+=1;
-            Some(crate::cocommit::prepare_clean_cache(&model,&clean.tokens,device))
-        } else {None};
-        while final_values.iter().any(Option::is_none) {
-            if s.cocommit.is_some() && n>1 {
+        let mut poststeps=0usize;
+        let coordination_cache = Some(crate::cocommit::prepare_clean_cache(&model,&clean.tokens,device));
+        if s.cocommit.is_some() {coordinated_blocks+=1;}
+        while final_values.iter().any(Option::is_none) || (s.cocommit.is_some() && poststeps<16) {
+            if s.cocommit.is_some() {
                 passes+=1;
                 block_passes+=1;
                 coordinated_passes+=1;
                 let seed = if model.codpula.is_some() {proposal_rng.next()} else {0};
                 let assignment = crate::cocommit::assign(&model,c,coordination_cache.as_ref().unwrap(),&soft,block_passes,seed,device)?;
+                let was_complete=soft.observed.iter().all(Option::is_some);
+                let mut edits=Vec::new();
+                for i in 0..n {
+                    if soft.observed[i].is_some_and(|old|old!=assignment.proposals[i]) {
+                        // CoCommit's evaluated edit gate is zero. Only the current
+                        // block is present here; prompt/completed prefix cannot enter.
+                        soft.observed[i]=Some(assignment.proposals[i]);
+                        edits.push(i);
+                    }
+                }
                 if let Some((targets,weights))=targets {
                     let start=generated.len();
-                    score.observe(&assignment.host_logs,&assignment.proposals,&assignment.commits,
+                    let mut written=assignment.commits.clone();
+                    written.extend_from_slice(&edits);
+                    score.observe(&assignment.host_logs,&assignment.proposals,&written,
                         &targets[start..start+n],&weights[start..start+n],c.vocab());
                 }
-                advance_generation_state(c,&mut soft,&assignment.proposals,&assignment.commits,
+                advance_generation_state(&model,c,&mut soft,&assignment.proposals,&assignment.commits,
                     assignment.feedback,assignment.feedback_temperature,device)?;
                 final_values=soft.observed.clone();
+                if was_complete {poststeps+=1;if edits.is_empty(){break;}}
                 continue;
             }
             let output = if let Some(cache) = &coordination_cache {
@@ -493,7 +507,7 @@ pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32],
             };
             passes += 1;
             block_passes += 1;
-            let joint = model.codpula.is_some() && n > 1;
+            let joint = model.codpula.is_some();
             let (log_probabilities,proposals,scores,feedback_logits,feedback_temperature) = if joint {
                 let (circuit,tokens,observed) = prepare_circuit(&model,output,&soft,c.soft_temperature)?;
                 let logs = circuit.marginals(tokens.clone(),observed.clone())?.log();
@@ -542,7 +556,7 @@ pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32],
                 let start=generated.len();
                 score.observe(&logs,&proposal_values,&commits,&targets[start..start+n],&weights[start..start+n],c.vocab());
             }
-            advance_generation_state(c,&mut soft,&proposal_values,&commits,
+            advance_generation_state(&model,c,&mut soft,&proposal_values,&commits,
                 feedback_logits.reshape([n,c.vocab()]),feedback_temperature,device)?;
             final_values = soft.observed.clone();
         }

@@ -37,6 +37,8 @@ pub(crate) fn backward_profiled<P: Sections>(
     profile: &mut P,
 ) -> Result<Backward> {
     ensure!(!rows.is_empty(), "SBD backward requires at least one row");
+    let selected_config=sbd::training_config(c,seed);
+    let c=&selected_config;
     let configured = c.sbd.as_ref().and_then(|s| s.rows_per_pass);
     let rows_per_pass = configured.unwrap_or(rows.len()).min(rows.len());
     if rows_per_pass == rows.len() {

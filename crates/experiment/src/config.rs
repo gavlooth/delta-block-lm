@@ -227,23 +227,13 @@ impl Default for CocommitConfig {
             execution: CocommitExecution::Separate }
     }
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct AnnouncementConfig {
-    pub count: usize,
-    pub dependence_threshold: Option<f64>,
-    pub entropy_threshold: Option<f64>,
-}
-impl Default for AnnouncementConfig {
-    fn default() -> Self {
-        Self { count: 2, dependence_threshold: None, entropy_threshold: None }
-    }
-}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SbdConfig {
     pub block_lengths: Vec<usize>,
+    /// One uniform draw shared by all rows of an ordinary training update.
+    pub training_block_lengths: Vec<usize>,
     pub feedback: SbdFeedback,
     #[serde(skip_serializing_if = "SbdBlockExecution::is_per_block")]
     pub block_execution: SbdBlockExecution,
@@ -262,8 +252,6 @@ pub struct SbdConfig {
     pub noisy_read_backend: delta_mixers::sbd::NoisyReadBackend,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cocommit: Option<CocommitConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub announcement: Option<AnnouncementConfig>,
     /// Optional exact row chunk size for SBD backward accumulation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rows_per_pass: Option<usize>,
@@ -280,15 +268,15 @@ pub struct SbdConfig {
 }
 impl Default for SbdConfig {
     fn default() -> Self {
-        Self { block_lengths: vec![8], feedback: SbdFeedback::SoftFeedback,
+        Self { block_lengths: vec![8], training_block_lengths:(2..=16).collect(), feedback: SbdFeedback::SoftFeedback,
             block_execution: SbdBlockExecution::PerBlock,
             joint_output: SbdJointOutput::Factorized,
             joint_execution: crate::codpula::CodpulaExecution::Tensor,
             commitment: None, dependence_threshold: None,
-            candidate_width: 4, commit_count: None, entropy_threshold: None, generate_tokens: 32,
-            in_block_reads: delta_mixers::sbd::InBlockReads::None,
+            candidate_width: 4, commit_count: None, entropy_threshold: Some(0.1), generate_tokens: 32,
+            in_block_reads: delta_mixers::sbd::InBlockReads::HolaRead,
             noisy_read_backend: delta_mixers::sbd::NoisyReadBackend::Tensor,
-            cocommit: None, announcement: None, rows_per_pass: None,
+            cocommit: None, rows_per_pass: None,
             refinement: None, training_mode: crate::tct::TrainingMode::Sbd }
     }
 }
@@ -302,11 +290,10 @@ impl SbdConfig {
 
 pub(crate) const KRON_MODEL_REVISION: &str = "kronlstm-learned-gate-biases-v1";
 
-// Keep the historical SBD revision; optional reads enter identity through their selectors.
-const SBD_MODEL_REVISION: &str = "sbd-recurrence-only-v1";
+const SBD_MODEL_REVISION: &str = "sbd-full-block-noisy-singleton-variable-update-v2";
 const PREFIX_RETRIEVAL_REVISION: &str = "prefix-block-moba-own-v1";
-const COCOMMIT_MODEL_REVISION: &str = "cocommit-full-stream-marker-event-v1";
-const COORDINATED_PROVISIONAL_REVISION: &str = "cocommit-coherent-b-permanent-O-provisional-R-v1";
+const COCOMMIT_MODEL_REVISION: &str = "cocommit-draft-weighted-marginal-ce-greedy-v2";
+const COORDINATED_PROVISIONAL_REVISION: &str = "cocommit-masked-bundle-visible-edits-chain-mean-v2";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -520,6 +507,10 @@ impl Config {
             ensure!(!self.autotune, "SBD variable-shape matmuls are not covered by the autotune preflight");
             ensure!(!sbd.block_lengths.is_empty() && sbd.block_lengths.iter().all(|&n| n > 0),
                 "SBD block lengths must be positive");
+            ensure!(!sbd.training_block_lengths.is_empty() && sbd.training_block_lengths.iter().all(|&n|n>0),
+                "SBD training block lengths must be positive");
+            ensure!(!sbd.joint_output.is_codpula() || sbd.training_block_lengths.iter().all(|&n|n<=16),
+                "Codpula training block lengths must be at most 16");
             ensure!(sbd.candidate_width > 0 && sbd.candidate_width <= self.vocab()
                 && sbd.commit_count() > 0 && sbd.generate_tokens > 0, "invalid SBD decoding counts");
             ensure!(sbd.entropy_threshold.is_none_or(|x| x.is_finite() && x >= 0.0),
@@ -530,29 +521,13 @@ impl Config {
                 "dependence commitment requires a Codpula joint output");
             ensure!(!sbd.joint_output.is_codpula() || sbd.block_lengths.iter().all(|&n| n <= 16),
                 "Codpula block lengths must be at most 16");
-            ensure!(!sbd.joint_output.is_codpula() || self.soft_temperature == 1.0,
-                "Codpula requires soft_temperature=1 to match training potentials");
             ensure!(sbd.joint_execution.is_tensor()
                 || (sbd.joint_output.is_codpula()
                     && matches!(self.backend.as_str(),"vulkan" | "cuda") && !self.fusion),
                 "sbd.joint_execution=fused_gpu requires Codpula and explicit non-fusion GPU execution");
-            if let Some(announcement) = &sbd.announcement {
-                ensure!(sbd.refinement.is_some() && sbd.cocommit.is_some(),
-                    "sbd.announcement requires refinement and cocommit");
-                ensure!(announcement.count > 0,
-                    "sbd.announcement.count must be positive");
-                ensure!(announcement.dependence_threshold.is_none_or(|value| value.is_finite() && value > 0.0)
-                    && announcement.entropy_threshold.is_none_or(|value| value.is_finite() && value >= 0.0),
-                    "invalid sbd.announcement thresholds");
-                ensure!(announcement.dependence_threshold.is_none() || sbd.joint_output.is_codpula(),
-                    "dependence announcements require Codpula");
-                ensure!(announcement.dependence_threshold.is_none() || announcement.entropy_threshold.is_none(),
-                    "choose dependence or entropy announcements, not both");
-            }
             if let Some(refinement) = &sbd.refinement {
-                ensure!(sbd.commit_count.is_none() && sbd.commitment.is_none()
-                    && sbd.dependence_threshold.is_none() && sbd.entropy_threshold.is_none(),
-                    "refinement does not use SBD commit rules; omit commit_count, commitment, dependence_threshold and entropy_threshold");
+                ensure!(sbd.commit_count.is_none() && sbd.commitment.is_none() && sbd.dependence_threshold.is_none(),
+                    "refinement does not use SBD count or dependence commit rules");
                 ensure!(sbd.block_lengths.iter().all(|&n| n <= 16),
                     "remasking supports block lengths at most 16");
                 ensure!(sbd.feedback == SbdFeedback::SoftFeedback && !self.hard_mask_only,
@@ -1565,7 +1540,6 @@ mod tests {
             trajectory.validate().unwrap();
         }
         trajectory.sbd.as_mut().unwrap().refinement = None;
-        trajectory.sbd.as_mut().unwrap().announcement = None;
         trajectory.validate().unwrap();
     }
     #[test]
