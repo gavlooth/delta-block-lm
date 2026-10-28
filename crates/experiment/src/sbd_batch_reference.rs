@@ -183,7 +183,7 @@ fn logits_case(model: &LanguageModel, c: &Config, device: &Device) -> Result<Val
         if feedback == SbdFeedback::SoftFeedback {
             let teacher = model.cached_block(&caches[row], local_index, &state, false).logits.detach();
             reference_teacher.extend(values(teacher.clone()));
-            state.update(teacher.reshape([n, c.vocab()]), 1.0, c.soft_temperature, c.soft_steps, c.sbd.as_ref().unwrap().candidate_width)?;
+            state.update(teacher.reshape([n, c.vocab()]),c.soft_temperature,c.sbd.as_ref().unwrap().candidate_width,model.soft_confidence.as_ref().unwrap())?;
         }
         reference.extend(values(model.cached_block(&caches[row], local_index, &state, feedback == SbdFeedback::HardMask).logits));
         observed.extend(visible);
@@ -196,7 +196,7 @@ fn logits_case(model: &LanguageModel, c: &Config, device: &Device) -> Result<Val
     let teacher_report = if feedback == SbdFeedback::SoftFeedback {
         let teacher = model.cached_blocks(&cache, &state, false).logits.detach();
         let report = compare(&active_values(teacher.clone(), &lengths, c.vocab()), &reference_teacher).context("batched SBD detached teacher logits")?;
-        state.update(teacher.reshape([blocks.len() * width, c.vocab()]), 1.0, c.soft_temperature, c.soft_steps, c.sbd.as_ref().unwrap().candidate_width)?;
+        state.update(teacher.reshape([blocks.len() * width, c.vocab()]),c.soft_temperature,c.sbd.as_ref().unwrap().candidate_width,model.soft_confidence.as_ref().unwrap())?;
         Some(report)
     } else { None };
     let actual = model.cached_blocks(&cache, &state, feedback == SbdFeedback::HardMask).logits;
@@ -226,27 +226,27 @@ fn seed_for(c: &Config, rows: &[Example], predicate: impl Fn(&[TrainingBlock]) -
 }
 
 #[derive(Clone, Copy)]
-enum CausalExpectation { None, AllObserved, LengthOne }
+enum CausalExpectation { None, AllObserved, Reconstructed }
 
 fn causal_objective(model: &LanguageModel, c: &Config, rows: &[Example], batch: &Batch, blocks: &[TrainingBlock]) -> Result<(Tensor<1>, Vec<Value>)> {
-    let logits = model.forward(batch);
-    let mut loss = model.loss(logits.clone(), batch);
-    let device = batch.input.device();
-    let mut logits_reports = Vec::with_capacity(blocks.len());
+    let mut loss=model.loss(model.forward(batch),batch);
+    let device=batch.input.device();
+    let mut reports=Vec::new();
     for block in blocks {
-        ensure!(block.masked.len() == 1 && block.masked[0], "causal expectation only accepts selected length-one blocks");
-        let row = &rows[block.row];
-        let selected = logits.clone().slice([block.row..block.row + 1, block.start..block.start + 1, 0..c.vocab()]).reshape([1, c.vocab()]);
-        let state = soft(c, vec![None], vec![true], &device)?;
-        let reconstructed = crate::sbd::block_forward(model, &row.input[..block.start + 1], &state, c.sbd.as_ref().unwrap().feedback == SbdFeedback::HardMask, &device).logits;
-        let mut report = compare(&values(selected.clone()), &values(reconstructed)).context("length-one clean batch versus causal prefix logits")?;
-        report["row"] = json!(block.row);
-        report["start"] = json!(block.start);
-        logits_reports.push(report);
-        let target = Tensor::<2, Int>::from_data([[row.target[block.start]]], &device);
-        loss = loss - log_softmax(selected, 1).gather(1, target).sum() * f64::from(row.weight[block.start]) / (rows.len() * row.target.len()) as f64;
+        let row=&rows[block.row];
+        let n=block.masked.len();
+        let observed=(0..n).map(|i|(!block.masked[i]).then_some(row.target[block.start+i] as usize)).collect();
+        let mut state=soft(c,observed,vec![true;n],&device)?;
+        if c.sbd.as_ref().unwrap().feedback==SbdFeedback::SoftFeedback {
+            let teacher=model.valid();
+            let output=crate::sbd::block_forward(&teacher,&row.input[..block.start+1],&state,false,&device);
+            crate::sbd::update_feedback(model,c,output,&mut state)?;
+        }
+        let output=crate::sbd::block_forward(model,&row.input[..block.start+1],&state,c.sbd.as_ref().unwrap().feedback==SbdFeedback::HardMask,&device);
+        loss=loss+crate::sbd::masked_training_loss(output.logits,block,row,rows.len(),c.vocab(),&device);
+        reports.push(json!({"row":block.row,"start":block.start,"length":n,"noisy_input_consumed":true}));
     }
-    Ok((loss, logits_reports))
+    Ok((loss,reports))
 }
 
 fn loss_case(model: &LanguageModel, c: &Config, rows: &[Example], seed: u64, blocks: &[TrainingBlock], expectation: CausalExpectation, device: &Device) -> Result<Value> {
@@ -255,7 +255,7 @@ fn loss_case(model: &LanguageModel, c: &Config, rows: &[Example], seed: u64, blo
     per_block.sbd.as_mut().unwrap().block_execution = SbdBlockExecution::PerBlock;
     let mut batched = per_block.clone();
     batched.sbd.as_mut().unwrap().block_execution = SbdBlockExecution::Batched;
-    let noisy = blocks.iter().any(|block| block.masked.len() > 1);
+    let noisy = !blocks.is_empty();
     let reference_loss = crate::sbd::training_loss(model, &per_block, rows, &batch, seed)?.loss;
     let reference_value = values(reference_loss.clone());
     let reference_gradients = gradient_snapshot(model, reference_loss, noisy)?;
@@ -266,21 +266,21 @@ fn loss_case(model: &LanguageModel, c: &Config, rows: &[Example], seed: u64, blo
     let gradient_report = compare_gradients(&actual_gradients, &reference_gradients)?;
     let causal = match expectation {
         CausalExpectation::None => None,
-        CausalExpectation::AllObserved | CausalExpectation::LengthOne => {
+        CausalExpectation::AllObserved | CausalExpectation::Reconstructed => {
             if matches!(expectation, CausalExpectation::AllObserved) {
                 ensure!(blocks.is_empty(), "all-observed fixture unexpectedly selected a masked block");
             }
             let (expected_loss, logits_reports) = causal_objective(model, c, rows, &batch, blocks)?;
             let expected_value = values(expected_loss.clone());
-            let expected_gradients = gradient_snapshot(model, expected_loss, false)?;
+            let expected_gradients = gradient_snapshot(model, expected_loss, noisy)?;
             let bit_identical = reference_value.iter().zip(&actual_value).zip(&expected_value).all(|((&a, &b), &e)| a.to_bits() == b.to_bits() && a.to_bits() == e.to_bits());
             if matches!(expectation, CausalExpectation::AllObserved) {
                 ensure!(bit_identical, "all-observed loss must be exactly clean NTP in both execution modes");
             }
             Some(json!({
-                "objective": if matches!(expectation, CausalExpectation::AllObserved) { "clean_ntp" } else { "clean_ntp_plus_selected_causal_length_one_targets" },
+                "objective": if matches!(expectation, CausalExpectation::AllObserved) { "clean_ntp" } else { "clean_ntp_plus_reconstructed_full_noisy_blocks" },
                 "loss_bit_identical": bit_identical,
-                "length_one_logits": logits_reports,
+                "noisy_blocks": logits_reports,
                 "per_block_loss": compare(&reference_value, &expected_value)?,
                 "batched_loss": compare(&actual_value, &expected_value)?,
                 "per_block_all_parameter_gradients": compare_gradients(&reference_gradients, &expected_gradients)?,
@@ -290,7 +290,7 @@ fn loss_case(model: &LanguageModel, c: &Config, rows: &[Example], seed: u64, blo
     };
     Ok(json!({
         "seed": seed, "rows": rows.len(), "targets_per_row": rows[0].target.len(),
-        "configured_block_lengths": c.sbd.as_ref().unwrap().block_lengths,
+        "configured_training_block_lengths": c.sbd.as_ref().unwrap().training_block_lengths,
         "draw": blocks.iter().map(|block| json!({"row":block.row,"start":block.start,"configured_length":block.length,"masked":block.masked})).collect::<Vec<_>>(),
         "per_block_loss": reference_value[0], "batched_loss": actual_value[0],
         "total_training_loss": loss_report, "all_parameter_gradients": gradient_report,
@@ -299,51 +299,31 @@ fn loss_case(model: &LanguageModel, c: &Config, rows: &[Example], seed: u64, blo
 }
 
 fn training_cases(model: &LanguageModel, c: &Config, device: &Device) -> Result<Vec<Value>> {
-    let mut reports = Vec::new();
-    let mut cfg = c.clone();
-    cfg.sbd.as_mut().unwrap().block_lengths = vec![1, 4, 8, 16];
-    let mixed = rows(4, 19);
-    let (seed, blocks) = seed_for(&cfg, &mixed, |blocks| {
-        [1, 4, 8, 16].iter().all(|&length| blocks.iter().any(|block| block.length == length && block.masked.len() == length))
-            && blocks.iter().any(|block| block.masked.len() == 3)
-            && blocks.iter().any(|block| block.masked.iter().any(|&masked| !masked))
-    })?;
-    reports.push(loss_case(model, &cfg, &mixed, seed, &blocks, CausalExpectation::None, device).context("mixed-length random training fixture")?);
-
-    cfg.sbd.as_mut().unwrap().block_lengths = vec![4, 8, 16];
-    let tails = rows(2, 17);
-    let (seed, blocks) = seed_for(&cfg, &tails, |blocks| {
-        blocks.iter().any(|block| block.masked.len() == 1)
-            && blocks.iter().any(|block| block.masked.len() > 1)
-            && [0, 1].iter().all(|&row| blocks.iter().any(|block| block.row == row))
-    })?;
-    reports.push(loss_case(model, &cfg, &tails, seed, &blocks, CausalExpectation::None, device).context("length-one random tail training fixture")?);
-
-    cfg.sbd.as_mut().unwrap().block_lengths = vec![4, 8];
-    let observed = rows(2, 9);
-    let (seed, blocks) = seed_for(&cfg, &observed, |blocks| blocks.is_empty())?;
-    reports.push(loss_case(model, &cfg, &observed, seed, &blocks, CausalExpectation::AllObserved, device).context("all-observed training fixture")?);
-
-    cfg.sbd.as_mut().unwrap().block_lengths = vec![1];
-    let singleton = rows(2, 3);
-    let (seed, blocks) = seed_for(&cfg, &singleton, |blocks| {
-        blocks.len() < 6 && blocks.iter().any(|block| block.start > 0)
-            && [0, 1].iter().all(|&row| blocks.iter().any(|block| block.row == row))
-    })?;
-    reports.push(loss_case(model, &cfg, &singleton, seed, &blocks, CausalExpectation::LengthOne, device).context("exact causal length-one training fixture")?);
-
-    if let Some(retrieval) = &c.prefix_block_retrieval {
-        cfg.sbd.as_mut().unwrap().block_lengths = vec![16];
-        let retrieval_rows = rows(2, late_boundary(c) + 5);
-        let (seed, blocks) = seed_for(&cfg, &retrieval_rows, |blocks| {
-            blocks.iter().any(|block| block.masked.len() > 1
-                && (block.start + 1) / c.chunk_size * c.chunk_size / retrieval.block_size > retrieval.blocks_per_query)
-                && [0, 1].iter().all(|&row| blocks.iter().any(|block| block.row == row))
-        })?;
-        let mut report = loss_case(model, &cfg, &retrieval_rows, seed, &blocks, CausalExpectation::None, device).context("selected completed-prefix retrieval training fixture")?;
-        report["retrieval_selection_exercised"] = json!(true);
-        reports.push(report);
+    let mut reports=Vec::new();
+    let mut cfg=c.clone();
+    cfg.soft_training_probability=1.0;
+    for length in [1usize,4,8,16] {
+        cfg.sbd.as_mut().unwrap().training_block_lengths=vec![length];
+        let samples=rows(2,19);
+        let (seed,blocks)=seed_for(&cfg,&samples,|blocks|[0,1].iter().all(|&r|blocks.iter().any(|b|b.row==r)))?;
+        ensure!(blocks.iter().all(|b|b.length==length && b.masked.len()==length && b.start+length<=19/length*length),"partial noisy training target entered full-block objective");
+        reports.push(loss_case(model,&cfg,&samples,seed,&blocks,CausalExpectation::Reconstructed,device)?);
     }
+    cfg.sbd.as_mut().unwrap().training_block_lengths=vec![4,8];
+    let observed=rows(2,9);
+    let (seed,blocks)=seed_for(&cfg,&observed,|blocks|blocks.is_empty())?;
+    reports.push(loss_case(model,&cfg,&observed,seed,&blocks,CausalExpectation::AllObserved,device)?);
+    let variable=rows(4,35);
+    let mut drawn=std::collections::BTreeSet::new();
+    for seed in 0..128 {
+        let blocks=sample_training_blocks(&cfg,&variable,seed)?;
+        if let Some(first)=blocks.first() {
+            ensure!(blocks.iter().all(|b|b.length==first.length && b.masked.len()==first.length),"training update drew different row lengths or a partial tail");
+            drawn.insert(first.length);
+        }
+    }
+    ensure!(drawn==[4usize,8].into_iter().collect(),"variable training did not exercise configured lengths");
+    reports.push(json!({"shared_update_length":true,"complete_blocks_only":true,"clean_tail_loss_retained":true,"drawn_lengths":drawn}));
     Ok(reports)
 }
 
