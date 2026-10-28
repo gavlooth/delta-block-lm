@@ -229,6 +229,8 @@ fn announcement_marks(model: &LanguageModel, c: &Config, a: crate::model::Denois
     let rows=state.lengths.len();
     let width=state.width();
     let s=c.sbd.as_ref().unwrap();
+    let default_announcement=crate::config::AnnouncementConfig::default();
+    let announcement=s.announcement.as_ref().unwrap_or(&default_announcement);
     let (logs,scores)=if model.codpula.is_some() {
         let (circuit,tokens,observed)=crate::sbd::prepare_circuit(model,a,&state.soft,c.soft_temperature)?;
         let (tokens,observed)=if carry_reveals {
@@ -242,7 +244,7 @@ fn announcement_marks(model: &LanguageModel, c: &Config, a: crate::model::Denois
         work.circuit_query_dispatched_rows+=rows;
         work.circuit_query_used_rows+=rows;
         let logs=circuit.marginals(tokens.clone(),observed.clone())?.log();
-        let scores=if s.commitment==crate::config::SbdCommitment::Dependence {
+        let scores=if announcement.dependence_threshold.is_some() {
             let proposals=circuit.sample_with_uniforms(tokens.clone(),observed.clone(),
                 token_uniforms(state,keys,seed,call,device))?;
             work.ffbs_passes+=1;
@@ -262,7 +264,7 @@ fn announcement_marks(model: &LanguageModel, c: &Config, a: crate::model::Denois
         let chosen=if let Some(scores)=&scores {
             ensure!(positions.iter().all(|&i|scores[row][i].is_finite()),
                 "CoCommit dependence requires finite supported scores");
-            crate::sbd::dependence_commits(&positions,&scores[row],s.dependence_threshold,false)
+            crate::sbd::dependence_commits(&positions,&scores[row],announcement.dependence_threshold.unwrap(),false)
         } else {
             let mut order=positions.into_iter().map(|i| {
                 let logs=&logs[(row*width+i)*c.vocab()..(row*width+i+1)*c.vocab()];
@@ -270,12 +272,12 @@ fn announcement_marks(model: &LanguageModel, c: &Config, a: crate::model::Denois
                 (i,entropy)
             }).collect::<Vec<_>>();
             order.sort_by(|a,b|a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
-            let take=if order.is_empty() {0} else if let Some(gamma)=s.entropy_threshold {
+            let take=if order.is_empty() {0} else if let Some(gamma)=announcement.entropy_threshold {
                 let mut take=1;
                 let mut sum=0.0;
                 while take<order.len() && sum+order[take-1].1<=gamma {sum+=order[take-1].1;take+=1;}
                 take
-            } else {s.commit_count.min(order.len())};
+            } else {announcement.count.min(order.len())};
             order[..take].iter().map(|&(i,_)|i).collect()
         };
         for i in chosen {marks[row*width+i]=true;}
@@ -1319,9 +1321,11 @@ pub fn numerical_checks(c: &Config, device: &Device) -> Result<Value> {
     let mut co_check = check.clone();
     let co_options=co_check.sbd.as_mut().unwrap();
     co_options.cocommit=Some(crate::config::CocommitConfig::default());
-    co_options.commitment=crate::config::SbdCommitment::Fixed;
-    co_options.commit_count=1;
+    co_options.commitment=None;
+    co_options.commit_count=None;
     co_options.entropy_threshold=None;
+    co_options.dependence_threshold=None;
+    co_options.announcement=Some(crate::config::AnnouncementConfig {count:1,..Default::default()});
     co_options.training_mode=crate::tct::TrainingMode::Sbd;
     co_options.in_block_reads=delta_mixers::sbd::InBlockReads::HolaRead;
     co_options.joint_output=crate::config::SbdJointOutput::CodpulaContextual;

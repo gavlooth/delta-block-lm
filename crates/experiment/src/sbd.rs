@@ -506,7 +506,7 @@ pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32],
                 let (circuit,tokens,observed) = prepare_circuit(&model,output,&soft,c.soft_temperature)?;
                 let logs = circuit.marginals(tokens.clone(),observed.clone())?.log();
                 let proposals = circuit.sample(tokens.clone(),observed.clone(),proposal_rng.next())?;
-                let scores = if s.commitment == SbdCommitment::Dependence {
+                let scores = if s.commitment() == SbdCommitment::Dependence {
                     Some(circuit.dependence_scores(tokens,observed,&proposals)?.remove(0))
                 } else { None };
                 (logs.clone(),Some(proposals.into_iter().next().unwrap()),scores,logs,1.0)
@@ -526,7 +526,7 @@ pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32],
                 let unresolved = order.iter().map(|&(i,_,_)|i).collect::<Vec<_>>();
                 ensure!(unresolved.iter().all(|&i| scores[i].is_finite()),
                     "Codpula commitment requires supported finite proposal scores");
-                dependence_commits(&unresolved,&scores,s.dependence_threshold,block_passes == n)
+                dependence_commits(&unresolved,&scores,s.dependence_threshold(),block_passes == n)
             } else {
                 order.sort_by(|a,b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
                 let take = if let Some(gamma) = s.entropy_threshold {
@@ -538,7 +538,7 @@ pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32],
                         take += 1;
                     }
                     take
-                } else { s.commit_count.min(order.len()) };
+                } else { s.commit_count().min(order.len()) };
                 order[..take].iter().map(|&(i,_,_)|i).collect()
             };
             let proposal_values = proposals.unwrap_or_else(|| {
@@ -562,7 +562,7 @@ pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32],
     }
     runtime::sync(device)?;
     let seconds = clock.elapsed().as_secs_f64();
-    let mut report = json!({"tokens":generated,"text":String::from_utf8_lossy(&generated.iter().map(|&x| x as u8).collect::<Vec<_>>()),"finalized_tokens":generated.len(),"finalized_tokens_per_second":generated.len() as f64/seconds,"seconds":seconds,"denoising_passes":passes,"blocks":blocks,"causally_replayed_tokens":clean.replayed,"includes_replay":true,"prefill_included":false,"replay_implementation":"full clean-prefix reconstruction once per finalized block; no incremental optimization","commit_rule":if s.commitment == SbdCommitment::Dependence {"dependence"} else if s.entropy_threshold.is_some() {"sbd_entropy_eq8"} else {"fixed_count"},"joint_output":s.joint_output,"joint_execution":s.joint_execution,"proposal_seed":c.seed,"potential_temperature":c.soft_temperature,"dependence_threshold":s.dependence_threshold,"maximum_passes_per_block":"actual block length"});
+    let mut report = json!({"tokens":generated,"text":String::from_utf8_lossy(&generated.iter().map(|&x| x as u8).collect::<Vec<_>>()),"finalized_tokens":generated.len(),"finalized_tokens_per_second":generated.len() as f64/seconds,"seconds":seconds,"denoising_passes":passes,"blocks":blocks,"causally_replayed_tokens":clean.replayed,"includes_replay":true,"prefill_included":false,"replay_implementation":"full clean-prefix reconstruction once per finalized block; no incremental optimization","commit_rule":if s.commitment() == SbdCommitment::Dependence {"dependence"} else if s.entropy_threshold.is_some() {"sbd_entropy_eq8"} else {"fixed_count"},"joint_output":s.joint_output,"joint_execution":s.joint_execution,"proposal_seed":c.seed,"potential_temperature":c.soft_temperature,"dependence_threshold":s.dependence_threshold(),"maximum_passes_per_block":"actual block length"});
     if targets.is_some() {report["decode_score"]=score.report();}
     report["teacher_feedback_passes"]=json!(teacher_feedback_passes);
     if let Some(options) = &s.cocommit {

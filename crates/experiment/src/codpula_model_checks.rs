@@ -825,7 +825,7 @@ fn evaluation_and_generation(model: &LanguageModel, cfg: &Config, device: &Devic
     let s = cfg.sbd.as_mut().unwrap();
     s.block_lengths = vec![1,4];
     s.generate_tokens = 5;
-    s.commitment = SbdCommitment::Dependence;
+    s.commitment = Some(SbdCommitment::Dependence);
     let evaluation = sbd::evaluate(model,&cfg,&rows(1,5),device)?;
     ensure!(evaluation["predicted_tokens"] == 10 && evaluation["block_nll"].as_f64().is_some_and(f64::is_finite),"joint evaluation omits a configured length or has nonfinite NLL");
     let generated = sbd::generate(model,&cfg,&[256,65,66],device)?;
