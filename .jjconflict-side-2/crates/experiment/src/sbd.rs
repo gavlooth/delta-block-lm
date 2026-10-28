@@ -498,7 +498,11 @@ pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32],
                 final_values=soft.observed.clone();
                 continue;
             }
-            let output = block_forward(&model,&clean.tokens,&soft,s.feedback == SbdFeedback::HardMask,device);
+            let output = if let Some(cache) = &coordination_cache {
+                model.cached_block(cache,0,&soft,s.feedback == SbdFeedback::HardMask)
+            } else {
+                block_forward(&model,&clean.tokens,&soft,s.feedback == SbdFeedback::HardMask,device)
+            };
             passes += 1;
             block_passes += 1;
             let joint = model.codpula.is_some() && n > 1;
@@ -813,6 +817,35 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn plain_generation_matches_cached_training_assignments() {
+        for ohc in [false,true] {
+            let device=Device::ndarray();
+            device.seed(913);
+            let c=Config {task:"lm".into(),d_model:8,layers:2,heads:2,key_dim:2,value_dim:2,chunk_size:4,cache_capacity:2,
+                ohc_streams:ohc,wavelet_layers:vec![0],lngram_layers:vec![0],lngram_routes:2,lngram_bits:1,lngram_memory_dim:2,lngram_orders:vec![2,3],
+                projection_backend:delta_mixers::ProjectionBackend::Merged,
+                sbd:Some(crate::config::SbdConfig {block_lengths:vec![3],generate_tokens:6,commit_count:3,feedback:SbdFeedback::HardMask,..Default::default()}),
+                ..Default::default()};
+            let arm=Arm {name:"kronlstm-hola".into(),mixer:"kronlstm".into(),cache:"surprise".into()};
+            let model=LanguageModel::new(&c,&arm,&device).unwrap();
+            let mut prefix=vec![256,11,23,37,41,53,61];
+            let prompt=prefix.clone();
+            let mut expected=Vec::new();
+            for _ in 0..2 {
+                let cache=crate::cocommit::prepare_clean_cache(&model,&prefix,&device);
+                let soft=state(&c,vec![None;3],&device).unwrap();
+                let logits=values(model.cached_block(&cache,0,&soft,true).logits);
+                let tokens=(0..3).map(|i|(0..c.vocab()).max_by(|&a,&b|
+                    logits[i*c.vocab()+a].total_cmp(&logits[i*c.vocab()+b]).then(b.cmp(&a))).unwrap() as i32).collect::<Vec<_>>();
+                prefix.extend_from_slice(&tokens);
+                expected.extend(tokens);
+            }
+            let actual=generate(&model,&c,&prompt,&device).unwrap();
+            assert_eq!(actual["tokens"],json!(expected));
+            assert_eq!(actual["denoising_passes"],2);
+        }
+    }
     #[test]
     fn dependence_commitment_uses_strict_threshold_and_supported_candidates() {
         let unresolved = [3,1,2];
