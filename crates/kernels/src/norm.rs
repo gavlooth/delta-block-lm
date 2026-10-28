@@ -60,7 +60,11 @@ fn forward_kernel(
     if mode != 0 {
         square /= width as f32;
     }
-    let inv = 1.0f32 / f32::sqrt(square + epsilon);
+    let inv = if mode == 0 {
+        1.0f32 / f32::sqrt(f32::max(square, epsilon * epsilon))
+    } else {
+        1.0f32 / f32::sqrt(square + epsilon)
+    };
     if c == 0 {
         inverse[row] = inv;
     }
@@ -105,14 +109,20 @@ fn input_backward_kernel(
             u *= weight[c * weight.stride(0)];
         }
     }
-    let mut dot = Shared::<[f32]>::new_slice(lanes);
+    let mut dot = Shared::<[f32]>::new_slice(if mode == 0 { lanes * 2 } else { lanes });
     dot[c] = u * z;
+    if mode == 0 {
+        dot[lanes + c] = z * z;
+    }
     sync_cube();
     let mut offset = 0usize;
     offset += lanes / 2;
     while offset > 0 {
         if c < offset {
             dot[c] += dot[c + offset];
+            if mode == 0 {
+                dot[lanes + c] += dot[lanes + c + offset];
+            }
         }
         sync_cube();
         offset /= 2;
@@ -121,6 +131,12 @@ fn input_backward_kernel(
     let mut correction = dot[0] * inv * inv;
     if mode != 0 {
         correction /= width as f32;
+    }
+    if mode == 0 {
+        if dot[lanes] < 1.0e-24f32 {
+            // Below the norm floor the denominator is constant, including at zero.
+            correction = 0.0f32;
+        }
     }
     if c < width {
         let dz = (u - z * correction) * inv;

@@ -19,7 +19,6 @@
   "max_seconds":60,
   "arms":[
     {"name":"kronlstm","mixer":"kronlstm","cache":"none"},
-    {"name":"kronlstm-hola","mixer":"kronlstm","cache":"surprise"},
-    {"name":"kronlstm-recency","mixer":"kronlstm","cache":"recency"}
+    {"name":"kronlstm-hola","mixer":"kronlstm","cache":"surprise"}
   ]
 }

@@ -1,6 +1,6 @@
 # Causal KronLSTM mixer
 
-Current local optimization results are in the root `RESULTS.md`. Fused KronLSTM and fused HOLA pass independent f64 operator checks, and the measured normalized models pass CPU parameter-gradient/update comparisons. A newly exposed legacy GPU TensorSolver gradient failure remains on the short nonzero-initial-state stress fixture; do not treat that path as an arbitrary-input numerical oracle. CPU remains the tensor reference. Explicit fused selection is recommended for new supported Vulkan experiments; historical defaults are unchanged.
+Current local optimization results are in the root `RESULTS.md`. The historical GPU TensorSolver short/nonzero-initial-state VJP failure was corrected by the rowwise dot-GEMM change; retained acceptance at `e1cb69ce` / integration `53a684349a1a` is scoped in `docs/optimization/tensor-solver.md`. Earlier failed reports remain evidence, not the current solver status. Those results predate the norm-floor, scaled readout and initialization changes below; they do not certify the new math.
 
 `delta-mixers` supplies a trainable Burn 0.22 module, not a frozen feature map.
 GDN-2 removed on 2026-10-28 by user decision; KronLSTM is the only mixer.
@@ -11,6 +11,15 @@ initialization and by the low-level scan. This is the migrated kernel contract,
 not a maximum context length or a denoising-block limit. Larger computational
 chunks need a different stable triangular solver and are not implemented:
 unbounded nilpotent matrix powers in f32 can overflow on contractive inputs.
+
+Today `chunk_size` is also HOLA's **logical** current-block KV span, not merely
+a recurrence execution tile. The small pilot's configured span/capacity 16 are
+retained; this is not paper HOLA's span 256/capacity 64 at equivalent compute.
+Neither clean nor frozen noisy readers truncate a separately larger configured
+span. Increasing that exact context/budget requires an explicit configuration
+decision, not an automatic paper-setting enlargement.
+Production experiment arms accept surprise retention (or no-HOLA isolation);
+recency selection remains only an internal cache-comparison reference.
 
 ```rust,ignore
 use burn::prelude::*;
@@ -42,7 +51,7 @@ with separately learned scalar gates per head:
 
 - `B = diag(alpha) S`,
 - `z = c - beta * k^T B v`,
-- `S' = B + z k v^T`, `o = q^T S'`.
+- `S' = B + z k v^T`, `o = q^T S' / sqrt(key_dim)` (Appendix A8.7).
 
 KronLSTM recurrent queries, keys and values are L2-normalized. The mixer has
 learned Q/K/V projections, document-aware short convolutions of width four,
@@ -52,9 +61,9 @@ head RMS normalization and an output projection.
 The learned gate offsets from [Eq. (11)](https://arxiv.org/html/2610.26834#S2.E11)
 and the following output-gate definition are stored as `erase.bias` (`b_beta`),
 `write.bias` (`b_c`) and `output_gate.bias` (`b_o`). The first two have one
-entry per head; the last has one entry per head/value channel. All three are
-zero-initialized: the paper does not prescribe their initialization, so zero
-is the necessary local initialization choice, not a paper-specified recipe.
+entry per head; the last has one entry per head/value channel. Beta/c biases
+start at zero. The output gate uses zero weights and bias +3, as prescribed by
+the pinned release when the paper leaves initialization unspecified.
 Every separate, grouped and merged projection adds the bias before sigmoid.
 Clean, temporary noisy, cached and batched SBD paths use these same linears.
 The fused 64/128/256-lane scans consume already activated beta/c gates;
@@ -62,11 +71,20 @@ the fused output RMSNorm consumes biased output-gate logits. Neither kernel
 applies another bias or sigmoid to beta/c. Their VJPs flow through the shared
 affine projections to all three learned offsets.
 
-The model identity is now `kronlstm-learned-gate-biases-v1`. Historical
-bias-free KronLSTM checkpoints are incompatible and must be rejected, not
-loaded with newly initialized missing parameters. Historical measurements
+The central `model_math_revision` checkpoint identity rejects earlier model
+math (including bias-free and additive-epsilon L2 checkpoints); no missing
+parameters or changed equations are silently filled in. Historical measurements
 below and in the root results describe the earlier parameterization unless
-their report explicitly names this revision.
+their report explicitly names the new math.
+
+Initialization follows the [official source pinned at
+`3d800c9a153a88ee9624fe6acf7f39a58017a17e`](https://github.com/NX-AI/KronLSTM/tree/3d800c9a153a88ee9624fe6acf7f39a58017a17e):
+projections and short convolutions use Normal std .02; the residual output
+uses `.02/sqrt(2*num_layers)`. `MixerConfig.num_layers` is the total model
+depth (one for standalone mixers). Decay uses `A_log=log U(0,16)` per head
+and inverse-softplus of log-uniform time constants in [.001,.1] per key.
+The release's missing beta/c biases and norm-before-gate ordering do not
+override the paper's affine gates and gate-before-RMS equation.
 
 `gate_bias_checks::numerical_checks` independently evaluates a scalar-f64
 whole layer and finite-difference gradients at the unchanged
@@ -124,10 +142,13 @@ the measured adoption decision, not just the forward-only improvement.
 `fused_norms_gates` (also fold sigmoid/output multiplication into mixer
 RMSNorm and fuse channel-bias/head-scale/softplus/exp decay). Original modules,
 gamma IDs, separate HOLA Q/K parameters, valid masks and checkpoint storage
-remain unchanged. L2 uses `sum(x²)+1e-6`; block/final RMSNorm uses
-`mean(x²)+1e-6`; inherited mixer/HOLA RMSNorm uses `mean(x²)+1e-5`.
-No epsilon or softplus threshold is retuned. The custom scopes require f32
-GPU execution, final-axis widths 1..=1024 and first-order differentiation.
+remain unchanged. Recurrent L2 is `x/max(sqrt(sum(x²)),1e-12)`, including
+the constant-denominator derivative below the floor and finite derivative at
+zero; block/final RMSNorm uses `mean(x²)+1e-6`, mixer/HOLA RMSNorm
+`mean(x²)+1e-5`. Recurrent readout alone is scaled by `key_dim^-1/2`
+before adding HOLA; cache softmax and its separate learned gate are unchanged.
+The custom scopes require f32 GPU execution, final-axis widths 1..=1024 and
+first-order differentiation.
 
 The remaining convolution SiLU, erase/write sigmoids, HOLA blend gate and
 residual additions continue to use existing primitives. These small pieces

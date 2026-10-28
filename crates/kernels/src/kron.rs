@@ -116,7 +116,7 @@ fn forward_kernel(
             }
         }
         let token = (b * time + t) * heads + h;
-        packed[token * V + j] = output;
+        packed[token * V + j] = output / f32::sqrt(K as f32);
         if j == 0 {
             auxiliary[token * 4] = correction;
             auxiliary[token * 4 + 1] = p;
@@ -226,7 +226,7 @@ fn backward_kernel(
             if active {
                 value = v[ix(v, b, t, h, j)];
                 beta = erase[ix(erase, b, t, h, 0)];
-                dy = upstream[(token * V + j) * upstream.stride(0)];
+                dy = upstream[(token * V + j) * upstream.stride(0)] / f32::sqrt(K as f32);
                 score_grad = upstream[(output_len + state_len + token) * upstream.stride(0)];
                 i = 0;
                 while i < K {

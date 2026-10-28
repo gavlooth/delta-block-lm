@@ -29,7 +29,6 @@ impl Arm {
         let cache_policy = match self.cache.as_str() {
             "none" => CachePolicy::None,
             "surprise" => CachePolicy::Surprise,
-            "recency" => CachePolicy::Recency,
             value => anyhow::bail!("unknown cache {value}"),
         };
         ensure!(
@@ -38,6 +37,7 @@ impl Arm {
         );
         Ok(MixerConfig {
             d_model: c.d_model,
+            num_layers: c.layers,
             heads: c.heads,
             key_dim: c.key_dim,
             value_dim: c.value_dim,
@@ -1491,6 +1491,18 @@ mod tests {
         assert_eq!(c.coordination_contract_revision(),None);
         let historical_tct = crate::data::hash(&serde_json::to_vec(&(&c,tokens,SBD_MODEL_REVISION,KRON_MODEL_REVISION)).unwrap());
         assert_eq!(c.training_fingerprint(tokens).unwrap(),historical_tct);
+    }
+    #[test]
+    fn production_cache_policy_is_surprise_and_depth_reaches_mixer() {
+        let c=Config {layers:7,..Default::default()};
+        let mut arm=Arm {name:"kronlstm-hola".into(),mixer:"kronlstm".into(),cache:"surprise".into()};
+        let mixer=arm.mixer_config(&c).unwrap();
+        assert_eq!(mixer.cache_policy,CachePolicy::Surprise);
+        assert_eq!(mixer.num_layers,7);
+        arm.cache="recency".into();
+        assert!(arm.mixer_config(&c).unwrap_err().to_string().contains("unknown cache recency"));
+        arm.cache="none".into();
+        assert_eq!(arm.mixer_config(&c).unwrap().cache_policy,CachePolicy::None);
     }
     #[test]
     fn doubled_marked_tail_rejects_retrieval_instead_of_switching_execution() {

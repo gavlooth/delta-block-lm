@@ -114,6 +114,8 @@ pub struct MixerConfig {
     #[serde(skip_serializing_if = "ConvolutionBackend::is_tensor")]
     pub convolution_backend: ConvolutionBackend,
     pub d_model: usize,
+    /// Total model depth, used only for residual-output initialization.
+    pub num_layers: usize,
     pub heads: usize,
     pub key_dim: usize,
     pub value_dim: usize,
@@ -141,6 +143,7 @@ impl Default for MixerConfig {
             normalization_backend: NormalizationBackend::Tensor,
             convolution_backend: ConvolutionBackend::Tensor,
             d_model: 128,
+            num_layers: 1,
             heads: 4,
             key_dim: 32,
             value_dim: 64,
@@ -153,6 +156,7 @@ impl MixerConfig {
     pub fn init(&self, device: &Device) -> Mixer {
         assert!(
             self.d_model > 0
+                && self.num_layers > 0
                 && self.heads > 0
                 && self.key_dim > 0
                 && self.value_dim > 0
@@ -196,7 +200,12 @@ impl MixerConfig {
         }
         let kw = self.heads * self.key_dim;
         let vw = self.heads * self.value_dim;
-        let linear = |i, o| LinearConfig::new(i, o).with_bias(false).init(device);
+        // Pinned official model initialization: Normal(.02), with a smaller
+        // projection into the residual stream. Paper gate equations still keep
+        // their beta/c biases even though the release omits those offsets.
+        let normal = Initializer::Normal { mean: 0.0, std: 0.02 };
+        let linear = |i, o| LinearConfig::new(i, o).with_bias(false)
+            .with_initializer(normal.clone()).init(device);
         // Eq. 11 and the output-gate definition require learned offsets.
         // The paper gives no bias initializer; zeros preserve neutral initial gates.
         let gate = |i, o| {
@@ -204,13 +213,21 @@ impl MixerConfig {
             layer.bias = Some(Initializer::Zeros.init([o], device));
             layer
         };
-        let conv = |channels| {
-            Param::from_tensor(Tensor::random(
-                [4, channels],
-                Distribution::Uniform(-0.1, 0.1),
-                device,
-            ))
+        let conv = |channels| normal.init([4, channels], device);
+        let output_gate = Linear {
+            weight: Initializer::Zeros.init([self.d_model, vw], device),
+            bias: Some(Initializer::Constant { value: 3.0 }.init([vw], device)),
         };
+        let output = LinearConfig::new(vw, self.d_model).with_bias(false)
+            .with_initializer(Initializer::Normal {
+                mean: 0.0, std: 0.02 / (2.0 * self.num_layers as f64).sqrt(),
+            }).init(device);
+        // Official A_log ~ log U(0,16); dt ~ log U(.001,.1), then inverse softplus.
+        let decay_scale = Tensor::<1>::random([self.heads], Distribution::Uniform(0.0, 16.0), device).log();
+        let dt = (Tensor::<1>::random([kw], Distribution::Uniform(0.0, 1.0), device)
+            * (0.1f64.ln() - 0.001f64.ln()) + 0.001f64.ln()).exp().clamp_min(1e-4);
+        // dt is at least .001 here, so this equivalent inverse is well resolved in f32.
+        let decay_bias = dt.clone() + (dt.neg().exp().neg() + 1.0).log();
         Mixer {
             q: linear(self.d_model, kw),
             k: linear(self.d_model, kw),
@@ -218,13 +235,13 @@ impl MixerConfig {
             decay: linear(self.d_model, kw),
             erase: gate(self.d_model, self.heads),
             write: gate(self.d_model, self.heads),
-            output_gate: gate(self.d_model, vw),
-            output: linear(vw, self.d_model),
+            output_gate,
+            output,
             q_conv: conv(kw),
             k_conv: conv(kw),
             v_conv: conv(vw),
-            decay_scale: Param::from_tensor(Tensor::zeros([self.heads], device)),
-            decay_bias: Param::from_tensor(Tensor::full([kw], -4.0, device)),
+            decay_scale: Param::from_tensor(decay_scale),
+            decay_bias: Param::from_tensor(decay_bias),
             norm: RmsNormConfig::new(self.value_dim).init(device),
             cache: (self.cache_policy != CachePolicy::None).then(|| ExactMemory {
                 q_norm: RmsNormConfig::new(self.key_dim).init(device),

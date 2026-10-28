@@ -32,6 +32,7 @@ pub struct Case {
     width: usize,
     epsilon: f64,
     zero: bool,
+    input_scale: f64,
     strided_inputs: bool,
     internal_and_tail_padding: bool,
     all_input_parameter_gradients: bool,
@@ -64,7 +65,7 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
     };
     let mut cases = Vec::new();
     for width in [3, 32, 35, 64, 256] {
-        for zero in [false, true] {
+        for (zero, input_scale) in [(false, 1.0), (false, 1e-3), (false, 1e-12), (false, 1e-14), (true, 0.0)] {
             let shape = [2, 7, 2, width];
             let n = shape.iter().product();
             let data = (0..n)
@@ -75,7 +76,7 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
                     if zero || [0, 3, 6, 9, 13].contains(&token) {
                         0.
                     } else {
-                        ((i * 17 + 3) as f64 * 0.013).sin() as f32
+                        (((i * 17 + 3) as f64 * 0.013).sin() * input_scale) as f32
                     }
                 })
                 .collect();
@@ -138,8 +139,8 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
             let gv = values(gate.clone());
             let uv = values(upstream.clone());
             let wv = values(weight.clone());
-            // Check both historical epsilons, and the weighted and unweighted VJPs.
-            for (mode, epsilon) in [(0, 1e-6), (1, 1e-6), (1, 1e-5), (2, 1e-5)] {
+            // L2 uses a norm floor; RMS retains its separate additive epsilons.
+            for (mode, epsilon) in [(0, 1e-12), (1, 1e-6), (1, 1e-5), (2, 1e-5)] {
                 let mut y = vec![0.; n];
                 let mut dx = vec![0.; n];
                 let mut dg = vec![0.; n];
@@ -156,9 +157,13 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
                         z[c] = xv[i] as f64 * mask * s[c];
                     }
                     let divisor = if mode == 0 { 1. } else { width as f64 };
-                    let inverse = (z.iter().map(|z| z * z).sum::<f64>() / divisor + epsilon)
-                        .sqrt()
-                        .recip();
+                    let square = z.iter().map(|z| z * z).sum::<f64>();
+                    let inverse = if mode == 0 {
+                        square.sqrt().max(epsilon).recip()
+                    } else {
+                        (square / divisor + epsilon).sqrt().recip()
+                    };
+                    let norm_derivative = mode != 0 || square >= epsilon * epsilon;
                     let dot = (0..width)
                         .map(|c| {
                             uv[row * width + c] as f64
@@ -172,7 +177,7 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
                         let w = if mode == 0 { 1. } else { wv[c] as f64 };
                         y[i] = z[c] * inverse * w * mask;
                         let dz = (uv[i] as f64 * mask * w
-                            - z[c] * dot * inverse * inverse / divisor)
+                            - if norm_derivative { z[c] * dot * inverse * inverse / divisor } else { 0.0 })
                             * inverse;
                         dx[i] = dz * s[c] * mask;
                         dg[i] = dz * z[c] * (1. - s[c]);
@@ -232,6 +237,7 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
                         width,
                         epsilon,
                         zero,
+                        input_scale,
                         strided_inputs: true,
                         internal_and_tail_padding: true,
                         all_input_parameter_gradients: true,
@@ -339,6 +345,7 @@ pub fn numerical_checks(device: &Device) -> Result<Report, String> {
                 width: 3,
                 epsilon: 0.,
                 zero,
+                input_scale: if zero { 0.0 } else { 1.0 },
                 strided_inputs: true,
                 internal_and_tail_padding: true,
                 all_input_parameter_gradients: true,

@@ -648,6 +648,7 @@ fn layer_check(
         normalization_backend: crate::NormalizationBackend::Tensor,
         convolution_backend: crate::ConvolutionBackend::Tensor,
         d_model: 8,
+        num_layers: 1,
         heads: 1,
         key_dim: if scan_backend.is_fused() || hola_backend.is_fused() {
             32

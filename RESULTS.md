@@ -159,7 +159,7 @@ Datasets, checkpoints, generated evidence, caches and local session notes are ig
 
 ## Reproduction of the original pilot
 
-The commands below describe the original pilot. The expanded all-path Vulkan reference now also reports the legacy GPU-solver stress failure documented below; use the explicit fused checks in the optimization section for current optimized acceptance.
+The commands below describe the original pilot. The historical GPU TensorSolver stress failure was subsequently corrected by rowwise dot-GEMM; retained source-scoped acceptance is documented in `docs/optimization/tensor-solver.md`. Results below predate the current norm-floor/readout/initializer corrections unless explicitly identified otherwise.
 
 See `crates/experiment/README.md` and `crates/mixers/README.md` for command details. From the workspace root:
 
@@ -226,18 +226,27 @@ At context 512/capacity 16, HOLA's isolated forward gain is about 46x and forwar
 
 At batch 1/head 4/context 512/chunk 16, HOLA schedule/lifetime/softmax metadata is 33,024 bytes at capacity 16 or 58,368 at capacity 64. Backward auxiliary storage adds 16,384 bytes; retained output is separately 524,288 bytes. These are implementation buffer sizes, not measured total GPU peak memory.
 
-### Acceptance and known legacy limitation
+### Historical acceptance and corrected solver limitation
 
 Fused Kron passed independent f64 output, final-state, physical-score, all-input and initial-state VJPs, including combined and separate objectives, zero decay, signed/zero correction, zero norms, padding, resets and strided/chained continuation. HOLA tensor/fused checks passed against an independent scalar oracle, including membership and Q/K/V/sink gradients at capacities 16/64. Regressions cover normalized-before-accumulation large values and consistent forward/backward arithmetic for cancellation-sensitive logits. The large-value fixture uses normal-range upstream gradients: Vulkan subnormal preservation is not assumed.
 
-The expanded checks also exposed an **unresolved legacy GPU TensorSolver gradient defect** for a nonzero-initial-state, normalized-key/value, short-sequence stress fixture. CPU TensorSolver and fused Kron pass; GPU TensorSolver's key gradient fails the unchanged tolerance. Output-only and score-only objectives reproduce it; final-state-only passes. Rank-four overlap, direct triangular substitution and RHS reassociation experiments did not fix it and were reverted.
+The expanded checks originally exposed a GPU TensorSolver gradient defect
+for a nonzero-initial-state, normalized-key/value short-sequence stress fixture.
+The failed reports and unsuccessful intermediate fixes remain historical
+evidence. The accepted rowwise dot-GEMM correction is in current `chunk.rs`.
+`docs/optimization/tensor-solver.md` records acceptance of source `e1cb69ce`
+in integration `53a684349a1a`: the independent key/initial/reset/padding fixture
+and T7 output/state/score VJPs passed with unchanged tolerances. This is retained
+evidence, not a newly executed check or certification of later paper-math edits.
 
-This failure is not hidden or accepted as a correct numerical oracle. `reference` and the strict `kron-benchmark` retain their all-path gates and report it. The workload-scoped `kron-model-check` / `kron-model-benchmark` instead:
-1. retain and hash the original legacy failure evidence, explicitly setting `global_tensor_solver_stress_accepted=false`;
-2. validate the fused kernels independently against f64;
-3. validate each exact normalized model being timed against a genuine CPU reference, including logits, every parameter gradient, one AdamW update and a full-parameter directional finite-difference sanity check.
+The workload-scoped `kron-model-check` / `kron-model-benchmark` still checks
+actual normalized models against CPU logits, all parameter gradients, an
+AdamW update and a directional finite-difference guard. Its
+`global_tensor_solver_stress_accepted=false` describes that command's scope,
+not an unresolved current defect. A historical failed report may optionally be
+copied/hashed, but producing another failure is no longer required.
 
-All measured model cases passed those scoped checks. This certifies the reported fixtures at initialization/first update, not arbitrary legacy inputs or complete training trajectories. No tolerances were loosened. The GPU tensor solver remains a historical/reference path with this documented limitation; use explicit fused paths for new supported local experiments.
+All measured model cases passed those historical scoped checks. This certifies the reported fixtures at initialization/first update, not arbitrary inputs, later paper-math edits or complete training trajectories. No tolerances were loosened. The later solver correction has its own source-scoped acceptance above.
 
 Checkpoint save and guarded load/validation are measured separately. In the context-512/HOLA-on samples, save was approximately 249–259 ms and validated load approximately 326–349 ms; these costs were excluded from step speedups. A historical language-model checkpoint and optimizer continuation were also exercised successfully after adding selectors.
 
@@ -258,14 +267,14 @@ timeout 120s target/debug/delta-experiment kron-reference configs/reference-vulk
 timeout 120s target/debug/delta-experiment hola-reference configs/reference-vulkan.json
 timeout 120s target/debug/delta-experiment benchmark configs/lm512-kron-fused.json
 timeout 400s target/debug/delta-experiment hola-benchmark configs/kron-benchmark.json --trials 5
-# Expected to exit 1 on the affected local backend; retain the real failure report.
+# Historical stress workload; the corrected solver is not expected to fail.
 timeout 120s target/debug/delta-experiment kron-reference configs/reference-vulkan.json --scan-backend tensor_solver --tokens 7 --objective output_only
 timeout 400s target/debug/delta-experiment kron-model-benchmark configs/kron-benchmark.json --warmups 2 --trials 5 --legacy-stress-report artifacts/reference-vulkan/kron-reference.json
 ```
 
-The scoped benchmark requires the retained failed report; it does not manufacture a successful legacy gate. All generated artifacts remain local/ignored. Existing old CPU and GPU configuration defaults were not silently changed, and no subsequent architecture/training-plan step was implemented.
+The original scoped benchmark required the retained failed report; current code accepts it only as optional historical evidence. All generated artifacts remain local/ignored. The reported measurements did not change historical configuration defaults.
 
-On a fresh checkout, the explicit TensorSolver diagnostic above generates the required failure report; do not chain that expected failing command with `&&`. If all reference checks pass on another backend/version, use the strict `kron-benchmark` instead. Never manufacture legacy failure evidence to enable the scoped benchmark.
+These are historical reproduction commands; do not manufacture failed evidence. Current `kron-model-benchmark` accepts optional genuine pre-correction evidence, while strict `kron-benchmark` performs its own all-path gates. The source-scoped solver acceptance above does not automatically certify the later norm-floor/readout/initializer changes.
 
 ## Whole-model profile
 

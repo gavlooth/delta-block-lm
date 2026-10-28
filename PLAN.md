@@ -46,9 +46,9 @@ No cited result establishes the complete proposed combination. Exact circuit inf
 
 Use KronLSTM with the configured embedding, head dimensions, training data, precision, optimizer and token schedule. Report actual parameter counts and recurrent-state memory; no cross-mixer comparison is part of the current architecture.
 
-Keep the existing KronLSTM configurations with no cache, HOLA surprise selection and matched-size recency selection. These isolate cache behavior without maintaining a second mixer.
+Production configurations use KronLSTM with HOLA surprise retention. No-cache configurations remain for numerical/component isolation; matched recency retention is only an internal cache-comparison reference, not a selectable production model.
 
-HOLA retains original KV pairs, not the gated/preconditioned update factors. Its cache-read Q/K normalization is separate from recurrent-update normalization. Compare surprise selection with a matched-size recency cache. The local current-chunk attention supplied by HOLA must be counted in memory and work.
+HOLA retains original KV pairs, not the gated/preconditioned update factors. Its cache-read Q/K normalization is separate from recurrent-update normalization. The local current-chunk attention supplied by HOLA must be counted in memory and work. Configured chunk 16 is both the current logical exact-KV span and recurrence tile; it does not reproduce paper span 256 at lower execution cost.
 
 Proposed surprise scores, requiring implementation checks:
 - KronLSTM: absolute scalar correction multiplied by key and value norms.
@@ -208,7 +208,7 @@ GDN-2 removed on 2026-10-28 by user decision. The following checklist records th
 - Implement KronLSTM's sequential float64 recurrence first, then its chunked forward/backward and GPU path.
 - Implement HOLA's exact KV cache and sharpened read as shared model components where semantics allow, with mixer-specific update-magnitude scores.
 - Derive KronLSTM cache-selection scores from its scalar correction and verify them against the independent reference.
-- Compare surprise-based selection with a cache of the same capacity using recency selection. Count HOLA's current-chunk attention work.
+- Keep surprise-retention membership/read checks against independent references; internal matched-size recency comparisons isolate cache behavior without adding a production model option. Count HOLA's current-chunk attention work.
 - Start cache capacity at 16; measure 64 after the first pilot.
 
 **Deliverable:** KronLSTM runnable with and without HOLA.
@@ -219,7 +219,7 @@ GDN-2 removed on 2026-10-28 by user decision. The following checklist records th
 
 - Start with two mixer layers, model width 128 and contexts 128/512. Keep the inherited kernel key/value widths initially.
 - Generate deterministic training examples and a disjoint fixed evaluation set. Sweep the number of key/value associations to expose memory interference.
-- Current configurations run KronLSTM and KronLSTM+HOLA, with the matched recency-cache option retained. Earlier four-arm results are historical: GDN-2 removed on 2026-10-28 by user decision.
+- Current configurations run KronLSTM and KronLSTM+HOLA for component isolation, without a production recency-cache option. Earlier multi-arm results are historical: GDN-2 removed on 2026-10-28 by user decision.
 - Run one seed as a smoke, then three paired seeds for an architectural decision. Use a short throughput pilot to choose and record a fixed training-token budget for the comparison.
 - Report recall by association count and distance, actual parameter count, recurrent/cache memory, peak GPU memory, training throughput and warm decode latency.
 

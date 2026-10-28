@@ -2,7 +2,7 @@
 //!
 //! This deliberately does not call the tensor recurrence, projection packing, or
 //! existing scan oracle. Eq. (11)'s beta/c biases and the following output-gate
-//! bias are nonzero. The repository's L2 epsilon, per-head RMS epsilon, masking
+//! bias are nonzero. The release's L2 norm floor, per-head RMS epsilon, masking
 //! and independent temporary SBD updates are included explicitly.
 use crate::{CachePolicy, Mixer, MixerConfig, MixerKind, ProjectionBackend, ScanBackend};
 use burn::{module::Param, nn::Linear, optim::GradientsParams, prelude::*};
@@ -103,7 +103,7 @@ impl Oracle {
         }).collect()
     }
     fn normalize(x: &mut [f64]) {
-        let norm=(x.iter().map(|x|x*x).sum::<f64>()+1e-6).sqrt();
+        let norm=x.iter().map(|x|x*x).sum::<f64>().sqrt().max(1e-12);
         for x in x { *x/=norm; }
     }
     fn output(&self, s: &Scenario) -> Vec<f64> {
@@ -173,7 +173,7 @@ impl Oracle {
                         let correction=target-beta*association;
                         for i in 0..k {for j in 0..v {
                             current[(head*k+i)*v+j]+=correction*qkv[2][head*v+j]*qkv[1][head*k+i];
-                            mixed[head*v+j]+=current[(head*k+i)*v+j]*qkv[0][head*k+i];
+                            mixed[head*v+j]+=current[(head*k+i)*v+j]*qkv[0][head*k+i]/(k as f64).sqrt();
                         }}
                         for j in 0..v {mixed[head*v+j]*=sigmoid(projections[t][6][head*v+j]);}
                         let rms=(mixed[head*v..(head+1)*v].iter().map(|x|x*x).sum::<f64>()/v as f64+self.epsilon).sqrt();
@@ -374,20 +374,96 @@ pub fn numerical_checks_selected(device:&Device,backend:ScanBackend)->Result<imp
 #[cfg(test)]
 mod tests {
     #[test]
-    fn kron_gate_biases_are_learned_zero_initialized_offsets() {
+    fn kron_gate_biases_match_paper_and_release_initialization() {
         let device = burn::prelude::Device::ndarray().autodiff();
         let mixer = crate::MixerConfig::default().init(&device);
-        for (layer, width) in [
-            (&mixer.erase, mixer.heads),
-            (&mixer.write, mixer.heads),
-            (&mixer.output_gate, mixer.heads * mixer.value_dim),
+        for (layer, width, initial) in [
+            (&mixer.erase, mixer.heads, 0.0),
+            (&mixer.write, mixer.heads, 0.0),
+            (&mixer.output_gate, mixer.heads * mixer.value_dim, 3.0),
         ] {
             let bias = layer.bias.as_ref().expect("paper gate bias");
             assert_eq!(bias.val().dims(), [width]);
-            assert!(super::values(bias.val()).iter().all(|&value| value == 0.0));
+            assert!(super::values(bias.val()).iter().all(|&value| value == initial));
+        }
+        assert!(super::values(mixer.output_gate.weight.val()).iter().all(|&x|x==0.0));
+        for log_rate in super::values(mixer.decay_scale.val()) {
+            assert!(log_rate.is_finite() && (0.0..16.0).contains(&log_rate.exp()));
+        }
+        for bias in super::values(mixer.decay_bias.val()) {
+            let dt=bias.exp().ln_1p();
+            assert!((0.000999..=0.100001).contains(&dt), "initial time constant {dt}");
         }
         for layer in [&mixer.q, &mixer.k, &mixer.v, &mixer.decay, &mixer.output] {
             assert!(layer.bias.is_none());
+        }
+    }
+    #[test]
+    fn residual_projection_initialization_uses_total_model_depth() {
+        let device=burn::prelude::Device::ndarray().autodiff();
+        device.seed(374);
+        let shallow=crate::MixerConfig {num_layers:1,..Default::default()}.init(&device);
+        let first=super::values(shallow.output.weight.val());
+        device.seed(374);
+        let deep=crate::MixerConfig {num_layers:4,..Default::default()}.init(&device);
+        let second=super::values(deep.output.weight.val());
+        for (&a,&b) in first.iter().zip(&second) {
+            assert!((a*0.5-b).abs()<=1e-8,"residual depth scale: {a} vs {b}");
+        }
+    }
+    #[test]
+    fn kron_and_hola_keep_the_paper_relative_readout_scale() {
+        use super::*;
+        let device=Device::ndarray().autodiff();
+        let mut mixer=fixture(&device,ScanBackend::TensorSolver);
+        let cache=MixerConfig {d_model:4,heads:2,key_dim:3,value_dim:3,
+            cache_policy:CachePolicy::Surprise,..Default::default()}.init(&device);
+        mixer.cache=cache.cache;
+        mixer.cache_policy=CachePolicy::Surprise;
+        let oracle=Oracle::from_mixer(&mixer);
+        let x=vec![0.3f32 as f64,-0.4f32 as f64,0.2f32 as f64,0.7f32 as f64];
+        let raw:Vec<Vec<f64>>=(0..3).map(|field| {
+            oracle.linear(field,&x).iter().enumerate().map(|(i,&p)| {
+                let convolved=p*oracle.parameters[CONVOLUTIONS+field][i];
+                convolved*sigmoid(convolved)
+            }).collect()
+        }).collect();
+        let cache=mixer.cache.as_ref().unwrap();
+        let q_gain=values(cache.q_norm.gamma.val());
+        let k_gain=values(cache.k_norm.gamma.val());
+        let sink=values(cache.sink.val());
+        let cache_gate=values(cache.gate.val());
+        let target=oracle.linear(5,&x);
+        let gate=oracle.linear(6,&x);
+        let mut mixed=vec![0.0;6];
+        for head in 0..2 {
+            let start=head*3;
+            let q=&raw[0][start..start+3];
+            let k=&raw[1][start..start+3];
+            let v=&raw[2][start..start+3];
+            let q_l2=q.iter().map(|x|x*x).sum::<f64>().sqrt().max(1e-12);
+            let k_l2=k.iter().map(|x|x*x).sum::<f64>().sqrt().max(1e-12);
+            let v_l2=v.iter().map(|x|x*x).sum::<f64>().sqrt().max(1e-12);
+            let overlap=q.iter().zip(k).map(|(q,k)|q*k/(q_l2*k_l2)).sum::<f64>();
+            let q_rms=(q.iter().map(|x|x*x).sum::<f64>()/3.0+cache.q_norm.epsilon).sqrt();
+            let k_rms=(k.iter().map(|x|x*x).sum::<f64>()/3.0+cache.k_norm.epsilon).sqrt();
+            let logit=(0..3).map(|j|q[j]*q_gain[j]/q_rms*k[j]*k_gain[j]/k_rms).sum::<f64>()/3.0f64.sqrt();
+            let probability=1.0/(1.0+(sink[head]-logit).exp());
+            // Empty initial state: the target writes, beta cannot change it.
+            for j in 0..3 {
+                let recurrent=sigmoid(target[head])*overlap*v[j]/v_l2/3.0f64.sqrt();
+                let exact=probability*v[j]*sigmoid(cache_gate[head]);
+                mixed[start+j]=(recurrent+exact)*sigmoid(gate[start+j]);
+            }
+            let rms=(mixed[start..start+3].iter().map(|x|x*x).sum::<f64>()/3.0+oracle.epsilon).sqrt();
+            for j in 0..3 {mixed[start+j]=mixed[start+j]/rms*oracle.parameters[RMS_SCALE][j];}
+        }
+        let expected=oracle.linear(7,&mixed);
+        for backend in [ProjectionBackend::Separate,ProjectionBackend::Grouped,ProjectionBackend::Merged] {
+            mixer.set_projection_backend(backend);
+            let actual=mixer.forward_masked(tensor(&x,[1,1,4],&device),
+                Tensor::ones([1,1],&device),Tensor::zeros([1,1],&device));
+            compare(&values(actual),&expected,"relative Kron/HOLA scale").unwrap();
         }
     }
     #[test]

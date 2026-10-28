@@ -145,10 +145,10 @@ impl<B: Backend + NormOps, C: CheckpointStrategy> NormOps for Autodiff<B, C> {
         )
     }
 }
-/// L2 over the last axis: x / sqrt(sum(x²) + 1e-6). Strided inputs supported.
+/// L2 over the last axis: x / max(||x||₂, 1e-12). Strided inputs supported.
 pub fn l2_norm(x: Tensor<4>) -> Tensor<4> {
     let raw = x.into_dispatch();
-    let (y, _) = <Dispatch as NormOps>::row_norm(raw.clone(), raw.clone(), raw, 0, 1e-6);
+    let (y, _) = <Dispatch as NormOps>::row_norm(raw.clone(), raw.clone(), raw, 0, 1e-12);
     Tensor::from_dispatch(y)
 }
 /// Learned RMSNorm, optionally after x * sigmoid(gate), without changing parameter storage.
