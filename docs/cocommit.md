@@ -149,7 +149,7 @@ For masks-only corruption, let `M` be unresolved positions and `G` the valid exp
 J=J_{\rm clean\ causal}
  +\frac1{BT}\sum_{b:L_b>1}\left[
  \sum_{i\in M_b}w_i\operatorname{CE}(\ell_{A,i},x_i)
- +\sum_{i\in A_b}w_i\operatorname{CE}(\ell_{B,i},x_i)
+ +\sum_{i\in M_b}w_i\operatorname{CE}(\ell_{B,i},x_i)
  +0.2\sum_{i\in G_b}w_i\{\operatorname{CE}(\ell_{A,i},x_i)
  +\operatorname{CE}(\ell_{B,i},x_i)\}\right].
 \]
@@ -167,14 +167,14 @@ The proposed combined objective replaces the factorized auxiliary terms above by
 \[
 J=J_{\rm clean\ causal}
  +\frac1{BT}\sum_b\left[-\log q_A(x_{M_b}\mid e_b)
-                         -\log q_B(x_{A_b}\mid e_b)\right].
+                         -\log q_B(x_{M_b}\mid e_b,A_b)\right].
 \]
 
-Here `e_b` fixes only the already-observed clean tokens. For the marked term, unselected unresolved positions `M_b \ A_b` are **marginalized**, not filled with their gold tokens, promoted to observations, removed from the chain or trained as extra targets. In prepared-circuit notation, the two marked queries are
+Here `e_b` fixes only the already-observed clean tokens, and `A_b` is the marker input, not circuit evidence. B is supervised on every free position it can write, including unmarked positions. The two marked queries are
 
-`minus = log Z_B(e)` and `plus = log Z_B(e union gold[A])`.
+`minus = log Z_B(e)` and `plus = log Z_B(e union gold[M])`.
 
-The event loss is `(minus-plus)/(B*T)`. It is **not** the current `conditional_nll` call with an altered observed mask: that routine fixes every valid token in its numerator. Add an event-loss form taking separate existing-evidence and target-position masks, and let ordinary conditional NLL use the special case targeting all unresolved positions. Fixed sets are `O` and `O union A`; neither query edits neural inputs. Preserve actual chain length and normalizers.
+The conditional loss is `(minus-plus)/(B*T)`. The event-loss API targets all valid free positions in rows with a nonempty announcement; empty-announcement rows contribute only A. Padding and permanent observations receive no extra circuit target. This same objective is used by TCT.
 
 The same generalized fixed masks must drive neural derivatives and circuit statistics. In probability notation, for posterior states `gamma+` and `gamma-`, normalized leaf `g`, and posterior token distribution `f+`/`f-` at a state (one-hot at a fixed token, otherwise `g`), accumulate emission positive flow `gamma+*f+ + gamma-*g` and negative flow `gamma-*f- + gamma+*g`, with the existing valid/active masks and tied-row sums. Transition/root flows retain the current two-posterior normalized-row formulas. This replaces the current numerator assumption that every leaf is fixed. Verify the difference against the full event likelihood derivative, including leaf denominators.
 

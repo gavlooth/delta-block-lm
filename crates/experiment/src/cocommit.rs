@@ -48,7 +48,7 @@ pub(crate) fn add_branch_losses(
         "CoCommit branch loss layout differs");
     let use_b = marks.chunks_exact(width).map(|row|row.iter().any(|&mark|mark)).collect::<Vec<_>>();
     let any_b=use_b.iter().any(|&used|used);
-    let selected_rows = Tensor::<2,Bool>::from_data(TensorData::new(use_b,[rows,1]),&targets.device())
+    let selected_rows = Tensor::<2,Bool>::from_data(TensorData::new(use_b.clone(),[rows,1]),&targets.device())
         .expand([rows,width]);
     let vocab = a.logits.dims()[2];
     let depth = a.features.dims()[2];
@@ -61,7 +61,10 @@ pub(crate) fn add_branch_losses(
         result.add_circuit_loss(a_circuit.conditional_nll(targets.clone(),observed,denominator)?);
         if any_b {
             let (b_circuit,observed) = sbd::prepare_distribution(model,b,soft,1.0)?;
-            let target_mask = marker_tensor(marks,rows,width,&targets.device()).greater_elem(0.5);
+            let targets_written = soft.active.iter().zip(&soft.observed).enumerate()
+                .map(|(i,(&active,observed))| active && observed.is_none() && use_b[i/width])
+                .collect::<Vec<_>>();
+            let target_mask = Tensor::<2,Bool>::from_data(TensorData::new(targets_written,[rows,width]),&targets.device());
             result.add_circuit_loss(b_circuit.event_nll(targets,observed,target_mask,denominator)?);
             Ok(Some(b_circuit))
         } else {
@@ -72,9 +75,9 @@ pub(crate) fn add_branch_losses(
         let a_weights = soft.active.iter().zip(&soft.observed).zip(target_weights)
             .map(|((&active,observed),&w)| if !active {0.0} else if observed.is_some() {weight*w} else {w}).collect::<Vec<_>>();
         let marked_rows = marks.chunks_exact(width).map(|row|row.iter().any(|&mark|mark)).collect::<Vec<_>>();
-        let b_weights = soft.active.iter().zip(&soft.observed).zip(marks).zip(target_weights).enumerate()
-            .map(|(i,(((&active,observed),&marked),&w))| if !marked_rows[i/width] || !active {0.0}
-                else if observed.is_some() {weight*w} else if marked {w} else {0.0}).collect::<Vec<_>>();
+        let b_weights = soft.active.iter().zip(&soft.observed).zip(target_weights).enumerate()
+            .map(|(i,((&active,observed),&w))| if !marked_rows[i/width] || !active {0.0}
+                else if observed.is_some() {weight*w} else {w}).collect::<Vec<_>>();
         result.loss = result.loss.clone() + token_loss(a.logits,targets.clone(),a_weights,denominator)
             + token_loss(b.logits,targets,b_weights,denominator);
         Ok(None)
@@ -491,5 +494,35 @@ mod tests {
         let entropy=checked_entropy_rows(&[negative_infinity,0.5f32.ln(),0.5f32.ln()],3,&[true]).unwrap();
         assert!((entropy[0]-std::f64::consts::LN_2).abs()<1e-7);
         assert_eq!(checked_entropy_rows(&[f32::NAN,f32::INFINITY],2,&[false]).unwrap(),vec![0.0]);
+    }
+    #[test]
+    fn decoder_fix_b_loss_trains_unmarked_free_outputs() {
+        use crate::config::{Arm,CocommitConfig,SbdConfig,SbdJointOutput};
+        for joint_output in [SbdJointOutput::Factorized,SbdJointOutput::Codpula,SbdJointOutput::CodpulaContextual] {
+            let device=Device::ndarray().autodiff();
+            device.seed(73);
+            let c=Config {task:"lm".into(),d_model:16,layers:1,heads:4,key_dim:32,value_dim:64,
+                sbd:Some(SbdConfig {joint_output,cocommit:Some(CocommitConfig::default()),..SbdConfig::default()}),
+                ..Config::default()};
+            let arm=Arm {name:"b-loss".into(),mixer:"kronlstm".into(),cache:"none".into()};
+            let model=LanguageModel::new(&c,&arm,&device).unwrap();
+            let soft=sbd::state(&c,vec![None,None,Some(2)],&device).unwrap();
+            let b_logits=Tensor::<3>::zeros([1,3,c.vocab()],&device).require_grad();
+            let output=|logits| DenoisingOutput {logits,features:Tensor::zeros([1,3,c.d_model],&device)};
+            let mut result=SbdTrainingResult {loss:Tensor::zeros([1],&device),circuit_flows:None};
+            add_branch_losses(&model,&c,output(Tensor::zeros([1,3,c.vocab()],&device)),output(b_logits.clone()),
+                &soft,Tensor::from_data([[0,1,2]],&device),&[true,false,false],&[1.0;3],1.0,&mut result).unwrap();
+            let gradients=result.loss.backward();
+            let values=b_logits.grad(&gradients).unwrap().into_data().try_to_vec::<f32>().unwrap();
+            assert!(values[c.vocab()..2*c.vocab()].iter().any(|x|x.abs()>1e-7),
+                "unmarked free B output has no gradient for {joint_output:?}");
+            if joint_output.is_factorized() {
+                let expected=(0..3).flat_map(|position|(0..c.vocab()).map(move |token| {
+                    let weight=if position==2 {0.2} else {1.0};
+                    weight*(1.0/c.vocab() as f64-f64::from(token==position))
+                })).collect::<Vec<_>>();
+                sbd::compare(&values,&expected).unwrap();
+            }
+        }
     }
 }
