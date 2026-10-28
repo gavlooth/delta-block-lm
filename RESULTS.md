@@ -2438,3 +2438,11 @@ integrated. Only the explicitly requested post-drop CPU
 `cocommit-reference` recheck is authorized before that integration; its
 result is recorded in the session report and command artifacts.
 
+The authorized post-drop recheck passed: `cargo build -p delta-experiment
+--features vulkan` exited 0 in 12.152 s, then
+`target/debug/delta-experiment cocommit-reference
+artifacts/review-fixes/cpu/config.json` exited 0 in 15.484 s at unchanged
+`2e-5 + 3e-4 * abs(reference)` tolerances. Records:
+`artifacts/review-fixes/commands/post-drop-{build,cpu-cocommit-reference}.{json,stdout,stderr}`.
+No other post-drop reference, test, integrated command or timing was run.
+
