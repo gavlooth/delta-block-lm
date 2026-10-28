@@ -688,7 +688,7 @@ impl PreparedCircuit {
         let loss = (if weighted {events * active.clone()} else {events}).sum() / denominator;
         let clean_ids = clean.mask_fill(self.valid.clone().equal_elem(0.0), 0);
         let gamma_plus = plus.state.detach();
-        let gamma_minus = minus.state.detach();
+        let gamma_minus = minus.state.clone().detach();
         let a = self.log_transition.clone().detach().exp();
         let active_emission = active.clone().reshape([rows, 1, 1]);
         let (emission_positive, emission_negative) = if self.execution.is_tensor() {
@@ -723,7 +723,7 @@ impl PreparedCircuit {
             { anyhow::bail!("fused circuit execution requires a GPU feature") }
         };
         let xi_plus = plus.summed_edge;
-        let xi_minus = minus.summed_edge;
+        let xi_minus = minus.summed_edge.clone();
         let transition_positive = ((xi_plus.clone() + xi_minus.clone().sum_dim(2) * a.clone()) * active_emission.clone()).sum_dim(0).reshape([states, states]);
         let transition_negative = ((xi_minus + xi_plus.sum_dim(2) * a) * active_emission.clone()).sum_dim(0).reshape([states, states]);
         let rho = match &self.contextual_log_root {
