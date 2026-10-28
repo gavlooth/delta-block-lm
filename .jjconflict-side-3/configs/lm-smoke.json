@@ -1,0 +1,22 @@
+{
+  "task":"lm",
+  "backend":"cpu",
+  "artifact_dir":"artifacts/lm-smoke",
+  "d_model":32,
+  "layers":1,
+  "context":32,
+  "batch_size":1,
+  "train_tokens":1024,
+  "eval_examples":4,
+  "association_counts":[2,4],
+  "learning_rate":0.003,
+  "checkpoint_every":4,
+  "max_seconds":30,
+  "pilot_steps":2,
+  "pilot_seconds":5,
+  "comparison_seconds":10,
+  "arms":[
+    {"name":"gdn2-hola","mixer":"gdn2","cache":"surprise"},
+    {"name":"kronlstm-hola","mixer":"kronlstm","cache":"surprise"}
+  ]
+}

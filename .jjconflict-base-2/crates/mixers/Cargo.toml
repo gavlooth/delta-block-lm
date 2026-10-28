@@ -1,0 +1,18 @@
+[package]
+name = "delta-mixers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["cpu"]
+cpu = ["burn/ndarray"]
+vulkan = ["burn/vulkan", "dep:delta-kernels", "delta-kernels/vulkan"]
+cuda = ["burn/cuda", "dep:delta-kernels", "delta-kernels/cuda"]
+fusion = ["burn/fusion", "delta-kernels?/fusion"]
+
+[dependencies]
+burn.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+delta-kernels = { path = "../kernels", optional = true, default-features = false }

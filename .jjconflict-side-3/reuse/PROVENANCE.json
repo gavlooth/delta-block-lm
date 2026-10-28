@@ -1,0 +1,152 @@
+{
+  "source_root": "/home/heefoo/Documents/code/diffusion-relation-extractor",
+  "copied_on": "2026-10-24",
+  "status": "Historical migration snapshots remain unmodified; active-source adaptations are recorded separately below",
+  "complete_crates": ["dre-core", "dre-gdn2", "dre-attention", "dre-wavelet", "dre-ohc", "dre-lngram"],
+  "partial_crate_files": ["crates/dre-relations/src/state.rs", "crates/dre-relations/src/denoiser.rs", "crates/dre-relations/src/diffusion_scheduler.rs", "crates/dre-relations/src/diffusion_scheduler_tests.rs", "crates/dre-relations/src/joint_circuit.rs", "crates/dre-relations/src/remask.rs"],
+  "file_count": 48,
+  "total_bytes": 740782,
+  "sha256_of_sorted_file_hash_lines": "8f5978cea249836c71b480120d6d31360216216d7012409d47f5bbf27a6e35e3",
+  "hash_format": "Sort copied crates/ file paths lexicographically; for each file concatenate lowercase SHA-256, two spaces, relative path, and newline; SHA-256 that UTF-8 text",
+  "verification": "All 48 destination files matched their source bytes at copy time",
+  "license": "Preserve the source manifests and inherited MIT OR Apache-2.0 license; no source license headers removed",
+  "excluded": ["training runs", "datasets", "model checkpoints", "vendored backend crates", "full relation-extraction application"],
+  "active_source_adaptations": [
+    {
+      "ported_on": "2026-10-25",
+      "component": "Stochastic mask-set energies and outcome-ranked refinement",
+      "source_files": [
+        {
+          "path": "crates/dre-relations/src/energy_guidance.rs",
+          "sha256": "20ffff5b3a9081b97f0012786cd1b96f7b3c386fbad8198921af2c0141b829fb",
+          "lines": ["186-210", "224-299", "371-393", "680-683", "739-764", "825-912", "1106-1182"],
+          "used": "Factorized local and symmetric bilinear terms, early padding zeroing, shared projections and categorical gathers, ordered host f64 final energies, exact eligible-masked softplus rank semantics and detached proposal-weighted corruption discipline"
+        },
+        {
+          "path": "docs/references/guidance.md",
+          "sha256": "d60a126ac534c63193f699ce7e553d4bdb2b20bf784fbe2c171ff9058127b6ab",
+          "lines": ["7-20", "24-46", "63-73", "173-212"],
+          "used": "Preserved user decisions: no second Transformer, factorized energy, rank fitting, ordered f64 final evaluation, no edge-by-vocabulary expansion and immutable facts outside learned energy"
+        }
+      ],
+      "destinations": ["crates/experiment/src/mask_energy.rs", "crates/experiment/src/remask.rs"],
+      "changes": [
+        "Replace relation assignments with eligible fixed-cardinality position mask sets",
+        "Use contextual 2D+12 to 32 features and symmetric bilinear position terms, not a constant binary compatibility that degenerates at fixed cardinality",
+        "Sample the explicit uniform/energy mixture with exact unary cardinality DP or pairwise enumeration through length 16; do not rerank token assignments by argmin energy",
+        "Outcome-rank equal-call refinement branches against clean-target conditional NLL; adapt proposal-weighted categorical corruption to same-size position swaps",
+        "Drop all relation ontology and exact relation-solving code; immutable observations, padding and block limits remain hard checks",
+        "No per-step token-logit gradient correction is enabled or ported"
+      ]
+    },
+    {
+      "ported_on": "2026-10-25",
+      "component": "Codpula short-chain inference, indexed sampling and dependence commitments",
+      "source_files": [
+        {
+          "path": "crates/dre-relations/src/joint_circuit.rs",
+          "sha256": "db5ebd8af2b2a1e29b3a3b8503b097b85064c6fa41e88fd8907fc1f60f3fe1de",
+          "lines": ["330-378", "399-448", "498-520", "777-900", "1378-1392", "1474-1554", "1580-1668"],
+          "used": "Stable zero-mass reductions, inverse-CDF categorical sampling, indexed-uniform/support rules, prepared-message and absolute-dependence semantics, and adapted support/sampling/dependence regressions"
+        },
+        {
+          "path": "crates/dre-relations/src/commitment.rs",
+          "sha256": "2f2c21ad2882f5e06aa81f3a3c054d433733a4d0a94d2a56fd4892b4c4cb998b",
+          "lines": ["6", "79-96", "117-135"],
+          "used": "Strict dependence threshold 0.05, supported-candidate selection, progress/final-pass semantics and adapted selector regressions"
+        },
+        {
+          "path": "crates/dre-relations/src/diffusion_scheduler.rs",
+          "sha256": "b23839b1fed7b459d7b27869ec7c3b9889175e5dc91b3634ccdd80a4d3e5ab6b",
+          "lines": ["125-216", "265-301"],
+          "used": "Per-call indexed proposal uniforms, temperature before circuit normalization, detached feedback, absorbing observations and one unchanged prepared snapshot across calls"
+        },
+        {
+          "path": "crates/dre-relations/src/diffusion_scheduler_tests.rs",
+          "sha256": "aa1e883d23edea0f36b9252c0d1aabf335c9cc911c882416d969023ea6ea425f",
+          "lines": ["35-38", "72-91", "102-186", "192-293"],
+          "used": "Adapted rollout regression patterns for values, gradients, commitments, padding, prepared-cache reuse and independent device RNG"
+        },
+        {
+          "path": "crates/dre-relations/src/training_query_chain.rs",
+          "sha256": "9dcdc30a5e89c6004868cc88fc25f320dd3e5e0b881e83976f0ec498a94ab035",
+          "lines": ["646-700"],
+          "used": "Detached-transition and dirty-padding regression patterns adapted to one immutable SBD clean cache and final-student-only supervision"
+        }
+      ],
+      "destinations": [
+        "crates/experiment/src/codpula.rs",
+        "crates/experiment/src/codpula_reference.rs",
+        "crates/experiment/src/codpula_model_checks.rs",
+        "crates/experiment/src/sbd.rs"
+      ],
+      "changes": [
+        "Replace five relation/pointer fields and distinct field transitions by actual SBD block positions, shared 32-state transitions and full 257-symbol emissions",
+        "Use a block-pooled biased 64-output gate head with group width four, not predecessor destination-state gates",
+        "Keep latent forward-filter/backward-sampling rather than predecessor token-chain-rule sampling, while adapting stable categorical and indexed-uniform semantics",
+        "Reject undefined evidence and unsupported production proposals clearly instead of returning a relation-layout valid mask",
+        "Use approved log-domain dual-flow/Anemone updates with separate bias-corrected positive and negative flow averages; the predecessor uses AdamW and has no matching dual-flow implementation",
+        "Retain existing clean-plus-student SBD loss, causal singleton bypass and sparse feedback instead of relation union events and all-round averaged supervision"
+      ]
+    }
+  ],
+  "reviewed_not_copied": [
+    {
+      "path": "crates/dre-relations/src/training_query_chain.rs",
+      "sha256": "9dcdc30a5e89c6004868cc88fc25f320dd3e5e0b881e83976f0ec498a94ab035",
+      "lines": ["19-27", "61-132"],
+      "reason": "Relation query windows and multi-call joint loss do not match decided student-only SBD supervision; the separate adapted regression section is listed above"
+    },
+    {
+      "path": "crates/dre-relations/src/training_query_batch_loss.rs",
+      "sha256": "be9b72f92b75aafa313593e5b06acab723c5b304d55e0340a374cb512ba13281",
+      "lines": ["58-76", "112-150", "310-345"],
+      "reason": "Per-document alias/mention sampling and all-round averaged relation losses are not byte-block targets; original SBD mask RNG order remains unchanged"
+    },
+    {
+      "path": "crates/dre-relations/src/learned_output.rs",
+      "sha256": "c32e0f531902935a15a4231f629af382270c5a18c1b47ad579cba0ede14704ef",
+      "lines": ["149-176", "200-238"],
+      "reason": "Zero-mass-safe entropy is reference material; SBD uses detached host log probabilities, with no log-zero entropy adjoints or need for another GPU reduction"
+    },
+    {
+      "path": "crates/dre-relations/src/decode.rs",
+      "sha256": "4078b3c4044b4625cff5d1f5e70984721b3695addf6a99ef385916ba42d55341",
+      "lines": ["33-79", "103-132"],
+      "reason": "Relation argmax and posterior calibration would replace approved exact joint sampling and pre-potential temperature; all-zero posterior handling also lacks an explicit validity check"
+    }
+  ],
+  "within_repository_integrations": [
+    {
+      "integrated_on": "2026-10-25",
+      "component": "Contextual Codpula, CoCommit and stochastic refinement/TCT",
+      "source_commits": [
+        {"commit": "a0c173c5", "used": "Explicit contextual root, ordered summary, approved initialization and independent circuit references"},
+        {"commit": "3c20ffc2", "used": "Saved-prefix A/B tails, marked event loss, position-only HOLA schedules, no-grad teacher and exact SBD row accumulation"},
+        {"commit": "b9e589b5", "used": "Stochastic mask-set laws, real outcome-ranked fitting, provisional refinement and persistent-chain TCT"},
+        {"commit": "093d0085", "used": "Docs-only independent precision diagnosis and preserved negative stress evidence, not a production correction"},
+        {"commit": "64590d18", "used": "Deterministic native clipping prerequisite without optimizer formula/state changes"},
+        {"commit": "e50cc523", "used": "Independent deterministic Tensor Lngram duplicate-index gradient accumulation prerequisite"}
+      ],
+      "destinations": [
+        "crates/experiment/src/cocommit.rs",
+        "crates/experiment/src/remask.rs",
+        "crates/experiment/src/tct.rs",
+        "crates/experiment/src/codpula_reference.rs",
+        "crates/experiment/src/cocommit_checks.rs",
+        "crates/experiment/src/config.rs"
+      ],
+      "changes": [
+        "Compose the existing batched saved-prefix/A/B primitives without absorbing writes or per-row neural/circuit graphs",
+        "Keep permanent O, provisional R and temporary announcements S distinct; use one coherent B distribution, or A for empty-S rows",
+        "Score retained-soft paired endpoints through the coordinated model; gold enters only the conditional-NLL scorer",
+        "Combine all-free TCT A correction and B marked-subset event statistics before one optimizer/circuit update",
+        "Retain full-batch RNG/normalization and separate SBD versus persistent-chain TCT row accumulators",
+        "Use an explicit combination-specific identity revision while preserving historical standalone/omitted selectors"
+      ],
+      "external_code_copied": false,
+      "scope": "Composition of the given architecture only; no new mechanism, quality study, ablation, sweep or resumed Step7 quality experiment",
+      "evidence": "artifacts/integrated11/"
+    }
+  ]
+}

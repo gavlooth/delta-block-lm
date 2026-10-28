@@ -98,7 +98,7 @@ fn assert_output_and_gradients(model: &LanguageModel, actual: DenoisingOutput, e
                     self.2+=1;
                 }
                 (None,None)=>{},
-                _=>panic!("gradient presence differs for {}",p.id),
+                _=>panic!("gradient presence differs for {:?}",p.id),
             }
         }
     }

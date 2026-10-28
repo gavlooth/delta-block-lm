@@ -8,6 +8,9 @@ pub trait Sections {
     fn recurrent_state(&mut self, _state: &burn::prelude::Tensor<4>) {}
     const CAPTURE_CLEAN_INPUTS: bool = false;
     fn clean_input(&mut self, _layer: usize, _kind: &'static str, _input: &burn::prelude::Tensor<3>) {}
+    const CAPTURE_CLEAN_MIXERS: bool = false;
+    fn clean_starts(&self) -> Option<&[usize]> { None }
+    fn clean_mixer(&mut self, _clean: crate::sbd::CleanMixer) {}
 
     /// Called once per chunk with the slots kept (indices into cache ∪ chunk) and their
     /// token positions, for the current block.

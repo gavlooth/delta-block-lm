@@ -461,6 +461,7 @@ impl Mixer {
         let raw_q = projected[0]
             .take()
             .unwrap_or_else(|| profile.section("Projection: q", || self.q.forward(input.clone())));
+        let clean_raw_q = P::CAPTURE_CLEAN_MIXERS.then(||raw_q.clone());
         let raw_q = profile.section("Short causal convolutions", || {
             conv(raw_q, self.q_conv.val())
         });
@@ -470,6 +471,7 @@ impl Mixer {
         let raw_k = projected[1]
             .take()
             .unwrap_or_else(|| profile.section("Projection: k", || self.k.forward(input.clone())));
+        let clean_raw_k = P::CAPTURE_CLEAN_MIXERS.then(||raw_k.clone());
         let raw_k = profile.section("Short causal convolutions", || {
             conv(raw_k, self.k_conv.val())
         });
@@ -479,6 +481,7 @@ impl Mixer {
         let raw_v = projected[2]
             .take()
             .unwrap_or_else(|| profile.section("Projection: v", || self.v.forward(input.clone())));
+        let clean_raw_v = P::CAPTURE_CLEAN_MIXERS.then(||raw_v.clone());
         let raw_v = profile.section("Short causal convolutions", || {
             conv(raw_v, self.v_conv.val())
         });
@@ -528,6 +531,11 @@ impl Mixer {
         let write = profile.section("L2 normalization and gate activations", || {
             sigmoid(write).reshape([b, t, self.heads, write_width])
         });
+        let clean_scan = P::CAPTURE_CLEAN_MIXERS.then(||chunk::ScanInput {
+            q:q.clone(),k:k.clone(),v:v.clone(),alpha:alpha.clone(),erase:erase.clone(),write:write.clone(),
+        });
+        let clean_starts = if P::CAPTURE_CLEAN_MIXERS {profile.clean_starts().unwrap_or(&[]).to_vec()} else {Vec::new()};
+        let mut clean_states = Vec::new();
         let recurrent = profile.section("Recurrent scan", || {
             let inputs = chunk::ScanInput { q, k, v, alpha, erase, write };
             if let Some(start) = block_start {
@@ -559,12 +567,25 @@ impl Mixer {
                     scores: Tensor::cat(vec![prefix.scores, Tensor::zeros([b,n,self.heads,1], &input.device())], 1),
                     final_state: prefix.final_state,
                 }
+            } else if !clean_starts.is_empty() {
+                let result=self.scan_sbd_snapshots::<true>(inputs,valid.clone(),reset.clone(),&clean_starts);
+                clean_states=result.states;
+                chunk::ScanOutput {output:result.output.unwrap(),scores:result.scores,final_state:result.final_state}
             } else {
                 chunk::scan_selected(self.scan_backend, self.kind, inputs, valid.clone(), reset.clone(), self.chunk_size, None)
             }
         });
         if P::CAPTURE_RECURRENT_STATE {
             profile.recurrent_state(&recurrent.final_state);
+        }
+        if P::CAPTURE_CLEAN_MIXERS {
+            assert!(block_start.is_none(),"clean mixer capture requires a clean pass");
+            profile.clean_mixer(sbd::CleanMixer {
+                raw:[clean_raw_q.unwrap(),clean_raw_k.unwrap(),clean_raw_v.unwrap()],
+                keys:raw_k.clone(),values:raw_v.clone(),scan:clean_scan.unwrap(),
+                scores:recurrent.scores.clone(),valid:valid.clone(),reset:reset.clone(),
+                starts:clean_starts,states:clean_states,
+            });
         }
         let mut mixed = recurrent.output;
         if let Some(cache) = &self.cache {

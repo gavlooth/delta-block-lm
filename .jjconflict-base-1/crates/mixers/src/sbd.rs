@@ -76,6 +76,46 @@ pub struct MixerCache {
     states: Vec<Tensor<4>>,
     starts: Vec<usize>,
 }
+
+/// Aliases of clean-forward tensors, plus only the requested recurrent snapshots.
+#[derive(Clone)]
+pub struct CleanMixer {
+    pub(crate) raw: [Tensor<3>;3],
+    pub(crate) keys: Tensor<4>,
+    pub(crate) values: Tensor<4>,
+    pub(crate) scan: chunk::ScanInput,
+    pub(crate) scores: Tensor<4>,
+    pub(crate) valid: Tensor<2>,
+    pub(crate) reset: Tensor<2>,
+    pub(crate) starts: Vec<usize>,
+    pub(crate) states: Vec<Tensor<4>>,
+}
+impl CleanMixer {
+    pub fn select_row(&self, row: usize) -> Self {
+        let select3 = |x: &Tensor<3>| {
+            let [_,t,d]=x.dims(); x.clone().slice([row..row+1,0..t,0..d])
+        };
+        let select4 = |x: &Tensor<4>| {
+            let [_,t,h,d]=x.dims(); x.clone().slice([row..row+1,0..t,0..h,0..d])
+        };
+        let [_,t]=self.valid.dims();
+        Self {raw:self.raw.each_ref().map(select3), keys:select4(&self.keys),values:select4(&self.values),
+            scan:chunk::ScanInput {q:select4(&self.scan.q),k:select4(&self.scan.k),v:select4(&self.scan.v),
+                alpha:select4(&self.scan.alpha),erase:select4(&self.scan.erase),write:select4(&self.scan.write)},
+            scores:select4(&self.scores),valid:self.valid.clone().slice([row..row+1,0..t]),
+            reset:self.reset.clone().slice([row..row+1,0..t]),starts:self.starts.clone(),
+            states:self.states.iter().map(|x| {
+                let [_,h,k,v]=x.dims();x.clone().slice([row..row+1,0..h,0..k,0..v])
+            }).collect()}
+    }
+}
+
+pub(crate) struct CleanScan {
+    pub output: Option<Tensor<4>>,
+    pub scores: Tensor<4>,
+    pub final_state: Tensor<4>,
+    pub states: Vec<Tensor<4>>,
+}
 fn take4(x: &Tensor<4>, a: usize, z: usize) -> Tensor<4> {
     let [b,_,h,d] = x.dims();
     x.clone().slice([0..b,a..z,0..h,0..d])
@@ -133,35 +173,68 @@ impl Mixer {
     pub fn prepare_sbd(&self, input: Tensor<3>, starts: &[usize]) -> MixerCache {
         let [b,t,_] = input.dims();
         let device = input.device();
-        let raw = [self.q.forward(input.clone()),self.k.forward(input.clone()),self.v.forward(input.clone())];
+        let mut projected = self.project_input(input.clone(),&mut crate::profile::Unprofiled);
+        let raw = [
+            projected[0].take().unwrap_or_else(||self.q.forward(input.clone())),
+            projected[1].take().unwrap_or_else(||self.k.forward(input.clone())),
+            projected[2].take().unwrap_or_else(||self.v.forward(input.clone())),
+        ];
         let rq = convolve(self,raw[0].clone(),self.q_conv.val());
         let rk = convolve(self,raw[1].clone(),self.k_conv.val());
         let rv = convolve(self,raw[2].clone(),self.v_conv.val());
         let q = self.normalization_backend.l2(rq);
         let k = self.normalization_backend.l2(rk.clone());
         let v = if self.kind == MixerKind::KronLstm {self.normalization_backend.l2(rv.clone())} else {rv.clone()};
-        let alpha = self.normalization_backend.decay(self.decay.forward(input.clone()).reshape([b,t,self.heads,self.key_dim]),self.decay_bias.val(),self.decay_scale.val());
+        let decay=projected[3].take().unwrap_or_else(||self.decay.forward(input.clone()));
+        let alpha = self.normalization_backend.decay(decay.reshape([b,t,self.heads,self.key_dim]),self.decay_bias.val(),self.decay_scale.val());
         let ew = if self.kind == MixerKind::Gdn2 {self.key_dim} else {1};
         let ww = if self.kind == MixerKind::Gdn2 {self.value_dim} else {1};
-        let erase = sigmoid(self.erase.forward(input.clone())).reshape([b,t,self.heads,ew]);
-        let write = sigmoid(self.write.forward(input)).reshape([b,t,self.heads,ww]);
-        let mut current = Tensor::zeros([b,self.heads,self.key_dim,self.value_dim],&device);
-        let mut states = Vec::with_capacity(starts.len());
-        let mut scores = Vec::new();
-        let mut first = 0;
+        let erase = sigmoid(projected[4].take().unwrap_or_else(||self.erase.forward(input.clone()))).reshape([b,t,self.heads,ew]);
+        let write = sigmoid(projected[5].take().unwrap_or_else(||self.write.forward(input))).reshape([b,t,self.heads,ww]);
+        let scan=chunk::ScanInput {q,k,v,alpha,erase,write};
+        let valid=Tensor::ones([b,t],&device);
+        let reset=Tensor::zeros([b,t],&device);
+        let result=self.scan_sbd_snapshots::<false>(scan.clone(),valid.clone(),reset.clone(),starts);
+        self.prepare_sbd_from_clean(&CleanMixer {raw,keys:rk,values:rv,scan,scores:result.scores,valid,reset,starts:starts.to_vec(),states:result.states},starts)
+    }
+    /// Scan disjoint clean segments once, retaining state only at requested starts.
+    pub(crate) fn scan_sbd_snapshots<const KEEP_OUTPUT:bool>(&self, input: chunk::ScanInput, valid: Tensor<2>, reset: Tensor<2>, starts: &[usize])
+        -> CleanScan {
+        let [b,t,_,_]=input.q.dims();
+        assert!(starts.windows(2).all(|s|s[0]<s[1]) && starts.iter().all(|&s|s<=t));
+        let mut current=Tensor::zeros([b,self.heads,self.key_dim,self.value_dim],&valid.device());
+        let mut states=Vec::with_capacity(starts.len());
+        let mut outputs=Vec::new();
+        let mut scores=Vec::new();
+        let mut first=0;
         for end in starts.iter().copied().chain(std::iter::once(t)) {
-            if end > first {
-                let result = chunk::scan_selected(self.scan_backend,self.kind,chunk::ScanInput {
-                    q:take4(&q,first,end), k:take4(&k,first,end), v:take4(&v,first,end),
-                    alpha:take4(&alpha,first,end),erase:take4(&erase,first,end),write:take4(&write,first,end),
-                },Tensor::ones([b,end-first],&device),Tensor::zeros([b,end-first],&device),self.chunk_size,Some(current));
-                current = result.final_state;
+            if end>first {
+                let result=chunk::scan_selected(self.scan_backend,self.kind,chunk::ScanInput {
+                    q:take4(&input.q,first,end),k:take4(&input.k,first,end),v:take4(&input.v,first,end),
+                    alpha:take4(&input.alpha,first,end),erase:take4(&input.erase,first,end),write:take4(&input.write,first,end),
+                },valid.clone().slice([0..b,first..end]),reset.clone().slice([0..b,first..end]),self.chunk_size,Some(current));
+                current=result.final_state;
+                if KEEP_OUTPUT {outputs.push(result.output);}
                 scores.push(result.scores);
-                first = end;
+                first=end;
             }
-            if states.len() < starts.len() { states.push(current.clone()); }
+            if states.len()<starts.len() {states.push(current.clone());}
         }
-        let scores = Tensor::cat(scores,1);
+        CleanScan {output:KEEP_OUTPUT.then(||Tensor::cat(outputs,1)),scores:Tensor::cat(scores,1),final_state:current,states}
+    }
+    pub fn prepare_sbd_from_clean(&self, clean: &CleanMixer, starts: &[usize]) -> MixerCache {
+        let [b,t,_]=clean.raw[0].dims();
+        let device=clean.raw[0].device();
+        let states=if starts.iter().all(|s|clean.starts.binary_search(s).is_ok()) {
+            starts.iter().map(|s|clean.states[clean.starts.binary_search(s).unwrap()].clone()).collect()
+        } else {
+            // Diagnostics may request starts after the clean pass; production supplies them upfront.
+            self.scan_sbd_snapshots::<false>(clean.scan.clone(),clean.valid.clone(),clean.reset.clone(),starts).states
+        };
+        let raw=clean.raw.clone();
+        let rk=clean.keys.clone();
+        let rv=clean.values.clone();
+        let scores=clean.scores.clone();
         let mut schedule = None;
         let cache_k = if let Some(cache) = &self.cache {
             let ck = hola::normalize(self.hola_backend,self.normalization_backend,&cache.k_norm,rk);
@@ -183,12 +256,24 @@ impl Mixer {
     pub fn prepare_sbd_batched(&self, input: Tensor<3>, blocks: &[(usize,usize)]) -> BatchedMixerCache {
         let [rows,time,_] = input.dims();
         assert!(!blocks.is_empty() && blocks.iter().all(|&(row,start)| row<rows && start<time));
-        let device = input.device();
-        let b = blocks.len();
         let mut starts = blocks.iter().map(|&(_,start)| start).collect::<Vec<_>>();
         starts.sort_unstable();
         starts.dedup();
-        let clean = self.prepare_sbd(input,&starts);
+        self.batch_sbd_cache(self.prepare_sbd(input,&starts),blocks)
+    }
+    pub fn prepare_sbd_batched_from_clean(&self, clean: &CleanMixer, blocks: &[(usize,usize)]) -> BatchedMixerCache {
+        let [rows,time,_]=clean.raw[0].dims();
+        assert!(!blocks.is_empty() && blocks.iter().all(|&(row,start)|row<rows && start<time));
+        let mut starts = blocks.iter().map(|&(_,start)| start).collect::<Vec<_>>();
+        starts.sort_unstable();
+        starts.dedup();
+        self.batch_sbd_cache(self.prepare_sbd_from_clean(clean,&starts),blocks)
+    }
+    fn batch_sbd_cache(&self, clean: MixerCache, blocks: &[(usize,usize)]) -> BatchedMixerCache {
+        let [rows,time,_]=clean.raw[0].dims();
+        let device=clean.raw[0].device();
+        let b=blocks.len();
+        let starts=&clean.starts;
         let (ids,visible) = history_indices(blocks,time,3,&device);
         let raw = clean.raw.each_ref().map(|raw| gather_history(raw,&ids,&visible));
         let state_ids = Tensor::<1,Int>::from_data(burn::tensor::TensorData::new(
@@ -257,12 +342,13 @@ impl Mixer {
         let [b,n,_] = input.dims();
         let device = input.device();
         let input = input*valid.clone().unsqueeze_dim::<3>(2);
+        let mut projected=self.project_input(input.clone(),profile);
         let project = |active: Tensor<3>, index: usize, weight: Tensor<2>| {
             take4(&convolve(self,Tensor::cat(vec![clean.raw[index].clone(),active],1),weight),3,3+n)
         };
-        let rq = project(self.q.forward(input.clone()),0,self.q_conv.val());
-        let rk = project(self.k.forward(input.clone()),1,self.k_conv.val());
-        let rv = project(self.v.forward(input.clone()),2,self.v_conv.val());
+        let rq = project(projected[0].take().unwrap_or_else(||self.q.forward(input.clone())),0,self.q_conv.val());
+        let rk = project(projected[1].take().unwrap_or_else(||self.k.forward(input.clone())),1,self.k_conv.val());
+        let rv = project(projected[2].take().unwrap_or_else(||self.v.forward(input.clone())),2,self.v_conv.val());
         let q = self.normalization_backend.l2(rq.clone());
         let k = self.normalization_backend.l2(rk.clone());
         let v = if self.kind==MixerKind::KronLstm {self.normalization_backend.l2(rv.clone())} else {rv.clone()};
@@ -273,10 +359,10 @@ impl Mixer {
             .reshape([b*n,self.heads,self.key_dim,self.value_dim]);
         let single = |x: Tensor<4>| {let width=x.dims()[3];x.reshape([b*n,1,self.heads,width])};
         let alpha = self.normalization_backend.decay(
-            self.decay.forward(input.clone()).reshape([b,n,self.heads,self.key_dim]),
+            projected[3].take().unwrap_or_else(||self.decay.forward(input.clone())).reshape([b,n,self.heads,self.key_dim]),
             self.decay_bias.val(),self.decay_scale.val());
-        let erase = sigmoid(self.erase.forward(input.clone())).reshape([b,n,self.heads,ew]);
-        let write = sigmoid(self.write.forward(input.clone())).reshape([b,n,self.heads,ww]);
+        let erase = sigmoid(projected[4].take().unwrap_or_else(||self.erase.forward(input.clone()))).reshape([b,n,self.heads,ew]);
+        let write = sigmoid(projected[5].take().unwrap_or_else(||self.write.forward(input.clone()))).reshape([b,n,self.heads,ww]);
         let recurrent = chunk::scan_selected(self.scan_backend,self.kind,chunk::ScanInput {
             q:single(q),k:single(k),v:single(v),alpha:single(alpha),erase:single(erase),write:single(write),
         },valid.clone().reshape([b*n,1]),Tensor::zeros([b*n,1],&device),self.chunk_size,Some(initial));
@@ -303,7 +389,7 @@ impl Mixer {
                 mixed+exact*sigmoid(cache.gate.val()).reshape([1,1,self.heads,1])
             });
         }
-        let gate = self.output_gate.forward(input);
+        let gate = projected[6].take().unwrap_or_else(||self.output_gate.forward(input));
         let mixed = if self.normalization_backend==crate::NormalizationBackend::FusedNormsGates {
             self.normalization_backend.gated_rms(&self.norm,mixed,gate.reshape([b,n,self.heads,self.value_dim]))
         } else {
@@ -319,15 +405,16 @@ impl Mixer {
         let start = clean.starts[block];
         let device = input.device();
         let input = input*valid.clone().unsqueeze_dim::<3>(2);
+        let mut projected=self.project_input(input.clone(),profile);
         let history = start.min(3);
         let project = |active: Tensor<3>, index: usize, weight: Tensor<2>| {
             let width = active.dims()[2];
             let combined = Tensor::cat(vec![clean.raw[index].clone().slice([0..b,start-history..start,0..width]),active],1);
             take4(&convolve(self,combined,weight),history,history+n)
         };
-        let rq = project(self.q.forward(input.clone()),0,self.q_conv.val());
-        let rk = project(self.k.forward(input.clone()),1,self.k_conv.val());
-        let rv = project(self.v.forward(input.clone()),2,self.v_conv.val());
+        let rq = project(projected[0].take().unwrap_or_else(||self.q.forward(input.clone())),0,self.q_conv.val());
+        let rk = project(projected[1].take().unwrap_or_else(||self.k.forward(input.clone())),1,self.k_conv.val());
+        let rv = project(projected[2].take().unwrap_or_else(||self.v.forward(input.clone())),2,self.v_conv.val());
         let q = self.normalization_backend.l2(rq.clone());
         let k = self.normalization_backend.l2(rk.clone());
         let v = if self.kind == MixerKind::KronLstm {self.normalization_backend.l2(rv.clone())} else {rv.clone()};
@@ -336,9 +423,10 @@ impl Mixer {
         let initial = clean.states[block].clone().unsqueeze_dim::<5>(1).expand([b,n,self.heads,self.key_dim,self.value_dim])
             .reshape([b*n,self.heads,self.key_dim,self.value_dim]);
         let single = |x: Tensor<4>| {let width = x.dims()[3]; x.reshape([b*n,1,self.heads,width])};
-        let alpha = self.normalization_backend.decay(self.decay.forward(input.clone()).reshape([b,n,self.heads,self.key_dim]),self.decay_bias.val(),self.decay_scale.val());
-        let erase = sigmoid(self.erase.forward(input.clone())).reshape([b,n,self.heads,ew]);
-        let write = sigmoid(self.write.forward(input.clone())).reshape([b,n,self.heads,ww]);
+        let decay=projected[3].take().unwrap_or_else(||self.decay.forward(input.clone()));
+        let alpha = self.normalization_backend.decay(decay.reshape([b,n,self.heads,self.key_dim]),self.decay_bias.val(),self.decay_scale.val());
+        let erase = sigmoid(projected[4].take().unwrap_or_else(||self.erase.forward(input.clone()))).reshape([b,n,self.heads,ew]);
+        let write = sigmoid(projected[5].take().unwrap_or_else(||self.write.forward(input.clone()))).reshape([b,n,self.heads,ww]);
         let recurrent = chunk::scan_selected(self.scan_backend,self.kind,chunk::ScanInput {
             q:single(q),k:single(k),v:single(v),alpha:single(alpha),erase:single(erase),write:single(write),
         },valid.clone().reshape([b*n,1]),Tensor::zeros([b*n,1],&device),self.chunk_size,Some(initial));
@@ -382,7 +470,7 @@ impl Mixer {
                 mixed + exact*sigmoid(cache.gate.val()).reshape([1,1,self.heads,1])
             });
         }
-        let gate = self.output_gate.forward(input);
+        let gate = projected[6].take().unwrap_or_else(||self.output_gate.forward(input));
         let mixed = if self.normalization_backend == crate::NormalizationBackend::FusedNormsGates {
             self.normalization_backend.gated_rms(&self.norm,mixed,gate.reshape([b,n,self.heads,self.value_dim]))
         } else {
@@ -514,3 +602,7 @@ impl crate::WaveletDyn {
         self.output.forward(mixed*self.value.forward(input))
     }
 }
+
+#[cfg(test)]
+#[path = "sbd_reuse_tests.rs"]
+mod tests;

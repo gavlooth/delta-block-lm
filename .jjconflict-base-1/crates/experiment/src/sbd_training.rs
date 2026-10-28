@@ -4,9 +4,31 @@ use burn::prelude::*;
 use delta_mixers::{profile::Sections, sbd::{BatchedMixerCache,BatchedWaveletCache,MixerCache,WaveletCache}};
 
 #[derive(Default)]
-pub struct CleanInputs(pub Vec<(usize,&'static str,Tensor<3>)>);
+pub struct CleanInputs(
+    pub Vec<(usize,&'static str,Tensor<3>)>,
+    Vec<(usize,delta_mixers::sbd::CleanMixer)>,
+    Vec<usize>,
+    Option<usize>,
+);
+impl CleanInputs {
+    pub fn new(starts: impl IntoIterator<Item=usize>) -> Self {
+        let mut starts=starts.into_iter().collect::<Vec<_>>();
+        starts.sort_unstable();
+        starts.dedup();
+        Self(Vec::new(),Vec::new(),starts,None)
+    }
+    fn mixer(&self,index:usize) -> &delta_mixers::sbd::CleanMixer {
+        &self.1.iter().find(|(layer,_)|*layer==index).expect("clean mixer tensors").1
+    }
+}
 impl Sections for CleanInputs {
     const CAPTURE_CLEAN_INPUTS: bool = true;
+    const CAPTURE_CLEAN_MIXERS: bool = true;
+    fn block(&mut self,index:Option<usize>) {self.3=index;}
+    fn clean_starts(&self)->Option<&[usize]> {Some(&self.2)}
+    fn clean_mixer(&mut self,clean:delta_mixers::sbd::CleanMixer) {
+        self.1.push((self.3.expect("clean mixer layer"),clean));
+    }
     fn clean_input(&mut self, layer: usize, kind: &'static str, input: &Tensor<3>) {
         self.0.push((layer,kind,input.clone()));
     }
@@ -124,7 +146,7 @@ impl LanguageModel {
             LayerCache {
                 wavelet: block.wavelet.as_ref().map(|wavelet| wavelet.prepare_sbd(get("wavelet"))),
                 lngram: block.lngram.as_ref().map(|_| get("lngram")),
-                mixer: block.mixer.prepare_sbd(get("mixer"),starts),
+                mixer: block.mixer.prepare_sbd_from_clean(&trace.mixer(index).select_row(row),starts),
             }
         }).collect();
         TrainingCache {layers,starts:starts.to_vec()}
@@ -153,7 +175,7 @@ impl LanguageModel {
             BatchedLayerCache {
                 wavelet: block.wavelet.as_ref().map(|wavelet| wavelet.prepare_sbd_batched(get("wavelet"),blocks)),
                 lngram: block.lngram.as_ref().map(|lngram| BatchedLngramCache::new(lngram,get("lngram"),blocks)),
-                mixer: block.mixer.prepare_sbd_batched(get("mixer"),blocks),
+                mixer: block.mixer.prepare_sbd_batched_from_clean(trace.mixer(index),blocks),
             }
         }).collect();
         BatchedTrainingCache {layers,blocks:blocks.len()}

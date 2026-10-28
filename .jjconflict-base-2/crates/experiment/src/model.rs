@@ -1,0 +1,692 @@
+use crate::{
+    config::{Arm, CocommitConfig, Config, HeadBackend, LossBackend, UpdateBackend},
+    data::Batch,
+};
+use anyhow::{Result, ensure};
+use burn::{
+    module::{Initializer, ModuleVisitor, Param, ParamId},
+    nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig},
+    optim::GradientsParams,
+    prelude::*,
+    tensor::activation::log_softmax,
+};
+use delta_mixers::{
+    Mixer,
+    ohc::{
+        OhcBackend, OhcReadout, OhcReadoutConfig, OhcStage, OhcStageConfig, StreamInit,
+        StreamInitConfig,
+    },
+    profile::{Sections, Unprofiled},
+};
+
+#[derive(Clone, Debug)]
+pub(crate) enum NoisyRepresentation {
+    Hidden(Tensor<3>),
+    Streams(Tensor<4>),
+}
+#[derive(Clone, Debug)]
+pub(crate) struct NoisyPrefix {
+    pub representation: NoisyRepresentation,
+    pub valid: Tensor<2>,
+    pub unresolved: Tensor<2>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Sublayer { Wavelet, Lngram, Mixer }
+
+#[derive(Module, Debug)]
+pub struct Block {
+    pub(super) wavelet_norm: Option<RmsNorm>,
+    pub(super) wavelet: Option<delta_mixers::WaveletDyn>,
+    pub(super) lngram_norm: Option<RmsNorm>,
+    pub(super) lngram: Option<delta_mixers::lngram::Lngram>,
+    pub(super) norm: RmsNorm,
+    pub(super) mixer: Mixer,
+    pub(super) ff_norm: RmsNorm,
+    pub(super) up: Linear,
+    pub(super) down: Linear,
+    /// oHC stages around the optional wavelet and Lngram sublayers (only when oHC is enabled).
+    pub(super) ohc_wavelet: Option<OhcStage>,
+    pub(super) ohc_lngram: Option<OhcStage>,
+    pub(super) ohc_mixer: Option<OhcStage>,
+    pub(super) ohc_mlp: Option<OhcStage>,
+}
+#[derive(Clone, Debug)]
+pub struct DenoisingOutput {
+    pub logits: Tensor<3>,
+    pub features: Tensor<3>,
+}
+impl DenoisingOutput {
+    pub fn detach(self) -> Self {
+        Self { logits: self.logits.detach(), features: self.features.detach() }
+    }
+    pub fn slice_positions(self, start: usize, length: usize) -> Self {
+        let [rows, _, vocab] = self.logits.dims();
+        let width = self.features.dims()[2];
+        Self {
+            logits: self.logits.slice([0..rows,start..start+length,0..vocab]),
+            features: self.features.slice([0..rows,start..start+length,0..width]),
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct LanguageModel {
+    pub(super) embedding: Embedding,
+    pub(super) sbd_mask: Option<Param<Tensor<1>>>,
+    pub(super) cocommit_marker: Option<Param<Tensor<2>>>,
+    pub(super) blocks: Vec<Block>,
+    pub(super) norm: RmsNorm,
+    pub(super) head: Linear,
+    pub(super) ohc_init: Option<StreamInit>,
+    pub(super) ohc_readout: Option<OhcReadout>,
+    pub(super) codpula: Option<crate::codpula::Codpula>,
+    #[module(skip)]
+    pub(super) ohc_backend: OhcBackend,
+    #[module(skip)]
+    pub(super) cocommit_config: Option<CocommitConfig>,
+    #[module(skip)]
+    pub(super) normalization_backend: delta_mixers::NormalizationBackend,
+    #[module(skip)]
+    pub(super) head_backend: HeadBackend,
+    #[module(skip)]
+    pub(super) epilogue_backend: crate::config::EpilogueBackend,
+    #[module(skip)]
+    pub(super) loss_backend: LossBackend,
+    #[module(skip)]
+    pub(super) update_backend: UpdateBackend,
+}
+impl LanguageModel {
+    pub fn new(c: &Config, arm: &Arm, device: &Device) -> Result<Self> {
+        let init = Initializer::Normal {
+            mean: 0.0,
+            std: 0.02,
+        };
+        let linear = |a, b| {
+            LinearConfig::new(a, b)
+                .with_bias(false)
+                .with_initializer(init.clone())
+                .init(device)
+        };
+        let norm = || {
+            RmsNormConfig::new(c.d_model)
+                .with_epsilon(1e-6)
+                .init(device)
+        };
+        let mut blocks = Vec::with_capacity(c.layers);
+        for index in 0..c.layers {
+            blocks.push(Block {
+                lngram_norm: c.lngram_layers.contains(&index).then(norm),
+                lngram: c
+                    .lngram_layers
+                    .contains(&index)
+                    .then(|| c.lngram_config().init(device)),
+                wavelet_norm: c.wavelet_layers.contains(&index).then(norm),
+                wavelet: c.wavelet_layers.contains(&index).then(|| {
+                    delta_mixers::WaveletDyn::new(c.d_model, 4, 8, c.wavelet_backend, device)
+                }),
+                norm: norm(),
+                mixer: {
+                    let mut mixer = arm.mixer_config(c)?.init(device).with_sbd_reads(
+                        c.sbd.as_ref().map_or(delta_mixers::sbd::InBlockReads::None, |s| s.in_block_reads),
+                        c.sbd.as_ref().map_or(delta_mixers::sbd::NoisyReadBackend::Tensor, |s| s.noisy_read_backend),
+                    );
+                    if let Some(retrieval) = &c.prefix_block_retrieval {
+                        if retrieval.layers.contains(&index) {
+                            mixer.set_prefix_retrieval(delta_mixers::prefix_retrieval::PrefixReadConfig {
+                                block_size: retrieval.block_size,
+                                blocks_per_query: retrieval.blocks_per_query,
+                                backend: c.prefix_block_retrieval_backend,
+                            });
+                        }
+                    }
+                    mixer
+                },
+                ff_norm: norm(),
+                up: linear(c.d_model, 2 * c.d_model),
+                down: linear(2 * c.d_model, c.d_model),
+                ohc_wavelet: None,
+                ohc_lngram: None,
+                ohc_mixer: None,
+                ohc_mlp: None,
+            });
+        }
+        let model = Self {
+            sbd_mask: c.sbd.as_ref().map(|_| init.init([c.d_model], device)),
+            cocommit_marker: None,
+            embedding: EmbeddingConfig::new(c.vocab(), c.d_model)
+                .with_initializer(init.clone())
+                .init(device),
+            blocks,
+            norm: norm(),
+            head: linear(c.d_model, c.vocab()),
+            ohc_init: None,
+            ohc_readout: None,
+            codpula: None,
+            ohc_backend: c.ohc_backend,
+            cocommit_config: c.sbd.as_ref().and_then(|sbd| sbd.cocommit.clone()),
+            normalization_backend: c.normalization_backend,
+            head_backend: c.head_backend,
+            epilogue_backend: c.epilogue_backend,
+            loss_backend: c.loss_backend,
+            update_backend: c.update_backend,
+        };
+        let mut model = if c.ohc_streams {
+            model.with_ohc(c.d_model, device)
+        } else {
+            model
+        };
+        if let Some(sbd) = &c.sbd {
+            model.codpula = match sbd.joint_output {
+                crate::config::SbdJointOutput::Factorized => None,
+                crate::config::SbdJointOutput::Codpula => Some(crate::codpula::Codpula::new(c.d_model,c.seed,device)
+                    .with_execution(sbd.joint_execution)),
+                crate::config::SbdJointOutput::CodpulaContextual => Some(crate::codpula::Codpula::new_contextual(c.d_model,c.seed,device)
+                    .with_execution(sbd.joint_execution)),
+            };
+        }
+        if model.cocommit_config.is_some() {
+            let streams = if c.ohc_streams { 4 } else { 1 };
+            let marker=Tensor::zeros([streams,c.d_model],device);
+            let marker=if device.is_autodiff() {marker.require_grad()} else {marker};
+            model.cocommit_marker=Some(Param::initialized(ParamId::new(),marker));
+        }
+        Ok(model)
+    }
+    /// Realize lazy initializers in visit order for matched-parameter diagnostics.
+    pub(super) fn materialize_parameters(&self) {
+        struct Materialize;
+        impl burn::module::ModuleVisitor for Materialize {
+            fn visit_float<const D:usize>(&mut self,value:&Param<Tensor<D>>) {
+                std::hint::black_box(value.val());
+            }
+        }
+        self.visit(&mut Materialize);
+    }
+    /// Attach only the added architecture, keeping all ordinary parameters shared with a clone.
+    pub(super) fn with_ohc(mut self, width: usize, device: &Device) -> Self {
+        self.ohc_init = Some(StreamInitConfig::new().with_d_model(width).init(device));
+        self.ohc_readout = Some(OhcReadoutConfig::new().with_d_model(width).init(device));
+        for block in &mut self.blocks {
+            if block.wavelet.is_some() {
+                block.ohc_wavelet = Some(OhcStageConfig::new().with_d_model(width).init(device));
+            }
+            if block.lngram.is_some() {
+                block.ohc_lngram = Some(OhcStageConfig::new().with_d_model(width).init(device));
+            }
+            block.ohc_mixer = Some(OhcStageConfig::new().with_d_model(width).init(device));
+            block.ohc_mlp = Some(OhcStageConfig::new().with_d_model(width).init(device));
+        }
+        self
+    }
+    pub fn set_scan_backend(&mut self, backend: delta_mixers::ScanBackend) {
+        for block in &mut self.blocks {
+            block.mixer.set_scan_backend(backend);
+        }
+    }
+    pub fn set_hola_backend(&mut self, backend: delta_mixers::HolaBackend) {
+        for block in &mut self.blocks {
+            block.mixer.set_hola_backend(backend);
+        }
+    }
+    pub fn set_noisy_read_backend(&mut self, backend: delta_mixers::sbd::NoisyReadBackend) {
+        for block in &mut self.blocks { block.mixer.set_noisy_read_backend(backend); }
+    }
+    pub fn set_projection_backend(&mut self, backend: delta_mixers::ProjectionBackend) {
+        for block in &mut self.blocks {
+            block.mixer.set_projection_backend(backend);
+        }
+    }
+    pub fn set_convolution_backend(&mut self, backend: delta_mixers::ConvolutionBackend) {
+        for block in &mut self.blocks {
+            block.mixer.set_convolution_backend(backend);
+        }
+    }
+    pub fn set_normalization_backend(&mut self, backend: delta_mixers::NormalizationBackend) {
+        self.normalization_backend = backend;
+        for block in &mut self.blocks {
+            block.mixer.set_normalization_backend(backend);
+        }
+    }
+    pub fn set_head_backend(&mut self, backend: HeadBackend) {
+        self.head_backend = backend;
+    }
+    pub fn set_loss_backend(&mut self, backend: LossBackend) {
+        self.loss_backend = backend;
+    }
+    pub fn set_update_backend(&mut self, backend: UpdateBackend) {
+        self.update_backend = backend;
+    }
+    pub fn set_epilogue_backend(&mut self, backend: crate::config::EpilogueBackend) {
+        self.epilogue_backend = backend;
+    }
+    pub fn set_lngram_backend(&mut self, backend: delta_mixers::lngram::LngramBackend) {
+        for block in &mut self.blocks {
+            if let Some(lngram) = &mut block.lngram {
+                lngram.backend = backend;
+            }
+        }
+    }
+    pub fn set_wavelet_backend(&mut self, backend: delta_mixers::WaveletBackend) {
+        for block in &mut self.blocks {
+            if let Some(wavelet) = &mut block.wavelet {
+                wavelet.backend = backend;
+            }
+        }
+    }
+    pub fn lngram_table_ids(&self) -> Vec<burn::module::ParamId> {
+        self.blocks
+            .iter()
+            .filter_map(|block| block.lngram.as_ref())
+            .flat_map(|lngram| lngram.tables.iter().map(|table| table.weight.id))
+            .collect()
+    }
+    pub fn loss(&self, logits: Tensor<3>, batch: &Batch) -> Tensor<1> {
+        loss_selected(logits, batch, self.loss_backend)
+    }
+    pub(super) fn head_forward(&self, hidden: Tensor<3>) -> Tensor<3> {
+        project_head(hidden, self.head.weight.val(), self.head_backend)
+    }
+    pub fn forward(&self, batch: &Batch) -> Tensor<3> {
+        self.forward_profiled(batch, &mut Unprofiled)
+    }
+    pub fn forward_profiled<P: Sections>(&self, batch: &Batch, profile: &mut P) -> Tensor<3> {
+        self.forward_output_profiled(batch,profile).logits
+    }
+    pub(super) fn forward_output_profiled<P: Sections>(&self, batch: &Batch, profile: &mut P) -> DenoisingOutput {
+        let hidden = profile.section("Embedding", || self.embedding.forward(batch.input.clone()));
+        self.forward_embedded(hidden, batch, profile, None)
+    }
+    pub(super) fn forward_noisy(&self, embeddings: Tensor<3>, batch: &Batch, start: usize) -> DenoisingOutput {
+        self.forward_embedded(embeddings, batch, &mut Unprofiled, Some(start))
+    }
+    fn forward_embedded<P: Sections>(&self, hidden: Tensor<3>, batch: &Batch, profile: &mut P, start: Option<usize>) -> DenoisingOutput {
+        let mut representation = if let Some(init) = &self.ohc_init {
+            NoisyRepresentation::Streams(profile.section("oHC stream init", || init.forward(hidden, batch.valid.clone())))
+        } else { NoisyRepresentation::Hidden(hidden) };
+        let lngram_layout = self.blocks.iter().any(|block| block.lngram.is_some()).then(|| {
+            delta_mixers::lngram::LngramLayout::new(batch.valid.clone(), batch.reset.clone())
+        });
+        for (index, block) in self.blocks.iter().enumerate() {
+            representation = self.layer_step(index, representation, batch.valid.clone(), profile, |kind, input, profile| {
+                match kind {
+                    Sublayer::Wavelet => block.wavelet.as_ref().unwrap().forward_profiled(input, batch.valid.clone(), batch.reset.clone(), profile),
+                    Sublayer::Lngram => profile.section("Lngram", || block.lngram.as_ref().unwrap().forward(input, lngram_layout.as_ref().unwrap())),
+                    Sublayer::Mixer => match start {
+                        Some(start) => block.mixer.forward_sbd(input, batch.valid.clone(), batch.reset.clone(), start),
+                        None => block.mixer.forward_profiled(input, batch.valid.clone(), batch.reset.clone(), profile),
+                    },
+                }
+            });
+        }
+        profile.block(None);
+        let hidden = match representation {
+            NoisyRepresentation::Hidden(hidden) => hidden,
+            NoisyRepresentation::Streams(streams) => profile.section("oHC readout", || self.ohc_readout.as_ref().unwrap().readout(streams)),
+        };
+        profile.section("Final norm and vocabulary head", || {
+            let features = self.normalization_backend.rms(&self.norm, hidden);
+            DenoisingOutput { logits: self.head_forward(features.clone()), features }
+        })
+    }
+    pub fn set_ohc_backend(&mut self, backend: OhcBackend) {
+        self.ohc_backend = backend;
+    }
+    /// The shared layer order for clean, reconstructed, cached, and marked-tail execution.
+    pub(crate) fn layer_step<P: Sections>(
+        &self, index: usize, mut representation: NoisyRepresentation, valid: Tensor<2>, profile: &mut P,
+        mut update: impl FnMut(Sublayer, Tensor<3>, &mut P) -> Tensor<3>,
+    ) -> NoisyRepresentation {
+        let block = &self.blocks[index];
+        profile.block(Some(index));
+        for (kind, norm, stage, capture, norm_label, read_label, write_label) in [
+            (Some(Sublayer::Wavelet), block.wavelet_norm.as_ref(), block.ohc_wavelet.as_ref(), "wavelet", "Block RMSNorm: wavelet", "oHC read: wavelet", "oHC write: wavelet"),
+            (Some(Sublayer::Lngram), block.lngram_norm.as_ref(), block.ohc_lngram.as_ref(), "lngram", "Block RMSNorm: Lngram", "oHC read: Lngram", "oHC write: Lngram"),
+            (Some(Sublayer::Mixer), Some(&block.norm), block.ohc_mixer.as_ref(), "mixer", "Block RMSNorm: mixer", "oHC read: mixer", "oHC write: mixer"),
+            (None, Some(&block.ff_norm), block.ohc_mlp.as_ref(), "", "Block RMSNorm: MLP", "oHC read: MLP", "oHC write: MLP"),
+        ] {
+            let Some(norm) = norm else { continue };
+            let mut run = |work: Tensor<3>, profile: &mut P| {
+                let input = profile.section(norm_label, || self.normalization_backend.rms(norm, work));
+                if let Some(kind) = kind {
+                    if P::CAPTURE_CLEAN_INPUTS { profile.clean_input(index, capture, &input); }
+                    update(kind, input, profile)
+                } else {
+                    let output = profile.section("MLP: up", || block.up.forward(input));
+                    let output = profile.section("MLP: SiLU", || self.epilogue_backend.silu(output));
+                    profile.section("MLP: down", || block.down.forward(output))
+                }
+            };
+            representation = match representation {
+                NoisyRepresentation::Hidden(hidden) => {
+                    let output = run(hidden.clone(), profile);
+                    NoisyRepresentation::Hidden(profile.section("Residual adds", || hidden + output))
+                }
+                NoisyRepresentation::Streams(streams) => {
+                    let stage = stage.expect("oHC sublayer");
+                    let read = profile.section(read_label, || stage.read_selected(streams, self.ohc_backend));
+                    let output = run(read.work.clone(), profile);
+                    NoisyRepresentation::Streams(profile.section(write_label, || stage.write(read, output, valid.clone(), self.ohc_backend)))
+                }
+            };
+        }
+        representation
+    }
+}
+
+pub(super) fn heuristic_matmul(a: Tensor<2>, b: Tensor<2>) -> Tensor<2> {
+    #[cfg(any(feature = "vulkan", feature = "cuda"))]
+    {
+        delta_kernels::heuristic_matmul(a, b)
+    }
+    #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
+    {
+        let _ = (a, b);
+        panic!("heuristic matmul requires a GPU feature")
+    }
+}
+
+pub(super) fn project_head(
+    hidden: Tensor<3>,
+    weight: Tensor<2>,
+    backend: HeadBackend,
+) -> Tensor<3> {
+    match backend {
+        HeadBackend::Native => burn::tensor::module::linear(hidden, weight, None),
+        HeadBackend::Padded320 => {
+            let [b, t, _] = hidden.dims();
+            let [width, vocab] = weight.dims();
+            assert_eq!(vocab, 257);
+            // Padding is constant, absent from both stored parameters and the loss.
+            let padding = Tensor::<2>::zeros([width, 320 - vocab], &hidden.device());
+            burn::tensor::module::linear(hidden, Tensor::cat(vec![weight, padding], 1), None)
+                .slice([0..b, 0..t, 0..vocab])
+        }
+        HeadBackend::Heuristic => {
+            let [b, t, width] = hidden.dims();
+            let output = weight.dims()[1];
+            heuristic_matmul(hidden.reshape([b * t, width]), weight).reshape([b, t, output])
+        }
+    }
+}
+pub fn loss_selected(logits: Tensor<3>, batch: &Batch, backend: LossBackend) -> Tensor<1> {
+    let [b, t, v] = logits.dims();
+    let chosen = if backend.is_tensor() {
+        log_softmax(logits.reshape([b * t, v]), 1)
+            .gather(1, batch.target.clone().reshape([b * t, 1]))
+            .reshape([b, t])
+            .neg()
+    } else {
+        #[cfg(any(feature = "vulkan", feature = "cuda"))]
+        {
+            delta_kernels::cross_entropy_rows(
+                logits.reshape([b * t, v]),
+                batch.target.clone().reshape([b * t]).float(),
+                if backend == LossBackend::Fused64 {
+                    64
+                } else {
+                    256
+                },
+            )
+            .reshape([b, t])
+        }
+        #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
+        {
+            panic!("fused cross entropy requires a GPU feature")
+        }
+    };
+    (chosen * batch.weight.clone()).sum() / batch.weight.clone().sum()
+}
+pub fn scalar(tensor: Tensor<1>) -> Result<f64> {
+    let data = tensor
+        .into_data()
+        .try_to_vec::<f32>()
+        .map_err(|e| anyhow::anyhow!("reading scalar: {e:?}"))?;
+    let value = data[0] as f64;
+    ensure!(value.is_finite(), "nonfinite loss/state");
+    Ok(value)
+}
+/// Check every gradient before optimizer writes, not only the scalar loss.
+pub fn checked_gradients(model: &LanguageModel, loss: Tensor<1>) -> Result<GradientsParams> {
+    checked_gradients_profiled(model, loss, &mut Unprofiled)
+}
+pub fn checked_gradients_profiled<P: Sections>(
+    model: &LanguageModel,
+    loss: Tensor<1>,
+    profile: &mut P,
+) -> Result<GradientsParams> {
+    let grads = profile.section("Backward (total only)", || {
+        GradientsParams::from_grads(loss.backward(), model)
+    });
+    check_parameter_gradients(model, &grads, profile)?;
+    Ok(grads)
+}
+/// Draw-specific exceptions are exact parameter paths, never a blanket exemption.
+pub(crate) fn unused_denoising_parameters(noisy: bool, marked: bool) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    if !noisy {
+        names.extend(["sbd_mask", "codpula.gate_head.weight", "codpula.gate_head.bias"]);
+    }
+    if !marked { names.push("cocommit_marker"); }
+    names
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct GradientCount {
+    pub nonzero_steps: usize,
+    pub zero_steps: usize,
+    pub missing_steps: usize,
+}
+pub(crate) type GradientReport = std::collections::BTreeMap<String, GradientCount>;
+pub(crate) fn accumulate_gradient_report(total: &mut GradientReport, current: GradientReport) {
+    for (name, count) in current {
+        let entry = total.entry(name).or_default();
+        entry.nonzero_steps += count.nonzero_steps;
+        entry.zero_steps += count.zero_steps;
+        entry.missing_steps += count.missing_steps;
+    }
+}
+pub(crate) fn checked_gradients_with_unused<P: Sections>(
+    model: &LanguageModel, loss: Tensor<1>, unused: &[&str], profile: &mut P,
+) -> Result<(GradientsParams, GradientReport)> {
+    let grads = profile.section("Backward (total only)", || GradientsParams::from_grads(loss.backward(), model));
+    let report = check_parameter_gradients_with_unused(model, &grads, unused, profile)?;
+    Ok((grads, report))
+}
+pub(super) fn check_parameter_gradients<P: Sections>(
+    model: &LanguageModel, grads: &GradientsParams, profile: &mut P,
+) -> Result<()> {
+    check_parameter_gradients_with_unused(model, grads, &[], profile).map(|_| ())
+}
+pub(crate) fn check_parameter_gradients_with_unused<P: Sections>(
+    model: &LanguageModel, grads: &GradientsParams, unused: &[&str], profile: &mut P,
+) -> Result<GradientReport> {
+    struct Check<'a> {
+        grads: &'a GradientsParams,
+        path: Vec<String>,
+        names: Vec<String>,
+        missing: Vec<String>,
+        norms: Vec<Tensor<1>>,
+        backend: UpdateBackend,
+    }
+    impl ModuleVisitor for Check<'_> {
+        fn enter_module(&mut self, name: &str, _: &str) { self.path.push(name.to_owned()); }
+        fn exit_module(&mut self, _: &str, _: &str) { self.path.pop(); }
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+            if !param.val().is_require_grad() { return; }
+            let name = self.path.join(".");
+            if let Some(g) = self.grads.get::<D>(param.id) {
+                self.names.push(name);
+                self.norms.push(if self.backend.is_tensor() {
+                    g.square().sum()
+                } else {
+                    crate::update::square_sum(g)
+                });
+            } else {
+                self.missing.push(name);
+            }
+        }
+    }
+    let mut check = Check { grads, path: Vec::new(), names: Vec::new(),
+        missing: Vec::new(), norms: Vec::new(), backend: model.update_backend };
+    profile.section("Gradient checks: reductions", || model.visit(&mut check));
+    let unexpected = check.missing.iter().filter(|name| !unused.contains(&name.as_str())).collect::<Vec<_>>();
+    ensure!(unexpected.is_empty(), "trainable parameters have no gradient: {unexpected:?}; refusing partial/readout-only training");
+    let mut report = GradientReport::new();
+    for name in check.missing { report.insert(name, GradientCount { missing_steps: 1, ..Default::default() }); }
+    if !check.norms.is_empty() {
+        let norms = profile.section("Host/device: gradient norm readback", || {
+            Tensor::cat(check.norms, 0).into_data().try_to_vec::<f32>()
+        }).map_err(|e| anyhow::anyhow!("reading gradient norms: {e:?}"))?;
+        for (name, norm) in check.names.into_iter().zip(norms) {
+            ensure!(norm.is_finite(), "nonfinite parameter gradients: {name}");
+            report.insert(name, GradientCount { nonzero_steps: usize::from(norm > 0.0),
+                zero_steps: usize::from(norm == 0.0), missing_steps: 0 });
+        }
+    }
+    Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data;
+
+    #[test]
+    fn unused_denoising_list_does_not_hide_disconnected_backbone() {
+        let mut c = Config::default();
+        c.d_model = 8;
+        c.layers = 1;
+        let model = LanguageModel::new(&c, &c.arms[0], &Device::ndarray().autodiff()).unwrap();
+        let error = checked_gradients_with_unused(&model, model.head.weight.val().sum(),
+            &unused_denoising_parameters(false, false), &mut Unprofiled).unwrap_err();
+        assert!(error.to_string().contains("embedding.weight"));
+        assert!(error.to_string().contains("refusing partial"));
+    }
+
+    #[test]
+    fn singleton_draw_reports_missing_mask_instead_of_fabricating_gradient() {
+        let mut c = Config::default();
+        c.task = "lm".into();
+        c.context = 8;
+        c.d_model = 8;
+        c.layers = 1;
+        c.sbd = Some(crate::config::SbdConfig { block_lengths: vec![1], ..Default::default() });
+        let device = Device::ndarray().autodiff();
+        let model = LanguageModel::new(&c, &c.arms[0], &device).unwrap();
+        let rows = vec![data::Example { input: vec![256,1,2,3,4,5,6,7],
+            target: vec![1,2,3,4,5,6,7,8], weight: vec![1.0;8], groups: vec![None;8] }];
+        let result = crate::sbd::training_loss(&model, &c, &rows, &Batch::new(&rows,&device), 1).unwrap();
+        let (grads, report) = checked_gradients_with_unused(&model, result.loss,
+            &result.unused_parameters, &mut Unprofiled).unwrap();
+        assert!(grads.get::<1>(model.sbd_mask.as_ref().unwrap().id).is_none());
+        assert_eq!(report["sbd_mask"].missing_steps, 1);
+        assert_eq!(report["sbd_mask"].zero_steps, 0);
+        assert_eq!(report["head.weight"].nonzero_steps, 1);
+        assert!(check_parameter_gradients(&model, &grads, &mut Unprofiled).is_err());
+    }
+
+    struct Parameters(Vec<Vec<f32>>);
+    impl ModuleVisitor for Parameters {
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+            self.0
+                .push(param.val().into_data().try_to_vec::<f32>().unwrap());
+        }
+    }
+    #[test]
+    fn padded_head_preserves_parameters_logits_and_vjps() {
+        let mut c = Config::default();
+        c.task = "lm".into();
+        c.d_model = 8;
+        c.layers = 1;
+        let device = Device::ndarray().autodiff();
+        device.seed(3107);
+        let mut model = LanguageModel::new(&c, &c.arms[0], &device).unwrap();
+        let hidden = Tensor::<3>::random(
+            [2, 3, 8],
+            burn::tensor::Distribution::Uniform(-0.1, 0.1),
+            &device,
+        )
+        .require_grad();
+        let weight = model.head.weight.val();
+        let count = model.num_params();
+        let original = model.head_forward(hidden.clone());
+        let grads = original.clone().sum().backward();
+        let dx = hidden.grad(&grads).unwrap();
+        let dw = weight.grad(&grads).unwrap();
+        model.set_head_backend(HeadBackend::Padded320);
+        let padded = model.head_forward(hidden.clone());
+        let grads = padded.clone().sum().backward();
+        assert_eq!(count, model.num_params());
+        assert_eq!(model.head.weight.dims(), [8, 257]);
+        for (a, b) in [
+            ((original - padded).abs().max(), 2e-6),
+            ((dx - hidden.grad(&grads).unwrap()).abs().max(), 2e-6),
+            ((dw - weight.grad(&grads).unwrap()).abs().max(), 2e-6),
+        ] {
+            assert!(a.into_data().try_to_vec::<f32>().unwrap()[0] < b);
+        }
+    }
+    #[test]
+    fn full_mixer_training_and_optimizer_resume_match() {
+        let mut c = Config::default();
+        c.d_model = 8;
+        c.layers = 1;
+        c.context = 16;
+        c.association_counts = vec![2];
+        c.batch_size = 1;
+        let device = Device::ndarray().autodiff();
+        device.seed(719);
+        let arm = &c.arms[0];
+        let mut model = LanguageModel::new(&c, arm, &device).unwrap();
+        let batch = Batch::new(&[data::recall(&c, 1, 0, false)], &device);
+        let mut before = Parameters(Vec::new());
+        model.blocks[0].mixer.visit(&mut before);
+        let mut optim = crate::train::optimizer(&c);
+        let objective = model.loss(model.forward(&batch), &batch);
+        let grads = checked_gradients(&model, objective).unwrap();
+        model = optim.step(0.001, model, grads);
+        let mut after = Parameters(Vec::new());
+        model.blocks[0].mixer.visit(&mut after);
+        assert!(
+            before
+                .0
+                .iter()
+                .zip(&after.0)
+                .any(|(a, b)| a.iter().zip(b).any(|(a, b)| (a - b).abs() > 1e-8)),
+            "mixer weights did not train"
+        );
+        let path =
+            std::env::temp_dir().join(format!("delta-experiment-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        model
+            .clone()
+            .save_file(path.join("model.burnpack"))
+            .unwrap();
+        optim.save(path.join("optimizer.burnpack")).unwrap();
+        let restored = crate::checkpoint::load_model(
+            LanguageModel::new(&c, arm, &device).unwrap(),
+            path.join("model.burnpack"),
+            &device,
+        )
+        .unwrap();
+        let mut restored_optim =
+            crate::checkpoint::load_optimizer(&c, path.join("optimizer.burnpack")).unwrap();
+        let grads = checked_gradients(&model, model.loss(model.forward(&batch), &batch)).unwrap();
+        let restored_grads =
+            checked_gradients(&restored, restored.loss(restored.forward(&batch), &batch)).unwrap();
+        let model = optim.step(0.001, model, grads);
+        let restored = restored_optim.step(0.001, restored, restored_grads);
+        let difference = (model.forward(&batch) - restored.forward(&batch))
+            .abs()
+            .max()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap()[0];
+        assert!(
+            difference < 2e-6,
+            "next resumed AdamW step diverged: {difference}"
+        );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}

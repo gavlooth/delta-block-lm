@@ -114,9 +114,9 @@ return complete, retained candidates
 
 ### 2.3 Decode budgets and comparable schedules
 
-One denoising call means one backbone evaluation plus its selected output preparation. Count teacher calls, commitment calls and any diagnostic calls too. The maximum for an isolated R²D episode is `K*(M_paper+1)`, with no hidden initial prediction. Prefix reconstruction and final clean replay are wall-time costs, even though replay is not a noisy-denoiser evaluation.
+One denoising call means one backbone evaluation plus its selected output preparation. Count teacher calls, commitment calls and any diagnostic calls too. The maximum for an isolated R²D episode is `K*(M_paper+1)`, with no hidden initial prediction. Required prefix-cache preparation and clean-history appends are wall-time costs but not noisy-denoiser evaluations. No discarded clean forward is required after the final completed block.
 
-Inference uses the selected adaptive exit and records actual denoiser calls, episode seconds and final clean replay work. Energy-training labels instead use exactly H fixed calls per fork, with identical remaining r sequence and supplied random values, because equal work is part of the training recipe. Pairwise mask scoring adds no denoiser call. No mask-policy quality comparison or operating curve is authorized.
+Inference uses the selected adaptive exit and records actual denoiser calls, episode seconds and clean-history appends. Energy-training labels instead use exactly H fixed calls per fork, with identical remaining r sequence and supplied random values, because equal work is part of the training recipe. Pairwise mask scoring adds no denoiser call. No mask-policy quality comparison or operating curve is authorized.
 
 ## 3. The user's distribution over size-r mask sets
 
@@ -227,7 +227,7 @@ Unary enumeration uses the same ordered f64 sums and remains the oracle and fina
 
 On M use the existing probability-weighted candidate-plus-mask embedding with visibility `1/soft_steps` after a fresh prediction. Candidate updates retain original top-k weights and mass and use existing soft_eta/soft_temperature, with Codpula temperature applied before local emission normalization and feedback update temperature one. Provisional reveals use E[x_i]. Neither kind of neural input changes permanent O. Initial visibility zero is the genuine all-masked start, not a hard-mask comparison.
 
-Each noisy pass starts from the same clean-prefix recurrent/HOLA/history snapshots. Temporary noisy states and in-block K/V never enter the clean cache. After the episode commit all remaining valid positions, and replay the completed block exactly once. Existing prefix reconstruction is the correctness baseline; reusable cached execution must match it numerically.
+Each noisy pass starts from the same clean-prefix recurrent/HOLA/history snapshots. Temporary noisy states and in-block K/V never enter the clean cache. After the episode, commit all remaining valid positions and append the completed block to clean history. Prepare the extended-prefix cache only if another multi-token block needs it; no standalone discarded final clean forward runs. Existing prefix reconstruction is the correctness baseline; reusable cached execution must match it numerically.
 
 ### 5.2 Codpula output during refinement
 
@@ -286,7 +286,7 @@ readout; charge its actual prefix/tail/head/circuit work separately from the
 one logical endpoint-scoring call.
 
 Report logical R²D iterations separately from shared-prefix, A/B tail/head
-calls, circuit preparations/evidence queries/FFBS and final clean replay.
+calls, circuit preparations/evidence queries/FFBS, clean-cache preparations and history appends.
 Full-backbone NFE alone hides a marked partial pass. Standalone Step11 costs
 below are not measurements or same-cost comparisons of the combination.
 
@@ -473,7 +473,7 @@ The proposed 2,048 pairs/H2 require **8,192 branch call/block units**, about 16 
 
 where F values are separately measured frozen full-axis times. Do not multiply 24 by the **8-second optimizer step**: collection has no backward/update, and a clean scorer differs from the noisy scorer. Larger H, repeated seeds or commitment composition scale those explicit counts.
 
-Generation work for pure L8/M1 at B8/T512 is 64 frontiers*16 calls = **1,024 B8 frontier evaluations**; the recommended M4 cap is 64*40 = **2,560**, before adaptive exit. Both add initial prefill and 64 completed-block clean replays. For adaptive scheduling the maximum is `64*8*(M_paper+1)` and actual calls must be reported. Dependence composition adds one assignment call/commitment round and can repeat the full episode up to L times/block; never present its cost as the same 16- or 40-call decoder.
+Generation work for pure L8/M1 at B8/T512 is 64 frontiers*16 calls = **1,024 B8 frontier evaluations**; the recommended M4 cap is 64*40 = **2,560**, before adaptive exit. Both add initial prefix-cache preparation and 63 extended-prefix cache preparations before subsequent frontiers; no unused final clean replay is required. For adaptive scheduling the maximum is `64*8*(M_paper+1)` and actual calls must be reported. Dependence composition adds one assignment call/commitment round and can repeat the full episode up to L times/block; never present its cost as the same 16- or 40-call decoder.
 
 ## 11. Correctness plan
 
@@ -503,7 +503,7 @@ Acceptance for this implementation is numerical correctness, exact-law enumerati
 2. Prepare final h, model probabilities and sparse candidate expectations once/pass. Compute z once/position; prepare zS once and one scalar/pair. Batch the block axis and unique feature states, reuse local projections for both members of a rank pair, and use selected gathers rather than `[sets,positions,D]` or `[edges,257]` expansions. Set membership and enumeration remain host integer work.
 3. Download one compact buffer of FP32 unary/pair terms per frontier or full batched collection call. Run ordered f64 accumulation/DP on the host with reusable scratch. No per-mask GPU dispatch or device readback. Keep detached teacher temporaries dead after candidates are extracted; do not retain every rollout graph.
 4. Compare ordinary Burn primitives with at least one batched/fused feature-assembly design on identical inputs. A CubeCL kernel must show useful integrated savings after host synchronization, not just a faster isolated reduction. Do not import predecessor CSR/backend patches merely because they exist; its OOM came from huge relation axes absent here.
-5. Measure B1 and B8, T32 pilot then T512, L8 and L16, selected feedback/output modes, with identical parameters/masks/uniforms. Separate cold compile/autotune, synchronization, transfer, host enumeration, prefix reconstruction, final replay, forward, backward and optimizer. Record launch counts, scalar-buffer sizes, retained state and sampled memory with its limitations. Use synchronized warm interleaved pairs and a predeclared interval method; main integration owns verification, not parallel workers.
+5. Measure B1 and B8, T32 pilot then T512, L8 and L16, selected feedback/output modes, with identical parameters/masks/uniforms. Separate cold compile/autotune, synchronization, transfer, host enumeration, prefix-cache preparation, history appends, forward, backward and optimizer. Record launch counts, scalar-buffer sizes, retained state and sampled memory with its limitations. Use synchronized warm interleaved pairs and a predeclared interval method; main integration owns verification, not parallel workers.
 6. Set component budgets from measured integrated cost before longer contexts. A provisional target is energy feature/sampler overhead below 5% of matched denoising wall time, **not a correctness exemption or demonstrated performance result**. If the target is missed, preserve the law/precision while profiling head projection, entropy, round trips and L16 enumeration; adjust batching or scratch reuse before changing the model. Reject larger-L enumeration before allocation rather than silently switching to an approximate law.
 
 **Completion:** all affected callers, numerical gates, dataset identities, checkpoint/chain continuation, execution selectors and implementation evidence are updated; mask-set selection remains stochastic with exact legal support; final commitments remain immutable; TCT is distinct from energy fitting. This turn authorizes the selected implementation, correctness checks, execution measurements and tiny smokes only.
@@ -586,7 +586,7 @@ This is an actual batched active-block workload, not B8/T512 teacher-forced trai
 
 Initial513-position prefix-cache preparation measured3.146883s/B1 and1.030727s/B8 in their respective fresh processes; these one-off samples can include JIT/setup and are not a paired prefill comparison. Logical prefix length is512; the extra position is the snapshot API dummy and never evidence. These samples must not be silently included as warmed per-pass latency or excluded when estimating first-output latency. Exact live peak memory was not measured; the small retained-feedback estimates exclude model, clean cache and circuit temporaries.
 
-Raw samples and work boundaries: `artifacts/remasking/remask-timing-b1/remask-benchmark.json` and `artifacts/remasking/remask-benchmark.json`. An earlier timing omitted replay; it was replaced by this complete boundary, not used to select a favorable timing. Current CLI generation also reports actual calls and includes prefill/replay.
+Raw samples and work boundaries: `artifacts/remasking/remask-timing-b1/remask-benchmark.json` and `artifacts/remasking/remask-benchmark.json`. These historical measurements include the then-required final replay. The current `remask-benchmark` method version 2 instead times the resident-prefix episode and completed token-history append, without a discarded final clean forward. Initial cache preparation remains outside the repeated timed episode and is reported separately as `prefill_seconds`; the actual fixture remains prefix512/L8. `history_append_seconds` replaces `clean_replay_seconds`, and current CLI generation reports `clean_history_appended_tokens` rather than claiming the final tokens were processed by recurrence. No new latency result or speedup is claimed here.
 
 ### 14.4 TCT execution and memory
 
