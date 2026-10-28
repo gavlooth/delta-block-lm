@@ -20,6 +20,8 @@ Ordinary SBD/CoCommit with refinement keeps the energy/uniform decoder. Its deta
 
 TCT requires explicit `refinement.policy: "confidence"`. Both streaming training and the existing remask decoder call one confidence-reveal transition: four monotone reveal rounds, at least `ceil(masked / remaining_rounds)` positions each round, plus any confidence at least 0.9. Earlier self-generated reveals remain unchanged neural inputs. An additional fully revealed endpoint is scored during training and decoded once for final output. TCT does not load a mask energy, and learned/uniform policies are rejected for TCT rather than silently ignored. Ordinary refinement rejects confidence policy.
 
+Confidence refinement is part of the saved TCT training identity, so the ordinary validated checkpoint loader can evaluate and generate from a new TCT checkpoint without weakening its configuration check. Warm-start comparison restores the recorded source's ordinary `sbd.rows_per_pass` before checking identity; the live TCT configuration still uses only `tct.rows_per_pass`. First-call teacher preparation belongs to the shared prediction path, including collection and resident-cache decode benchmarks, and its extra unmarked work is counted.
+
 Required sources:
 
 - Zhou, Wu and Zanette, [Random Remasking Scales Masked Diffusion Inference, arXiv:2610.30744v1](https://arxiv.org/html/2610.30744v1), full paper including Appendices A–E; [version page](https://arxiv.org/abs/2610.30744). Algorithm and equation numbers below refer to this version.

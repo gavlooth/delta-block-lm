@@ -470,6 +470,7 @@ pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32],
     let mut blocks = 0;
     let mut coordinated_passes = 0usize;
     let mut coordinated_blocks = 0usize;
+    let mut teacher_feedback_passes=0usize;
     let mut proposal_rng = Rng(c.seed);
     while generated.len() < s.generate_tokens {
         let n = s.block_lengths[blocks%s.block_lengths.len()].min(s.generate_tokens-generated.len());
@@ -482,6 +483,7 @@ pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32],
         } else {None};
         if let Some(cache)=&coordination_cache {
             prepare_generation_feedback(&model,c,cache,&mut soft)?;
+            teacher_feedback_passes+=usize::from(s.feedback==SbdFeedback::SoftFeedback);
         }
         while final_values.iter().any(Option::is_none) {
             if s.cocommit.is_some() && n>1 {
@@ -566,6 +568,7 @@ pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32],
     let seconds = clock.elapsed().as_secs_f64();
     let mut report = json!({"tokens":generated,"text":String::from_utf8_lossy(&generated.iter().map(|&x| x as u8).collect::<Vec<_>>()),"finalized_tokens":generated.len(),"finalized_tokens_per_second":generated.len() as f64/seconds,"seconds":seconds,"denoising_passes":passes,"blocks":blocks,"causally_replayed_tokens":clean.replayed,"includes_replay":true,"prefill_included":false,"replay_implementation":"full clean-prefix reconstruction once per finalized block; no incremental optimization","commit_rule":if s.commitment == SbdCommitment::Dependence {"dependence"} else if s.entropy_threshold.is_some() {"sbd_entropy_eq8"} else {"fixed_count"},"joint_output":s.joint_output,"joint_execution":s.joint_execution,"proposal_seed":c.seed,"potential_temperature":c.soft_temperature,"dependence_threshold":s.dependence_threshold,"maximum_passes_per_block":"actual block length"});
     if targets.is_some() {report["decode_score"]=score.report();}
+    report["teacher_feedback_passes"]=json!(teacher_feedback_passes);
     if let Some(options) = &s.cocommit {
         report["cocommit"] = json!({"config":options,"shared_noisy_prefix_calls":coordinated_passes,
             "unmarked_tail_calls":coordinated_passes,"marked_tail_calls":coordinated_passes,
@@ -578,7 +581,7 @@ pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32],
     Ok(report)
 }
 
-fn validate_checkpoint_identity(c: &Config, arm: &Arm, seed: u64, saved: &crate::train::State) -> Result<()> {
+pub(crate) fn validate_checkpoint_identity(c: &Config, arm: &Arm, seed: u64, saved: &crate::train::State) -> Result<()> {
     ensure!(c.sbd.is_some(), "SBD config is required");
     ensure!(
         saved.schema == 1

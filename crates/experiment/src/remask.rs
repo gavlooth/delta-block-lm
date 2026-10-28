@@ -320,6 +320,7 @@ struct Prediction {
 }
 fn predict(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, state: &mut Episode,
     keys: &[u64], seed: u64, call: usize, device: &Device) -> Result<Prediction> {
+    let teacher_feedback=prepare_episode_feedback(model,c,cache,state)?;
     state.validate(c.vocab())?;
     ensure!(keys.len() == state.lengths.len(),"token RNG identities differ from active rows");
     let view = provisional_input(&state.soft,&state.values,&state.revealed,device)?;
@@ -336,6 +337,16 @@ fn predict(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, stat
     } else {(model.cached_blocks(cache,&view,false).detach(),Vec::new(),crate::cocommit::CoordinationWork::default())};
     let used_b_count=marks.chunks_exact(width).filter(|marks|marks.iter().any(|&mark|mark)).count();
     let hidden=output.features.clone();
+    if teacher_feedback {
+        work.prefix_batches+=1;
+        work.prefix_rows+=rows;
+        work.a_tail_dispatches+=1;
+        work.a_tail_rows+=rows;
+        work.a_tail_used_rows+=rows;
+        work.head_dispatches+=1;
+        work.head_rows+=rows;
+        work.head_used_rows+=rows;
+    }
     let mut write_logs=None;
     let logs = if model.codpula.is_some() {
         if marked {
@@ -355,6 +366,12 @@ fn predict(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, stat
         let proposal_fixed = Tensor::<2,Bool>::from_data(TensorData::new(
             state.soft.observed.iter().zip(&revealed).map(|(value,&reveal)|value.is_some() || (!correction && reveal)).collect::<Vec<_>>(),[rows,width]),device);
         if state.scoring.is_some() {
+            if marked {
+                work.message_passes+=1;
+                work.evidence_queries+=1;
+                work.circuit_query_dispatched_rows+=rows;
+                work.circuit_query_used_rows+=rows;
+            }
             write_logs=Some(host(circuit.marginals(proposal_tokens.clone(),proposal_fixed.clone())?.reshape([rows*width,c.vocab()]).log())?);
         }
         let proposals = circuit.sample_with_uniforms(proposal_tokens,proposal_fixed,token_uniforms(state,keys,seed,call,device))?;
@@ -456,16 +473,18 @@ fn energy_terms(energy: &MaskEnergy, input: Tensor<3>, state: &Episode, policy: 
 }
 
 struct EpisodeResult { state: Episode, calls: usize, row_calls: Vec<usize>, work: crate::cocommit::CoordinationWork }
-fn prepare_episode_feedback(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, state: &mut Episode) -> Result<()> {
-    if c.sbd.as_ref().unwrap().feedback == crate::config::SbdFeedback::SoftFeedback
+fn prepare_episode_feedback(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, state: &mut Episode) -> Result<bool> {
+    if state.previous_candidates.is_none()
+        && c.sbd.as_ref().unwrap().feedback == crate::config::SbdFeedback::SoftFeedback
         && state.soft.observed.iter().zip(&state.soft.active).any(|(observed,&active)|active && observed.is_none())
         && c.sbd.as_ref().unwrap().training_mode != crate::tct::TrainingMode::Tct
         && !state.revealed.iter().any(|&revealed|revealed)
         && host(state.soft.visibility.clone())?.iter().zip(&state.soft.observed).all(|(&visibility,observed)|observed.is_some() || visibility==0.0) {
         let teacher=model.cached_blocks(cache,&state.soft,false);
         crate::sbd::update_feedback(model,c,teacher,&mut state.soft,1.0)?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 fn apply_confidence_reveals(state: &mut Episode, before: &Episode, logs: Tensor<2>, round: usize) -> Result<()> {
     let width=state.width();
@@ -481,7 +500,6 @@ fn apply_confidence_reveals(state: &mut Episode, before: &Episode, logs: Tensor<
 }
 fn episode(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, mut state: Episode,
     keys: &[u64], seed: u64, energy: Option<&MaskEnergy>, adaptive: bool, device: &Device) -> Result<EpisodeResult> {
-    prepare_episode_feedback(model,c,cache,&mut state)?;
     let policy = settings(c)?.policy;
     let rows = state.lengths.len();
     let free = (0..rows).map(|row|state.eligible(row).len()).collect::<Vec<_>>();
@@ -1596,6 +1614,21 @@ mod decoder_fix_tests {
                 feedback:crate::config::SbdFeedback::SoftFeedback,..Default::default()}),..Config::default()};
         let arm=crate::config::Arm {name:"provisional".into(),mixer:"kronlstm".into(),cache:"none".into()};
         (c,arm,device)
+    }
+    #[test]
+    fn decoder_fix_first_refinement_prediction_uses_training_teacher_state() {
+        let (c,arm,device)=fixture();
+        let model=LanguageModel::new(&c,&arm,&device).unwrap();
+        let cache=prefix_cache(&model,&[vec![256,13,19]],&device).unwrap();
+        let mut episode=Episode::new(&c,vec![8],8,vec![None;8],&device).unwrap();
+        let mut training=episode.soft.clone();
+        let teacher=model.cached_blocks(&cache,&training,false);
+        crate::sbd::update_feedback(&model,&c,teacher,&mut training,1.0).unwrap();
+        let expected=model.cached_blocks(&cache,&training,false);
+        let actual=predict(&model,&c,&cache,&mut episode,&[0],c.seed,0,&device).unwrap();
+        assert_eq!(host(actual.input_visibility).unwrap(),host(training.visibility).unwrap());
+        let expected=host(expected.features).unwrap().into_iter().map(f64::from).collect::<Vec<_>>();
+        crate::sbd::compare(&host(actual.hidden).unwrap(),&expected).unwrap();
     }
     #[test]
     fn decoder_fix_provisional_training_consumes_self_generated_inputs_without_evidence() {

@@ -580,10 +580,11 @@ fn warm_start_identity(c: &Config, path: &Path, saved: &train::State, target_tok
     requested.train_tokens = source.train_tokens;
     requested.budget_file = source.budget_file.clone();
     requested.sbd.as_mut().unwrap().refinement = source.sbd.as_ref().unwrap().refinement.clone();
+    requested.sbd.as_mut().unwrap().rows_per_pass=source.sbd.as_ref().unwrap().rows_per_pass;
     ensure!(requested.training_fingerprint(source_tokens)? == saved.config_sha256,
-        "TCT warm-start differs from its verified source beyond training_mode, decoder refinement, token budget or artifact_dir");
+        "TCT warm-start differs from its verified source beyond training mode, refinement, row execution, token budget or artifact_dir");
     Ok(json!({"source_training_sha256":saved.config_sha256,"verified_source_config":source_path,
-        "allowed_changes":["training_mode","sbd.refinement","tct","train_tokens","budget_file","artifact_dir"]}))
+        "allowed_changes":["training_mode","sbd.refinement","sbd.rows_per_pass","tct","train_tokens","budget_file","artifact_dir"]}))
 }
 
 /// Actual joint TCT training only: no held-out evaluation or generation routine is called.
@@ -596,8 +597,7 @@ pub fn run(c: &Config, arm: &Arm, seed: u64, device: &Device, resume: Option<&Pa
     let target_tokens = c.resolved_tokens()?;
     let quantum = c.tokens_per_step();
     ensure!(target_tokens >= quantum && target_tokens % quantum == 0,"TCT token budget must be a positive multiple of batch*context");
-    let mut identity_config = c.clone();
-    identity_config.sbd.as_mut().unwrap().refinement = None;
+    let identity_config = c.clone();
     let fingerprint = identity_config.training_fingerprint(target_tokens)?;
     let run_dir = c.artifact_dir.join(format!("tct-{}-seed{seed}",arm.name));
     std::fs::create_dir_all(&run_dir)?;
@@ -1019,6 +1019,13 @@ fn restart_checks(device:&Device,execution:CodpulaExecution,cocommit:bool)->Resu
     let saved = train::State {schema:1,config_sha256:c.training_fingerprint(c.train_tokens)?,data:json!({"fixture":"tct-restart-v1"}),
         arm:arm.name.clone(),seed:991,step:chains.steps,tokens:chains.scored_target_visits,training_seconds:0.0,initial_evaluation:Value::Null};
     save(&c,&path,&model,&optim,&saved,&chains)?;
+    crate::sbd::validate_checkpoint_identity(&c,&arm,991,&saved)?;
+    let decode_model=checkpoint::load_model(LanguageModel::new(&c,&arm,device)?,path.join("model.burnpack"),device)?;
+    let mut decode_config=c.clone();
+    decode_config.sbd.as_mut().unwrap().generate_tokens=8;
+    let decoded=crate::sbd::generate(&decode_model,&decode_config,&[256,11,19],device)?;
+    ensure!(decoded["finalized_tokens"]==8 && decoded["policy"]=="confidence"
+        && decoded["denoising_passes"]==TRAIN_ROUNDS+1,"saved TCT model did not use confidence refinement generation");
     let mut resumed = checkpoint::load_model(LanguageModel::new(&c,&arm,&target)?,path.join("model.burnpack"),&target)?;
     let mut resumed_optim = checkpoint::load_optimizer(&c,path.join("optimizer.burnpack"))?;
     let mut resumed_chains: TrainingState = serde_json::from_slice(&std::fs::read(path.join("tct.json"))?)?;
@@ -1141,6 +1148,8 @@ fn warm_start_checks() -> Result<Value> {
     let path = directory.0.join("checkpoint-1");
     let mut source = requested.clone();
     source.sbd.as_mut().unwrap().training_mode = TrainingMode::Sbd;
+    source.sbd.as_mut().unwrap().refinement=None;
+    source.sbd.as_mut().unwrap().rows_per_pass=Some(1);
     source.artifact_dir = directory.0.join("source-output");
     source.train_tokens = 32;
     let mut saved = train::State {schema:1,config_sha256:source.training_fingerprint(32)?,data:json!({"fixture":"source-config"}),
@@ -1149,7 +1158,7 @@ fn warm_start_checks() -> Result<Value> {
     runtime::write_json(&directory.0.join("metrics.json"),&metrics)?;
     requested.artifact_dir = directory.0.join("new-tct-output");
     requested.train_tokens = 32*5;
-    requested.sbd.as_mut().unwrap().refinement = Some(crate::remask::RefinementConfig::default());
+    requested.sbd.as_mut().unwrap().refinement = Some(crate::remask::RefinementConfig {policy:crate::mask_energy::MaskPolicy::Confidence,..Default::default()});
     let accepted = warm_start_identity(&requested,&path,&saved,requested.train_tokens)?;
     ensure!(accepted["verified_source_config"].is_string(),"changed-budget TCT warm-start did not prove source configuration");
     let mut changed_optimizer = requested.clone();
