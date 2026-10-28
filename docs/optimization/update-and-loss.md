@@ -66,9 +66,19 @@ TCT persists its source-step offset and validates the resulting global clock
 on subsequent resume. Other optimizer hyperparameter changes remain errors.
 Old optimizer records cannot silently resume changed clipping/schedule semantics.
 
+Pilots use a separate explicit optimizer horizon: one first-use update plus
+`pilot_steps` warm updates. They do not resolve or consume `budget_file`, since
+that file is their output and may be missing or stale. The existing time limit
+can truncate the warm loop without retiming its planned schedule; each arm reports
+`optimizer_schedule_steps` and actual `optimizer_updates`. Normal training still
+requires the resolved comparison budget, and checkpoint continuation is unchanged.
+The implementation uses the same optimizer groups with an explicit horizon,
+rather than cloning configuration or inventing a replacement training-token budget.
+
 New, **not executed by the implementation worker**, acceptance cases cover the
 `.8 + .8` global-clipping counterexample, unequal tensor directions, finite guards,
-numeric decay exclusions and the Lngram rate, moment-level clipping checks,
+numeric decay exclusions (including `wavelet_norm.gamma`/`beta`, nonzero Kron
+gate-bias vectors and the separate soft-confidence group), the Lngram rate, moment-level clipping checks,
 native/fused updates against scalar float64, exact checkpoint continuation across
 the schedule with an intermittently absent gradient, changed-target TCT horizon
 import, and skip-draw→soft-draw head restart using global LR/local Adam counters.
@@ -76,6 +86,14 @@ Run the integrated
 CPU test suite and `update-loss-reference` without an obsolete historical
 `--resume` checkpoint. No tolerance was loosened. Historical timings and passes
 below do not certify this changed recipe.
+
+The CPU regression `pilot_creates_fresh_budget_and_replaces_stale_budget_without_consuming_either`
+runs actual tiny pilots against first a missing, then an invalid stale budget,
+checks the two-update optimizer horizon/counter, and validates each regenerated
+budget through the normal training-budget reader. This regression is not a
+worker-executed result. A fresh-artifact Vulkan smoke is
+`delta-experiment benchmark configs/lm512-projections.json`; run it only after
+selecting a fresh artifact/budget path, under the integration GPU lock/deadline.
 
 
 ## Scope and baseline

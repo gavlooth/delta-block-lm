@@ -25,6 +25,9 @@ pub(crate) fn optimizer_config(c: &Config) -> AdamWConfig {
         .with_epsilon(c.optimizer_epsilon)
 }
 pub(crate) fn optimizer(c: &Config) -> ModuleOptimizer {
+    optimizer_with_steps(c, c.resolved_tokens().expect("resolved optimizer token budget")/c.tokens_per_step())
+}
+fn optimizer_with_steps(c: &Config, steps: usize) -> ModuleOptimizer {
     let optimizer = burn::optim::ModuleOptimizer::from(crate::update::AdamW::new(c, c.weight_decay, 1.0))
         .with_group(
             burn::module::ParamGroup::from_regex(crate::update::NO_DECAY_PARAMETERS)
@@ -37,7 +40,7 @@ pub(crate) fn optimizer(c: &Config) -> ModuleOptimizer {
             crate::update::AdamW::new(c, 0.0, 5.0),
             None,
         );
-    ModuleOptimizer::new(c, optimizer)
+    ModuleOptimizer::with_horizon(c, optimizer, steps)
 }
 pub(crate) fn optimizer_step(
     c: &Config,
@@ -479,6 +482,9 @@ pub fn run(
 }
 
 pub fn pilot(c: &Config, device: &Device) -> Result<Value> {
+    // One first-use update plus the configured warm-update cap. A pilot produces
+    // its comparison budget; it must not read that missing or stale output first.
+    let optimizer_steps = c.pilot_steps.checked_add(1).context("pilot update count overflow")?;
     let corpus = loaded_corpus(c)?;
     let mut arms = Vec::new();
     let mut slowest = f64::INFINITY;
@@ -486,7 +492,7 @@ pub fn pilot(c: &Config, device: &Device) -> Result<Value> {
         device.seed(c.seed);
         let train_device = device.clone().autodiff();
         let mut model = LanguageModel::new(c, arm, &train_device)?;
-        let mut optim = optimizer(c);
+        let mut optim = optimizer_with_steps(c, optimizer_steps);
         let rows = data::examples(c, corpus.as_ref(), c.seed, 0, c.batch_size, "train")?;
         let batch = Batch::new(&rows,&train_device);
         let first = Instant::now();
@@ -536,7 +542,7 @@ pub fn pilot(c: &Config, device: &Device) -> Result<Value> {
             "invalid pilot throughput"
         );
         slowest = slowest.min(throughput);
-        arms.push(json!({"arm":arm,"training_algorithm":arm.training_algorithm(c),"custom_gpu_kernel_proof":arm.uses_custom_gpu(c),"hola_work_per_model_forward":attention_work(c,arm)?,"first_use_forward_backward_step_seconds":first_use,"warm_steps":steps,"warm_seconds":seconds,"tokens_per_second":throughput,"backward_passes":passes,"rows_per_pass":rows_per_pass}));
+        arms.push(json!({"arm":arm,"training_algorithm":arm.training_algorithm(c),"custom_gpu_kernel_proof":arm.uses_custom_gpu(c),"hola_work_per_model_forward":attention_work(c,arm)?,"first_use_forward_backward_step_seconds":first_use,"warm_steps":steps,"warm_seconds":seconds,"tokens_per_second":throughput,"backward_passes":passes,"rows_per_pass":rows_per_pass,"optimizer_schedule_steps":optimizer_steps,"optimizer_updates":optim.completed_steps()}));
         drop(model);
         device.memory_cleanup();
     }
@@ -827,6 +833,35 @@ pub fn compare(c: &Config, device: &Device, decision: bool) -> Result<Value> {
 #[cfg(test)]
 mod summary_tests {
     use super::*;
+    #[test]
+    fn pilot_creates_fresh_budget_and_replaces_stale_budget_without_consuming_either() {
+        let directory = std::env::temp_dir().join(format!("delta-pilot-horizon-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut c = Config::default();
+        c.artifact_dir = directory.clone();
+        c.budget_file = Some(directory.join("budget.json"));
+        c.d_model = 8;
+        c.layers = 1;
+        c.context = 16;
+        c.association_counts = vec![1];
+        c.pilot_steps = 1;
+        c.pilot_seconds = 10.0;
+        c.comparison_seconds = 0.001;
+        assert!(c.resolved_tokens().is_err(), "fresh fixture unexpectedly has a training budget");
+        let device = Device::ndarray();
+        let fresh = pilot(&c, &device).unwrap();
+        assert_eq!(fresh["measurements"][0]["optimizer_schedule_steps"], 2);
+        assert_eq!(fresh["measurements"][0]["optimizer_updates"], 2);
+        assert_eq!(c.resolved_tokens().unwrap(), fresh["train_tokens"].as_u64().unwrap() as usize);
+        runtime::write_json(c.budget_file.as_ref().unwrap(),
+            &json!({"pilot_config_sha256":"stale","train_tokens":123456})).unwrap();
+        assert!(c.resolved_tokens().unwrap_err().to_string().contains("stale pilot budget"));
+        let renewed = pilot(&c, &device).unwrap();
+        assert_eq!(renewed["measurements"][0]["optimizer_schedule_steps"], 2);
+        assert_eq!(renewed["measurements"][0]["optimizer_updates"], 2);
+        assert_eq!(c.resolved_tokens().unwrap(), renewed["train_tokens"].as_u64().unwrap() as usize);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
     #[test]
     fn pairwise_training_writes_source_metrics_without_an_energy() {
         let root = std::env::temp_dir().join(format!("delta-source-metrics-{}", std::process::id()));

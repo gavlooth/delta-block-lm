@@ -133,6 +133,11 @@ pub struct NeuralOptimizer {
 }
 impl NeuralOptimizer {
     pub fn new(c: &crate::config::Config, inner: ModuleOptimizer) -> Self {
+        Self::with_horizon(c, inner,
+            c.resolved_tokens().expect("resolved optimizer token budget")/c.tokens_per_step())
+    }
+    /// An explicit update horizon avoids consuming a budget that a pilot is producing.
+    pub fn with_horizon(c: &crate::config::Config, inner: ModuleOptimizer, steps: usize) -> Self {
         let soft_group = c.sbd.as_ref().filter(|s| s.feedback == crate::config::SbdFeedback::SoftFeedback)
             .map(|_|burn::module::ParamGroup::from_regex(SOFT_CONFIDENCE).expect("soft confidence parameter paths"));
         let inner = if let Some(group) = &soft_group {
@@ -141,7 +146,7 @@ impl NeuralOptimizer {
         Self { inner, recipe: Recipe { revision: "kron-global-adamw-soft-head-v1".into(),
             beta1: c.optimizer_beta1, beta2: c.optimizer_beta2, epsilon: c.optimizer_epsilon,
             decay: c.weight_decay, clip: c.gradient_clip, peak: c.learning_rate,
-            steps: c.resolved_tokens().expect("resolved optimizer token budget")/c.tokens_per_step(),
+            steps,
             warmup_fraction: c.warmup_fraction, minimum_ratio: c.min_learning_rate_ratio,
             soft_peak: soft_group.as_ref().map(|_|c.soft_confidence_learning_rate),
             soft_warmup_steps: c.soft_confidence_warmup_steps },
@@ -233,7 +238,7 @@ pub fn clipping_checks(device: &Device) -> Result<serde_json::Value> {
 
 /// Numeric group check with the production constructor and actual parameter paths.
 pub fn optimizer_group_checks(c: &crate::config::Config, device: &Device) -> Result<serde_json::Value> {
-    use burn::nn::{Linear, LinearConfig, RmsNorm, RmsNormConfig};
+    use burn::nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig};
     // Make the no-decay and 5x-rate effects much larger than the unchanged oracle tolerance.
     let mut fixture = c.clone();
     fixture.learning_rate = 0.05;
@@ -255,6 +260,7 @@ pub fn optimizer_group_checks(c: &crate::config::Config, device: &Device) -> Res
     #[derive(Module, Debug)]
     struct Parameters {
         norm: RmsNorm, erase: Linear, write: Linear, output_gate: Linear,
+        wavelet_norm: LayerNorm,
         decay_scale: Param<Tensor<1>>, decay_bias: Param<Tensor<1>>,
         a_log: Param<Tensor<1>>, b_delta: Param<Tensor<1>>, gate_bias: Param<Tensor<1>>,
         lngram: Tables, frozen: Param<Tensor<1>>,
@@ -262,9 +268,15 @@ pub fn optimizer_group_checks(c: &crate::config::Config, device: &Device) -> Res
     }
     let device = device.clone().autodiff();
     let one = || Param::from_tensor(Tensor::<1>::ones([1], &device));
-    let linear = || LinearConfig::new(1, 1).init(&device);
-    let parameters = Parameters { norm: RmsNormConfig::new(1).init(&device),
-        erase: linear(), write: linear(), output_gate: linear(),
+    let linear = |width| {
+        let mut layer = LinearConfig::new(2, width).init(&device);
+        layer.bias = Some(Param::from_tensor(Tensor::<1>::ones([width], &device)));
+        layer
+    };
+    let mut wavelet_norm = LayerNormConfig::new(3).init(&device);
+    wavelet_norm.beta = Some(Param::from_tensor(Tensor::<1>::ones([3], &device)));
+    let parameters = Parameters { norm: RmsNormConfig::new(1).init(&device), wavelet_norm,
+        erase: linear(4), write: linear(4), output_gate: linear(8),
         decay_scale: one(), decay_bias: one(), a_log: one(), b_delta: one(), gate_bias: one(),
         lngram: Tables { tables: vec![Table { weight: Param::from_tensor(Tensor::<2>::ones([1,1], &device)) }] },
         soft_confidence: SoftConfidence { raw_scale: one(), raw_centre_neg: one(), raw_steep: one() },
@@ -287,9 +299,15 @@ pub fn optimizer_group_checks(c: &crate::config::Config, device: &Device) -> Res
         }
     }
     let mut before = Values::default(); parameters.visit(&mut before);
+    for name in ["wavelet_norm.gamma","wavelet_norm.beta","erase.bias","write.bias","output_gate.bias",
+        "soft_confidence.raw_scale","soft_confidence.raw_centre_neg","soft_confidence.raw_steep"] {
+        ensure!(before.values.contains_key(name), "missing decay-exclusion fixture path: {name}");
+    }
     let mut gradients = Gradients { values: GradientsParams::new() }; parameters.visit(&mut gradients);
     let count = gradients.values.len();
-    let g = (f64::from(c.gradient_clip)/(count as f64).sqrt()).min(1.0);
+    let elements = before.values.iter().filter(|(name,_)|name.as_str()!="frozen")
+        .map(|(_,values)|values.len()).sum::<usize>();
+    let g = (f64::from(c.gradient_clip)/(elements as f64).sqrt()).min(1.0);
     let mut optimizer = crate::train::optimizer(c);
     let lr = c.learning_rate*learning_rate_factor(0, optimizer.recipe.steps, c.warmup_fraction, c.min_learning_rate_ratio);
     let updated = optimizer.step(c.learning_rate, parameters, gradients.values);
@@ -316,7 +334,9 @@ pub fn optimizer_group_checks(c: &crate::config::Config, device: &Device) -> Res
             ensure!(error <= 2e-5+3e-4*expected.abs(), "optimizer group {name}: {b} vs {expected}");
             maximum = maximum.max(error);
         }
-        groups.insert(name.clone(), serde_json::json!({"decay":decayed,"lr_multiplier":if table {5}else{1},"frozen":frozen}));
+        groups.insert(name.clone(), serde_json::json!({"decay":decayed,
+            "lr_multiplier":if table {5}else{1},"absolute_rate":head.then_some(rate),
+            "elements":values.len(),"frozen":frozen}));
     }
     let reader = burn_pack::Reader::from_bytes(optimizer.into_bytes()?)?;
     let mut checked_moments = 0;
@@ -332,7 +352,7 @@ pub fn optimizer_group_checks(c: &crate::config::Config, device: &Device) -> Res
         checked_moments += 1;
     }
     ensure!(checked_moments == count*2, "missing optimizer moment checks");
-    Ok(serde_json::json!({"passed":true,"groups":groups,"global_gradient_norm":(count as f64).sqrt(),
+    Ok(serde_json::json!({"passed":true,"groups":groups,"global_gradient_norm":(elements as f64).sqrt(),
         "global_coefficient":g,"checked_moments":checked_moments,"maximum_parameter_error":maximum}))
 }
 
