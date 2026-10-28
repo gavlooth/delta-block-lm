@@ -128,7 +128,7 @@ pub(crate) fn forward_kernel(
         }
         let token = (b * time + t) * heads + h;
         if shard == 0 {
-            packed[token * V + j] = reduction[j];
+            packed[token * V + j] = reduction[j] / f32::sqrt(K as f32);
         }
         if lane == 0 {
             auxiliary[token * 4] = correction;
@@ -245,7 +245,7 @@ pub(crate) fn backward_kernel(
             if active {
                 value = v[ix(v, b, t, h, j)];
                 beta = erase[ix(erase, b, t, h, 0)];
-                dy = upstream[(token * V + j) * upstream.stride(0)];
+                dy = upstream[(token * V + j) * upstream.stride(0)] / f32::sqrt(K as f32);
                 score_grad = upstream[(output_len + state_len + token) * upstream.stride(0)];
                 a = 0;
                 while a < K / partitions {

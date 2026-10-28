@@ -573,7 +573,7 @@ fn prepare_model_case(
         report,
     })
 }
-/// Actual normalized model scope only; the unresolved legacy stress diagnostic is not accepted.
+/// Actual normalized model scope only; primitive stress certification is separate.
 pub fn model_check(c: &Config, device: &Device, configured_only: bool) -> Result<Value> {
     ensure!(
         c.backend == "cpu" || c.backend == "vulkan",
@@ -588,7 +588,7 @@ pub fn model_check(c: &Config, device: &Device, configured_only: bool) -> Result
     let report_path = directory.join("report.json");
     let mut result = json!({"schema":1,"command":"kron-model-check","scope":"actual_normalized_full_model_only",
         "completed":false,"passed":false,"global_tensor_solver_stress_accepted":false,
-        "known_legacy_diagnostic":"Central Vulkan TensorSolver T7 nonzero-initial-state/zero-decay stress VJP failed separately; this command neither repairs nor accepts that path on all primitive inputs",
+        "known_legacy_diagnostic":"Historical Vulkan TensorSolver stress failure was corrected by rowwise dot-GEMM; retained acceptance at e1cb69ce/53a684349a1a is documented in docs/optimization/tensor-solver.md, not re-exercised by this model-only command",
         "config":c,"device":runtime::identity(device),"directory":directory,
         "absolute_tolerance":ATOL,"relative_tolerance":RTOL,"cases":[]});
     result["execution_scope"] = json!(if configured_only {
@@ -855,10 +855,6 @@ pub fn model_run(
         c.backend == "cpu" || c.backend == "vulkan",
         "model benchmark is local CPU/Vulkan only"
     );
-    ensure!(
-        c.backend != "vulkan" || legacy_report.is_some(),
-        "Vulkan model benchmark requires --legacy-stress-report with the retained TensorSolver failure evidence"
-    );
     let started = Instant::now();
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     std::fs::create_dir_all(&c.artifact_dir)?;
@@ -882,9 +878,9 @@ pub fn model_run(
         let copy = directory.join("legacy-tensor-stress.json");
         std::fs::write(&copy, &bytes)?;
         json!({"certified":false,"source":path,"retained_copy":copy,"sha256":data::hash(&bytes),
-            "known_issue":value["error"],"acceptance_policy":"retained failure; not repaired, suppressed or accepted by this scoped benchmark"})
+            "historical_error":value["error"],"acceptance_policy":"historical pre-correction failure retained unchanged; not a current defect or fresh certification"})
     } else {
-        json!({"certified":false,"scope":"CPU model only; no Vulkan legacy stress certification claimed"})
+        json!({"certified":false,"scope":"model-only command; primitive stress certification must be run separately"})
     };
     let mut result = json!({"schema":1,"command":"kron-model-benchmark","scope":"actual_normalized_full_model",
         "completed":false,"global_tensor_solver_stress_accepted":false,"legacy_gpu_stress":legacy_evidence,

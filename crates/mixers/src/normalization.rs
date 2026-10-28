@@ -20,7 +20,8 @@ impl NormalizationBackend {
     }
     pub fn l2(self, x: Tensor<4>) -> Tensor<4> {
         if self.is_tensor() {
-            return x.clone() / (x.square().sum_dim(3) + 1e-6).sqrt();
+            // Floor before sqrt so the zero-vector backward never evaluates 0/0.
+            return x.clone() / x.square().sum_dim(3).clamp_min(1e-24).sqrt();
         }
         #[cfg(any(feature = "vulkan", feature = "cuda"))]
         {

@@ -91,7 +91,7 @@ pub fn scan(
         for i in 0..k {
             for j in 0..v {
                 state[i * v + j] += x.k[i] * edit[j];
-                out[j] += x.q[i] * state[i * v + j];
+                out[j] += x.q[i] * state[i * v + j] / (k as f64).sqrt();
             }
         }
         output.push(out);
@@ -147,8 +147,9 @@ pub fn backward(
         let mut bar = vec![0.; k * v];
         for i in 0..k {
             for j in 0..v {
-                g.q[i] += forward.states[t][i * v + j] * upstream[t][j];
-                adj[i * v + j] += x.q[i] * upstream[t][j];
+                let dy = upstream[t][j] / (k as f64).sqrt();
+                g.q[i] += forward.states[t][i * v + j] * dy;
+                adj[i * v + j] += x.q[i] * dy;
                 bar[i * v + j] = x.alpha[i] * previous[i * v + j];
             }
         }

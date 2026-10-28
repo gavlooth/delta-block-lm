@@ -8,7 +8,6 @@ const trials = Number(process.argv[5] ?? "5");
 const mode = process.argv[6] ?? "strict";
 const legacyReport = process.argv[7] ? resolve(process.argv[7]) : undefined;
 if (!["strict", "model"].includes(mode)) throw new Error("scope: strict | model");
-if (mode === "model" && backend !== "cpu" && !legacyReport) throw new Error("model Vulkan comparison requires the retained failed TensorSolver kron-reference JSON as final argument");
 if (legacyReport && !await Bun.file(legacyReport).exists()) throw new Error("retained legacy stress evidence does not exist");
 if (!["cpu", "vulkan", "both"].includes(backend)) throw new Error("backend: cpu | vulkan | both (local only)");
 if (!Number.isInteger(warmups) || warmups < 1 || warmups > 20 || !Number.isInteger(trials) || trials < 3 || trials > 31) throw new Error("warmups 1..20; trials 3..31");

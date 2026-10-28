@@ -23,20 +23,24 @@ omits `normalization_backend`, retaining tensor normalization/gating. See
 evidence; the opt-in selectors exist for reproduction, not as a third
 recommended configuration.
 
-The expanded checks expose a legacy GPU TensorSolver key-gradient error on a short nonzero-initial-state stress case. CPU and fused Kron pass. The global `reference` / strict `kron-benchmark` intentionally still report that failure. Current optimized checks and the separately scoped model benchmark are:
+The historical GPU TensorSolver short/nonzero-initial-state key-gradient failure was corrected by rowwise dot-GEMM. Retained acceptance at `e1cb69ce` / integration `53a684349a1a` is recorded in `docs/optimization/tensor-solver.md`; original negative reports remain unchanged. That evidence predates the current paper-math corrections and is not fresh certification. Current operator and model commands are:
 
 ```sh
 timeout 120s target/debug/delta-experiment kron-reference configs/reference-vulkan.json --scan-backend fused_gpu
 timeout 120s target/debug/delta-experiment hola-reference configs/reference-vulkan.json
 timeout 120s target/debug/delta-experiment benchmark configs/lm512-kron-fused.json
-# On the affected backend this exits 1 and creates the retained report:
+# Historical stress fixture: no expected failure is imposed on the corrected solver.
 timeout 120s target/debug/delta-experiment kron-reference configs/reference-vulkan.json --scan-backend tensor_solver --tokens 7 --objective output_only
-timeout 400s target/debug/delta-experiment kron-model-benchmark configs/kron-benchmark.json --warmups 2 --trials 5 --legacy-stress-report artifacts/reference-vulkan/kron-reference.json
+timeout 400s target/debug/delta-experiment kron-model-benchmark configs/kron-benchmark.json --warmups 2 --trials 5
 ```
 
-The scoped model benchmark requires and preserves the real failed legacy report, then checks its exact normalized workloads against CPU logits, every parameter gradient and AdamW updates, with a directional finite-difference sanity check. It never certifies arbitrary legacy-solver inputs. Checkpoints are timed separately; training-step times include production loss and finite-gradient scalar readbacks.
-
-Do not chain the expected failing diagnostic with `&&`. If the legacy checks instead pass on your backend/version, use the strict all-path benchmark; do not construct fake failed evidence.
+The scoped model benchmark checks exact normalized workloads against CPU
+logits, every parameter gradient and AdamW updates, with a directional
+finite-difference guard. Optional `--legacy-stress-report` preserves a real
+pre-correction failed report as history, not a prerequisite or current defect.
+Primitive all-input acceptance remains a separate reference/strict-benchmark
+scope. Checkpoints are timed separately; training-step times include
+production loss and finite-gradient scalar readbacks.
 
 Run commands from the workspace root. The reference and soft-feedback commands are numerical checks, not training results. Step 7 adds opt-in causal Lngram injections. SBD training, generation and evaluation are implemented, but the within-block attention design remains undecided; see `docs/sbd.md`.
 
@@ -207,10 +211,8 @@ timeout 930s target/debug/delta-experiment kron-benchmark configs/kron-benchmark
 timeout 930s target/debug/delta-experiment hola-benchmark configs/kron-benchmark.json --trials 5
 # Full-model numerical preflight only (no throughput), CPU truth plus directional guard:
 timeout 930s target/debug/delta-experiment kron-model-check configs/kron-benchmark.json
-# Actual CPU-certified model scope, preserving the separate legacy failure:
-timeout 930s target/debug/delta-experiment kron-model-benchmark configs/kron-benchmark.json --warmups 2 --trials 5 --legacy-stress-report artifacts/reference-vulkan/kron-reference.json
-# Same explicit scope through the bounded Bun runner:
-bun scripts/benchmark-kron.ts vulkan target/debug/delta-experiment 2 5 model artifacts/reference-vulkan/kron-reference.json
+# Actual CPU-certified model scope; optional retained pre-correction evidence:
+timeout 930s target/debug/delta-experiment kron-model-benchmark configs/kron-benchmark.json --warmups 2 --trials 5
 ```
 
 The command writes only a unique `kron-benchmark-*` namespace, never an old suite budget, metric, checkpoint or certificate. The Bun runner records subprocess deadlines/outcomes and stops on failure. Partial reports are retained. This is scratch numerical/performance work, not a new quality-training run.
@@ -221,9 +223,20 @@ Isolated HOLA forward/backward timings additionally cover contexts 128/512 at ca
 
 `hola-benchmark` invokes those same per-fixture gates and paired timings independently of Kron's recurrence gate. It writes a unique `hola-benchmark-*` namespace with raw samples, medians and two warmups per mode, under the configured deadline. It establishes only isolated HOLA operator throughput, not Kron equivalence or full-model training throughput. Its first shape-specific calls precede per-fixture correctness preflight; caches may already be warm, so these calls are not isolated cold-JIT measurements. Warm throughput samples follow the checked preflight and two warmups.
 
-`kron-model-check` independently checks the actual normalized language model at contexts 128/512 with HOLA off/on, without making an all-primitive-input claim for the unresolved legacy TensorSolver stress diagnostic. It uses canonical identical parameters, a CPU full-parameter directional finite-difference guard, and CPU logits/every parameter gradient/AdamW-updated parameters as the reference for each actual execution combination. Missing or nonfinite gradients fail. Results and any failure context are retained in a unique namespace before a nonzero exit. No timing or training-quality result is produced by this command. The paired benchmark reuses this same full-model preflight before its step timing; its separate all-stress gate remains intact.
+`kron-model-check` independently checks the normalized language model at
+contexts 128/512 with HOLA off/on. It uses identical canonical parameters, a
+CPU directional finite-difference guard, and CPU logits/every parameter
+gradient/AdamW-updated parameters as reference for each execution combination.
+Missing/nonfinite gradients fail; reports retain the actual failure context.
+This model-only check does not freshly certify arbitrary primitive inputs.
 
-`kron-model-benchmark` independently accepts the new selected kernels against all float64 stress fixtures, then reuses the exact CPU-certified model preflight and paired full-model AdamW/checkpoint timing loop. Its declared scope is only the actual normalized model workload. On Vulkan it requires a retained failed TensorSolver `kron-reference` report, validates that provenance, copies the original bytes and records their SHA256 alongside the known issue. `global_tensor_solver_stress_accepted` remains false. The legacy arbitrary-input GPU failure is neither hidden nor accepted, and the strict `kron-benchmark` gate remains unchanged. Artifact namespaces are unique; earlier reports, suite budgets and checkpoints are not overwritten. The Bun runner defaults to strict scope; the `model` argument selects this narrower, explicitly CPU-certified comparison.
+`kron-model-benchmark` independently checks selected kernels against f64 stress
+fixtures and reuses the CPU-certified model preflight before timing. Optional
+`--legacy-stress-report` copies/hashes an actual failed pre-correction Vulkan
+report unchanged. `global_tensor_solver_stress_accepted=false` means this
+scoped command does not run that separate all-input certification, not that the
+corrected solver is known to fail. The strict benchmark gate remains intact.
+Unique namespaces preserve earlier reports, budgets and checkpoints.
 
 Before throughput is published, independent f64 recurrence checks cover output/final-state/physical-score values and VJPs, including initial state and single-output objectives. Each paired fixture then checks output/state/score/input-gradient equivalence; each full model checks identical initialization, logits, every parameter gradient and the first complete AdamW update. Missing/nonfinite full-model gradients fail. HOLA's isolated checks additionally certify exact cache membership and sink/read gradients.
 
@@ -395,7 +408,7 @@ Historical dense-attention SBD checkpoints are incompatible with the current SBD
 ## Deterministic recall and paired comparisons
 
 ```sh
-# One-seed small full-model smoke for all four arms and matched recency controls:
+# One-seed small full-model smoke for KronLSTM/no-cache and HOLA isolation:
 timeout 300s bun scripts/run-experiments.ts smoke cpu
 # Pilot -> one paired smoke seed -> exactly three paired decision seeds:
 timeout 1500s bun scripts/run-experiments.ts recall128 vulkan
@@ -404,11 +417,11 @@ timeout 1500s bun scripts/run-experiments.ts recall512 vulkan
 
 The runner does not build anything. Its optional fourth argument selects an already-built executable. It writes a resolved configuration per suite/backend and uses a separate hard deadline for each subprocess; command exit codes, elapsed time, stdout and stderr paths are recorded in `command-outcomes.json`. Any nonzero exit stops the sequence. An incomplete one-seed budget stops before the three-seed comparison. Repeating a comparison reuses completed metrics unchanged after validating the complete config/resolved-token-budget fingerprint, current corpus/evaluation identity, arm, seed, precision, optimizer, full-model training path, backend, actual device identity and measurement implementation version `guarded-validated-load-v2`. It does not reload models or re-evaluate completed runs and therefore preserves the original measured loss, training memory and timing. Older measurement versions fail with an explicit `train --resume` or evaluation-only `certify` action; they are never silently treated as corrected evaluations. Only matching incomplete runs resume `latest.json`, retaining the original fixed budget. Historical checkpoint baselines are untrusted for improvement claims until certification regenerates them; absent trusted baselines make improvement null and withhold learning eligibility. Measurement versioning does not change checkpoint configuration/data fingerprints.
 
-The planned recall files use two layers, width 128, contexts 128/512 and the inherited four heads, key width 32, value width 64 and chunk 16. The intentionally smaller smoke file uses one layer, width 32 and context 32 only to exercise training cheaply. The context-128 file includes both matched-size recency controls; the context-512 file does not scale those controls into the entire grid. Cache capacity starts at 16 and can be changed in the file.
+The planned recall files use two layers, width 128, contexts 128/512 and the inherited four heads, key width 32, value width 64 and chunk 16. The intentionally smaller smoke file uses one layer, width 32 and context 32 only to exercise training cheaply. Production arms use surprise-retained HOLA; no-cache cases isolate its contribution. Recency controls remain internal numerical comparisons, not production arms. Cache capacity starts at 16 and can be changed explicitly in the file.
 
 Each example stores distinct random keys and values, inserts distractor filler, then asks multiple queries in shuffled order. Loss is applied only to answer positions, whose answers occur later than the query input. Association count and query-to-write distance are reported separately and jointly. A hash partition of the complete input/label sequence prevents **any** example collision from crossing training/evaluation splits. Evaluation has its own fixed seed and recorded fixture hash, independent of training seeds. Training example index is a pure function of seed and step, so resume preserves data order.
 
-`benchmark CONFIG` measures first-use forward/backward/AdamW separately, then a short warm full-model training pilot for every configured KronLSTM cache arm. It writes `budget.json`: slowest measured arm throughput times `comparison_seconds`, rounded down to complete batches (at least one). The configured no-cache/HOLA/recency arms receive that fixed token budget. The budget loader requires a SHA256 identity of the entire resolved configuration plus optimizer, precision and training-path identity; changing cache capacity or optimizer settings invalidates an existing pilot as surely as changing dimensions or arms. The runner preserves an existing budget, but stale identities fail before training and require a fresh pilot/artifact directory. Hyperparameters and arms live in files, not code.
+`benchmark CONFIG` measures first-use forward/backward/AdamW separately, then a short warm full-model training pilot for every configured KronLSTM cache arm. It writes `budget.json`: slowest measured arm throughput times `comparison_seconds`, rounded down to complete batches (at least one). Configured no-cache/HOLA isolation arms receive that fixed token budget. The budget loader requires a SHA256 identity of the entire resolved configuration plus optimizer, precision and training-path identity; changing cache capacity or optimizer settings invalidates an existing pilot as surely as changing dimensions or arms. The runner preserves an existing budget, but stale identities fail before training and require a fresh pilot/artifact directory. Hyperparameters and arms live in files, not code.
 
 `compare CONFIG` runs one paired seed; `decision CONFIG` runs exactly three distinct paired seeds. Results include actual parameter counts, recurrent-state bytes, HOLA plus current-chunk memory, convolution-state bytes, training throughput, held-out losses, recall breakdowns and warm next-token latency. `hola_work_per_model_forward` counts allocated history, current-chunk and sink attention pairs across all layers, plus exact pairwise-rank comparisons and sort input elements; it includes masked/unfilled slots and does not pretend sort elements are sort comparisons or infer backward FLOPs. Decode timing is explicitly full-prefix recomputation, not an unimplemented incremental cache benchmark. The decision summary reports paired seed values, seed standard deviation and a quality/throughput/state-memory Pareto screen, not a single-seed winner. It withholds decision eligibility unless all budgets finish and each arm improves mean held-out NLL. A recall improvement is not a language-modeling result.
 
@@ -474,7 +487,7 @@ For each arm it records logical parameter SHA256 snapshots (shape, dtype, module
 All active model loads now use that synchronization boundary and compare every saved logical parameter's bytes, shape, dtype and parameter ID with the loaded value; any discrepancy is fatal. No CPU staging, backend patch or relaxed numerical tolerance is used. Production optimizer loads compare the stored and restored complete typed logical state, rejecting the upstream loader's otherwise-silent omission of unreconstructable states. Canonical state includes tensor name, dtype, shape, ID and logical bytes, scalar counters, path metadata, actual AdamWConfig and learning rate. Raw container hashes are retained for forensics but are not equality criteria: tensor insertion order and file offsets can differ without changing optimizer semantics. Diagnostics load the actual source optimizer when available before scratch continuation, then compare the next AdamW step's parameters, semantic optimizer state and logits. Installed Burn 0.22.0/0.22.1 source comparisons found identical core-record loading, parameter transformation and CubeCL tensor upload code, so there was no source evidence for a patch-version-only fix.
 
 ```sh
-# Six arms including recency controls; identical small fixture on each backend:
+# No-cache/HOLA isolation arms; identical small fixture on each backend:
 timeout 180s target/debug/delta-experiment checkpoint-check configs/checkpoint-cpu.json
 timeout 180s target/debug/delta-experiment checkpoint-check configs/checkpoint-vulkan.json
 # Diagnose actual Vulkan-trained weights without altering their source config/hash:

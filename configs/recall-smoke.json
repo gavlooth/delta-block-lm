@@ -17,7 +17,6 @@
   "comparison_seconds":10,
   "arms":[
     {"name":"kronlstm","mixer":"kronlstm","cache":"none"},
-    {"name":"kronlstm-hola","mixer":"kronlstm","cache":"surprise"},
-    {"name":"kronlstm-recency","mixer":"kronlstm","cache":"recency"}
+    {"name":"kronlstm-hola","mixer":"kronlstm","cache":"surprise"}
   ]
 }

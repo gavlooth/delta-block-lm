@@ -124,7 +124,8 @@ pub fn scan(
             .clone()
             .slice([0..batch, first..first + size])
             .reshape([batch, 1, size, 1]);
-        let q = slice(&input.q) * active.clone();
+        // Scale only read queries, never keys/writes or physical surprise scores.
+        let q = slice(&input.q) * (active.clone() / (keys as f64).sqrt());
         let k = slice(&input.k) * active.clone();
         let v = slice(&input.v) * active.clone();
         let erase = slice(&input.erase) * active.clone();
