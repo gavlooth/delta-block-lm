@@ -22,6 +22,14 @@ scored, and `cocommit_marker` when no marked branch is used. Every other missing
 gradient still stops the update. No zero-weight parameter terms are inserted
 into losses, and these counts do not assert that every parameter learned.
 
+For paired execution measurements, the ignored
+`warm_complete_step_and_generation_cost_sample` test accepts a validated
+`DELTA_COST_CONFIG` path. It reports three synchronized complete optimizer steps
+and three complete generation calls from fixed initial inference parameters.
+Discard the first two samples of each kind; alternate historical/current test
+executables for paired measurements. The outer generation timer includes prompt
+preparation and final history handling, not checkpoint I/O or model creation.
+
 Enabled-SBD training and pilot fingerprints retain the semantic revision introduced after dense attention removal. Selecting `hola_read` additionally changes the serialized model identity; omitted/explicit `none` keeps the previous SBD identity. Old dense-SBD checkpoints remain incompatible. Configurations without `sbd` retain their hashes.
 ### Configuration controls and validation
 
