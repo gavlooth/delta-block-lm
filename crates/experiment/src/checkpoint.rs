@@ -256,10 +256,17 @@ fn optimizer_reader_signature(c: &Config, reader: Reader) -> Result<Value> {
         json!({"tensors":tensors,"scalars":scalars,"metadata":metadata,"optimizer_config":serde_json::to_value(train::optimizer_config(c))?,"learning_rate":c.learning_rate}),
     )
 }
-pub fn load_optimizer(c: &Config, path: impl AsRef<Path>) -> Result<burn::optim::ModuleOptimizer> {
-    let path = path.as_ref();
+pub fn load_optimizer(c: &Config, path: impl AsRef<Path>) -> Result<crate::update::NeuralOptimizer> {
+    load_optimizer_recipe(c, path.as_ref(), false)
+}
+/// TCT warm-start/continuation keeps the source schedule horizon and logical clock.
+pub fn load_optimizer_for_continuation(c: &Config, path: impl AsRef<Path>) -> Result<crate::update::NeuralOptimizer> {
+    load_optimizer_recipe(c, path.as_ref(), true)
+}
+fn load_optimizer_recipe(c: &Config, path: &Path, source_horizon: bool) -> Result<crate::update::NeuralOptimizer> {
     let expected = optimizer_file_signature(c, path)?;
-    let optimizer = train::optimizer(c).load(path)?;
+    let optimizer = if source_horizon { train::optimizer(c).load_for_continuation(path)? }
+        else { train::optimizer(c).load(path)? };
     let actual = optimizer_signature(c, optimizer.into_bytes()?)?;
     ensure!(
         actual == expected,

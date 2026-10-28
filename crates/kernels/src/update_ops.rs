@@ -15,7 +15,7 @@ use burn_cubecl::CubeBackend;
 pub trait UpdateOps: Backend {
     #[fusion(meta = |x: &TensorSpec| TensorSpec::new([1].into(), x.dtype))]
     fn square_sum(x: FloatTensor<Self>) -> FloatTensor<Self>;
-    #[fusion(meta = |x: &TensorSpec, _g, _m, _v, _initialized, _time, _lr, _decay, _clip| (x.clone(), x.clone(), x.clone()))]
+    #[fusion(meta = |x: &TensorSpec, _g, _m, _v, _initialized, _time, _lr, _decay, _beta1, _beta2, _epsilon| (x.clone(), x.clone(), x.clone()))]
     fn adam(
         x: FloatTensor<Self>,
         g: FloatTensor<Self>,
@@ -25,7 +25,9 @@ pub trait UpdateOps: Backend {
         time: usize,
         lr: f64,
         decay: f32,
-        clip: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
     ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>);
 }
 impl UpdateOps for CubeBackend {
@@ -41,9 +43,11 @@ impl UpdateOps for CubeBackend {
         time: usize,
         lr: f64,
         decay: f32,
-        clip: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
     ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
-        crate::update::adam(x, g, m, v, initialized, time, lr, decay, clip)
+        crate::update::adam(x, g, m, v, initialized, time, lr, decay, beta1, beta2, epsilon)
     }
 }
 impl<B: Backend + UpdateOps, C: CheckpointStrategy> UpdateOps for Autodiff<B, C> {
@@ -59,7 +63,9 @@ impl<B: Backend + UpdateOps, C: CheckpointStrategy> UpdateOps for Autodiff<B, C>
         time: usize,
         lr: f64,
         decay: f32,
-        clip: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
     ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
         let (x, m, v) = B::adam(
             x.into_primitive(),
@@ -70,7 +76,9 @@ impl<B: Backend + UpdateOps, C: CheckpointStrategy> UpdateOps for Autodiff<B, C>
             time,
             lr,
             decay,
-            clip,
+            beta1,
+            beta2,
+            epsilon,
         );
         use burn::backend::AutodiffBackend;
         (
@@ -86,7 +94,7 @@ pub fn gradient_square_sum<const D: usize>(gradient: Tensor<D>) -> Tensor<1> {
         gradient.into_dispatch(),
     ))
 }
-/// First-order optimizer operation. Scalar arguments match Burn0.22 AdamW defaults exactly.
+/// First-order optimizer operation on globally clipped gradients, with explicit AdamW constants.
 pub fn adamw_update<const D: usize>(
     x: Tensor<D>,
     g: Tensor<D>,
@@ -95,7 +103,9 @@ pub fn adamw_update<const D: usize>(
     time: usize,
     lr: f64,
     decay: f32,
-    clip: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
 ) -> (Tensor<D>, Tensor<D>, Tensor<D>) {
     let initialized = m.is_some();
     assert_eq!(initialized, v.is_some());
@@ -109,7 +119,9 @@ pub fn adamw_update<const D: usize>(
         time,
         lr,
         decay,
-        clip,
+        beta1,
+        beta2,
+        epsilon,
     );
     (
         Tensor::from_dispatch(x),

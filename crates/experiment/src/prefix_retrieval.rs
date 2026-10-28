@@ -1,7 +1,8 @@
 //! Execution cost measurements only; no quality evaluation or training study.
 use crate::{config::Config,data::{self,Batch,Corpus},model::{self,LanguageModel},profile::median,runtime,sbd,train};
 use anyhow::{Result,ensure};
-use burn::{optim::{ModuleOptimizer,GradientsParams},prelude::*,tensor::Distribution};
+use burn::{optim::GradientsParams,prelude::*,tensor::Distribution};
+use crate::update::NeuralOptimizer as ModuleOptimizer;
 use delta_mixers::prefix_retrieval::{PrefixReadConfig,PrefixRetrievalBackend,read};
 use serde_json::{Value,json};
 use std::{collections::BTreeMap,sync::{Arc,Mutex},time::Instant};

@@ -50,7 +50,6 @@ fn adam_kernel(
     gradient: &View<f32>,
     first: &View<f32>,
     second: &View<f32>,
-    square: &View<f32>,
     output: &mut View<f32>,
     next_first: &mut View<f32>,
     next_second: &mut View<f32>,
@@ -59,25 +58,23 @@ fn adam_kernel(
     correction2: f32,
     decay: f32,
     lr: f32,
-    threshold: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
 ) {
     let i = ABSOLUTE_POS as usize;
     if i < parameter.len() {
-        // Burn clips each parameter separately, with f32::MIN_POSITIVE, not a global norm.
-        let coefficient = f32::min(
-            threshold / (f32::sqrt(square[0]) + 1.17549435e-38f32),
-            1.0f32,
-        );
-        let g = gradient[index(gradient, i)] * coefficient;
-        let mut m = g * (1.0f32 - 0.9f32);
-        let mut v = (g * g) * (1.0f32 - 0.999f32);
+        // The module boundary already applied the one global clipping coefficient.
+        let g = gradient[index(gradient, i)];
+        let mut m = g * (1.0f32 - beta1);
+        let mut v = (g * g) * (1.0f32 - beta2);
         if initialized {
-            m = first[index(first, i)] * 0.9f32 + m;
-            v = second[index(second, i)] * 0.999f32 + v;
+            m = first[index(first, i)] * beta1 + m;
+            v = second[index(second, i)] * beta2 + v;
         }
         next_first[i] = m;
         next_second[i] = v;
-        let delta = (m / correction1) / (f32::sqrt(v / correction2) + 1e-5f32);
+        let delta = (m / correction1) / (f32::sqrt(v / correction2) + epsilon);
         output[i] = parameter[index(parameter, i)] * decay - delta * lr;
     }
 }
@@ -132,7 +129,9 @@ pub(crate) fn adam(
     time: usize,
     lr: f64,
     weight_decay: f32,
-    threshold: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
 ) -> (CubeTensor, CubeTensor, CubeTensor) {
     validate(&[&parameter, &gradient, &first, &second]);
     assert_eq!(parameter.shape(), gradient.shape());
@@ -140,7 +139,6 @@ pub(crate) fn adam(
         assert_eq!(parameter.shape(), first.shape());
         assert_eq!(parameter.shape(), second.shape());
     }
-    let square = square_sum(gradient.clone());
     // Reuse only uniquely owned, contiguous buffers: each lane reads/writes its own element.
     // Shared model clones, record views and strided inputs retain independent output storage.
     let reuse_parameter = parameter.can_mut() && parameter.is_contiguous();
@@ -184,16 +182,17 @@ pub(crate) fn adam(
         gradient.into_tensor_arg(),
         first.into_tensor_arg(),
         second.into_tensor_arg(),
-        square.into_tensor_arg(),
         out_arg,
         m_arg,
         v_arg,
         initialized,
-        1f32 - 0.9f32.powi(time as i32),
-        1f32 - 0.999f32.powi(time as i32),
+        1f32 - beta1.powi(time as i32),
+        1f32 - beta2.powi(time as i32),
         (1.0 - lr * f64::from(weight_decay)) as f32,
         lr as f32,
-        threshold,
+        beta1,
+        beta2,
+        epsilon,
     );
     (out, m, v)
 }

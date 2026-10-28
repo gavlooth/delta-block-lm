@@ -7,7 +7,8 @@ use crate::{
     profile, runtime, train,
 };
 use anyhow::{Context, Result, ensure};
-use burn::{module::Module, optim::ModuleOptimizer, prelude::*};
+use burn::{module::Module, prelude::*};
+use crate::update::NeuralOptimizer as ModuleOptimizer;
 use burn_pack::Reader;
 use serde_json::{Value, json};
 use std::{

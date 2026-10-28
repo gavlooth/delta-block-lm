@@ -537,10 +537,8 @@ pub fn attribution(c: &Config, device: &Device, warmups: usize, trials: usize) -
         }
         g
     };
-    let mut optimizer = burn::optim::ModuleOptimizer::from(crate::update::LngramAdamW {
-        fused: !c.update_backend.is_tensor(),
-        clip: c.gradient_clip,
-    });
+    let mut optimizer = crate::update::NeuralOptimizer::new(c,
+        burn::optim::ModuleOptimizer::from(crate::update::AdamW::new(c, 0.0, 5.0)));
     let mut current = Some(tables);
     let mut samples = Vec::new();
     for iteration in 0..warmups + trials {

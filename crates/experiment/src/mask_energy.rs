@@ -506,9 +506,13 @@ pub fn fit(c: &Config, device: &Device) -> Result<Value> {
     train_device.seed(c.seed);
     let mut energy = MaskEnergy::new(dataset.feature_width, &train_device);
     energy.pair = energy.pair.map(|value| value.set_require_grad(false));
-    // Keep native AdamW state/settings, with the same deterministic clipping as model training.
-    let mut optimizer: burn::optim::ModuleOptimizer =
-        crate::update::TensorAdamW {decay:c.weight_decay,clip:c.gradient_clip}.into();
+    // The auxiliary rank fitter remains native and constant-rate, separate from Kron pretraining.
+    let mut fit_config = c.clone();
+    fit_config.update_backend = crate::config::UpdateBackend::Tensor;
+    fit_config.warmup_fraction = 0.0;
+    fit_config.min_learning_rate_ratio = 1.0;
+    fit_config.sbd = None;
+    let mut optimizer = crate::train::optimizer(&fit_config);
     let parts = if pairwise { 2 } else { 1 };
     let mut losses = Vec::with_capacity(parts * refinement.fit_steps);
     let mut part_reports = Vec::with_capacity(parts);

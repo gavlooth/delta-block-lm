@@ -9,9 +9,10 @@ use crate::{
 use anyhow::{Result, ensure};
 use burn::{
     module::{Module, ModuleMapper, ModuleVisitor, Param},
-    optim::{GradientsParams, ModuleOptimizer},
+    optim::GradientsParams,
     prelude::*,
 };
+use crate::update::NeuralOptimizer as ModuleOptimizer;
 use delta_mixers::{
     HolaBackend, MixerKind, ScanBackend,
     chunk::{self, ScanInput},

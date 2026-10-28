@@ -7,43 +7,37 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use burn::{
-    grad_clipping::GradientClippingConfig,
     module::Module,
-    optim::{AdamWConfig, ModuleOptimizer},
+    optim::AdamWConfig,
     prelude::*,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path, time::Instant};
+use crate::update::NeuralOptimizer as ModuleOptimizer;
 
 pub(crate) const MEASUREMENT_VERSION: &str = "per-parameter-gradient-counts-v3";
 pub(crate) fn optimizer_config(c: &Config) -> AdamWConfig {
     AdamWConfig::new()
         .with_weight_decay(c.weight_decay)
-        .with_grad_clipping(Some(GradientClippingConfig::Norm(c.gradient_clip)))
+        .with_beta_1(c.optimizer_beta1)
+        .with_beta_2(c.optimizer_beta2)
+        .with_epsilon(c.optimizer_epsilon)
 }
 pub(crate) fn optimizer(c: &Config) -> ModuleOptimizer {
-    let optimizer = if c.update_backend.is_tensor() {
-        crate::update::TensorAdamW {decay:c.weight_decay,clip:c.gradient_clip}.into()
-    } else {
-        crate::update::FusedAdamW {
-            decay: c.weight_decay,
-            clip: c.gradient_clip,
-        }
-        .into()
-    };
-    if c.lngram_layers.is_empty() {
-        return optimizer;
-    }
-    optimizer.with_group(
-        burn::module::ParamGroup::from_regex(r"(^|\.)lngram\.tables\.[0-9]+\.weight$")
-            .expect("Lngram table parameter path"),
-        crate::update::LngramAdamW {
-            fused: !c.update_backend.is_tensor(),
-            clip: c.gradient_clip,
-        },
-        None,
-    )
+    let optimizer = burn::optim::ModuleOptimizer::from(crate::update::AdamW::new(c, c.weight_decay, 1.0))
+        .with_group(
+            burn::module::ParamGroup::from_regex(crate::update::NO_DECAY_PARAMETERS)
+                .expect("norm/bias/decay parameter paths"),
+            crate::update::AdamW::new(c, 0.0, 1.0),
+            None,
+        ).with_group(
+            burn::module::ParamGroup::from_regex(crate::update::LNGRAM_TABLES)
+                .expect("Lngram table parameter paths"),
+            crate::update::AdamW::new(c, 0.0, 5.0),
+            None,
+        );
+    ModuleOptimizer::new(c, optimizer)
 }
 pub(crate) fn optimizer_step(
     c: &Config,
@@ -304,6 +298,8 @@ pub fn run(
         );
         model = checkpoint::load_model(model, path.join("model.burnpack"), device)?;
         optim = checkpoint::load_optimizer(c, path.join("optimizer.burnpack"))?;
+        ensure!(optim.completed_steps() == state.step,
+            "resume mismatch: optimizer schedule counter differs from saved training step");
         step = state.step;
         tokens = state.tokens;
         previous_seconds = state.training_seconds;
