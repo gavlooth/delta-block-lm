@@ -15,7 +15,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use burn::{
     module::{Module, ModuleVisitor, Param},
-    optim::{GradientsParams, ModuleOptimizer},
+    optim::GradientsParams,
     prelude::*,
 };
 use delta_mixers::sbd::{InBlockReads, NoisyReadBackend};
@@ -188,7 +188,8 @@ fn fixture_config(c: &Config, mixer: &str, extended: bool) -> (Config, Arm) {
     cfg.lngram_orders = vec![2, 3];
     cfg.soft_selection_backend = crate::config::SoftSelectionBackend::Cpu;
     cfg.soft_temperature = 0.8;
-    cfg.sbd = Some(SbdConfig { block_lengths: vec![4], joint_output: SbdJointOutput::Codpula,
+    cfg.soft_training_probability = 1.0;
+    cfg.sbd = Some(SbdConfig { block_lengths: vec![4], training_block_lengths: vec![4], joint_output: SbdJointOutput::Codpula,
         in_block_reads: if extended { InBlockReads::HolaRead } else { InBlockReads::None }, ..SbdConfig::default() });
     let arm = Arm { name: format!("{mixer}-{}", if extended { "hola" } else { "none" }), mixer: mixer.into(), cache: if extended { "surprise".into() } else { "none".into() } };
     cfg.arms = vec![arm.clone()];
@@ -403,9 +404,10 @@ fn output_paths(model: &LanguageModel, cfg: &Config, device: &Device) -> Result<
     let dirty_output = model.cached_blocks(&dirty_cache, &dirty_state, false);
     let dirty = readout(model, dirty_output, &dirty_state, target.clone(), 108.0)?;
     let dirty_report = compare_readouts(&dirty, &batched)?;
-    let clean_neural_gradients = model::checked_gradients(model,batched.loss.clone())?;
-    let dirty_neural_gradients = model::checked_gradients(model,dirty.loss.clone())?;
-    let padding_neural_gradients = compare_snapshots(&snapshot(model,Some(&dirty_neural_gradients))?,&snapshot(model,Some(&clean_neural_gradients))?,false)?;
+    let unused = model::unused_soft_parameters();
+    let (clean_neural_gradients,_) = model::checked_gradients_with_unused(model,batched.loss.clone(),&unused,&mut delta_mixers::profile::Unprofiled)?;
+    let (dirty_neural_gradients,_) = model::checked_gradients_with_unused(model,dirty.loss.clone(),&unused,&mut delta_mixers::profile::Unprofiled)?;
+    let padding_neural_gradients = compare_snapshots(&snapshot_with_unused(model,Some(&dirty_neural_gradients),&unused)?,&snapshot_with_unused(model,Some(&clean_neural_gradients),&unused)?,false)?;
     let clean_logits = output.logits.clone().detach().require_grad();
     let clean_features = output.features.clone().detach().require_grad();
     let clean_circuit = readout(model,DenoisingOutput { logits:clean_logits.clone(),features:clean_features.clone() },&state,target.clone(),108.0)?;
@@ -493,9 +495,9 @@ fn teacher_and_student(model: &LanguageModel, cfg: &Config, device: &Device) -> 
     let mut expected_state = state.clone();
     let (teacher_circuit,tokens,fixed) = sbd::prepare_circuit(model,teacher.clone().detach(),&state,cfg.soft_temperature)?;
     let expected_feedback = teacher_circuit.marginals(tokens,fixed)?.detach().log().reshape([4,VOCAB]);
-    expected_state.update(expected_feedback,1.0,1.0,cfg.soft_steps,cfg.sbd.as_ref().unwrap().candidate_width)?;
+    expected_state.update(expected_feedback,1.0,cfg.sbd.as_ref().unwrap().candidate_width,model.soft_confidence.as_ref().unwrap())?;
     let initial_observed = values(state.candidates.dense(VOCAB)).drain(VOCAB..2 * VOCAB).collect::<Vec<_>>();
-    sbd::update_feedback(model, cfg, teacher, &mut state, 1.0)?;
+    sbd::update_feedback(model, cfg, teacher, &mut state)?;
     identical(&values(state.candidates.dense(VOCAB))[VOCAB..2 * VOCAB], &initial_observed, "teacher changed observed feedback distribution")?;
     let temperature_report = compare(&values(state.candidates.dense(VOCAB)),&values(expected_state.candidates.dense(VOCAB)))?;
     let visibility_report = compare(&values(state.visibility.clone()),&values(expected_state.visibility.clone()))?;
@@ -649,9 +651,9 @@ fn training_paths(model: &LanguageModel, cfg: &Config, device: &Device) -> Resul
         let actual = sbd::training_loss(model, &batched, &examples, &batch, mixed_seed)?;
         let loss = compare(&values(actual.loss.clone()), &values(reference.loss.clone()))?;
         let flows = compare_flows(actual.circuit_flows.as_ref().context("batched circuit flows")?, reference.circuit_flows.as_ref().context("per-block circuit flows")?)?;
-        let reference_gradients = model::checked_gradients(model, reference.loss)?;
-        let actual_gradients = model::checked_gradients(model, actual.loss)?;
-        let gradients = compare_snapshots(&snapshot(model,Some(&actual_gradients))?, &snapshot(model,Some(&reference_gradients))?, false)?;
+        let (reference_gradients,_) = model::checked_gradients_with_unused(model, reference.loss, &reference.unused_parameters, &mut delta_mixers::profile::Unprofiled)?;
+        let (actual_gradients,_) = model::checked_gradients_with_unused(model, actual.loss, &actual.unused_parameters, &mut delta_mixers::profile::Unprofiled)?;
+        let gradients = compare_snapshots(&snapshot_with_unused(model,Some(&actual_gradients),&actual.unused_parameters)?, &snapshot_with_unused(model,Some(&reference_gradients),&reference.unused_parameters)?, false)?;
         reports.push(json!({"feedback":feedback,"loss":loss,"all_neural_gradients":gradients,"separate_nonnegative_circuit_flows":flows}));
     }
     let mut weighted = examples.clone();
@@ -660,6 +662,7 @@ fn training_paths(model: &LanguageModel, cfg: &Config, device: &Device) -> Resul
     ensure!(error.to_string().contains("unit"), "unsupported joint weights did not explain unit-weight requirement: {error}");
     let mut singleton = cfg.clone();
     singleton.sbd.as_mut().unwrap().block_lengths = vec![1];
+    singleton.sbd.as_mut().unwrap().training_block_lengths = vec![1];
     let result = sbd::training_loss(model, &singleton, &examples, &batch, 1)?;
     ensure!(result.circuit_flows.is_none(), "L1 bypass produces circuit updates");
     let mut factorized = singleton.clone();
@@ -715,7 +718,7 @@ fn circuit_state(model: &LanguageModel) -> Result<Value> {
     let step = state.step.val().into_data().try_to_vec_as::<i32>().map_err(|e|anyhow::anyhow!("circuit update step {e:?}"))?;
     Ok(json!({"passed":true,"update_step":step[0],"row_normalization":normalized,"circuit_parameters_frozen":true,"ema_state_finite_nonnegative":true}))
 }
-fn complete_step(model: LanguageModel, cfg: &Config, optimizer: &mut ModuleOptimizer, examples: &[Example], seed: u64, device: &Device) -> Result<(LanguageModel,Value)> {
+fn complete_step(model: LanguageModel, cfg: &Config, optimizer: &mut train::NeuralOptimizer, examples: &[Example], seed: u64, device: &Device) -> Result<(LanguageModel,Value)> {
     let before = snapshot(&model,None)?;
     let previous_circuit_step = model.codpula.as_ref().context("complete-step circuit")?.probability.step.val().into_scalar::<i32>();
     let result = sbd::training_loss(&model,cfg,examples,&Batch::new(examples,device),seed)?;
@@ -723,8 +726,8 @@ fn complete_step(model: LanguageModel, cfg: &Config, optimizer: &mut ModuleOptim
     let flow = result.circuit_flows.as_ref().context("complete-step fixture has no circuit statistics")?;
     let flow_report = finite_flows(flow)?;
     ensure!(flow.active_blocks > 0,"complete-step fixture has no active blocks");
-    let gradients = model::checked_gradients(&model,result.loss)?;
-    let gradient_values = snapshot(&model,Some(&gradients))?;
+    let (gradients,_) = model::checked_gradients_with_unused(&model,result.loss,&result.unused_parameters,&mut delta_mixers::profile::Unprofiled)?;
+    let gradient_values = snapshot_with_unused(&model,Some(&gradients),&result.unused_parameters)?;
     let gradient_sha256 = snapshot_hash(&gradient_values)?;
     let root_head_gradient = if cfg.sbd.as_ref().unwrap().joint_output == SbdJointOutput::CodpulaContextual {
         let (_,weight) = gradient_values.iter().find(|(name,_)|name.ends_with("codpula.gate_head.weight")).context("complete-step contextual head gradient")?;
@@ -919,10 +922,10 @@ fn rollout_run(model: &LanguageModel, cfg: &Config, device: &Device, width: usiz
         ensure!(!commits.is_empty(),"rollout selector does not make progress");
         let feedback_logits = marginals.clone().log().reshape([width,VOCAB]);
         let mut feedback_only = state.clone();
-        feedback_only.update(feedback_logits.clone().detach(),cfg.soft_eta,1.0,cfg.soft_steps,cfg.sbd.as_ref().unwrap().candidate_width)?;
+        feedback_only.update(feedback_logits.clone().detach(),1.0,cfg.sbd.as_ref().unwrap().candidate_width,model.soft_confidence.as_ref().unwrap())?;
         let mut stored_proposals = proposals.clone();
         stored_proposals.resize(width,0);
-        sbd::advance_generation_state(cfg,&mut state,&stored_proposals,&commits,feedback_logits.clone(),1.0,device)?;
+        sbd::advance_generation_state(model,cfg,&mut state,&stored_proposals,&commits,feedback_logits.clone(),1.0,device)?;
         let dense = values(state.candidates.dense(VOCAB));
         let expected_feedback = values(feedback_only.candidates.dense(VOCAB));
         let visibility = values(state.visibility.clone());
@@ -945,7 +948,7 @@ fn rollout_run(model: &LanguageModel, cfg: &Config, device: &Device, width: usiz
         let mut attempted_revision = state.clone();
         let conflicting = stored_proposals.iter().map(|&value|(value+17)%VOCAB).collect::<Vec<_>>();
         let protected = (0..width).filter(|&position|state.observed[position].is_some() || !state.active[position]).collect::<Vec<_>>();
-        sbd::advance_generation_state(cfg,&mut attempted_revision,&conflicting,&protected,feedback_logits,1.0,device)?;
+        sbd::advance_generation_state(model,cfg,&mut attempted_revision,&conflicting,&protected,feedback_logits,1.0,device)?;
         ensure!(attempted_revision.observed == state.observed,"repeated writes revise an absorbing observation or commit padding");
         for ((_,kind,tensor),before) in trace.0.iter().zip(&clean_before) {
             identical(&values(tensor.clone()),before,&format!("rollout changed clean {kind} snapshot"))?;

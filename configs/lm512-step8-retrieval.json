@@ -43,9 +43,8 @@
     "feedback": "soft_feedback",
     "in_block_reads": "hola_read",
     "noisy_read_backend": "fused_gpu",
-    "candidate_width": 4,
-    "commit_count": 2,
-    "entropy_threshold": null,
+    "candidate_width": 3,
+    "entropy_threshold": 0.1,
     "generate_tokens": 32
   },
   "prefix_block_retrieval": {"layers":[3],"block_size":64,"blocks_per_query":2},

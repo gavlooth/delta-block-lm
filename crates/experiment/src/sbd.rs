@@ -282,7 +282,7 @@ fn teacher_prefix_evaluate(model: &LanguageModel, c: &Config, examples: &[Exampl
             let prefix = &row.input[..start+1];
             feedback(&model,c,prefix,&mut soft,device)?;
             let output = block_forward(&model,prefix,&soft,s.feedback == SbdFeedback::HardMask,device);
-            let joint = model.codpula.is_some() && n > 1;
+            let joint = model.codpula.is_some();
             let probabilities = if joint {
                 let (circuit,tokens,observed) = prepare_circuit(&model,output,&soft,1.0)?;
                 let clean = Tensor::<2,Int>::from_data(TensorData::new(row.target[start..start+n].to_vec(),[1,n]),device);
@@ -468,6 +468,7 @@ pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32],
         let mut final_values = vec![None;n];
         let mut block_passes = 0;
         let mut poststeps=0usize;
+        let mut final_scores=targets.filter(|_|s.cocommit.is_some()).map(|_|vec![None::<(f64,bool)>;n]);
         let coordination_cache = Some(crate::cocommit::prepare_clean_cache(&model,&clean.tokens,device));
         if s.cocommit.is_some() {coordinated_blocks+=1;}
         while final_values.iter().any(Option::is_none) || (s.cocommit.is_some() && poststeps<16) {
@@ -475,8 +476,7 @@ pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32],
                 passes+=1;
                 block_passes+=1;
                 coordinated_passes+=1;
-                let seed = if model.codpula.is_some() {proposal_rng.next()} else {0};
-                let assignment = crate::cocommit::assign(&model,c,coordination_cache.as_ref().unwrap(),&soft,block_passes,seed,device)?;
+                let assignment = crate::cocommit::assign(&model,c,coordination_cache.as_ref().unwrap(),&soft,device)?;
                 let was_complete=soft.observed.iter().all(Option::is_some);
                 let mut edits=Vec::new();
                 for i in 0..n {
@@ -491,8 +491,12 @@ pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32],
                     let start=generated.len();
                     let mut written=assignment.commits.clone();
                     written.extend_from_slice(&edits);
-                    score.observe(&assignment.host_logs,&assignment.proposals,&written,
-                        &targets[start..start+n],&weights[start..start+n],c.vocab());
+                    for &i in &written {
+                        if weights[start+i]!=0.0 {
+                            final_scores.as_mut().unwrap()[i]=Some((-f64::from(assignment.host_logs[i*c.vocab()+targets[start+i] as usize]),
+                                assignment.proposals[i]==targets[start+i] as usize));
+                        }
+                    }
                 }
                 advance_generation_state(&model,c,&mut soft,&assignment.proposals,&assignment.commits,
                     assignment.feedback,assignment.feedback_temperature,device)?;
@@ -559,6 +563,9 @@ pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32],
             advance_generation_state(&model,c,&mut soft,&proposal_values,&commits,
                 feedback_logits.reshape([n,c.vocab()]),feedback_temperature,device)?;
             final_values = soft.observed.clone();
+        }
+        if let Some(scores)=final_scores {
+            for (nll,hit) in scores.into_iter().flatten() {score.nll+=nll;score.hits+=usize::from(hit);score.count+=1;}
         }
         drop(coordination_cache);
         let finalized: Vec<i32> = final_values.into_iter().map(|v| v.unwrap() as i32).collect();
@@ -909,30 +916,53 @@ mod tests {
         assert_eq!(dependence_commits(&[3,2],&[0.0,0.2,f64::INFINITY,0.2],0.05,false),vec![3]);
     }
     #[test]
-    fn sampled_blocks_keep_original_random_draw_order() {
-        let mut c = Config {task:"lm".into(),sbd:Some(crate::config::SbdConfig {
-            block_lengths:vec![1,4,8],..Default::default()
+    fn sampled_blocks_share_one_update_length_and_drop_partial_tails() {
+        let c=Config {task:"lm".into(),sbd:Some(crate::config::SbdConfig {
+            training_block_lengths:vec![1,4,8],..Default::default()
         }),..Config::default()};
-        let rows = [9,5,7,4].into_iter().map(|n|fixture(vec![0;n])).collect::<Vec<_>>();
-        let original = [
-            (0,vec![
-                (0,0,4,"1011"),(0,4,4,"1010"),(0,8,4,"1"),
-                (1,0,4,"0011"),(2,1,1,"1"),(2,3,1,"1"),(2,5,1,"1"),(2,6,1,"1"),
-                (3,0,4,"0011"),
-            ]),
-            (1,vec![
-                (0,0,8,"01100110"),(0,8,8,"1"),(1,0,4,"0110"),(2,0,8,"1111111"),
-            ]),
-        ];
-        for (seed,draws) in original {
-            let expected = draws.into_iter().map(|(row,start,length,mask)| TrainingBlock {
-                row,start,length,masked:mask.bytes().map(|value|value == b'1').collect(),
-            }).collect::<Vec<_>>();
-            for execution in [SbdBlockExecution::PerBlock,SbdBlockExecution::Batched] {
-                c.sbd.as_mut().unwrap().block_execution = execution;
-                assert_eq!(sample_training_blocks(&c,&rows,seed).unwrap(),expected);
+        let rows=[9,5,7,4].into_iter().map(|n|fixture(vec![0;n])).collect::<Vec<_>>();
+        for seed in 0..32 {
+            let mut rng=Rng(seed);
+            let lengths=&c.sbd.as_ref().unwrap().training_block_lengths;
+            let length=lengths[rng.index(lengths.len())];
+            let mut expected=Vec::new();
+            for (row,sample) in rows.iter().enumerate() {
+                let eta=(rng.next() as f64+0.5)/(u64::MAX as f64+1.0);
+                for start in (0..sample.target.len()/length*length).step_by(length) {
+                    let masked=(0..length).map(|_|rng.next() as f64/(u64::MAX as f64)<eta).collect::<Vec<_>>();
+                    if masked.iter().any(|&m|m) {expected.push(TrainingBlock{row,start,length,masked});}
+                }
             }
+            assert_eq!(sample_training_blocks(&c,&rows,seed).unwrap(),expected);
         }
+    }
+    #[test]
+    fn binary_and_soft_training_draws_keep_distinct_inputs_and_gradients() {
+        let device=Device::ndarray().autodiff();
+        device.seed(113);
+        let mut c=Config{task:"lm".into(),context:8,batch_size:2,d_model:16,layers:1,
+            sbd:Some(crate::config::SbdConfig{training_block_lengths:vec![4],..Default::default()}),..Default::default()};
+        let arm=Arm{name:"feedback-draw".into(),mixer:"kronlstm".into(),cache:"surprise".into()};
+        let model=LanguageModel::new(&c,&arm,&device).unwrap();
+        let samples=(0..2).map(|r|Example{input:vec![256,1+r,2,3,4,5,6,7],target:vec![1+r,2,3,4,5,6,7,8],weight:vec![1.0;8],groups:vec![None;8]}).collect::<Vec<_>>();
+        let batch=Batch::new(&samples,&device);
+        let blocks=[TrainingBlock{row:0,start:0,length:4,masked:vec![true,false,true,false]},
+            TrainingBlock{row:1,start:4,length:4,masked:vec![true,true,false,false]}];
+        let mut embedding_gradients=Vec::new();
+        for probability in [0.0,1.0] {
+            c.soft_training_probability=probability;
+            let selected=training_config(&c,41);
+            let result=training_loss_sampled_profiled(&model,&selected,&samples,&batch,&blocks,None,&mut delta_mixers::profile::Unprofiled).unwrap();
+            let gradients=(result.loss-model.loss(model.forward(&batch),&batch)).backward();
+            let head=model.soft_confidence.as_ref().unwrap();
+            assert_eq!(head.raw_scale.val().grad(&gradients).is_some(),probability==1.0);
+            assert!(model.sbd_mask.as_ref().unwrap().val().grad(&gradients).is_some());
+            embedding_gradients.push(values(model.embedding.weight.val().grad(&gradients).unwrap()));
+        }
+        assert!(embedding_gradients[0].iter().zip(&embedding_gradients[1]).any(|(a,b)|(a-b).abs()>1e-12));
+        c.soft_training_probability=0.8;
+        let choices=(0..32).map(|seed|training_config(&c,seed).sbd.unwrap().feedback).collect::<Vec<_>>();
+        assert!(choices.contains(&SbdFeedback::HardMask) && choices.contains(&SbdFeedback::SoftFeedback));
     }
     #[test]
     fn checkpoint_rejects_old_dense_model_identity() {
@@ -968,7 +998,7 @@ mod tests {
         let device = Device::ndarray();
         device.seed(13);
         let mut c = Config { task:"lm".into(),d_model:16,layers:1,..Config::default() };
-        c.sbd = Some(crate::config::SbdConfig {block_lengths:vec![1,4],..Default::default()});
+        c.sbd = Some(crate::config::SbdConfig {block_lengths:vec![1,4],in_block_reads:delta_mixers::sbd::InBlockReads::None,..Default::default()});
         let arm = Arm {name:"kronlstm".into(),mixer:"kronlstm".into(),cache:"none".into()};
         let model = LanguageModel::new(&c,&arm,&device).unwrap();
         let example = Example {input:vec![256,65,66,67],target:vec![65,66,67,68],weight:vec![1.0;4],groups:vec![None;4]};
@@ -980,7 +1010,7 @@ mod tests {
         let device=Device::ndarray();
         device.seed(281);
         let c=Config {task:"lm".into(),d_model:16,layers:1,
-            sbd:Some(crate::config::SbdConfig {block_lengths:vec![1],..Default::default()}),..Config::default()};
+            sbd:Some(crate::config::SbdConfig {block_lengths:vec![1],in_block_reads:delta_mixers::sbd::InBlockReads::None,..Default::default()}),..Config::default()};
         let arm=Arm {name:"decode-score".into(),mixer:"kronlstm".into(),cache:"none".into()};
         let model=LanguageModel::new(&c,&arm,&device).unwrap();
         let mut prefix=vec![256];

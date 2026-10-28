@@ -2,7 +2,7 @@
 use crate::{
     config::{Arm, Config, SbdBlockExecution, SbdConfig, SbdFeedback},
     data::{Batch, Example},
-    kron_benchmark::{parameters, values},
+    kron_benchmark::{parameters_with_unused, values},
     model::{self, LanguageModel},
     sbd::{sample_training_blocks, TrainingBlock},
     sbd_training::CleanInputs,
@@ -20,14 +20,11 @@ fn compare(actual: &[f32], reference: &[f32]) -> Result<Value> {
 }
 
 fn gradient_snapshot(model: &LanguageModel, loss: Tensor<1>, noisy: bool) -> Result<ParameterSnapshot> {
-    let unused = model::unused_denoising_parameters(noisy, false);
-    let (gradients, report) = model::checked_gradients_with_unused(model, loss, &unused, &mut delta_mixers::profile::Unprofiled)?;
-    let mut visited = model.clone();
-    if !noisy {
-        ensure!(report.get("sbd_mask").is_some_and(|count| count.missing_steps == 1), "causal draw fabricated a mask gradient");
-        visited.sbd_mask = None;
-    }
-    parameters(&visited, Some(&gradients))
+    let mut unused=model::unused_denoising_parameters(noisy,false);
+    if !noisy {unused.extend(model::unused_soft_parameters());}
+    let (gradients,report)=model::checked_gradients_with_unused(model,loss,&unused,&mut delta_mixers::profile::Unprofiled)?;
+    if !noisy {ensure!(report.get("sbd_mask").is_some_and(|count|count.missing_steps==1),"causal draw fabricated a mask gradient");}
+    parameters_with_unused(model,Some(&gradients),&unused)
 }
 
 fn compare_gradients(actual: &ParameterSnapshot, reference: &ParameterSnapshot) -> Result<Value> {

@@ -49,10 +49,9 @@
     "in_block_reads": "hola_read",
     "noisy_read_backend": "fused_gpu",
     "feedback": "soft_feedback",
-    "candidate_width": 4,
+    "candidate_width": 3,
     "generate_tokens": 32,
     "joint_output": "codpula_contextual",
-    "announcement": {"dependence_threshold": 0.05},
     "cocommit": {
       "tail_layers": 1,
       "training_bundle_max": 16

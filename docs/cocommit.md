@@ -1,5 +1,63 @@
 # Step 10: CoCommit for recurrent block denoising
 
+## Current paper contract (2026-10-28)
+
+The equations in [CoCommit §§3–5](https://arxiv.org/html/2607.04469v2)
+now govern the decoder and its ordinary training objective:
+
+- A chooses only masked positions with maximum denoiser probability **strictly
+  greater than 0.7**; if none qualifies, it chooses the most confident mask
+  (position order breaks ties). The marker announces membership, never values.
+- Proposals are deterministic per-position argmax. With Codpula active, these
+  probabilities are circuit conditional token marginals, not raw neural-potential
+  softmaxes and not FFBS draws. Standalone Codpula retains its joint FFBS API.
+- B supplies masked writes only on the announced set S. Unannounced masked
+  proposals, feedback and confidence remain from A. B also supplies the paper's
+  separate visible-edit operation in rows with a nonempty announcement. Empty-S
+  rows use A for visible edits. No visible token is ever marked.
+- Only the current block is editable. Prompt and completed blocks remain outside
+  the mutable state. The evaluated CoCommit edit gate is zero; a visible token
+  changes when its greedy candidate differs. After filling all masks, decoding
+  stops when no edit fires or after at most 16 poststeps. Final tokens are replayed
+  causally before the next block; noisy A/B work never updates clean snapshots.
+- Ordinary training uses a detached own-draft pass to populate visible inputs,
+  including model-generated errors. A's token CE weights are 1 for masks, 0.3
+  for wrong visible drafts and 0.2 for clean visible drafts. B uses the same
+  visible terms but its masked CE targets only the random announced bundle.
+- Circuit-backed branches optimize the **sum of marginal token CEs**, not a
+  replacement joint event. Weighted singleton conditional events supply both
+  neural derivatives and real positive/negative manual circuit flows. Their
+  reach/count normalization counts a logical chain once, not once per target.
+  Standalone Codpula's joint objective remains separate.
+- Retained soft inputs use latest normalized top-k feedback and the learned
+  entropy confidence head. The ordinary binary/soft draw happens before the
+  optional soft-feedback teacher; CoCommit's own-draft corruption is required in
+  either draw. It is not ordinary provisional-input augmentation.
+- TCT retains its own A correction CE on **every mutable position**, including
+  wrong reveals, averaged over logical chains and summed over tokens. The B
+  masked-S/visible coordination CE is an explicitly composed auxiliary term,
+  not a claim that A+B is exactly TCT Eq. (2). The separate SBD clean term remains.
+
+Small configured generation blocks and tail depths are size choices. This is a
+from-scratch recurrent composition, not a frozen-random-backbone LoRA experiment
+or a reproduction of the paper's pretrained-checkpoint recipe. No such recipe
+change is inferred. New SBD/CoCommit/provisional revision identifiers reject old
+training fingerprints; TCT chain schema 3 also persists feedback entropy and
+availability and rejects earlier chain records.
+
+The reference routes now cover noisy singletons, target/write branch matching,
+weighted marginal CE, wrong revealed inputs, full-block-only targets and logical
+row accumulation. Checks in this change were **not executed by the worker**;
+the integrator owns the single final acceptance run.
+
+## Historical design and execution record
+
+The remainder records earlier implementation choices, rejected equations,
+measurements and partial acceptance. Its joint-event objectives, sampled
+CoCommit proposals, entropy/dependence bundle selectors and singleton causal
+bypass are historical, **not the current implementation contract** above.
+
+
 ## Status and use
 
 **Implementation decisions adopted 2026-10-25; numerical and cost evidence is recorded below after execution.** Q1–Q16 follow the highest-ROI recommendations; Q17 is a saved-input zero-marker correctness gate only. No quality study, trained comparison arm or sweep is authorized.

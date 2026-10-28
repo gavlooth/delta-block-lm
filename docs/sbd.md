@@ -1,5 +1,57 @@
 # SBD-style recurrent block denoising
 
+## Current paper contract (2026-10-28)
+
+[SBD Eqs. (8), (9), (13), (14)](https://arxiv.org/html/2509.04185v1#S2)
+now apply without a singleton clean-logit shortcut or partial auxiliary blocks.
+One uniform `sbd.training_block_lengths` draw is shared by every row in an
+ordinary logical optimizer update, before row accumulation. Its default is every
+integer 2 through 16. Only complete blocks contribute noisy targets; incomplete
+tails still contribute the unchanged clean causal loss. Independent per-row
+mask rates and per-token Bernoulli masks remain.
+
+`sbd.block_lengths` separately controls generation/TCT block sizes (default [8]).
+Small explicit fixture training sets remain possible. Training-size variability
+does not silently enlarge generation blocks, model dimensions or caches.
+Singletons run the ordinary noisy network using the mask/visible input; they are
+not a second copy of the clean next-token loss.
+
+The omitted in-block read is `hola_read`, reusing existing HOLA rather than
+introducing dense block attention. Explicit `none` is a reference-only causal
+communication isolation variant, not the paper's bidirectional noisy read.
+The ordinary factorized sampler defaults to the paper entropy budget
+`entropy_threshold: 0.1` nats (a reported low reasoning setting), not a fixed
+commit count. Explicit standalone Codpula selection retains its own algorithm.
+Plain decoding reuses the clean-prefix cache on every noisy attempt.
+
+Ordinary soft training chooses a binary or soft draw with configured probability
+`soft_training_probability` (default 0.8) before any optional teacher. The binary
+draw skips that teacher and the learned confidence head. Soft draws detach the
+teacher probabilities but use the live student's entropy confidence head and
+embedding table. Latest normalized top-k feedback replaces scheduled visibility
+and distribution interpolation. CoCommit additionally requires its detached own
+draft errors in both draws; that is separate from soft feedback.
+
+CoCommit uses weighted marginal token CE and masked-only B bundles, greedy
+per-position circuit marginals, and current-block visible edits; see its current
+contract in [CoCommit](cocommit.md). TCT uses all-mutable correction CE with a
+logical-chain denominator alongside this module's clean loss; see [remasking](remasking.md).
+Standalone Codpula retains its separate conditional joint objective/FFBS API.
+Every finalized block is appended/replayed causally exactly once; noisy state is
+temporary and cannot mutate completed context.
+
+SBD, CoCommit and provisional-contract identities change with this cutover.
+Old records cannot silently resume under new sampler/objective/decoder semantics.
+References were updated, but no worker verification was executed.
+
+## Historical design and execution record
+
+The remainder preserves the original implementation and measured history.
+Its omitted `none` default, per-row lengths, shortened-tail training, singleton
+causal bypass, fixed-count default and scheduled soft feedback are superseded by
+the current contract above.
+
+
 ## Objective and input realization
 
 This is the recurrent adaptation of [Set Block Decoding, arXiv:2509.04185](https://arxiv.org/html/2509.04185v1), equations 8 and 14. It is not the paper's Transformer implementation or a reproduction of its speedups.

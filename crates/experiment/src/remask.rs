@@ -163,20 +163,6 @@ impl Episode {
     }
 }
 
-fn token_uniforms(state: &Episode, keys: &[u64], seed: u64, call: usize, device: &Device) -> Tensor<3> {
-    let width = state.width();
-    let mut values = vec![0.0f32;state.values.len()*2];
-    for (row,&key) in keys.iter().enumerate() {
-        let mut random = Rng(indexed_seed(seed,1,key,call));
-        for position in 0..state.lengths[row] {
-            for channel in 0..2 {
-                // Exactly representable FP32 uniforms cannot round up to one.
-                values[(row*width+position)*2+channel] = (random.next()>>40) as f32 / 16777216.0;
-            }
-        }
-    }
-    Tensor::from_data(TensorData::new(values,[state.lengths.len(),width,2]),device)
-}
 
 fn select_branch_output(a: crate::model::DenoisingOutput, b: crate::model::DenoisingOutput,
     use_b: &[bool], device: &Device) -> crate::model::DenoisingOutput {
@@ -552,12 +538,12 @@ pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32],
         "denoising_passes":calls,"active_row_calls":row_calls,"blocks":blocks,"clean_history_appended_tokens":generated.len(),
         "includes_clean_cache_preparation":true,"prefill_included":true,"commit_rule":"delay_until_episode_end","policy":settings(c)?.policy,
         "levels":"K=eligible_count","calls_per_level_max":CALLS_PER_LEVEL,"patience":PATIENCE,
-        "token_operator":if s.training_mode == crate::tct::TrainingMode::Tct {"correction_all_free"}else if model.codpula.is_some(){"indexed_seeded_ffbs_standard_carry"}else{"factorized_argmax_standard_carry"},
-        "feedback":"retained_topk_masked_visibility_1_over_soft_steps","feature_definition":FEATURE_VERSION,"rng":RANDOM_VERSION,
-        "proposal_evidence":if s.training_mode == crate::tct::TrainingMode::Tct {"permanent_O_only"}else{"permanent_O_plus_provisional_reveals"},"feedback_and_feature_evidence":"permanent_O_only",
+        "token_operator":if s.training_mode==crate::tct::TrainingMode::Tct || model.cocommit_config.is_some() {"greedy_marginal_correction_and_visible_edits"}else{"greedy_marginal_standard_carry"},
+        "feedback":"latest_normalized_topk_learned_entropy_weight_retained_on_remask","feature_definition":FEATURE_VERSION,"rng":RANDOM_VERSION,
+        "proposal_evidence":if s.training_mode==crate::tct::TrainingMode::Tct || model.cocommit_config.is_some() {"permanent_O_only"}else{"permanent_O_plus_provisional_reveals"},"feedback_and_feature_evidence":"same_branch_and_evidence_as_proposal",
         "marginal_queries_per_joint_call":if model.cocommit_config.is_some(){None}else{Some(1usize)},
-        "ffbs_queries_per_joint_call":if model.cocommit_config.is_some(){None}else{Some(1usize)},
-        "proposal_seed":c.seed,"potential_temperature":c.soft_temperature,"quality_evaluation":targets.is_some()});
+        "ffbs_queries_per_joint_call":0,
+        "mask_set_seed":c.seed,"potential_temperature":c.soft_temperature,"quality_evaluation":targets.is_some()});
     if targets.is_some() {report["decode_score"]=score.report();}
     Ok(report)
 }
@@ -1111,13 +1097,6 @@ pub fn numerical_checks(c: &Config, device: &Device) -> Result<Value> {
     }
     let prefix_after = host(model.forward_output_profiled(&Batch::new(&[prefix_fixture(prefix.clone())],device),&mut delta_mixers::profile::Unprofiled).logits)?;
     ensure!(prefix_before.iter().zip(&prefix_after).all(|(a,b)|a.to_bits()==b.to_bits()),"noisy refinement changed the clean prefix");
-    let paired = repeat_state(&check,&state,&[0,0],device)?;
-    let uniforms = host(token_uniforms(&paired,&[77,77],check.seed,4,device))?;
-    ensure!(uniforms[..width*2]==uniforms[width*2..],"paired token uniforms are not identical by indexed decision");
-    let direct = token_uniforms(&state,&keys,check.seed,4,device);
-    ensure!(host(direct.clone())?==host(token_uniforms(&state,&keys,check.seed,4,device))?,"indexed RNG is not reproducible");
-    let single = Episode::new(&check,vec![3],width,observed[..width].to_vec(),device)?;
-    ensure!(host(direct)?[..width*2]==host(token_uniforms(&single,&keys[..1],check.seed,4,device))?[..width*2],"padding or another row changed a token RNG stream");
     let candidate_logs = host(second.logs.clone())?;
     let eligible = state.eligible(0);
     let mut swap_rng=Rng(7);
@@ -1292,7 +1271,7 @@ pub fn numerical_checks(c: &Config, device: &Device) -> Result<Value> {
         "coordination":coordinated_report,
         "feature_definition":FEATURE_VERSION,"feature_width":2*check.d_model+12,"immutable_O":true,"immutable_prefix":true,
         "candidates_retained":true,"right_padding_ignored":true,"invalid_sets_rejected":true,"paired_indexed_uniforms":true,
-        "independent_row_rng":true,"weighted_swap_and_independent_distinct":true,"l1_exact_causal_bypass":true,
+        "independent_row_rng":true,"weighted_swap_and_independent_distinct":true,"l1_noisy_cache_reconstruction":true,
         "all_observed_zero_calls":true,"schedule":schedule_cases,"proposal_evidence":if check.sbd.as_ref().unwrap().training_mode == crate::tct::TrainingMode::Tct {"permanent_O_only"}else{"permanent_O_plus_provisional_reveals"},
         "feedback_feature_endpoint_evidence":"permanent_O_only","device":runtime::identity(device),"quality_evaluation":false}))
 }

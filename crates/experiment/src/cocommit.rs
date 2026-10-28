@@ -1,6 +1,6 @@
 //! Shared-input marked-tail training and temporary block assignment.
 use crate::{
-    config::{Config, SbdBlockExecution, SbdCommitment, SbdFeedback},
+    config::{Config, SbdBlockExecution, SbdFeedback},
     data::{Batch, Example, Rng},
     model::{self, DenoisingOutput, LanguageModel},
     sbd::{self, SbdTrainingResult, TrainingBlock},
@@ -232,8 +232,26 @@ pub(super) fn training_loss_sampled_profiled<P:Sections>(model:&LanguageModel,c:
     // predictions at the masked positions. No random vocabulary errors are substituted.
     soft=SoftState::new(c.vocab(),s.candidate_width,soft.observed,soft.active,&device,c.soft_selection_backend)?;
     if s.feedback==SbdFeedback::SoftFeedback {
-        soft.update(draft_logs.reshape([blocks.len()*width,c.vocab()]),1.0,s.candidate_width,
+        soft.update(draft_logs.clone().reshape([blocks.len()*width,c.vocab()]),1.0,s.candidate_width,
             model.soft_confidence.as_ref().context("soft feedback head missing")?)?;
+    }
+    if s.block_execution==SbdBlockExecution::PerBlock {
+        for (r,block) in blocks.iter().enumerate() {
+            let n=block.masked.len();
+            let mut input=sbd::state(c,soft.observed[r*width..r*width+n].to_vec(),&device)?;
+            if s.feedback==SbdFeedback::SoftFeedback {
+                input.update(draft_logs.clone().slice([r..r+1,0..n,0..c.vocab()]).reshape([n,c.vocab()]),1.0,s.candidate_width,
+                    model.soft_confidence.as_ref().context("soft feedback head missing")?)?;
+            }
+            let cache=model.training_cache(&trace,block.row,&[block.start+1]);
+            let prefix=model.cached_block_prefix_profiled(&cache,0,&input,s.feedback==SbdFeedback::HardMask,profile);
+            let a=model.cached_block_tail_profiled(&cache,0,prefix.clone(),None,profile);
+            let selected=&marks[r*width..r*width+n];
+            let b=if selected.iter().any(|&mark|mark) {model.cached_block_tail_profiled(&cache,0,prefix,Some(marker_tensor(selected,1,n,&device)),profile)}else{a.clone()};
+            let clean=Tensor::from_data(TensorData::new(targets[r*width..r*width+n].to_vec(),[1,n]),&device);
+            let _=add_branch_losses(model,c,a,b,&input,clean,selected,&weights[r*width..r*width+n],denominator,&mut result)?;
+        }
+        return Ok(result);
     }
     let row_bundles=marks.chunks_exact(width).map(|row|row.to_vec()).collect::<Vec<_>>();
     let (a,b,_)=training_pair_profiled(model,c,&cache,&soft,&row_bundles,profile)?;
@@ -279,14 +297,11 @@ fn checked_entropy_rows(values:&[f32],vocab:usize,active:&[bool])->Result<Vec<f6
 }
 struct Prediction {
     host_logs: Vec<f32>,
-    entropies: Vec<f64>,
     proposals: Vec<usize>,
-    scores: Option<Vec<f64>>,
     feedback: Tensor<2>,
     feedback_temperature: f64,
-    circuit: Option<crate::codpula::PreparedCircuit>,
 }
-fn prediction(model: &LanguageModel, c: &Config, output: DenoisingOutput, soft: &SoftState, _seed: u64, temperature: f64, assignments: bool) -> Result<Prediction> {
+fn prediction(model: &LanguageModel, c: &Config, output: DenoisingOutput, soft: &SoftState, temperature: f64, assignments: bool) -> Result<Prediction> {
     let n = soft.observed.len();
     if model.codpula.is_some() {
         let mut mutable=soft.clone();
@@ -294,20 +309,20 @@ fn prediction(model: &LanguageModel, c: &Config, output: DenoisingOutput, soft: 
         let (circuit,tokens,observed) = sbd::prepare_circuit(model,output,&mutable,temperature)?;
         let logs = circuit.marginals(tokens.clone(),observed.clone())?.log();
         let host_logs=logs.clone().into_data().try_to_vec::<f32>().map_err(|e|anyhow::anyhow!("CoCommit probabilities {e:?}"))?;
-        let entropies=checked_entropy_rows(&host_logs,c.vocab(),&soft.active)?;
+        let _=checked_entropy_rows(&host_logs,c.vocab(),&soft.active)?;
         let proposals=if assignments {greedy_tokens(&host_logs,c.vocab())}else{Vec::new()};
-        Ok(Prediction { feedback: logs.reshape([n,c.vocab()]), host_logs,entropies,
-            proposals,scores:None, feedback_temperature:1.0,circuit:Some(circuit) })
+        Ok(Prediction { feedback: logs.reshape([n,c.vocab()]), host_logs,
+            proposals, feedback_temperature:1.0 })
     } else {
         let logs = log_softmax(output.logits.clone()/temperature,2);
         let host_logs=logs.into_data().try_to_vec::<f32>().map_err(|e|anyhow::anyhow!("CoCommit probabilities {e:?}"))?;
-        let entropies=checked_entropy_rows(&host_logs,c.vocab(),&soft.active)?;
+        let _=checked_entropy_rows(&host_logs,c.vocab(),&soft.active)?;
         let proposals = if assignments {
             host_logs.chunks_exact(c.vocab()).zip(&soft.active).map(|(row,&active)|{
                 if active {(0..row.len()).max_by(|&a,&b|row[a].total_cmp(&row[b]).then(b.cmp(&a))).unwrap()}else{0}
             }).collect()
         } else {Vec::new()};
-        Ok(Prediction { host_logs,entropies,proposals,scores:None,feedback:output.logits.reshape([n,c.vocab()]),feedback_temperature:temperature,circuit:None })
+        Ok(Prediction { host_logs,proposals,feedback:output.logits.reshape([n,c.vocab()]),feedback_temperature:temperature })
     }
 }
 pub(crate) fn confidence_bundle(logs:&[f32],vocab:usize,positions:&[usize])->Vec<usize> {
@@ -330,18 +345,18 @@ pub(super) struct Assignment {
     pub feedback_temperature: f64,
     pub host_logs: Vec<f32>,
 }
-pub(super) fn assign(model: &LanguageModel, c: &Config, cache: &TrainingCache, soft: &SoftState, pass: usize, proposal_seed: u64, device: &Device) -> Result<Assignment> {
+pub(super) fn assign(model: &LanguageModel, c: &Config, cache: &TrainingCache, soft: &SoftState, device: &Device) -> Result<Assignment> {
     let s = c.sbd.as_ref().unwrap();
     let n = soft.observed.len();
     let hidden = model.cached_block_prefix_profiled(cache,0,soft,s.feedback==SbdFeedback::HardMask,&mut Unprofiled);
     let output = model.cached_block_tail_profiled(cache,0,hidden.clone(),None,&mut Unprofiled);
-    let a = prediction(model,c,output,soft,proposal_seed,c.soft_temperature,true)?;
-    let announcement = select(c,&a,soft,pass==n)?;
+    let a = prediction(model,c,output,soft,c.soft_temperature,true)?;
+    let announcement = select(c,&a,soft,false)?;
     if announcement.is_empty() { return Ok(Assignment {proposals:a.proposals, commits:announcement,feedback:a.feedback,feedback_temperature:a.feedback_temperature,host_logs:a.host_logs}); }
     let mut marks = vec![false;n];
     for &i in &announcement {marks[i]=true;}
     let output = model.cached_block_tail_profiled(cache,0,hidden,Some(marker_tensor(&marks,1,n,device)),&mut Unprofiled);
-    let b = prediction(model,c,output,soft,proposal_seed,c.soft_temperature,true)?;
+    let b = prediction(model,c,output,soft,c.soft_temperature,true)?;
     let mut logs=a.host_logs;
     for i in 0..n {
         if marks[i] || soft.observed[i].is_some() {
@@ -362,7 +377,6 @@ pub(super) fn teacher_prefix_evaluate(model: &LanguageModel, c: &Config, example
     let mut marked_count = 0usize;
     let mut hits = 0usize;
     let mut marked_hits = 0usize;
-    let mut rng = Rng(c.seed);
     for row in examples {
         if model.codpula.is_some() {ensure!(row.weight.iter().all(|&w|w==1.0),"Codpula joint event evaluation requires unit valid target weights");}
         for &length in &s.block_lengths {
@@ -370,18 +384,6 @@ pub(super) fn teacher_prefix_evaluate(model: &LanguageModel, c: &Config, example
                 let n = length.min(row.target.len()-start);
                 let mut soft = sbd::state(c,vec![None;n],device)?;
                 let prefix = &row.input[..start+1];
-                if n==1 {
-                    let output = sbd::block_forward(&model,prefix,&soft,s.feedback==SbdFeedback::HardMask,device);
-                    let logs = log_softmax(output.logits,2).into_data().try_to_vec::<f32>().map_err(|e|anyhow::anyhow!("CoCommit singleton {e:?}"))?;
-                    checked_entropy_rows(&logs,c.vocab(),&[true])?;
-                    if row.weight[start] != 0.0 {
-                        nll -= logs[row.target[start] as usize] as f64;
-                        let best = (0..c.vocab()).max_by(|&a,&b|logs[a].total_cmp(&logs[b]).then(b.cmp(&a))).unwrap();
-                        hits += usize::from(best==row.target[start] as usize);
-                        count += 1;
-                    }
-                    continue;
-                }
                 let cache=prepare_clean_cache(&model,prefix,device);
                 if s.feedback==SbdFeedback::SoftFeedback {
                     let teacher=model.cached_block_profiled(&cache,0,&soft,false,&mut Unprofiled);
@@ -389,20 +391,12 @@ pub(super) fn teacher_prefix_evaluate(model: &LanguageModel, c: &Config, example
                 }
                 let hidden=model.cached_block_prefix_profiled(&cache,0,&soft,s.feedback==SbdFeedback::HardMask,&mut Unprofiled);
                 let output_a = model.cached_block_tail_profiled(&cache,0,hidden.clone(),None,&mut Unprofiled);
-                let seed = if model.codpula.is_some() {rng.next()} else {0};
-                let a = prediction(&model,c,output_a,&soft,seed,1.0,true)?;
+                let a = prediction(&model,c,output_a,&soft,1.0,true)?;
                 let announcement = select(c,&a,&soft,false)?;
                 let mut marks = vec![false;n];
                 for &i in &announcement {marks[i]=true;}
                 let output_b = model.cached_block_tail_profiled(&cache,0,hidden,Some(marker_tensor(&marks,1,n,device)),&mut Unprofiled);
-                let b = prediction(&model,c,output_b,&soft,seed,1.0,false)?;
-                let clean = Tensor::<2,Int>::from_data(TensorData::new(row.target[start..start+n].to_vec(),[1,n]),device);
-                if let (Some(circuit_a),Some(circuit_b)) = (&a.circuit,&b.circuit) {
-                    let observed = Tensor::<2,Bool>::from_data(TensorData::new(vec![false;n],[1,n]),device);
-                    let all = observed.clone().bool_not();
-                    nll += model::scalar(circuit_a.log_partition(clean.clone(),observed.clone())?-circuit_a.log_partition(clean.clone(),all)?)?;
-                    marked_nll += model::scalar(circuit_b.log_partition(clean.clone(),observed.clone())?-circuit_b.log_partition(clean,marker_tensor(&marks,1,n,device).greater_elem(0.5))?)?;
-                }
+                let b = prediction(&model,c,output_b,&soft,1.0,false)?;
                 let av=a.host_logs;
                 let bv=b.host_logs;
                 for j in 0..n {
@@ -411,10 +405,10 @@ pub(super) fn teacher_prefix_evaluate(model: &LanguageModel, c: &Config, example
                     let best = |values:&[f32]| (0..c.vocab()).max_by(|&a,&b|values[a].total_cmp(&values[b]).then(b.cmp(&a))).unwrap();
                     let ar = &av[j*c.vocab()..(j+1)*c.vocab()];
                     let br = &bv[j*c.vocab()..(j+1)*c.vocab()];
-                    if model.codpula.is_none() {nll-=ar[gold] as f64;}
+                    nll-=ar[gold] as f64;
                     hits+=usize::from(best(ar)==gold);count+=1;
                     if marks[j] {
-                        if model.codpula.is_none() {marked_nll-=br[gold] as f64;}
+                        marked_nll-=br[gold] as f64;
                         marked_hits+=usize::from(best(br)==gold);marked_count+=1;
                     }
                 }
@@ -426,13 +420,64 @@ pub(super) fn teacher_prefix_evaluate(model: &LanguageModel, c: &Config, example
         "marked_subset_nll":if marked_count>0 {Some(marked_nll/marked_count as f64)} else {None},
         "marked_subset_accuracy":if marked_count>0 {Some(marked_hits as f64/marked_count as f64)} else {None},"marked_predicted_tokens":marked_count,
         "block_lengths":s.block_lengths,"joint_output":s.joint_output,"cocommit":s.cocommit,
-        "conditioning":"all targets initially masked; unmarked detached teacher; A full-block NLL and B announced-subset NLL reported separately; L1 causal bypass",
-        "nll_reduction":"A sum full-block event NLL / all valid targets; B sum announced event NLL / announced valid targets, not full-block NLL"}))
+        "conditioning":"all targets initially masked; detached soft teacher; A all-target marginal CE and B announced-target marginal CE, including noisy singletons",
+        "nll_reduction":"A sum marginal token CE / all valid targets; B sum announced marginal token CE / announced valid targets"}))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn weighted_visible_targets_are_not_hard_circuit_evidence() {
+        use crate::config::{Arm,CocommitConfig,SbdConfig,SbdJointOutput};
+        let device=Device::ndarray().autodiff();
+        for joint in [false,true] {
+            device.seed(127);
+            let c=Config{task:"lm".into(),d_model:16,layers:1,
+                sbd:Some(SbdConfig{cocommit:Some(CocommitConfig::default()),
+                    joint_output:if joint{SbdJointOutput::Codpula}else{SbdJointOutput::Factorized},..Default::default()}),..Default::default()};
+            let arm=Arm{name:"weighted-visible".into(),mixer:"kronlstm".into(),cache:"surprise".into()};
+            let model=LanguageModel::new(&c,&arm,&device).unwrap();
+            let soft=sbd::state(&c,vec![None,Some(9),Some(7),None],&device).unwrap();
+            let a=Tensor::<3>::zeros([1,4,c.vocab()],&device).require_grad();
+            let b=Tensor::<3>::zeros([1,4,c.vocab()],&device).require_grad();
+            let output=|logits:Tensor<3>|DenoisingOutput{logits,features:Tensor::zeros([1,4,16],&device)};
+            let clean=Tensor::<2,Int>::from_data([[3,5,7,11]],&device);
+            let mut mutable=soft.clone();mutable.observed.fill(None);
+            let logs=|logits:Tensor<3>| {
+                if joint {
+                    let (circuit,tokens,observed)=sbd::prepare_circuit(&model,output(logits),&mutable,1.0).unwrap();
+                    circuit.marginals(tokens,observed).unwrap().log()
+                }else{log_softmax(logits,2)}
+            };
+            let a_logs=logs(a.clone()).into_data().try_to_vec::<f32>().unwrap();
+            let b_logs=logs(b.clone()).into_data().try_to_vec::<f32>().unwrap();
+            let expected=(0..4).map(|i|{
+                let target=[3usize,5,7,11][i];
+                -f64::from(a_logs[i*c.vocab()+target])*[1.0,0.3,0.2,1.0][i]
+                -f64::from(b_logs[i*c.vocab()+target])*[1.0,0.3,0.2,0.0][i]
+            }).sum::<f64>()/4.0;
+            let mut result=SbdTrainingResult{loss:Tensor::zeros([1],&device),circuit_flows:None,unused_parameters:Vec::new()};
+            add_branch_losses(&model,&c,output(a.clone()),output(b.clone()),&soft,clean,&[true,false,false,false],&[1.0;4],4.0,&mut result).unwrap();
+            sbd::compare(&[model::scalar(result.loss.clone()).unwrap()],&[expected]).unwrap();
+            let gradients=result.loss.backward();
+            let a_grad=a.grad(&gradients).unwrap().into_data().try_to_vec::<f32>().unwrap();
+            let b_grad=b.grad(&gradients).unwrap().into_data().try_to_vec::<f32>().unwrap();
+            for i in [1usize,2] {
+                assert!(a_grad[i*c.vocab()..(i+1)*c.vocab()].iter().any(|g|g.abs()>1e-8));
+                assert!(b_grad[i*c.vocab()..(i+1)*c.vocab()].iter().any(|g|g.abs()>1e-8));
+            }
+            assert_eq!(result.circuit_flows.is_some(),joint);
+        }
+    }
+    #[test]
+    fn confidence_selection_and_argmax_share_the_same_event() {
+        let logs=[0.8f32.ln(),0.2f32.ln(),0.1f32.ln(),0.9f32.ln(),0.6f32.ln(),0.4f32.ln()];
+        assert_eq!(confidence_bundle(&logs,2,&[0,1,2]),vec![1,0]);
+        assert_eq!(greedy_tokens(&logs,2),vec![0,1,0]);
+        assert_eq!(confidence_bundle(&logs,2,&[2]),vec![2]);
+        assert!(confidence_bundle(&logs,2,&[]).is_empty());
+    }
     #[test]
     fn bundles_are_masked_uniform_size_draws_with_independent_seed() {
         let blocks = vec![
@@ -441,15 +486,14 @@ mod tests {
             TrainingBlock { row:1,start:0,length:4,masked:vec![false,true,false,true] },
         ];
         let bundles = sample_bundles(&blocks,16,77);
-        assert_eq!(bundles[0],vec![false]);
-        assert_eq!(bundles[1..],sample_bundles(&blocks[1..],16,77));
+        assert_eq!(bundles[0],vec![true]);
         assert_eq!(bundles,sample_bundles(&blocks,16,77));
-        for (block,bundle) in blocks.iter().zip(&bundles).skip(1) {
+        for (block,bundle) in blocks.iter().zip(&bundles) {
             let count=bundle.iter().filter(|&&x|x).count();
             assert!(count>0 && count<=block.masked.iter().filter(|&&x|x).count());
             assert!(bundle.iter().zip(&block.masked).all(|(&chosen,&masked)|!chosen || masked));
         }
-        for bundle in sample_bundles(&blocks,1,77).iter().skip(1) {
+        for bundle in sample_bundles(&blocks,1,77).iter() {
             assert_eq!(bundle.iter().filter(|&&x|x).count(),1);
         }
     }
@@ -473,7 +517,7 @@ mod tests {
         let c=Config {task:"lm".into(),d_model:16,layers:1,heads:4,key_dim:32,value_dim:64,
             sbd:Some(SbdConfig {block_lengths:vec![4],feedback:SbdFeedback::SoftFeedback,
                 cocommit:Some(CocommitConfig::default()),..SbdConfig::default()}),..Config::default()};
-        let arm=Arm {name:"validation".into(),mixer:"kronlstm".into(),cache:"none".into()};
+        let arm=Arm {name:"validation".into(),mixer:"kronlstm".into(),cache:"surprise".into()};
         let model=LanguageModel::new(&c,&arm,&device).unwrap();
         let rows=[Example {input:vec![256,11,19,23],target:vec![11,19,23,29],weight:vec![1.0;4],groups:vec![None;4]}];
         let before=sbd::evaluate(&model,&c,&rows,&device).unwrap();
