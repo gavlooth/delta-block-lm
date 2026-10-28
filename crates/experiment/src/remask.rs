@@ -509,7 +509,7 @@ fn prefix_cache(model: &LanguageModel, prefixes: &[Vec<i32>], device: &Device) -
         input.push(0);
         prefix_fixture(input)
     }).collect::<Vec<_>>();
-    let mut trace = CleanInputs::default();
+    let mut trace = CleanInputs::new(prefixes.iter().map(Vec::len));
     let _ = model.forward_profiled(&Batch::new(&rows,device),&mut trace);
     let blocks = (0..rows.len()).map(|row|(row,prefixes[row].len())).collect::<Vec<_>>();
     Ok(model.training_cache_batched(&trace,&blocks))
@@ -585,16 +585,15 @@ pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32],
         };
         prefix.extend_from_slice(&values);
         generated.extend_from_slice(&values);
-        coordination.final_replay_dispatches += 1;
-        coordination.final_replay_rows += 1;
         blocks += 1;
         let remaining=s.generate_tokens-generated.len();
         let next_length=s.block_lengths[blocks%s.block_lengths.len()].min(remaining);
         if next_length>1 {
+            coordination.final_replay_dispatches += 1;
+            coordination.final_replay_rows += 1;
             clean_cache=Some(prefix_cache(&model,&[prefix.clone()],device)?);
         } else {
             clean_cache=None;
-            let _ = model.forward_output_profiled(&Batch::new(&[prefix_fixture(prefix.clone())],device),&mut delta_mixers::profile::Unprofiled);
         }
     }
     runtime::sync(device)?;
@@ -602,8 +601,8 @@ pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32],
     let mut report=json!({"tokens":generated,"text":String::from_utf8_lossy(&generated.iter().map(|&v|v as u8).collect::<Vec<_>>()),
         "seconds":seconds,"finalized_tokens":generated.len(),"finalized_tokens_per_second":generated.len() as f64/seconds,
         "coordination_work":coordination,
-        "denoising_passes":calls,"active_row_calls":row_calls,"blocks":blocks,"causally_replayed_tokens":generated.len(),
-        "includes_replay":true,"prefill_included":true,"commit_rule":"delay_until_episode_end","policy":settings(c)?.policy,
+        "denoising_passes":calls,"active_row_calls":row_calls,"blocks":blocks,"clean_history_appended_tokens":generated.len(),
+        "includes_clean_cache_preparation":true,"prefill_included":true,"commit_rule":"delay_until_episode_end","policy":settings(c)?.policy,
         "levels":"K=eligible_count","calls_per_level_max":CALLS_PER_LEVEL,"patience":PATIENCE,
         "token_operator":if s.training_mode == crate::tct::TrainingMode::Tct {"correction_all_free"}else if model.codpula.is_some(){"indexed_seeded_ffbs_standard_carry"}else{"factorized_argmax_standard_carry"},
         "feedback":"retained_topk_masked_visibility_1_over_soft_steps","feature_definition":FEATURE_VERSION,"rng":RANDOM_VERSION,
@@ -755,7 +754,7 @@ pub fn collect(model: &LanguageModel, c: &Config, rows: &[Example], checkpoint_i
     let model = model.valid();
     runtime::sync(device)?;
     let clock = Instant::now();
-    let mut trace = CleanInputs::default();
+    let mut trace = CleanInputs::new(groups.values().flatten().map(|block|block.start+1));
     let _ = model.forward_profiled(&Batch::new(rows,device),&mut trace);
     let mut dataset_states = Vec::with_capacity(refinement.states);
     let mut records = Vec::with_capacity(refinement.states);
@@ -999,7 +998,7 @@ pub fn benchmark(c: &Config, arm: &Arm, seed: u64, device: &Device, warmups: usi
     let keys = (0..c.batch_size).map(|row|row as u64).collect::<Vec<_>>();
     let mut seconds = Vec::with_capacity(trials);
     let mut refinement_seconds = Vec::with_capacity(trials);
-    let mut replay_seconds = Vec::with_capacity(trials);
+    let mut history_append_seconds = Vec::with_capacity(trials);
     let mut dispatches = Vec::with_capacity(trials);
     let mut active_calls = Vec::with_capacity(trials);
     let mut coordination_samples=Vec::with_capacity(trials);
@@ -1010,32 +1009,30 @@ pub fn benchmark(c: &Config, arm: &Arm, seed: u64, device: &Device, warmups: usi
         let result = episode(&model,c,&cache,state,&keys,seed,energy.as_ref(),true,device)?;
         runtime::sync(device)?;
         let refinement_elapsed = clock.elapsed().as_secs_f64();
-        let replay_rows=prefixes.iter().enumerate().map(|(row,prefix)| {
+        let completed_prefixes=prefixes.iter().enumerate().map(|(row,prefix)| {
             let mut completed=prefix.clone();
             completed.extend(result.state.values[row*length..(row+1)*length].iter().map(|&token|token as i32));
-            prefix_fixture(completed)
+            completed
         }).collect::<Vec<_>>();
-        let _=model.forward_output_profiled(&Batch::new(&replay_rows,device),&mut delta_mixers::profile::Unprofiled);
+        std::hint::black_box(&completed_prefixes);
         runtime::sync(device)?;
         let elapsed = clock.elapsed().as_secs_f64();
         if iteration>=warmups {
             seconds.push(elapsed);
             refinement_seconds.push(refinement_elapsed);
-            replay_seconds.push(elapsed-refinement_elapsed);
+            history_append_seconds.push(elapsed-refinement_elapsed);
             dispatches.push(result.calls);
             active_calls.push(result.row_calls);
-            let mut work=result.work;
-            work.final_replay_dispatches=1;
-            work.final_replay_rows=c.batch_size;
-            coordination_samples.push(work);
+            coordination_samples.push(result.work);
         }
     }
     Ok(json!({"shape":{"batch":c.batch_size,"clean_prefix":prefix_length,"episode_length":length,"depth":c.d_model},
-        "seconds":seconds,"refinement_seconds":refinement_seconds,"clean_replay_seconds":replay_seconds,
+        "seconds":seconds,"refinement_seconds":refinement_seconds,"history_append_seconds":history_append_seconds,
         "noisy_dispatches":dispatches,"active_row_calls":active_calls,"rectangular_row_calls":dispatches.iter().map(|&n|n*c.batch_size).collect::<Vec<_>>(),
         "coordination_work":coordination_samples,"noisy_dispatches_unit":"logical episode reads; use coordination_work for physical A/B execution",
-        "warmups":warmups,"trials":trials,"prefill_seconds":prefill_seconds,"prefill_in_timed_episode":false,"clean_replay_in_timed_episode":true,
-        "clean_replay_processed_positions_per_row":prefix_length+length,
+        "method_version":2,"method":"resident clean-prefix cache; complete episode and token-history append; no discarded final clean forward",
+        "warmups":warmups,"trials":trials,"prefill_seconds":prefill_seconds,"prefill_in_timed_episode":false,
+        "clean_history_appended_tokens_per_row":length,"final_clean_forward_in_timed_episode":false,
         "prefill_processed_positions_per_row":prefix_length+1,"prefill_extra_position":"snapshot API dummy after the immutable prefix, never used as evidence",
         "state_initialization_included":true,"device":runtime::identity(device),"policy":settings(c)?.policy,
         "retained_feedback_device_bytes_estimate":c.batch_size*length*(16*c.sbd.as_ref().unwrap().candidate_width+4*c.vocab()+24),

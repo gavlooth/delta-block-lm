@@ -270,7 +270,8 @@ struct Loss {
 /// Both execution layouts share the exact same neural inputs, O-only evidence and loss.
 fn training_loss(c: &Config, model: &LanguageModel, state: &mut TrainingState, device: &Device, layout: SbdBlockExecution, proposal: Option<(u64,usize)>, bundles: Option<&[Vec<bool>]>) -> Result<Loss> {
     let batch = state.batch(device);
-    let mut trace = CleanInputs::default();
+    let mut trace = CleanInputs::new(state.rows.iter().flat_map(|row|row.chains.iter()
+        .filter(|chain|chain.len()>1).map(|chain|chain.start+1)));
     let logits = model.forward_profiled(&batch, &mut trace);
     let clean_loss = model.loss(logits.clone(), &batch);
     let clean = model::scalar(clean_loss.clone())?;

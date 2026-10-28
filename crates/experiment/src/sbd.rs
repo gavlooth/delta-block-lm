@@ -142,7 +142,7 @@ fn training_loss_per_block<P: delta_mixers::profile::Sections>(model: &LanguageM
     let teacher_model=(s.feedback==SbdFeedback::SoftFeedback && blocks.iter().any(|block|block.masked.len()>1)).then(||model.valid());
     for (row_index,row) in rows.iter().enumerate() {
         let Some(length) = selected.peek().filter(|block| block.row == row_index).map(|block| block.length) else {continue;};
-        let starts = (0..row.target.len()).step_by(length).map(|start|start+1).collect::<Vec<_>>();
+        let starts = blocks.iter().filter(|block|block.row==row_index && block.masked.len()>1).map(|block|block.start+1).collect::<Vec<_>>();
         let cache = (length > 1).then(|| model.training_cache(trace,row_index,&starts));
         let teacher_cache=teacher_model.as_ref().and_then(|_|cache.as_ref().map(|cache|cache.detached()));
         while selected.peek().is_some_and(|block| block.row == row_index) {
@@ -156,7 +156,7 @@ fn training_loss_per_block<P: delta_mixers::profile::Sections>(model: &LanguageM
             let observed = (0..n).map(|j| (!block.masked[j]).then_some(row.target[block.start+j] as usize)).collect();
             let mut soft = state(c,observed,&device)?;
             let cache = cache.as_ref().unwrap();
-            let block_index = block.start/block.length;
+            let block_index = starts.binary_search(&(block.start+1)).unwrap();
             if s.feedback == SbdFeedback::SoftFeedback {
                 let teacher_model=teacher_model.as_ref().unwrap();
                 let teacher=teacher_model.cached_block_profiled(teacher_cache.as_ref().unwrap(),block_index,&soft,false,profile);
@@ -252,7 +252,7 @@ pub(crate) fn training_loss_sampled_profiled<P:delta_mixers::profile::Sections>(
         ensure!(rows.iter().all(|row|row.weight.iter().all(|&weight|weight == 1.0)),
             "Codpula joint event loss requires unit valid target weights");
     }
-    let mut trace = crate::sbd_training::CleanInputs::default();
+    let mut trace = crate::sbd_training::CleanInputs::new(blocks.iter().filter(|block|block.masked.len()>1).map(|block|block.start+1));
     let clean_logits = model.forward_profiled(batch,&mut trace);
     let loss = model.loss(clean_logits.clone(), batch);
     let result = SbdTrainingResult {loss,circuit_flows:None,
@@ -361,15 +361,27 @@ fn clean_snapshot(model: &LanguageModel, prefix: &[i32], device: &Device) -> (Te
     (logits,trace.0)
 }
 
-/// Mutable clean history is changed only by `replay`. Denoising uses its immutable
-/// token snapshot, reconstructing tensor states without changing this history.
+/// Clean token history; the next block's cache is its only required clean pass.
 struct CleanPrefix {
+    tokens: Vec<i32>,
+    appended: usize,
+}
+impl CleanPrefix {
+    fn new(tokens: Vec<i32>) -> Self { Self {tokens,appended:0} }
+    fn append(&mut self, finalized: &[i32]) {
+        self.tokens.extend_from_slice(finalized);
+        self.appended+=finalized.len();
+    }
+}
+
+/// Explicit full snapshots retained only by the numerical replay diagnostic.
+struct ReferencePrefix {
     tokens: Vec<i32>,
     logits: Tensor<3>,
     states: Vec<Tensor<4>>,
     replayed: usize,
 }
-impl CleanPrefix {
+impl ReferencePrefix {
     fn new(model: &LanguageModel, tokens: Vec<i32>, device: &Device) -> Self {
         let (logits,states) = clean_snapshot(model,&tokens,device);
         Self { tokens, logits, states, replayed: 0 }
@@ -438,7 +450,7 @@ pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32],
     }
     ensure!(!prompt.is_empty(),"generation requires a clean prefix");
     let model = model.valid();
-    let mut clean = CleanPrefix::new(&model,prompt.to_vec(),device);
+    let mut clean = CleanPrefix::new(prompt.to_vec());
     runtime::sync(device)?;
     let clock = Instant::now();
     let mut passes = 0;
@@ -536,13 +548,13 @@ pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32],
         }
         drop(coordination_cache);
         let finalized: Vec<i32> = final_values.into_iter().map(|v| v.unwrap() as i32).collect();
-        clean.replay(&model,&finalized,device);
+        clean.append(&finalized);
         generated.extend_from_slice(&finalized);
         blocks += 1;
     }
     runtime::sync(device)?;
     let seconds = clock.elapsed().as_secs_f64();
-    let mut report = json!({"tokens":generated,"text":String::from_utf8_lossy(&generated.iter().map(|&x| x as u8).collect::<Vec<_>>()),"finalized_tokens":generated.len(),"finalized_tokens_per_second":generated.len() as f64/seconds,"seconds":seconds,"denoising_passes":passes,"blocks":blocks,"causally_replayed_tokens":clean.replayed,"includes_replay":true,"prefill_included":false,"replay_implementation":"full clean-prefix reconstruction once per finalized block; no incremental optimization","commit_rule":if s.commitment() == SbdCommitment::Dependence {"dependence"} else if s.entropy_threshold.is_some() {"sbd_entropy_eq8"} else {"fixed_count"},"joint_output":s.joint_output,"joint_execution":s.joint_execution,"proposal_seed":c.seed,"potential_temperature":c.soft_temperature,"dependence_threshold":s.dependence_threshold(),"maximum_passes_per_block":"actual block length"});
+    let mut report = json!({"tokens":generated,"text":String::from_utf8_lossy(&generated.iter().map(|&x| x as u8).collect::<Vec<_>>()),"finalized_tokens":generated.len(),"finalized_tokens_per_second":generated.len() as f64/seconds,"seconds":seconds,"denoising_passes":passes,"blocks":blocks,"clean_history_appended_tokens":clean.appended,"includes_clean_cache_preparation":true,"prefill_included":true,"clean_history_implementation":"finalized tokens extend clean history; the next block prepares one shared clean-prefix cache","commit_rule":if s.commitment() == SbdCommitment::Dependence {"dependence"} else if s.entropy_threshold.is_some() {"sbd_entropy_eq8"} else {"fixed_count"},"joint_output":s.joint_output,"joint_execution":s.joint_execution,"proposal_seed":c.seed,"potential_temperature":c.soft_temperature,"dependence_threshold":s.dependence_threshold(),"maximum_passes_per_block":"actual block length"});
     if targets.is_some() {report["decode_score"]=score.report();}
     if let Some(options) = &s.cocommit {
         report["cocommit"] = json!({"config":options,"shared_noisy_prefix_calls":coordinated_passes,
@@ -551,7 +563,7 @@ pub(crate) fn generate_scored(model: &LanguageModel, c: &Config, prompt: &[i32],
             "clean_prefix_cache_reuses":coordinated_passes.saturating_sub(coordinated_blocks),
             "circuit_preparations":if model.codpula.is_some() {2*coordinated_passes}else{0},
             "circuit_proposals":if model.codpula.is_some() {2*coordinated_passes}else{0},
-            "clean_replays":blocks,"cost_note":"seconds include both tails, all circuit queries, host selection, feedback and replay"});
+            "clean_history_appends":blocks,"cost_note":"seconds include clean-cache preparation, both tails, all circuit queries, host selection and feedback"});
     }
     Ok(report)
 }
@@ -753,7 +765,7 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
                     lengths.push(json!({"length":n,"leakage_bit_identical":true,"boundary":prefix.len(),"computational_chunk":16}));
                 }
                 let inference = tested.valid();
-                let mut replay = CleanPrefix::new(&inference,prefix.clone(),device);
+                let mut replay = ReferencePrefix::new(&inference,prefix.clone(),device);
                 let frozen = values(replay.logits.clone());
                 let frozen_states = replay.states.iter().cloned().map(values).collect::<Vec<_>>();
                 let noisy = state(&cfg,vec![None;4],device)?;
