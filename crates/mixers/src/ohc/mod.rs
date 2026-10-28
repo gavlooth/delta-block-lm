@@ -47,16 +47,14 @@ impl OhcBackend {
                 panic!("fused oHC has no CPU fallback");
             }
         }
-        let flat = streams
-            .clone()
-            .cast(burn::tensor::DType::F32)
-            .reshape([b * t, 4 * d]);
-        let projected = if *self == Self::TransposedGate {
-            weight.transpose().matmul(flat.transpose()).transpose()
-        } else {
-            flat.matmul(weight)
-        };
-        self.gate_norm(streams, projected.reshape([b, t, 16]))
+        // Normalize before the contraction so its backward sums dy * W before
+        // multiplying by inverse RMS. Scaling each dy first loses cancellation
+        // accuracy at near-zero inputs, where inverse RMS approaches 1e6.
+        let flat = streams.clone().cast(burn::tensor::DType::F32)
+            .reshape([b, t, 4 * d]);
+        let flat = Self::Tensor.gate_norm(streams, flat).reshape([b * t, 4 * d]);
+        let projected = delta_kernels::ohc_linear(flat, weight, *self == Self::TransposedGate);
+        projected.reshape([b, t, 16])
     }
     pub fn gate_norm(&self, streams: Tensor<4>, projected: Tensor<3>) -> Tensor<3> {
         if self.fused_read() {

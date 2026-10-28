@@ -1,5 +1,115 @@
 # Implementation and measured results
 
+## Current combined objective — focused numerical and CLI acceptance
+
+The approved combined design retains Codpula joint conditional NLL and adds
+CoCommit coordination / TCT correction token CE. For each branch, the joint
+event selects the positive-weight mutable targets; singleton CE retains its
+existing token weights and denominator. Positive/negative circuit statistics
+sum both terms, while traversal reach and active-chain count are recorded once
+per branch-chain, not once per term. Standalone Codpula remains joint-only.
+This is an explicit repository design, not a claim to reproduce either paper's
+standalone objective. Checkpoint math identity changes to prevent silent resume
+under the earlier token-only objective.
+
+The independent exhaustive float64 reference covers the combined scalar loss,
+all six neural/probability parameter-field derivatives, circuit statistics,
+single-count reaches and the first finite circuit update, including ragged and
+empty rows and evidence values distinct from gold. The previously passed focused
+tests were retained without rerunning them. The resumed CPU/local Vulkan
+references and actual short command chain below passed; historical timings do
+not certify the corrected equations' performance.
+
+### Resumed acceptance ledger
+
+Exact commands, exit statuses and stdout/stderr are retained under
+`artifacts/resume-acceptance/commands/`. The consolidated result is
+`artifacts/resume-acceptance/acceptance-summary.json`; original failed attempts
+remain evidence rather than being overwritten or relabeled as passes.
+
+| Reference | CPU | Local Vulkan |
+|---|---|---|
+| Kron | PASS, previously measured; not rerun | Not requested in this resumption |
+| oHC | PASS (0) | PASS (0) |
+| Wavelet | PASS (0) | PASS (0) |
+| Lngram | PASS (0) | PASS (0) |
+| Soft feedback | PASS (0) | PASS (0) |
+| Update/loss | Not applicable: custom GPU-kernel reference | PASS (0) |
+| Codpula | PASS (0) | PASS (0) |
+| Codpula model | PASS (0) | PASS (0) |
+| CoCommit | PASS (0) | PASS (0) |
+| TCT | PASS (0) | PASS (0) |
+| Remasking | PASS (0) | PASS (0) |
+| SBD batching | PASS (0) | PASS (0) |
+
+The attempted CPU update/loss command exited 101 at unsupported custom
+cross-entropy; it is not a CPU pass. Four later commands failed 15-second shared
+GPU-lock admission with empty output, not numerical execution. Subsequent CPU
+commands did not request GPU admission, and Vulkan commands used a bounded
+longer queue with an explicit admission-failure status. No concurrent GPU job
+was launched outside the shared lock.
+
+Permanent repairs exposed by these gates include compensated oHC input-adjoint
+contraction before inverse-RMS scaling; full clean-prefix `start=T` batched
+Mixer/Wavelet caches; explicit no-in-block-read serialization; Vulkan
+subnormal-weight normalization; normalized TCT candidate weights separate from
+retained mass; and declared-f32 typed checkpoint collision comparison. Remasking
+now keeps O-only full-support feature/feedback marginals separate from standard
+O+R greedy proposal marginals, reusing prepared circuits and identical A/B
+selection masks. Zero-weight observed/padded endpoint targets are selected out
+before multiplication, preventing `0 * -inf` without masking active failures.
+Stale causal/soft-feedback, query-scaling, optimizer-schedule and old-checkpoint
+fixtures were corrected without changing the independent numerical tolerances.
+
+Five newly exercised targeted unit tests passed: explicit-none config roundtrip
+(one), full clean-prefix output/VJP regressions (two), normalized saved feedback
+(one), and typed chain-state roundtrip/corruption discrimination (one). This was
+not a full-suite run.
+
+### Actual combined CLI chain
+
+All commands used the prepared D256/four-layer/B1/context32, seed-4 combined
+configuration and source checkpoint
+`smoke-source/kronlstm-hola-seed4/checkpoint-3` under the acceptance directory.
+The source trained **96 target tokens in three updates**. Saved evaluation and
+generation were separate checkpoint-loading commands; uniform generation
+finalized eight tokens.
+
+| Stage | Final outcome |
+|---|---|
+| Source `sbd-train` | PASS (0), checkpoint-3 saved |
+| Saved `sbd-evaluate` | PASS (0) |
+| Saved `sbd-generate` | PASS (0), 8 finalized tokens |
+| `remask-collect` | PASS (0), authorized 64 states × 4 pairs, H2; 35 of 256 pairs eligible |
+| `energy-fit` | PASS (0), 3 attempts per unary/pairwise part; 2 actual optimizer updates |
+| Pairwise `remask-generate` | PASS (0), 8 finalized tokens from the fitted energy |
+| TCT warm-start completion | PASS (0), 5 updates / 160 target visits, source optimizer offset/horizon 3/3 |
+| TCT checkpoint-4 → checkpoint-5 resume | PASS (0), 1 update / 32 visits; exact endpoint |
+
+The original 8-state × 2-pair collection completed but produced **zero eligible
+pairs**; fitting correctly exited 1 rather than inventing labels. The user then
+authorized 64 states × 4 pairs from the **same three-update checkpoint**, which
+produced real eligible labels. The original dataset/config are retained as
+`trajectories-8x2.json` and `collect/config-8x2.json`. The conditional authorization
+to train a 40-step source was **not used**. The fit made six attempts across two
+parts, with four zero-eligible batches skipped and two real updates
+(`eligible_weight_seen=4`); no tie tolerance changed.
+
+The first warm-start invocation executed all five updates and saved checkpoint-5
+but failed its final duplicate-save collision check: JSON had compared declared
+f32 fields as inferred f64 numbers. After the typed comparison repair,
+checkpoint-5 was completed with **zero additional updates**, then the genuine
+checkpoint-4 was resumed for the final update. Model, optimizer and chain-file
+SHA-256 checksums before/after were identical; strict model/optimizer/chain
+collision checks also passed. See `tct-exact-resume.json`.
+
+**Limits:** these are execution/numerical proofs, not text-quality or policy
+improvement results. No full suite, new B8/T512 memory diagnostic, live B8/T1024
+timing, CUDA run, paired timing study or quality training was run. The oHC
+precision repair adds synchronization; old performance figures are historical.
+Old-equation/removed-selector checkpoints are intentionally rejected, not
+silently converted. Step 12 remains outside this acceptance.
+
 **Architecture history:** **GDN-2 removed on 2026-10-28 by user decision.** KronLSTM is the only supported mixer. All GDN-labelled arms, selectors, commands, parameter counts and timings below describe historical executions; they are not current run instructions. Historical numeric results remain unchanged and do not establish acceptance of later parameterization changes.
 
 For historical optimized execution paths, measured speedups and legacy GPU-solver limitations, see [Early GPU kernel optimization](#early-gpu-kernel-optimization). The earlier batch-8 configuration and its combined measurements are in [Batch-8 component optimization round](#batch-8-component-optimization-round). Step 7 (oHC, wavelet mixer, three Lngram injections) is in [Step 7: oHC, wavelet and Lngram](#step-7-ohc-wavelet-and-lngram). The first sections retain the original pilot measurements.

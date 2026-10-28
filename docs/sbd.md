@@ -19,6 +19,9 @@ not a second copy of the clean next-token loss.
 The omitted in-block read is `hola_read`, reusing existing HOLA rather than
 introducing dense block attention. Explicit `none` is a reference-only causal
 communication isolation variant, not the paper's bidirectional noisy read.
+Both `in_block_reads` values are serialized explicitly. In particular, a saved
+reference-only `none` must not disappear and deserialize as the omitted
+`hola_read` default; both settings retain their own roundtrip fingerprints.
 The ordinary factorized sampler defaults to the paper entropy budget
 `entropy_threshold: 0.1` nats (a reported low reasoning setting), not a fixed
 commit count. Explicit standalone Codpula selection retains its own algorithm.
@@ -67,9 +70,9 @@ The optional `sbd.cocommit` adds one learned marker over the full saved hidden r
 The optional execution setting `sbd.rows_per_pass` processes every full-batch row in explicit groups, sums scaled gradients and unscaled circuit flows/counts, then performs one clipping/AdamW/circuit update. Full-batch mask and CoCommit-bundle sampling occurs before partitioning. Omission preserves the historical one-pass path and serialization. The CoCommit B8 profile uses two four-row groups; this is exact gradient accumulation, not fewer examples or a hidden allocation fallback.
 
 Training reports `gradient_counts_this_invocation` per trainable parameter
-tensor: optimizer steps with nonzero squared gradient norm, zero norm, or no
+tensor: optimizer steps with positive absolute-gradient sum, zero sum, or no
 gradient. The last case is allowed only by an exact, draw-specific parameter
-list: `sbd_mask` and the Codpula gate head when no multi-token noisy block is
+list: `sbd_mask` and the Codpula gate head when no noisy block is
 scored, and `cocommit_marker` when no marked branch is used. Every other missing
 gradient still stops the update. No zero-weight parameter terms are inserted
 into losses, and these counts do not assert that every parameter learned.
@@ -132,6 +135,8 @@ Training retains normalized sublayer inputs and aliases of the clean mixer's raw
 
 Cache membership preparation now reuses the existing fused position-selection schedule without computing a complete TensorHOLA attention read. The selected positions, ties, document resets, padding and chunk-boundary snapshots are unchanged; original clean K/V tensors remain the differentiable value sources. Ninety oracle/old-read comparisons have exact membership equality. Soft-feedback teachers use frozen parameters and detached cache aliases before execution, not an unused graph detached only at the output; student computation and gradients are unchanged.
 A target block starting at target index `s` sees exactly `example.input[..s+1]`: BOS followed by all clean target tokens strictly before `s`. Noisy target `s+j` occupies the same input-position identity `s+1+j` as its clean token counterpart. There is no second positional coordinate or repeated learned position embedding in this model.
+
+Cache starts are clean-prefix boundaries in `[0,T]` for a nonempty clean input of length `T`. In particular, the final target can require the full clean prefix (`start=T`). Batched mixer and wavelet caches accept this endpoint, retaining the terminal recurrent state, preceding convolution inputs and original HOLA chunk membership. The cache regressions compare endpoint outputs and input/parameter gradients with the individual-prefix path, including aligned and unfinished chunks.
 
 Each mixer computes its clean-prefix recurrence and uses that final state as the initial state of every noisy query's **independent, temporary one-step recurrence**. Temporary states are discarded.
 

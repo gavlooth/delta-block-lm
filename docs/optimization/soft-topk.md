@@ -80,12 +80,17 @@ Normalization uses a custom first-order VJP:
 `dp = (g - sum(g * normalized)) / mass`.
 The centered numerator is formed before direct division. Splitting this into
 reciprocal/divisor paths causes `inf - inf` for positive subnormal mass even
-when the true gradient of `sum(normalized)` is exactly zero. Sparse selection
-and dense references share the corrected operation; all-zero rows keep the
-existing denominator-one extension. References now check subnormal outputs
-and the constant-loss zero VJP, zero-row derivatives, and honest infinities
+when the true gradient of `sum(normalized)` is exactly zero. Vulkan can also
+flush the raw mass reduction and division inputs to zero. GPU normalization
+therefore reconstructs tiny-row values from their IEEE significand bits in
+units of `2^-126`, sums and divides those normal values, and records that
+power-of-two scale for the centered VJP. Normal-mass rows retain ordinary
+division. Sparse and dense mask-only decisions use normalized support, not a
+potentially flushed raw diagnostic mass. All-zero rows retain the denominator-one
+extension. References check subnormal outputs, preserved `1:3` ratios, sparse
+support and constant-loss zero VJPs, zero-row derivatives, and honest infinities
 for genuinely unrepresentable derivatives. No probability floor, gradient
-clamp, or selected-probability detach is introduced.
+clamp, selected-probability detach, or tolerance change is introduced.
 
 Ordinary training samples soft students with probability `0.8` and binary
 students otherwise; binary draws do not run a teacher or train confidence

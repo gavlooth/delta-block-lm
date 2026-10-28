@@ -7,7 +7,7 @@ use serde_json::{Value,json};
 use std::time::Instant;
 use crate::profile::median;
 
-struct Runner { model:Option<LanguageModel>,optim:train::NeuralOptimizer,step:usize,peak:Option<u64> }
+struct Runner { model:Option<LanguageModel>,optim:crate::update::NeuralOptimizer,step:usize,peak:Option<u64> }
 impl Runner {
     fn sample(&mut self,device:&Device) { if let Some(bytes)=runtime::sampled_reserved(device) {self.peak=Some(self.peak.unwrap_or(0).max(bytes));} }
     fn step(&mut self,c:&Config,corpus:Option<&Corpus>,device:&Device) -> Result<f64> {

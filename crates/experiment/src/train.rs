@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path, time::Instant};
 use crate::update::NeuralOptimizer as ModuleOptimizer;
 
-pub(crate) const MEASUREMENT_VERSION: &str = "per-parameter-gradient-counts-v3";
+pub(crate) const MEASUREMENT_VERSION: &str = "absolute-gradient-counts-v4";
 pub(crate) fn optimizer_config(c: &Config) -> AdamWConfig {
     AdamWConfig::new()
         .with_weight_decay(c.weight_decay)
@@ -204,7 +204,7 @@ pub(crate) fn checkpoint_with_tct(
     model: &LanguageModel,
     optim: &ModuleOptimizer,
     state: &State,
-    tct: Option<&Value>,
+    tct: Option<&crate::tct::TrainingState>,
 ) -> Result<()> {
     if !path.exists() {
         let stamp = std::time::SystemTime::now()
@@ -236,7 +236,10 @@ pub(crate) fn checkpoint_with_tct(
             "checkpoint destination collision: optimizer state differs; existing evidence was not overwritten"
         );
         let saved_tct = path.join("tct.json");
-        let previous_tct: Option<Value> = if saved_tct.exists() {
+        // Compare saved f32 fields as f32, not JSON's inferred f64 numbers.
+        // Parsing an expanded f32 decimal as f64 can differ by a final f64 ULP
+        // even though loading it as the declared checkpoint type is exact.
+        let previous_tct: Option<crate::tct::TrainingState> = if saved_tct.exists() {
             Some(serde_json::from_slice(&std::fs::read(saved_tct)?)?)
         } else {
             None
@@ -434,7 +437,7 @@ pub fn run(
     let mix = arm.mixer_config(c)?;
     let mut metrics = json!({"schema":1,"task":c.task,"arm":arm,"seed":seed,"config":c,"config_sha256":fingerprint,"data":data,
         "device":runtime::identity(device),"precision":"float32","optimizer":"AdamW",
-        "gradient_counts_this_invocation":gradient_counts,"gradient_counts_note":"per trainable parameter tensor: optimizer steps with nonzero squared norm, zero norm, or an explicitly allowed missing gradient; no assertion that every parameter learned",
+        "gradient_counts_this_invocation":gradient_counts,"gradient_counts_note":"per trainable parameter tensor: optimizer steps with positive absolute-gradient sum, zero sum, or an explicitly allowed missing gradient; no assertion that every parameter learned",
         "measurement_implementation_version":MEASUREMENT_VERSION,
         "training_algorithm":arm.training_algorithm(c),"custom_gpu_kernel_proof":arm.uses_custom_gpu(c),
         "parameters":parameters,"recurrent_state_bytes":mix.recurrent_state_bytes(c.batch_size)*c.layers,"cache_including_current_chunk_bytes":mix.exact_memory_bytes(c.batch_size)*c.layers,
@@ -877,6 +880,7 @@ mod summary_tests {
         let mut c = Config::default();
         c.task = "lm".into();
         c.backend = "cpu".into();
+        c.arms = vec![crate::config::Arm {name:"kronlstm-hola".into(),mixer:"kronlstm".into(),cache:"surprise".into()}];
         c.corpus_manifest = manifest;
         c.artifact_dir = root.join("runs");
         c.d_model = 8;
@@ -889,7 +893,7 @@ mod summary_tests {
         c.train_tokens = 8;
         c.eval_examples = 1;
         c.sbd = Some(crate::config::SbdConfig {
-            block_lengths: vec![2],
+            block_lengths: vec![2], training_block_lengths: vec![2],
             refinement: Some(crate::remask::RefinementConfig {
                 policy: crate::mask_energy::MaskPolicy::Pairwise,
                 energy_path: Some(root.join("missing-energy.burnpack")),

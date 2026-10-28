@@ -191,13 +191,15 @@ impl Candidates {
         let [rows, k] = self.ids.dims();
         let d = embeddings.dims()[1];
         let inactive = active.lower_elem(0.5);
+        // Raw diagnostic mass can flush subnormals on GPU; normalized support cannot.
+        let support = self.weights.clone().sum_dim(1).greater_elem(0.0);
         let visibility = visibility.mask_fill(
-            inactive.clone().bool_or(self.retained_mass.clone().equal_elem(0.0)), 0.0);
+            inactive.clone().bool_or(support.clone().bool_not()), 0.0);
         if hard_mask {
             let first = self.ids.clone().slice([0..rows, 0..1]).reshape([rows]);
             let visible = visibility
                 .greater_equal_elem(1.0)
-                .bool_and(self.retained_mass.clone().greater_elem(0.0));
+                .bool_and(support);
             let values = embeddings
                 .select(0, first)
                 .mask_fill(visible.clone().bool_not().expand([rows, d]), 0.0);
@@ -270,8 +272,8 @@ pub fn dense_expected_masked(
     let hidden = visibility.clone().equal_elem(0.0).bool_or(inactive.clone());
     let probabilities = probabilities.mask_fill(hidden.expand([rows, vocab]), 0.0);
     let mass = probabilities.clone().sum_dim(1);
-    let visibility = visibility.mask_fill(mass.clone().equal_elem(0.0), 0.0);
     let probabilities = delta_kernels::soft_normalize(probabilities, mass);
+    let visibility = visibility.mask_fill(probabilities.clone().sum_dim(1).equal_elem(0.0), 0.0);
     // Keep finite zero-probability derivatives; sanitize only unused nonfinite embedding rows.
     let unused = probabilities
         .clone()

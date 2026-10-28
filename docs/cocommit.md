@@ -2,8 +2,8 @@
 
 ## Current paper contract (2026-10-28)
 
-The equations in [CoCommit §§3–5](https://arxiv.org/html/2607.04469v2)
-now govern the decoder and its ordinary training objective:
+The decoder follows [CoCommit §§3–5](https://arxiv.org/html/2607.04469v2).
+The circuit-backed training composition below is an explicit user-selected design:
 
 - A chooses only masked positions with maximum denoiser probability **strictly
   greater than 0.7**; if none qualifies, it chooses the most confident mask
@@ -24,19 +24,21 @@ now govern the decoder and its ordinary training objective:
   including model-generated errors. A's token CE weights are 1 for masks, 0.3
   for wrong visible drafts and 0.2 for clean visible drafts. B uses the same
   visible terms but its masked CE targets only the random announced bundle.
-- Circuit-backed branches optimize the **sum of marginal token CEs**, not a
-  replacement joint event. Weighted singleton conditional events supply both
-  neural derivatives and real positive/negative manual circuit flows. Their
-  reach/count normalization counts a logical chain once, not once per target.
-  Standalone Codpula's joint objective remains separate.
+- Circuit-backed branches retain **joint conditional Codpula NLL and add
+  weighted marginal token CE**. The joint event fixes the branch's positive-weight
+  mutable targets together; the token term queries them individually with the
+  existing weights. Neural derivatives and positive/negative circuit statistics
+  sum both terms, but traversal reach and active-chain count are recorded once
+  per branch-chain. Standalone Codpula remains joint-only.
 - Retained soft inputs use latest normalized top-k feedback and the learned
   entropy confidence head. The ordinary binary/soft draw happens before the
   optional soft-feedback teacher; CoCommit's own-draft corruption is required in
   either draw. It is not ordinary provisional-input augmentation.
-- TCT retains its own A correction CE on **every mutable position**, including
-  wrong reveals, averaged over logical chains and summed over tokens. The B
-  masked-S/visible coordination CE is an explicitly composed auxiliary term,
-  not a claim that A+B is exactly TCT Eq. (2). The separate SBD clean term remains.
+- TCT adds token CE on **every mutable position**, including wrong reveals,
+  averaged over logical chains and summed over tokens, to its retained joint
+  Codpula NLL. Optional B adds its own joint event and masked-S/visible token CE.
+  This composition is not exactly TCT Eq. (2) or standalone CoCommit; the separate
+  SBD clean term remains.
 
 Small configured generation blocks and tail depths are size choices. This is a
 from-scratch recurrent composition, not a frozen-random-backbone LoRA experiment
@@ -45,15 +47,20 @@ change is inferred. New SBD/CoCommit/provisional revision identifiers reject old
 training fingerprints; TCT chain schema 3 also persists feedback entropy and
 availability and rejects earlier chain records.
 
-The reference routes now cover noisy singletons, target/write branch matching,
-weighted marginal CE, wrong revealed inputs, full-block-only targets and logical
-row accumulation. Checks in this change were **not executed by the worker**;
-the integrator owns the single final acceptance run.
+The reference routes cover noisy singletons, target/write branch matching,
+weighted token CE, wrong revealed inputs, full-block-only targets and logical
+row accumulation. The exhaustive Codpula oracle additionally checks combined
+joint-plus-token loss, all neural/probability derivatives, summed circuit flows,
+single-count reaches and the first finite update. Current execution outcomes
+are recorded in [RESULTS](../RESULTS.md), separately from historical evidence.
+The independent temporary-Kron reference applies `1/sqrt(key_dim)` only to
+the query readout, matching the current scan. It leaves the stored state and
+physical edit norm unscaled.
 
 ## Historical design and execution record
 
 The remainder records earlier implementation choices, rejected equations,
-measurements and partial acceptance. Its joint-event objectives, sampled
+measurements and partial acceptance. Its joint-only branch objectives, sampled
 CoCommit proposals, entropy/dependence bundle selectors and singleton causal
 bypass are historical, **not the current implementation contract** above.
 

@@ -932,7 +932,7 @@ fn projection_checks(
                     "gate projection dx",
                     &values(x.grad(&g).ok_or("projection dx")?),
                     &dx,
-                )?);
+                ).map_err(|e| format!("{e}; backend={backend:?}, input_scale={scale}, strided={strided}"))?);
                 let actual_dw = values(w.grad(&g).ok_or("projection dw")?);
                 error = error.max(compare("gate projection dw", &actual_dw, &dw)?);
                 for _ in 0..2 {

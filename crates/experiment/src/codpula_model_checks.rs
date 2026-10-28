@@ -473,8 +473,39 @@ fn locality_and_singletons(model: &LanguageModel, cfg: &Config, device: &Device)
         let state = soft(cfg, vec![observation], vec![true], device)?;
         let prefix = &examples[0].input[..prefix_length];
         let singleton = sbd::block_forward(model, prefix, &state, false, device);
+        let cached = model.cached_block(&cache, 0, &state, false);
+        let logits = compare(&values(singleton.logits.clone()), &values(cached.logits))?;
+        let features = compare(&values(singleton.features.clone()), &values(cached.features))?;
         let causal = model.forward_output_profiled(&Batch::new(&[Example { input:prefix.to_vec(),target:vec![0;prefix.len()],weight:vec![1.0;prefix.len()],groups:vec![None;prefix.len()] }], device), &mut delta_mixers::profile::Unprofiled).slice_positions(prefix_length - 1, 1);
-        singleton_reports.push(json!({"observed":observation,"logits":identical(&values(singleton.logits),&values(causal.logits),"Codpula L1 causal logits")?,"features":identical(&values(singleton.features),&values(causal.features),"Codpula L1 causal features")?}));
+        let causal_gap = values(singleton.logits.clone()).iter().zip(values(causal.logits))
+            .map(|(&a,b)|f64::from((a-b).abs())).fold(0.0f64,f64::max);
+        ensure!(causal_gap > 1e-8, "singleton fixture does not distinguish the noisy network from the removed causal bypass");
+        let (prepared,tokens,fixed) = sbd::prepare_circuit(model,singleton,&state,1.0)?;
+        let potentials = values(prepared.logits.clone());
+        let emission = values(prepared.log_emission.clone());
+        let roots = values(prepared.root_rows());
+        let mut expected = vec![0.0f64;VOCAB];
+        if let Some(token) = observation {
+            expected[token] = 1.0;
+        } else {
+            // At L=1 the independent HMM expansion is sum_s r_s g_s(v).
+            for latent in 0..STATES {
+                let scores = (0..VOCAB).map(|v|f64::from(emission[latent*VOCAB+v])+f64::from(potentials[v])).collect::<Vec<_>>();
+                let maximum = scores.iter().copied().fold(f64::NEG_INFINITY,f64::max);
+                let log_normalizer = maximum+scores.iter().map(|&x|(x-maximum).exp()).sum::<f64>().ln();
+                for v in 0..VOCAB {
+                    expected[v] += (f64::from(roots[latent])+scores[v]-log_normalizer).exp();
+                }
+            }
+        }
+        let marginals = sbd::compare(&values(prepared.marginals(tokens,fixed.clone())?),&expected)?;
+        let joint = prepared.conditional_nll(Tensor::<2,Int>::from_data([[91]],device),fixed,1.0)?;
+        let expected_loss = if observation.is_some() {0.0} else {-expected[91].ln()};
+        let loss = sbd::compare(&values(joint.loss),&[expected_loss])?;
+        ensure!(joint.flows.active_blocks == usize::from(observation.is_none()),
+            "singleton circuit learning count differs from its unresolved target count");
+        singleton_reports.push(json!({"observed":observation,"cached_logits":logits,"cached_features":features,
+            "independent_f64_mixture":marginals,"conditional_joint_nll":loss,"noisy_vs_causal_logit_gap":causal_gap}));
     }
     Ok(json!({"passed":true,"future_mutations":mutations,"future_features_logits_and_joint_queries_bit_identical":true,"observation_point_mass_immutable":true,"changed_explicit_observation_changes_query":true,"singletons":singleton_reports}))
 }
@@ -516,15 +547,32 @@ fn teacher_and_student(model: &LanguageModel, cfg: &Config, device: &Device) -> 
     ensure!(student_gradient[VOCAB..2 * VOCAB].iter().all(|&x| x == 0.0), "observed token potentials have a gradient");
     let features_gradient = values(student_feature_probe.grad(&gradients).context("student gate-feature gradient")?);
     let observed_features_max = nonzero_finite(&features_gradient[cfg.d_model..2 * cfg.d_model], "observed student features through context gates")?;
+    // The student backward consumed the learned-visibility graph in `state`.
+    // Rebuild the whole clean-cache/teacher/feedback path for the independent
+    // embedding VJP rather than detaching visibility or reusing that tape.
+    let mut embedding_trace = CleanInputs::default();
+    let _ = model.forward_profiled(&Batch::new(&examples,device),&mut embedding_trace);
+    let embedding_cache = model.training_cache(&embedding_trace,0,&[19]);
+    let mut embedding_state = soft(cfg,vec![None,Some(65),None,None],vec![true;4],device)?;
+    let mut embedding_teacher = model.cached_block(&embedding_cache,0,&embedding_state,false);
+    let embedding_teacher_potential_probe = Tensor::zeros(embedding_teacher.logits.dims(),device).require_grad();
+    let embedding_teacher_feature_probe = Tensor::zeros(embedding_teacher.features.dims(),device).require_grad();
+    embedding_teacher.logits = embedding_teacher.logits + embedding_teacher_potential_probe.clone();
+    embedding_teacher.features = embedding_teacher.features + embedding_teacher_feature_probe.clone();
+    sbd::update_feedback(model,cfg,embedding_teacher,&mut embedding_state)?;
+    identical(&values(embedding_state.candidates.dense(VOCAB)),&values(state.candidates.dense(VOCAB)),
+        "recomputed teacher changed selected embedding candidates")?;
+    identical(&values(embedding_state.visibility.clone()),&values(state.visibility.clone()),
+        "recomputed teacher changed learned visibility")?;
     let table = model.embedding.weight.val().detach().require_grad();
     let mask = model.sbd_mask.as_ref().unwrap().val().detach().require_grad();
-    let expected = state.embeddings(table.clone(), mask.clone(), false);
+    let expected = embedding_state.embeddings(table.clone(), mask.clone(), false);
     let direction = Tensor::from_data(TensorData::new((0..4 * cfg.d_model).map(|i| ((i * 13 % 19) as f32 + 1.0) / 19.0).collect::<Vec<_>>(), [4,cfg.d_model]), device);
     let embedding_gradients = (expected * direction).sum().backward();
-    ensure!(teacher_potential_probe.grad(&embedding_gradients).is_none() && teacher_feature_probe.grad(&embedding_gradients).is_none(), "selected-embedding loss differentiates through teacher");
+    ensure!(embedding_teacher_potential_probe.grad(&embedding_gradients).is_none() && embedding_teacher_feature_probe.grad(&embedding_gradients).is_none(), "selected-embedding loss differentiates through its recomputed teacher");
     let table_gradient = values(table.grad(&embedding_gradients).context("selected student embedding gradient")?);
-    let ids = crate::soft::ids_host(state.candidates.ids.clone());
-    let k = state.candidates.ids.dims()[1];
+    let ids = crate::soft::ids_host(embedding_state.candidates.ids.clone());
+    let k = embedding_state.candidates.ids.dims()[1];
     let mut selected_max = 0.0f64;
     for row in [0,2,3] {
         for &id in &ids[row*k..(row+1)*k] {
@@ -535,7 +583,10 @@ fn teacher_and_student(model: &LanguageModel, cfg: &Config, device: &Device) -> 
     for ((_,kind,value),before) in trace.0.iter().zip(&clean_before) {
         identical(&values(value.clone()),before,&format!("teacher/student changed clean {kind} snapshot"))?;
     }
-    Ok(json!({"passed":true,"same_clean_training_cache_for_teacher_and_student":true,"clean_snapshot_sources_bit_identical":true,"training_objective":"final student conditional NLL only; no teacher or per-round averaged loss","teacher_logits_and_features_gradients_absent":true,"teacher_potential_temperature_then_feedback_temperature_one":temperature_report,"feedback_visibility":visibility_report,"student_logit_gradient_max_abs":maximum,"observed_logit_gradient_zero":true,"observed_gate_feature_gradient_max_abs":observed_features_max,"selected_embedding_gradient_max_abs":selected_max}))
+    for ((_,kind,value),before) in embedding_trace.0.iter().zip(&clean_before) {
+        identical(&values(value.clone()),before,&format!("embedding VJP changed recomputed clean {kind} snapshot"))?;
+    }
+    Ok(json!({"passed":true,"same_clean_training_cache_for_teacher_and_student":true,"independent_forward_graph_for_embedding_vjp":true,"recomputed_candidates_and_visibility_bit_identical":true,"clean_snapshot_sources_bit_identical":true,"training_objective":"final student conditional NLL only; no teacher or per-round averaged loss","teacher_logits_and_features_gradients_absent":true,"teacher_potential_temperature_then_feedback_temperature_one":temperature_report,"feedback_visibility":visibility_report,"student_logit_gradient_max_abs":maximum,"observed_logit_gradient_zero":true,"observed_gate_feature_gradient_max_abs":observed_features_max,"selected_embedding_gradient_max_abs":selected_max}))
 }
 
 fn contextual_heads(model: &LanguageModel, cfg: &Config, device: &Device) -> Result<Value> {
@@ -663,21 +714,26 @@ fn training_paths(model: &LanguageModel, cfg: &Config, device: &Device) -> Resul
     let mut singleton = cfg.clone();
     singleton.sbd.as_mut().unwrap().block_lengths = vec![1];
     singleton.sbd.as_mut().unwrap().training_block_lengths = vec![1];
+    singleton.sbd.as_mut().unwrap().block_execution = SbdBlockExecution::PerBlock;
+    let singleton_blocks = sbd::sample_training_blocks(&singleton,&examples,1)?;
+    ensure!(!singleton_blocks.is_empty() && singleton_blocks.iter().all(|block|block.masked == [true]),
+        "singleton training fixture has no masked singleton targets");
     let result = sbd::training_loss(model, &singleton, &examples, &batch, 1)?;
-    ensure!(result.circuit_flows.is_none(), "L1 bypass produces circuit updates");
-    let mut factorized = singleton.clone();
-    factorized.sbd.as_mut().unwrap().joint_output = SbdJointOutput::Factorized;
-    let mut causal = model.clone();
-    causal.codpula = None;
-    let baseline = sbd::training_loss(&causal,&factorized,&examples,&batch,1)?;
-    let singleton_loss = identical(&values(result.loss.clone()),&values(baseline.loss.clone()),"L1 joint/factorized loss")?;
+    let flows = result.circuit_flows.as_ref().context("noisy singleton omitted its circuit statistics")?;
+    ensure!(flows.active_blocks == singleton_blocks.len(), "noisy singleton circuit count differs from sampled blocks");
+    let mut singleton_batched = singleton.clone();
+    singleton_batched.sbd.as_mut().unwrap().block_execution = SbdBlockExecution::Batched;
+    let baseline = sbd::training_loss(model,&singleton_batched,&examples,&batch,1)?;
+    let singleton_loss = compare(&values(result.loss.clone()),&values(baseline.loss.clone()))?;
+    let singleton_flows = compare_flows(flows,baseline.circuit_flows.as_ref().context("batched singleton circuit statistics")?)?;
     let (singleton_grads, _) = model::checked_gradients_with_unused(model,result.loss,&result.unused_parameters,&mut delta_mixers::profile::Unprofiled)?;
     let singleton_gradients = snapshot_with_unused(model,Some(&singleton_grads),&result.unused_parameters)?;
-    let (baseline_grads, _) = model::checked_gradients_with_unused(&causal,baseline.loss,&baseline.unused_parameters,&mut delta_mixers::profile::Unprofiled)?;
-    let singleton_common_gradients = compare_snapshots(&common(&singleton_gradients),&snapshot_with_unused(&causal,Some(&baseline_grads),&baseline.unused_parameters)?,true)?;
-    for (name,gradient) in &singleton_gradients {
-        if name.split('.').any(|part|part == "codpula") { ensure!(gradient.values.iter().all(|&x|x == 0.0),"L1 bypass trains context head {name}"); }
-    }
+    let (baseline_grads, _) = model::checked_gradients_with_unused(model,baseline.loss,&baseline.unused_parameters,&mut delta_mixers::profile::Unprofiled)?;
+    let singleton_all_gradients = compare_snapshots(&singleton_gradients,
+        &snapshot_with_unused(model,Some(&baseline_grads),&baseline.unused_parameters)?,false)?;
+    let mask_gradient = singleton_grads.get::<1>(model.sbd_mask.as_ref().context("singleton mask parameter")?.id)
+        .context("noisy singleton omitted its mask embedding gradient")?;
+    let singleton_mask_gradient = nonzero_finite(&values(mask_gradient),"noisy singleton mask embedding gradient")?;
     let one_row = rows(1, 4);
     let mut all_observed_seed = None;
     for seed in 0..65_536 { if sbd::sample_training_blocks(cfg,&one_row,seed)?.is_empty() { all_observed_seed = Some(seed); break; } }
@@ -690,7 +746,7 @@ fn training_paths(model: &LanguageModel, cfg: &Config, device: &Device) -> Resul
     let (gradients, report) = model::checked_gradients_with_unused(model,result.loss,&result.unused_parameters,&mut delta_mixers::profile::Unprofiled)?;
     let _ = snapshot_with_unused(model,Some(&gradients),&result.unused_parameters)?;
     ensure!(report.get("sbd_mask").is_some_and(|count| count.missing_steps == 1), "all-observed draw fabricated a mask gradient");
-    Ok(json!({"passed":true,"mixed_mask_seed":mixed_seed,"sampled_blocks":sbd::sample_training_blocks(cfg,&examples,mixed_seed)?.iter().map(|block|json!({"row":block.row,"start":block.start,"length":block.length,"masked":block.masked})).collect::<Vec<_>>(),"execution_paths":reports,"fractional_weight_rejection":error.to_string(),"length_one_no_circuit_update":true,"length_one_factorized_loss":singleton_loss,"length_one_factorized_common_gradients":singleton_common_gradients,"length_one_head_gradients_absent":true,"all_observed_seed":seed,"all_observed_loss":clean_report,"bypass_gradients_finite_except_named_unused_parameters":true}))
+    Ok(json!({"passed":true,"mixed_mask_seed":mixed_seed,"sampled_blocks":sbd::sample_training_blocks(cfg,&examples,mixed_seed)?.iter().map(|block|json!({"row":block.row,"start":block.start,"length":block.length,"masked":block.masked})).collect::<Vec<_>>(),"execution_paths":reports,"fractional_weight_rejection":error.to_string(),"length_one_active_circuit_blocks":singleton_blocks.len(),"length_one_per_block_vs_batched_loss":singleton_loss,"length_one_per_block_vs_batched_flows":singleton_flows,"length_one_per_block_vs_batched_all_gradients":singleton_all_gradients,"length_one_mask_gradient_max_abs":singleton_mask_gradient,"all_observed_seed":seed,"all_observed_loss":clean_report,"gradients_finite_except_named_unused_parameters":true}))
 }
 
 fn circuit_state(model: &LanguageModel) -> Result<Value> {
@@ -718,7 +774,7 @@ fn circuit_state(model: &LanguageModel) -> Result<Value> {
     let step = state.step.val().into_data().try_to_vec_as::<i32>().map_err(|e|anyhow::anyhow!("circuit update step {e:?}"))?;
     Ok(json!({"passed":true,"update_step":step[0],"row_normalization":normalized,"circuit_parameters_frozen":true,"ema_state_finite_nonnegative":true}))
 }
-fn complete_step(model: LanguageModel, cfg: &Config, optimizer: &mut train::NeuralOptimizer, examples: &[Example], seed: u64, device: &Device) -> Result<(LanguageModel,Value)> {
+fn complete_step(model: LanguageModel, cfg: &Config, optimizer: &mut crate::update::NeuralOptimizer, examples: &[Example], seed: u64, device: &Device) -> Result<(LanguageModel,Value)> {
     let before = snapshot(&model,None)?;
     let previous_circuit_step = model.codpula.as_ref().context("complete-step circuit")?.probability.step.val().into_scalar::<i32>();
     let result = sbd::training_loss(&model,cfg,examples,&Batch::new(examples,device),seed)?;
@@ -927,7 +983,12 @@ fn rollout_run(model: &LanguageModel, cfg: &Config, device: &Device, width: usiz
         stored_proposals.resize(width,0);
         sbd::advance_generation_state(model,cfg,&mut state,&stored_proposals,&commits,feedback_logits.clone(),1.0,device)?;
         let dense = values(state.candidates.dense(VOCAB));
-        let expected_feedback = values(feedback_only.candidates.dense(VOCAB));
+        // Absorbing commits rebuilds candidates from the mixed dense rows.
+        // Repeat that selection for the deferred-row oracle: normalized top-k
+        // weights can round differently on this second normalization.
+        let expected_feedback = values(crate::soft::Candidates::select(feedback_only.candidates.dense(VOCAB),
+            cfg.sbd.as_ref().unwrap().candidate_width,cfg.soft_selection_backend)?.dense(VOCAB));
+        let expected_visibility = values(feedback_only.visibility.clone());
         let visibility = values(state.visibility.clone());
         for position in 0..width {
             if let Some(value) = previous[position] {
@@ -937,6 +998,8 @@ fn rollout_run(model: &LanguageModel, cfg: &Config, device: &Device, width: usiz
             } else {
                 ensure!(state.observed[position].is_none(),"a deferred or padded proposal became observed");
                 identical(&dense[position*VOCAB..(position+1)*VOCAB],&expected_feedback[position*VOCAB..(position+1)*VOCAB],"deferred proposal was hardened instead of retaining soft feedback")?;
+                ensure!(visibility[position].to_bits() == expected_visibility[position].to_bits(),
+                    "deferred feedback changed its learned visibility");
             }
             if let Some(value) = state.observed[position] {
                 ensure!(visibility[position] == 1.0 && dense[position*VOCAB..(position+1)*VOCAB].iter().enumerate().all(|(id,&p)|p == if id == value {1.0}else{0.0}),
@@ -998,21 +1061,22 @@ fn scheduler_rollout(model: &LanguageModel, cfg: &Config, device: &Device) -> Re
 }
 
 
-fn historical_checkpoint_compatibility(device: &Device) -> Result<Value> {
+fn historical_checkpoint_compatibility() -> Result<Value> {
     let artifacts = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../artifacts");
     // This Step 8 payload predates recurrent-only SBD and must remain rejected.
     let dense_directory = artifacts.join("step8/pilot-soft/kronlstm-hola-seed1");
     let dense_metrics: Value = serde_json::from_slice(&std::fs::read(dense_directory.join("metrics.json"))?)?;
-    let dense: Config = serde_json::from_value(dense_metrics["config"].clone())?;
-    let dense_fingerprint = dense.training_fingerprint(dense.resolved_tokens()?)?;
-    ensure!(dense_metrics["config_sha256"] != dense_fingerprint,"obsolete dense-SBD revision was accepted");
-    let mut explicit = dense_metrics["config"].clone();
-    explicit["sbd"]["joint_output"] = json!("factorized");
-    let explicit: Config = serde_json::from_value(explicit)?;
-    ensure!(serde_json::to_vec(&explicit)? == serde_json::to_vec(&dense)?
-        && explicit.training_fingerprint(explicit.resolved_tokens()?)? == dense_fingerprint,
-        "explicit factorized changes omitted-selector serialization or identity");
-    let rejection = sbd::checkpoint_report(&dense,&dense.arms[0],dense.seed,device,&dense_directory.join("checkpoint-4"),false)
+    // Read obsolete configuration as evidence, not as a current Config. Removed
+    // feedback selectors are deliberately rejected rather than migrated.
+    let schema_rejection = serde_json::from_value::<Config>(dense_metrics["config"].clone()).err()
+        .context("obsolete feedback selectors unexpectedly accepted as current config")?.to_string();
+    ensure!(schema_rejection.contains("unknown field"),
+        "obsolete config failed for another reason: {schema_rejection}");
+    let dense_state_path = dense_directory.join("checkpoint-4/state.json");
+    let dense_state: Value = serde_json::from_slice(&std::fs::read(&dense_state_path)?)?;
+    ensure!(dense_state["model_math_revision"].as_str() != Some(crate::config::MODEL_MATH_REVISION),
+        "historical dense-SBD fixture already has the current model revision");
+    let rejection = checkpoint::load_state(&dense_state_path)
         .err().context("obsolete dense-SBD checkpoint unexpectedly resumed")?.to_string();
     ensure!(rejection.contains("pre-correction checkpoints are incompatible"),
         "obsolete dense-SBD checkpoint failed for another reason: {rejection}");
@@ -1022,12 +1086,13 @@ fn historical_checkpoint_compatibility(device: &Device) -> Result<Value> {
     ensure!(recorded["passed"] == true,"historical continuation evidence was not accepted");
     let source = PathBuf::from(recorded["reports"][0]["source_checkpoint"].as_str().context("historical checkpoint path")?);
     let causal_rejection = checkpoint::load_state(source.join("state.json")).err()
-        .context("checkpoint without learned gate biases unexpectedly resumed")?.to_string();
+        .context("checkpoint without the corrected model equations unexpectedly resumed")?.to_string();
     ensure!(causal_rejection.contains("pre-correction checkpoints are incompatible"),
         "historical causal checkpoint failed for another reason: {causal_rejection}");
     Ok(json!({"passed":true,"fixture":source,
         "model_math_revision":crate::config::MODEL_MATH_REVISION,
-        "omitted_explicit_factorized_serialization_identical":true,
+        "obsolete_config_schema_rejected":schema_rejection,
+        "historical_dense_model_math_revision":dense_state["model_math_revision"],
         "obsolete_dense_sbd_rejected":rejection,
         "obsolete_causal_checkpoint_rejected":causal_rejection,
         "historical_payloads_unchanged":true}))
@@ -1077,9 +1142,12 @@ pub fn run(c: &Config, device: &Device) -> Result<Value> {
             let expected = readout(&reference,sbd::block_forward(&reference,&examples[0].input[..19],&cpu_state,false,&cpu),&cpu_state,cpu_target,4.0)?;
             let actual = readout(&tested,sbd::block_forward(&tested,&examples[0].input[..19],&state,false,&device),&state,target,4.0).with_context(||format!("{mixer} extended={extended}: joint readout"))?;
             let mut backend = compare_readouts(&actual,&expected)?;
-            let expected_gradients = model::checked_gradients(&reference,expected.loss)?;
-            let actual_gradients = model::checked_gradients(&tested,actual.loss)?;
-            backend["all_neural_gradients"] = compare_snapshots(&snapshot(&tested,Some(&actual_gradients))?,&snapshot(&reference,Some(&expected_gradients))?,false)?;
+            // This readout receives externally constructed candidate visibility,
+            // so the learned visibility head is not in either loss graph.
+            let unused = model::unused_soft_parameters();
+            let (expected_gradients,_) = model::checked_gradients_with_unused(&reference,expected.loss,&unused,&mut delta_mixers::profile::Unprofiled)?;
+            let (actual_gradients,_) = model::checked_gradients_with_unused(&tested,actual.loss,&unused,&mut delta_mixers::profile::Unprofiled)?;
+            backend["all_neural_gradients"] = compare_snapshots(&snapshot_with_unused(&tested,Some(&actual_gradients),&unused)?,&snapshot_with_unused(&reference,Some(&expected_gradients),&unused)?,false)?;
             let paths = output_paths(&tested,&cfg,&device).with_context(||format!("{mixer} extended={extended}: output paths"))?;
             let locality = locality_and_singletons(&tested,&cfg,&device).with_context(||format!("{mixer} extended={extended}: locality and singletons"))?;
             let gradients = teacher_and_student(&tested,&cfg,&device).with_context(||format!("{mixer} extended={extended}: teacher/student gradients"))?;
@@ -1096,7 +1164,7 @@ pub fn run(c: &Config, device: &Device) -> Result<Value> {
             };
             cases.push(json!({"mixer":mixer,"joint_output":joint_output,"ohc_wavelet_lngram_and_retrieval":extended,"in_block_reads":cfg.sbd.as_ref().unwrap().in_block_reads,"joint_execution":cfg.sbd.as_ref().unwrap().joint_execution,"cpu_vs_requested_backend":backend,"output_paths":paths,"observation_and_target_locality":locality,"teacher_student_gradients":gradients,"contextual_summary_and_root_head":heads,"training_paths":training,"inactive_rows":inactive,"inference":inference,"fixed_uniform_scheduler_rollout":rollout}));
     }
-    let historical = historical_checkpoint_compatibility(&device)?;
+    let historical = historical_checkpoint_compatibility()?;
     let mut report = json!({"passed":true,"command":"codpula-model-reference","device":runtime::identity(&device),"precision":"float32","seed":72,"absolute_tolerance":2e-5,"relative_tolerance":3e-4,"clipping":clipping,"selector_and_initialization":identity,"cases":cases,"checkpoint_continuation":continuation.context("missing legacy checkpoint continuation case")?,"contextual_checkpoint_continuation":contextual_continuation.context("missing contextual checkpoint continuation case")?,"historical_checkpoint_compatibility":historical,"old_sbd_leakage_checks":"unchanged; this module adds legacy and contextual Codpula checks"});
     let (mut absolute,mut ratio) = (0.0,0.0);
     maximum_errors(&report,&mut absolute,&mut ratio);

@@ -19,12 +19,16 @@ fn compare(actual: &[f32], reference: &[f32]) -> Result<Value> {
     crate::sbd::compare(actual, &reference.iter().map(|&x| f64::from(x)).collect::<Vec<_>>())
 }
 
-fn gradient_snapshot(model: &LanguageModel, loss: Tensor<1>, noisy: bool) -> Result<ParameterSnapshot> {
-    let mut unused=model::unused_denoising_parameters(noisy,false);
-    if !noisy {unused.extend(model::unused_soft_parameters());}
-    let (gradients,report)=model::checked_gradients_with_unused(model,loss,&unused,&mut delta_mixers::profile::Unprofiled)?;
+fn gradient_snapshot(model: &LanguageModel, loss: Tensor<1>, noisy: bool, unused: &[&str]) -> Result<ParameterSnapshot> {
+    let (gradients,report)=model::checked_gradients_with_unused(model,loss,unused,&mut delta_mixers::profile::Unprofiled)?;
     if !noisy {ensure!(report.get("sbd_mask").is_some_and(|count|count.missing_steps==1),"causal draw fabricated a mask gradient");}
-    parameters_with_unused(model,Some(&gradients),&unused)
+    if model.soft_confidence.is_some() && unused.contains(&"soft_confidence.raw_scale") {
+        for name in model::unused_soft_parameters() {
+            ensure!(report.get(name).is_some_and(|count|count.missing_steps==1),
+                "binary or causal draw fabricated a soft-feedback gradient for {name}");
+        }
+    }
+    parameters_with_unused(model,Some(&gradients),unused)
 }
 
 fn compare_gradients(actual: &ParameterSnapshot, reference: &ParameterSnapshot) -> Result<Value> {
@@ -161,9 +165,9 @@ fn logits_case(model: &LanguageModel, c: &Config, device: &Device) -> Result<Val
     let length = late_boundary(c) + width + 2;
     let rows = rows(2, length);
     let batch = Batch::new(&rows, device);
-    // Repeated rows, unaligned boundaries and a three-token tail share one padded batch.
-    let blocks = [(0, 1), (1, 9), (0, 17), (1, length - 2)];
-    let lengths = [16, 8, 4, 3];
+    // Repeated rows, unaligned boundaries, a tail and the full clean prefix share one padded batch.
+    let blocks = [(0, 1), (1, 9), (0, 17), (1, length - 2), (0, length)];
+    let lengths = [16, 8, 4, 3, 1];
     let mut trace = CleanInputs::default();
     let _ = model.forward_profiled(&batch, &mut trace);
     let row_starts = (0..rows.len()).map(|row| blocks.iter().filter_map(|&(r, start)| (r == row).then_some(start)).collect::<Vec<_>>()).collect::<Vec<_>>();
@@ -253,12 +257,16 @@ fn loss_case(model: &LanguageModel, c: &Config, rows: &[Example], seed: u64, blo
     let mut batched = per_block.clone();
     batched.sbd.as_mut().unwrap().block_execution = SbdBlockExecution::Batched;
     let noisy = !blocks.is_empty();
-    let reference_loss = crate::sbd::training_loss(model, &per_block, rows, &batch, seed)?.loss;
+    let reference_result = crate::sbd::training_loss(model, &per_block, rows, &batch, seed)?;
+    let unused = reference_result.unused_parameters;
+    let reference_loss = reference_result.loss;
     let reference_value = values(reference_loss.clone());
-    let reference_gradients = gradient_snapshot(model, reference_loss, noisy)?;
-    let actual_loss = crate::sbd::training_loss(model, &batched, rows, &batch, seed)?.loss;
+    let reference_gradients = gradient_snapshot(model, reference_loss, noisy, &unused)?;
+    let actual_result = crate::sbd::training_loss(model, &batched, rows, &batch, seed)?;
+    ensure!(actual_result.unused_parameters == unused, "batched execution changed draw-specific unused parameters");
+    let actual_loss = actual_result.loss;
     let actual_value = values(actual_loss.clone());
-    let actual_gradients = gradient_snapshot(model, actual_loss, noisy)?;
+    let actual_gradients = gradient_snapshot(model, actual_loss, noisy, &unused)?;
     let loss_report = compare(&actual_value, &reference_value).context("batched SBD total training loss")?;
     let gradient_report = compare_gradients(&actual_gradients, &reference_gradients)?;
     let causal = match expectation {
@@ -267,9 +275,10 @@ fn loss_case(model: &LanguageModel, c: &Config, rows: &[Example], seed: u64, blo
             if matches!(expectation, CausalExpectation::AllObserved) {
                 ensure!(blocks.is_empty(), "all-observed fixture unexpectedly selected a masked block");
             }
-            let (expected_loss, logits_reports) = causal_objective(model, c, rows, &batch, blocks)?;
+            let selected = crate::sbd::training_config(c,seed);
+            let (expected_loss, logits_reports) = causal_objective(model, &selected, rows, &batch, blocks)?;
             let expected_value = values(expected_loss.clone());
-            let expected_gradients = gradient_snapshot(model, expected_loss, noisy)?;
+            let expected_gradients = gradient_snapshot(model, expected_loss, noisy, &unused)?;
             let bit_identical = reference_value.iter().zip(&actual_value).zip(&expected_value).all(|((&a, &b), &e)| a.to_bits() == b.to_bits() && a.to_bits() == e.to_bits());
             if matches!(expectation, CausalExpectation::AllObserved) {
                 ensure!(bit_identical, "all-observed loss must be exactly clean NTP in both execution modes");
@@ -289,6 +298,7 @@ fn loss_case(model: &LanguageModel, c: &Config, rows: &[Example], seed: u64, blo
         "seed": seed, "rows": rows.len(), "targets_per_row": rows[0].target.len(),
         "configured_training_block_lengths": c.sbd.as_ref().unwrap().training_block_lengths,
         "draw": blocks.iter().map(|block| json!({"row":block.row,"start":block.start,"configured_length":block.length,"masked":block.masked})).collect::<Vec<_>>(),
+        "unused_parameters_for_draw": unused,
         "per_block_loss": reference_value[0], "batched_loss": actual_value[0],
         "total_training_loss": loss_report, "all_parameter_gradients": gradient_report,
         "causal_expectation": causal,

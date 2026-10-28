@@ -251,9 +251,10 @@ impl Mixer {
         });
         MixerCache {raw,cache_k,cache_v:rv,prefix_summaries,schedule,states,starts:starts.to_vec()}
     }
+    /// Starts are clean-prefix boundaries: the full prefix ends at `time`.
     pub fn prepare_sbd_batched(&self, input: Tensor<3>, blocks: &[(usize,usize)]) -> BatchedMixerCache {
         let [rows,time,_] = input.dims();
-        assert!(!blocks.is_empty() && blocks.iter().all(|&(row,start)| row<rows && start<time));
+        assert!(!blocks.is_empty() && time>0 && blocks.iter().all(|&(row,start)| row<rows && start<=time));
         let mut starts = blocks.iter().map(|&(_,start)| start).collect::<Vec<_>>();
         starts.sort_unstable();
         starts.dedup();
@@ -261,7 +262,7 @@ impl Mixer {
     }
     pub fn prepare_sbd_batched_from_clean(&self, clean: &CleanMixer, blocks: &[(usize,usize)]) -> BatchedMixerCache {
         let [rows,time,_]=clean.raw[0].dims();
-        assert!(!blocks.is_empty() && blocks.iter().all(|&(row,start)|row<rows && start<time));
+        assert!(!blocks.is_empty() && time>0 && blocks.iter().all(|&(row,start)|row<rows && start<=time));
         let mut starts = blocks.iter().map(|&(_,start)| start).collect::<Vec<_>>();
         starts.sort_unstable();
         starts.dedup();
@@ -545,7 +546,7 @@ impl crate::WaveletDyn {
     }
     pub fn prepare_sbd_batched(&self, input: Tensor<3>, blocks: &[(usize,usize)]) -> BatchedWaveletCache {
         let [rows,time,_] = input.dims();
-        assert!(!blocks.is_empty() && blocks.iter().all(|&(row,start)| row<rows && start<time));
+        assert!(!blocks.is_empty() && time>0 && blocks.iter().all(|&(row,start)| row<rows && start<=time));
         let device = input.device();
         let clean = self.prepare_sbd(input);
         let max_history = blocks.iter().map(|&(_,start)| start).max().unwrap();

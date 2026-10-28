@@ -6,6 +6,34 @@ Each item follows the "Optimize components before scaling" rules in `AGENTS.md`.
 
 Status: `[ ]` not started, `[~]` in progress, `[x]` done.
 
+## Current-equation evidence boundary — 2026-10-28
+
+The paper-equation and combined joint-plus-token objective cutover is not
+certified by the historical performance checkmarks below. Resumed acceptance
+uses the focused command ledger in `artifacts/resume-acceptance/commands/`;
+the previously passed focused tests and CPU Kron reference are retained
+without rerunning them.
+
+All applicable current-equation component references now pass on CPU/local
+Vulkan (update/loss is GPU-only). The actual source train/save/evaluate/generate,
+collection, fit, pairwise guided generation and five-update TCT warm-start/exact
+resume are complete. Collection was explicitly enlarged from 8×2 to 64×4 after
+zero eligible pairs; 35/256 became eligible from the same three-update source,
+so the authorized 40-step fallback was not used. Typed checkpoint collision
+comparison preserves f32 fields; the resumed model/optimizer/chain endpoint is
+checksum-identical. See RESULTS, Current combined objective, for the complete
+pass/failure ledger and the zero-update checkpoint-5 metadata recovery.
+
+Current oHC CPU and local Vulkan numerical references pass with the unchanged
+independent f64 oracle and tolerance. Its input-adjoint precision repair adds
+compensated products/sums and explicit Vulkan rounding boundaries; no new
+isolated or full-model timing was run. Historical oHC speedups therefore do
+not establish the repaired path's execution cost. See
+`docs/optimization/ohc.md`.
+
+No new full suite, B8/T512 memory diagnostic, CUDA run, timing study or quality
+training is part of this focused acceptance.
+
 ## Done
 
 - [x] KronLSTM recurrence: fused GPU scan forward/backward (context 512 model step 3.05x without HOLA).
@@ -62,7 +90,7 @@ Outside the resident step:
 - [x] Codpula circuit output, dual-flow training and dependence commitment (Step 9): homogeneous K32/full V257, b=4 context gates, log-domain rows, EMA0.9/alpha0.05 and all SBD callers integrated. CPU/f64/enumeration/full-VJP/flow/sampling/continuation and Vulkan model gates pass at unchanged tolerance; omitted factorized identity and exact L1 behavior remain. Fused leaf/chain/marginal/flow kernels are verified but **not adopted by default**: B1/T512 complete-step tensor/fused medians 1697.014/1631.830 ms, paired saving 60.951 ms with 95% interval [-23.545,84.668] (8/11 faster); isolated circuit saving 20.025 ms [16.577,23.311] is not sufficient. Tensor remains selected; factorized cost-reference median 1522.502 ms. Selected B8 diagnostic: 8000.071 ms, 30,745 launches, 8,826,550,976 bytes sampled pool reservation. Current-predecessor inference/sampling/commitment/rollout tests salvaged with provenance; no quality study. `docs/codpula.md`, `RESULTS.md`, `artifacts/codpula/`.
 - [x] CoCommit coordination passes (Step 10): saved oHC prefix, trainable marker and fresh marked circuit/event loss across SBD paths; full f64/CPU/Vulkan/all-gradient/leakage/restart gates pass at fixed tolerance. B1/T512 off/selected-separate/doubled medians 1286.855/1408.335/1393.231 ms, 11 paired trials after two warmups. Keep separate: doubled full-step saving24.124ms has95% interval[-23.326,49.555], despite isolated tail gain. Adopt exact position-only membership (99.272→1.038ms, paired98.227[91.325,104.213],90 exact oracle cases), frozen no-grad teachers and explicit two4-row gradient/flow accumulation for unchanged B8/T512/L8. Selected B8 diagnostic6893.824ms,49928 launches,3,951,724,736 sampled pool bytes; original allocation failures retained. No quality study. `docs/cocommit.md`, `RESULTS.md`, `artifacts/cocommit/`.
 - [x] Standalone R²D remasking and TCT profile (Step 11): its numerical gates, collection/fitting/guided and TCT command smokes, and execution costs are recorded in `artifacts/remasking/` and `docs/remasking.md` §14. This completion does not cover contextual+CoCommit composition.
-- [~] Combined contextual+CoCommit+refinement/TCT (Step 11): published on main as `9e67b7ac` with partial acceptance. `artifacts/integrated11/commands/collect-real-1792953578755` records failed collection; energy fit/guided, resumed/warm-start TCT, B8/T512 and remaining historical/component checks were not run. The RESULTS integrated11 ledger records every process outcome, including both fixture failures. Standalone costs do not substitute for combined results.
+- [~] Combined contextual+CoCommit+refinement/TCT (Step 11): focused current-equation CPU/Vulkan numerical and short CLI acceptance is complete in `artifacts/resume-acceptance/acceptance-summary.json`, including real rank fitting/guided generation and exact warm-start/resume. The original zero-eligible dataset/failed fit and corrected duplicate-save failure remain retained. This optimization item stays in progress because new combined B8/T512 memory/cost diagnostics and paired current-equation timings were not run. Historical publication-partial evidence under `artifacts/integrated11/commands/` remains unchanged; standalone costs do not substitute for current combined results.
 
 ## Cross-cutting
 

@@ -254,6 +254,12 @@ pub(crate) fn training_loss_sampled_profiled<P:delta_mixers::profile::Sections>(
     let loss = model.loss(clean_logits.clone(), batch);
     let mut unused=model::unused_denoising_parameters(!blocks.is_empty(), false);
     if s.feedback==SbdFeedback::HardMask || blocks.is_empty() {unused.extend(model::unused_soft_parameters());}
+    if s.joint_output == SbdJointOutput::Codpula && !blocks.is_empty()
+        && blocks.iter().all(|block|block.masked.len()==1) {
+        // Legacy gates affect transitions only; a singleton has no transition.
+        // Contextual roots still use their neural head and must retain gradients.
+        unused.extend(["codpula.gate_head.weight","codpula.gate_head.bias"]);
+    }
     let result = SbdTrainingResult {loss,circuit_flows:None,unused_parameters:unused};
     match s.block_execution {
         SbdBlockExecution::PerBlock => training_loss_per_block(model,c,rows,clean_logits,&trace,blocks,result,profile),
@@ -882,9 +888,9 @@ mod tests {
             let device=Device::ndarray();
             device.seed(913);
             let c=Config {task:"lm".into(),d_model:8,layers:2,heads:2,key_dim:2,value_dim:2,chunk_size:4,cache_capacity:2,
-                ohc_streams:ohc,wavelet_layers:vec![0],lngram_layers:vec![0],lngram_routes:2,lngram_bits:1,lngram_memory_dim:2,lngram_orders:vec![2,3],
+                ohc_streams:ohc,wavelet_layers:vec![0],lngram_layers:vec![0],lngram_routes:8,lngram_bits:1,lngram_memory_dim:2,lngram_orders:vec![2,3],
                 projection_backend:delta_mixers::ProjectionBackend::Merged,
-                sbd:Some(crate::config::SbdConfig {block_lengths:vec![3],generate_tokens:6,commit_count:Some(3),feedback:SbdFeedback::HardMask,..Default::default()}),
+                sbd:Some(crate::config::SbdConfig {block_lengths:vec![3],generate_tokens:6,commit_count:Some(3),entropy_threshold:None,feedback:SbdFeedback::HardMask,..Default::default()}),
                 ..Default::default()};
             let arm=Arm {name:"kronlstm-hola".into(),mixer:"kronlstm".into(),cache:"surprise".into()};
             let model=LanguageModel::new(&c,&arm,&device).unwrap();

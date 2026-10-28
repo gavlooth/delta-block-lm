@@ -52,7 +52,8 @@ fn project(x: &View<f32>, w: &View<f32>, y: &mut View<f32>) {
     }
 }
 
-#[cube(launch)]
+// Error-free transforms require rounded products/sums, not reassociated math.
+#[cube(launch, fast_math = FastMath::all().difference(FastMath::all()))]
 fn input_vjp(
     x: &View<f32>,
     w: &View<f32>,
@@ -96,21 +97,55 @@ fn input_vjp(
     let inv = 1.0f32 / (rms + 1e-6f32);
     let mut correction = 0.0f32;
     if rms > 0.0f32 {
-        correction = dots[0] * inv / (width as f32 * rms);
+        correction = dots[0] / (width as f32 * rms);
     }
     if lane < 16 {
-        adj[lane] *= inv;
-        dp[n * 16 + lane] = adj[lane];
+        dp[n * 16 + lane] = adj[lane] * inv;
     }
     sync_cube();
-    k = lane;
-    while k < width {
+    // Materialize rounding boundaries so compiler contraction/reassociation
+    // cannot erase the residuals. Register-only compensation failed the local
+    // Vulkan zero-input reference; these shared-memory boundaries preserve it.
+    let mut products = Shared::<[f32]>::new_slice(768usize);
+    let mut rounded = Shared::<[f32]>::new_slice(512usize);
+    for tile in 0..(width + 255) / 256 {
+        k = tile * 256 + lane;
         let mut value = 0.0f32;
+        let mut compensation = 0.0f32;
         for j in 0..16 {
-            value += adj[j] * w[k * w.stride(0) + j * w.stride(1)];
+            let a = adj[j];
+            let mut b = 0.0f32;
+            if k < width {
+                b = w[k * w.stride(0) + j * w.stride(1)];
+            }
+            products[lane] = a * b;
+            products[256 + lane] = a * 4097.0f32;
+            products[512 + lane] = b * 4097.0f32;
+            sync_cube();
+            let product = products[lane];
+            let split_a = products[256 + lane];
+            let high_a = split_a - (split_a - a);
+            let low_a = a - high_a;
+            let split_b = products[512 + lane];
+            let high_b = split_b - (split_b - b);
+            let low_b = b - high_b;
+            let residual = (((high_a * high_b - product) + high_a * low_b)
+                + low_a * high_b) + low_a * low_b;
+            rounded[lane] = value + product;
+            sync_cube();
+            let next = rounded[lane];
+            rounded[256 + lane] = next - value;
+            sync_cube();
+            let added = rounded[256 + lane];
+            let error = (value - (next - added)) + (product - added);
+            compensation += error + residual;
+            value = next;
+            sync_cube();
         }
-        dx[n * width + k] = value - x[x_index(x, n, k)] * correction;
-        k += 256;
+        value += compensation;
+        if k < width {
+            dx[n * width + k] = (value - x[x_index(x, n, k)] * correction) * inv;
+        }
     }
 }
 

@@ -63,7 +63,7 @@ impl Chain {
             start, round: 0, permanent: vec![None; length], values: vec![0; length],
             revealed: vec![false; length],
             candidate_ids: (0..length).flat_map(|_| (0..width).map(|x| x as i32)).collect(),
-            candidate_weights: vec![1.0 / vocab as f32; length * width],
+            candidate_weights: vec![1.0 / width as f32; length * width],
             retained_mass: vec![width as f32 / vocab as f32; length], visibility: vec![0.0; length],
             negative_entropy:vec![0.0;length],prediction_available:vec![false;length],
         }
@@ -191,8 +191,11 @@ impl TrainingState {
                 ensure!(chain.negative_entropy.iter().all(|x|x.is_finite() && *x<=0.0),"invalid saved TCT negative entropy");
                 for i in 0..n {
                     ensure!(chain.permanent[i].is_none_or(|x| x == row.target[start+i] as usize), "permanent TCT evidence differs from target");
-                    let mass = chain.candidate_weights[i*k..(i+1)*k].iter().sum::<f32>();
-                    ensure!(chain.retained_mass[i].is_finite() && (mass-chain.retained_mass[i]).abs() <= 2e-6 && mass <= 1.00001, "saved TCT retained mass differs from weights");
+                    let weight_sum = chain.candidate_weights[i*k..(i+1)*k].iter().sum::<f32>();
+                    ensure!((weight_sum-1.0).abs() <= 2e-6, "saved TCT candidate weights are not normalized");
+                    // Retained mass is measured before top-k normalization, not the sum above.
+                    ensure!(chain.retained_mass[i].is_finite() && chain.retained_mass[i] > 0.0
+                        && chain.retained_mass[i] <= 1.00001, "invalid saved TCT retained probability mass");
                 }
                 if chain.round == TRAIN_ROUNDS {
                     ensure!((0..n).all(|i| chain.permanent[i].is_some() || chain.revealed[i]), "TCT endpoint still has masked positions");
@@ -337,7 +340,7 @@ fn training_loss_reduced(c:&Config,model:&LanguageModel,state:&mut TrainingState
     };
     let (circuit,_)=crate::sbd::prepare_distribution(model,a,&soft,1.0)?;
     let weights=Tensor::from_data(TensorData::new(soft.active.iter().zip(&soft.observed).map(|(&active,o)|if active&&o.is_none(){1.0f32}else{0.0}).collect::<Vec<_>>(),[count,width]),device);
-    let correction=circuit.marginal_ce(targets.clone(),targets.clone(),observed.clone(),weights,denominator)?;
+    let correction=circuit.joint_marginal_ce(targets.clone(),targets.clone(),observed.clone(),weights,denominator)?;
     let mut joint=model::scalar(correction.loss.clone())?;
     loss=loss+correction.loss;
     let mut flows=correction.flows;
@@ -351,7 +354,7 @@ fn training_loss_reduced(c:&Config,model:&LanguageModel,state:&mut TrainingState
         }).collect::<Vec<_>>();
         let (b_circuit,_)=crate::sbd::prepare_distribution(model,b,&soft,1.0)?;
         let weights=Tensor::from_data(TensorData::new(use_b.iter().map(|&used|if used{1.0f32}else{0.0}).collect::<Vec<_>>(),[count,width]),device);
-        let auxiliary=b_circuit.marginal_ce(targets.clone(),targets.clone(),observed.clone(),weights,denominator)?;
+        let auxiliary=b_circuit.joint_marginal_ce(targets.clone(),targets.clone(),observed.clone(),weights,denominator)?;
         joint+=model::scalar(auxiliary.loss.clone())?;
         loss=loss+auxiliary.loss;
         flows.add(auxiliary.flows);
@@ -509,7 +512,7 @@ fn step_layout(c: &Config, model: LanguageModel, optim: &mut ModuleOptimizer, st
 }
 
 fn save(c: &Config, path: &Path, model: &LanguageModel, optim: &ModuleOptimizer, saved: &train::State, chains: &TrainingState) -> Result<()> {
-    train::checkpoint_with_tct(c,path,model,optim,saved,Some(&serde_json::to_value(chains)?))
+    train::checkpoint_with_tct(c,path,model,optim,saved,Some(chains))
 }
 
 fn warm_start_identity(c: &Config, path: &Path, saved: &train::State, target_tokens: usize) -> Result<Value> {
@@ -634,7 +637,7 @@ pub fn run(c: &Config, arm: &Arm, seed: u64, device: &Device, resume: Option<&Pa
         "source_training_identity":chains.source_training_identity,
         "threshold":REVEAL_THRESHOLD,"proposal":"greedy_conditional_marginal_argmax","evidence":"permanent_O_only",
         "inputs":"hard_provisional_reveals_and_retained_normalized_top_k_soft_feedback",
-        "objective":"clean causal mean plus logical-chain-mean token-sum A correction CE; optional B coordination CE on masked S and visible mutable positions",
+        "objective":"explicit combined design: clean causal mean plus logical-chain-mean joint Codpula NLL and token-sum correction CE; optional B joint event and coordination CE on masked S and visible mutable positions; circuit reach/count once per branch-chain",
         "optimizer_start_step":chains.optimizer_start_step,"optimizer_source_schedule_steps":chains.optimizer_schedule_steps,
         "quality_evaluation_performed":false});
     runtime::write_json(&run_dir.join("metrics.json"),&report)?;
@@ -683,7 +686,7 @@ pub fn benchmark(c: &Config, arm: &Arm, seed: u64, device: &Device) -> Result<Va
             "precision":"float32","batch":8,"context":512,"warmups":1,"samples":1,
             "diagnostic_only":true,"batched_samples_ms":[measured],"batched_median_ms":measured,
             "last_loss":loss,"sampled_peak_reserved_bytes":peak,
-            "method":"one warm and one synchronized complete batched optimizer step; clean forward, fresh prefix cache, marginal token CE/flows, greedy feedback, backward/checks, optimizer and chain update included",
+            "method":"one warm and one synchronized complete batched optimizer step; clean forward, fresh prefix cache, joint plus marginal token CE/shared flows, greedy feedback, backward/checks, optimizer and chain update included",
             "memory_note":"reservation sampled after complete steps, not a physical peak"}));
     }
     let mut models = [Some(base.clone()),Some(base)];
@@ -712,7 +715,7 @@ pub fn benchmark(c: &Config, arm: &Arm, seed: u64, device: &Device) -> Result<Va
         "warmups":warmups,"pairs":trials,"diagnostic_only":c.batch_size==8,"per_block_samples_ms":samples[0],"batched_samples_ms":samples[1],
         "per_block_median_ms":crate::profile::median(&samples[0]),"batched_median_ms":crate::profile::median(&samples[1]),
         "paired":if trials>1 {paired(&samples[0],&samples[1])} else {Value::Null},"last_losses":losses,"sampled_peak_reserved_bytes":peak,
-        "method":"alternating complete optimizer steps with identical initial models/chains; clean forward, fresh prefix cache, marginal correction CE/flows, greedy soft feedback, backward/checks, optimizer and refill; no evaluation/checkpoint IO",
+        "method":"alternating complete optimizer steps with identical initial models/chains; clean forward, fresh prefix cache, joint plus marginal correction CE/shared flows, greedy soft feedback, backward/checks, optimizer and refill; no evaluation/checkpoint IO",
         "memory_note":"device reservation sampled after each complete step; both runners coexist; not a physical peak"}))
 }
 
@@ -1006,8 +1009,8 @@ fn restart_checks(device:&Device,execution:CodpulaExecution,cocommit:bool)->Resu
     resumed_chains.validate(&c,991)?;
     ensure!(resumed_chains == chains,"real saved chain inputs, targets, loader counters or RNG changed");
     // Unchanged model/optimizer values isolate the chain-state collision check.
-    let mut changed = serde_json::to_value(&resumed_chains)?;
-    changed["rng"] = json!(resumed_chains.rng.wrapping_add(1));
+    let mut changed = resumed_chains.clone();
+    changed.rng = changed.rng.wrapping_add(1);
     ensure!(train::checkpoint_with_tct(&c,&path,&model,&optim,&saved,Some(&changed)).is_err(),"changed chain checkpoint collision was accepted");
     let mut losses = Vec::new();
     for _ in 0..4 {
@@ -1072,7 +1075,7 @@ fn layout_checks(device: &Device, execution: CodpulaExecution) -> Result<Value> 
                     let visibility = f64::from(chain.visibility[i]);
                     let weighted = (0..k).map(|j|f64::from(chain.candidate_weights[i*k+j])
                         *f64::from(embeddings[chain.candidate_ids[i*k+j] as usize*c.d_model+d])).sum::<f64>();
-                    weighted*visibility+f64::from(mask[d])*(1.0-visibility*f64::from(chain.retained_mass[i]))
+                    weighted*visibility+f64::from(mask[d])*(1.0-visibility)
                 };
             expected_inputs.push(expected);
         }}
@@ -1115,9 +1118,9 @@ fn layout_checks(device: &Device, execution: CodpulaExecution) -> Result<Value> 
         let output=crate::sbd::block_forward(&model,&row.input[..chain.start+1],&soft,false,&target);
         let (circuit,tokens,observed)=crate::sbd::prepare_circuit(&model,output,&soft,1.0)?;
         let probability=host(circuit.marginals(tokens,observed)?)?;
-        expected-=f64::from(probability[row.target[chain.start] as usize]).ln()/chain_count as f64;
+        expected-=2.0*f64::from(probability[row.target[chain.start] as usize]).ln()/chain_count as f64;
     }}
-    let singleton_objective=errors(&host(singleton.loss)?,&[clean_value+expected],"TCT singleton noisy marginal CE")?;
+    let singleton_objective=errors(&host(singleton.loss)?,&[clean_value+expected],"TCT singleton joint plus marginal CE")?;
     ensure!(singleton.flows.is_some() && singleton_state.rows.iter().flat_map(|row|&row.chains).all(|chain|chain.revealed[0]),
         "singleton did not consume noisy denoiser or reveal its argmax");
     Ok(json!({"passed":true,"loss":loss,"gradients":gradients,"flows":flows,"tail_block_length":4,"length_one_noisy_objective":singleton_objective,
@@ -1190,6 +1193,46 @@ pub fn numerical_checks(device: &Device) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn checkpoint_chain_roundtrip_uses_declared_float_precision() {
+        let (c,_,corpus)=restart_fixture();
+        let mut state=TrainingState::new(&c,Some(&corpus),991).unwrap();
+        let chain=&mut state.rows[0].chains[0];
+        chain.visibility[0]=f32::from_bits(0x1fabc123);
+        chain.retained_mass[0]=f32::from_bits(0x3eaaaaab);
+        // Older saves expanded f32 fields through Value/f64 before writing.
+        let bytes=serde_json::to_vec(&serde_json::to_value(&state).unwrap()).unwrap();
+        let restored:TrainingState=serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(state,restored);
+        let mut changed=restored.clone();
+        changed.rng=changed.rng.wrapping_add(1);
+        assert_ne!(state,changed);
+        let mut changed=restored;
+        let value=&mut changed.rows[0].chains[0].visibility[0];
+        *value=f32::from_bits(value.to_bits()+1);
+        assert_ne!(state,changed);
+    }
+    #[test]
+    fn saved_feedback_separates_normalized_weights_from_retained_mass() {
+        let (c,_,corpus)=restart_fixture();
+        let state=TrainingState::new(&c,Some(&corpus),991).unwrap();
+        state.validate(&c,991).unwrap();
+        let mut valid=state.clone();
+        valid.rows[0].chains[0].retained_mass[0]=0.25;
+        valid.validate(&c,991).unwrap();
+        let mut unnormalized=valid.clone();
+        unnormalized.rows[0].chains[0].candidate_weights[0]*=0.5;
+        assert!(unnormalized.validate(&c,991).is_err());
+        for invalid_mass in [0.0,-0.1,1.1,f32::NAN,f32::INFINITY] {
+            let mut corrupt=valid.clone();
+            corrupt.rows[0].chains[0].retained_mass[0]=invalid_mass;
+            assert!(corrupt.validate(&c,991).is_err());
+        }
+        let mut old_weights=valid;
+        let chain=&mut old_weights.rows[0].chains[0];
+        for weight in &mut chain.candidate_weights {*weight*=0.25;}
+        assert!(old_weights.validate(&c,991).is_err());
+    }
     #[test]
     fn confidence_schedule_keeps_self_generated_inputs_and_endpoint() {
         chain_checks().unwrap();

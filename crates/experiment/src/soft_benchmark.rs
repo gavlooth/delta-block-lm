@@ -229,11 +229,26 @@ pub fn reference(c: &Config, device: &Device) -> Result<Value> {
         // sum(normalized top-1) is constant, so its VJP is exactly zero, not inf-inf.
         let probability = Tensor::from_data([[-0.0f32, 0.0, f32::from_bits(1)]], &device).require_grad();
         let tiny = Candidates::select(probability.clone(), 1, path)?;
-        ensure!(ids_host(tiny.ids) == vec![2], "subnormal/signed-zero ordering");
+        ensure!(ids_host(tiny.ids.clone()) == vec![2], "subnormal/signed-zero ordering");
         ensure!(values(tiny.weights.clone()) == vec![1.0], "subnormal top-1 normalization");
+        ensure!(values(tiny.expected(
+            Tensor::ones([3,1], &device), Tensor::zeros([1], &device),
+            Tensor::ones([1,1], &device), false,
+        )) == vec![1.0], "subnormal sparse support was mistaken for zero mass");
         let gradients = tiny.weights.sum().backward();
         ensure!(values(probability.grad(&gradients).expect("subnormal selection VJP")) == vec![0.0;3],
             "constant normalized selection loss has a nonzero/nonfinite VJP");
+        let probability = Tensor::from_data(
+            [[f32::from_bits(1), f32::from_bits(3)]], &device,
+        ).require_grad();
+        let normalized = delta_kernels::soft_normalize(
+            probability.clone(), probability.clone().sum_dim(1),
+        );
+        ensure!(values(normalized.clone()) == vec![0.25,0.75],
+            "subnormal ratios changed during normalization");
+        let gradients = normalized.sum().backward();
+        ensure!(values(probability.grad(&gradients).expect("subnormal ratio VJP")) == vec![0.0;2],
+            "constant subnormal ratio sum has a nonzero/nonfinite VJP");
         let probability = Tensor::from_data([[0.0f32, 0.0, f32::from_bits(1)],[0.0,0.0,0.0]], &device).require_grad();
         let output = soft::dense_expected(probability.clone(), Tensor::ones([3,1], &device),
             Tensor::zeros([1], &device), Tensor::ones([2,1], &device));

@@ -1,8 +1,8 @@
 //! Independent exhaustive f64 oracle for the weighted singleton objective.
 use super::*;
-use crate::codpula::CircuitState;
+use crate::codpula::{CircuitState, PreparedCircuit};
 
-fn reference(c: &Circuit, evidence: &[Option<usize>], gold: &[usize], weights: &[f64], denominator: f64) -> Result<(f64, Flow, Derivative)> {
+fn reference(c: &Circuit, evidence: &[Option<usize>], gold: &[usize], weights: &[f64], denominator: f64, joint: bool) -> Result<(f64, Flow, Derivative)> {
     let prepared = c.prepare()?;
     let enumeration = Enumeration::new(&prepared);
     let base = enumeration.query(evidence)?;
@@ -10,6 +10,18 @@ fn reference(c: &Circuit, evidence: &[Option<usize>], gold: &[usize], weights: &
     for values in [&mut flow.pi_plus, &mut flow.pi_minus, &mut flow.a_plus, &mut flow.a_minus, &mut flow.root_plus, &mut flow.root_minus] { values.fill(0.0); }
     let mut derivative = prepared.derivative(&base, &base, c.group);
     let mut loss = 0.0;
+    if joint {
+        let selected = evidence.iter().enumerate().map(|(i,&value)| {
+            if value.is_none() && weights[i] > 0.0 { Some(gold[i]) } else { value }
+        }).collect::<Vec<_>>();
+        let selected = enumeration.query(&selected)?;
+        loss = (base.log_z - selected.log_z) / denominator;
+        flow = prepared.flows(&selected, &base);
+        derivative = prepared.derivative(&selected, &base, c.group);
+        for values in [&mut derivative.logits,&mut derivative.gates,&mut derivative.pi,&mut derivative.a,&mut derivative.root] {
+            for value in values { *value /= -denominator; }
+        }
+    }
     for i in 0..c.length {
         if evidence[i].is_some() || weights[i] == 0.0 { continue; }
         let mut selected = evidence.to_vec();
@@ -32,6 +44,10 @@ fn reference(c: &Circuit, evidence: &[Option<usize>], gold: &[usize], weights: &
 }
 
 pub(super) fn checks(device: &Device) -> Result<Value> {
+    Ok(json!({"token_only":checks_mode(device,false)?,"joint_plus_token":checks_mode(device,true)?}))
+}
+
+fn checks_mode(device: &Device, joint: bool) -> Result<Value> {
     let device = device.clone().autodiff();
     let (rows,width,k,v) = (3,3,2,3);
     let denominator = 2.75;
@@ -65,7 +81,7 @@ pub(super) fn checks(device: &Device) -> Result<Value> {
             labels[row*width+i] = gold[row][i];
             row_weights[row*width+i] = weights[row][i];
         }
-        let (loss, flow, derivative) = reference(c,&evidence[row],&gold[row],&weights[row],denominator)?;
+        let (loss, flow, derivative) = reference(c,&evidence[row],&gold[row],&weights[row],denominator,joint)?;
         expected_loss += loss;
         let root_reach = [flow.root_reach];
         let parts: [&[f64];9] = [&flow.pi_plus,&flow.pi_minus,&flow.a_plus,&flow.a_minus,&flow.root_plus,&flow.root_minus,&flow.pi_reach,&flow.a_reach,&root_reach];
@@ -84,7 +100,7 @@ pub(super) fn checks(device: &Device) -> Result<Value> {
             for coordinate in 0..analytic.len() {
                 let mut plus=c.clone(); plus.field(field)[coordinate] += 1e-5;
                 let mut minus=c.clone(); minus.field(field)[coordinate] -= 1e-5;
-                finite.push((reference(&plus,&evidence[row],&gold[row],&weights[row],denominator)?.0-reference(&minus,&evidence[row],&gold[row],&weights[row],denominator)?.0)/2e-5);
+                finite.push((reference(&plus,&evidence[row],&gold[row],&weights[row],denominator,joint)?.0-reference(&minus,&evidence[row],&gold[row],&weights[row],denominator,joint)?.0)/2e-5);
             }
             differences.add(&finite,analytic,2e-7,2e-6,"enumerated marginal CE derivative")?;
         }
@@ -96,13 +112,22 @@ pub(super) fn checks(device: &Device) -> Result<Value> {
     let gates=float_tensor(&raw_gates,[rows,k,k],&device).require_grad();
     let roots=float_tensor(&raw_roots,[rows,k],&device).require_grad();
     let prepared=PreparedCircuit::prepare_contextual(pi.clone(),a.clone(),rho.clone(),logits.clone(),gates.clone(),roots.clone(),vec![3,2,0],1)?;
-    let result=prepared.marginal_ce(int_tensor(&labels,[rows,width],&device),int_tensor(&supplied,[rows,width],&device),
-        bool_tensor(&fixed,[rows,width],&device),float_tensor(&row_weights,[rows,width],&device),denominator)?;
+    let result=if joint {
+        prepared.joint_marginal_ce(int_tensor(&labels,[rows,width],&device),int_tensor(&supplied,[rows,width],&device),
+            bool_tensor(&fixed,[rows,width],&device),float_tensor(&row_weights,[rows,width],&device),denominator)?
+    } else {
+        prepared.marginal_ce(int_tensor(&labels,[rows,width],&device),int_tensor(&supplied,[rows,width],&device),
+            bool_tensor(&fixed,[rows,width],&device),float_tensor(&row_weights,[rows,width],&device),denominator)?
+    };
     let mut errors=Errors::default();
     errors.tensor(&tensor_values(result.loss.clone()),&[expected_loss],"weighted marginal CE")?;
     ensure!(result.flows.active_blocks==2,"marginal objective counted targets instead of logical chains");
-    for (actual,expected) in [&result.flows.emission_positive,&result.flows.emission_negative,&result.flows.transition_positive,&result.flows.transition_negative,&result.flows.root_positive,&result.flows.root_negative,&result.flows.emission_reach,&result.flows.transition_reach,&result.flows.root_reach].into_iter().zip(&expected_flows) {
-        errors.tensor(&tensor_values(actual.clone()),expected,"weighted marginal flow/reach")?;
+    for (actual,expected) in [tensor_values(result.flows.emission_positive.clone()),tensor_values(result.flows.emission_negative.clone()),
+        tensor_values(result.flows.transition_positive.clone()),tensor_values(result.flows.transition_negative.clone()),
+        tensor_values(result.flows.root_positive.clone()),tensor_values(result.flows.root_negative.clone()),
+        tensor_values(result.flows.emission_reach.clone()),tensor_values(result.flows.transition_reach.clone()),
+        tensor_values(result.flows.root_reach.clone())].into_iter().zip(&expected_flows) {
+        errors.tensor(&actual,expected,"weighted marginal flow/reach")?;
     }
     let gradients=result.loss.backward();
     for (actual,expected) in [tensor_values(logits.grad(&gradients).unwrap()),tensor_values(gates.grad(&gradients).unwrap()),tensor_values(pi.grad(&gradients).unwrap()),tensor_values(a.grad(&gradients).unwrap()),tensor_values(rho.grad(&gradients).unwrap()),tensor_values(roots.grad(&gradients).unwrap())].into_iter().zip(&expected_gradients) {
@@ -123,8 +148,8 @@ pub(super) fn checks(device: &Device) -> Result<Value> {
         }
         errors.tensor(&actual,&expected,&format!("marginal first finite {kind} update"))?;
     }
-    Ok(json!({"passed":true,"lengths":[3,2,0],"weights":weights,"logical_active_blocks":2,"evidence_differs_from_gold":true,
-        "scalar_oracle":"exhaustive latent/output enumeration, singleton events conditioned only on O","all_six_parameter_fields_finite_differenced":true,
+    Ok(json!({"passed":true,"joint_plus_token":joint,"lengths":[3,2,0],"weights":weights,"logical_active_blocks":2,"evidence_differs_from_gold":true,
+        "scalar_oracle":"exhaustive latent/output enumeration; joint event plus weighted singleton events conditioned only on O; reach once","all_six_parameter_fields_finite_differenced":true,
         "errors":errors.report(),"f64_finite_differences":differences.report(),"first_bias_corrected_ema_update":true}))
 }
 
@@ -149,7 +174,7 @@ mod tests {
         let mut state=CircuitState::from_logs(float_tensor(&c.log_pi,[2,3],&device),
             float_tensor(&c.log_a,[2,2],&device),float_tensor(&c.log_root,[2],&device));
         state.update(result.flows).unwrap();
-        assert_eq!(state.step.val().into_data().try_to_vec::<i32>().unwrap(),vec![0]);
+        assert_eq!(state.step.val().into_data().try_to_vec_as::<i32>().unwrap(),vec![0]);
         for bad in [-0.1,f64::NAN,f64::INFINITY] {
             assert!(prepared.marginal_ce(labels.clone(),values.clone(),bool_tensor(&[false,false],[1,2],&device),
                 float_tensor(&[bad,0.0],[1,2],&device),1.0).is_err());

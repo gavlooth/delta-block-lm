@@ -666,12 +666,24 @@ pub struct Report {
 
 fn causality(device: &Device, backend: LngramBackend) {
     let (model, batch, layout, _) = small_fixture(Surrogate::OneBit);
+    let repeated_start=layout.rows[0][..layout.rows[0].len()-1].iter().sum::<usize>();
+    let repeated_end=layout.rows[0].iter().sum::<usize>();
+    let other_start=batch.tokens;
+    let other_end=other_start+layout.rows[1][0];
     let layer = load(&model, device, backend).valid();
     let layout = layout.tensor(device);
     let shape = [batch.batch, batch.tokens, model.d_model];
     let base = host(&layer.forward(tensor(&batch.u, shape, device), &layout));
     // Changes in the repeated document, and a complete later document, cannot affect any earlier position or other document.
-    for (begin, end) in [(7, 8), (5, 11), (11, 18)] {
+    for (begin, end) in [
+        (repeated_start+2,repeated_start+3),
+        (repeated_start,repeated_end),
+        (other_start,other_end),
+    ] {
+        // A fixture range must not span padding, a reset or a second batch row.
+        assert!(begin<end && batch.ends[begin]>=batch.starts[begin]);
+        assert!((begin..end).all(|p|p/batch.tokens==begin/batch.tokens
+            && batch.starts[p]==batch.starts[begin] && batch.ends[p]==batch.ends[begin]));
         let mut changed = batch.u.clone();
         for v in &mut changed[begin * model.d_model..end * model.d_model] {
             *v += 3.25;

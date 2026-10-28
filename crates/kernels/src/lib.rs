@@ -4,6 +4,10 @@
 mod soft_normalize;
 #[cfg(any(feature = "cpu", feature = "vulkan", feature = "cuda"))]
 pub use soft_normalize::soft_normalize;
+#[cfg(any(feature = "cpu", feature = "vulkan", feature = "cuda"))]
+mod ohc_linear;
+#[cfg(any(feature = "cpu", feature = "vulkan", feature = "cuda"))]
+pub use ohc_linear::ohc_linear;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 mod kron;
 #[cfg(any(feature = "vulkan", feature = "cuda"))]

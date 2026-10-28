@@ -524,7 +524,6 @@ pub(crate) fn check_parameter_gradients_with_unused<P: Sections>(
         names: Vec<String>,
         missing: Vec<String>,
         norms: Vec<Tensor<1>>,
-        backend: UpdateBackend,
     }
     impl ModuleVisitor for Check<'_> {
         fn enter_module(&mut self, name: &str, _: &str) { self.path.push(name.to_owned()); }
@@ -534,18 +533,15 @@ pub(crate) fn check_parameter_gradients_with_unused<P: Sections>(
             let name = self.path.join(".");
             if let Some(g) = self.grads.get::<D>(param.id) {
                 self.names.push(name);
-                self.norms.push(if self.backend.is_tensor() {
-                    g.square().sum()
-                } else {
-                    crate::update::square_sum(g)
-                });
+                // Squaring can erase the very small, valid confidence-head gradients.
+                self.norms.push(g.abs().sum());
             } else {
                 self.missing.push(name);
             }
         }
     }
     let mut check = Check { grads, path: Vec::new(), names: Vec::new(),
-        missing: Vec::new(), norms: Vec::new(), backend: model.update_backend };
+        missing: Vec::new(), norms: Vec::new() };
     profile.section("Gradient checks: reductions", || model.visit(&mut check));
     let unexpected = check.missing.iter().filter(|name| !unused.contains(&name.as_str())).collect::<Vec<_>>();
     ensure!(unexpected.is_empty(), "trainable parameters have no gradient: {unexpected:?}; refusing partial/readout-only training");
@@ -582,6 +578,21 @@ mod tests {
     }
 
     #[test]
+    fn tiny_finite_gradients_count_as_nonzero_without_squaring() {
+        let c=Config {task:"lm".into(),d_model:8,layers:1,heads:1,key_dim:2,value_dim:2,context:2,
+            ..Default::default()};
+        let device=Device::ndarray().autodiff();
+        device.seed(117);
+        let model=LanguageModel::new(&c,&c.arms[0],&device).unwrap();
+        let rows=[data::Example {input:vec![256,1],target:vec![1,2],weight:vec![1.0;2],groups:vec![None;2]}];
+        let batch=Batch::new(&rows,&device);
+        let loss=model.loss(model.forward(&batch),&batch)*1e-25;
+        let (_,report)=checked_gradients_with_unused(&model,loss,&[],&mut Unprofiled).unwrap();
+        assert_eq!(report["head.weight"].nonzero_steps,1);
+        assert_eq!(report["head.weight"].zero_steps,0);
+    }
+
+    #[test]
     fn singleton_masked_draw_trains_noisy_input_parameters() {
         let mut c = Config::default();
         c.task = "lm".into();
@@ -589,7 +600,9 @@ mod tests {
         c.d_model = 8;
         c.layers = 1;
         c.sbd = Some(crate::config::SbdConfig {
-            block_lengths: vec![1], training_block_lengths: vec![1], ..Default::default()
+            block_lengths: vec![1], training_block_lengths: vec![1],
+            in_block_reads: delta_mixers::sbd::InBlockReads::None, // Explicit causal reference for this isolated input VJP.
+            ..Default::default()
         });
         c.soft_training_probability = 1.0;
         let device = Device::ndarray().autodiff();

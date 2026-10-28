@@ -2,7 +2,7 @@
 
 **Current backbone decision:** KronLSTM only. **GDN-2 removed on 2026-10-28 by user decision.** Earlier comparison results remain historical evidence, not supported configurations or instructions to restore the removed mixer.
 
-Status: Steps 1–11 have separate implemented/correctness-gated profiles on CPU and local Intel Vulkan; their contextual/coordination/refinement composition was published on main as `9e67b7ac` before combined acceptance completed. The separate Step 5/6 quality gates were waived, not passed. Current Step 8 uses the explicitly selected HOLA in-block read and optional prefix retrieval; earlier removed dense-attention measurements remain historical only. The Step 7 quality ablation is cancelled, not pending. Step 12 has not started and is not authorized by this integration. Measured results and the exact partial integration command ledger are in [RESULTS.md](RESULTS.md#integrated11-publication-checkpoint).
+Status: Steps 1–11 have implemented profiles; their contextual/coordination/refinement composition was published on main as `9e67b7ac` before combined acceptance completed. Resumed focused CPU/local Vulkan numerical and actual short combined CLI acceptance now passes, including real energy fitting/guided generation and TCT warm-start/exact resume; see [RESULTS.md](RESULTS.md#current-combined-objective--focused-numerical-and-cli-acceptance) and `artifacts/resume-acceptance/acceptance-summary.json`. This is not new B8 cost/memory or quality evidence. The separate Step 5/6 quality gates were waived, not passed; Step 7 quality ablation remains cancelled. Current Step 8 uses HOLA in-block reads and optional prefix retrieval. Step 12 has not started and is not authorized.
 
 **Scope override — explicit user instruction:** implement and optimize the given architecture. Its components are requirements, not candidates that must win architecture-selection experiments. Correctness checks and focused runtime/memory measurements may verify an implementation optimization. Do not launch quality ablations, architecture comparisons, candidate sweeps, alternative-mechanism studies or research training runs unless the user explicitly requests them. This overrides experimental comparisons, sweeps and quality-adoption gates elsewhere in this document; those passages are historical proposals, not executable tasks. Steps 9–12 are implementation/optimization work only where they implement the specified architecture, not authorization to add alternatives.
 
@@ -12,12 +12,13 @@ Build and optimize the specified semi-autoregressive block-denoising language mo
 
 - Rust, Burn and custom CubeCL kernels. Intel Arc/Vulkan locally; DGX Spark/CUDA for larger runs after arranging GPU access. Follow `AGENTS.md` for build limits, mold, debug-free tests and experiment records.
 - KronLSTM with optional HOLA is the only recurrent mixer. Preserve its shared scan, chunking, convolution and exact-memory machinery.
-- KronLSTM learns beta, target and output-gate biases in every layer (`erase.bias`, `write.bias`, `output_gate.bias`). Corrected KronLSTM, oHC, WNet-Dyn J3/affine LayerNorm, square/four-tap Lngram and learned soft feedback share `model_math_revision: "paper-local-math-v2"` in training/pilot identities, checkpoint state and model burnpack metadata. Old equations, missing parameters and mismatched parameter sets/shapes are rejected explicitly, not converted on load. Earlier numerical and continuation results remain historical evidence for their original parameterization.
+- KronLSTM learns beta, target and output-gate biases in every layer (`erase.bias`, `write.bias`, `output_gate.bias`). Corrected KronLSTM, oHC, WNet-Dyn J3/affine LayerNorm, square/four-tap Lngram, learned soft feedback and the approved combined objective share `model_math_revision: "paper-local-math-joint-plus-token-v3"` in training/pilot identities, checkpoint state and model burnpack metadata. Old equations, missing parameters and mismatched parameter sets/shapes are rejected explicitly, not converted on load.
 - Keep wavelet token mixing, orthogonal hyper-connections (oHC) and **three Lngram modules/injections**, each with the supported paper orders `[2,3]`, in the target design. The original user wording “number of lngrams will remain to 3” refers to the module count, not three suffix orders. Use the square routing relationship `R=d_model/bits` (D256/M4 gives R64), preserving memory_dim 8 and the small model's other budgets.
 - Use Set Block Decoding (SBD) as the initial semi-autoregressive recipe. Block length, computational chunk length and tokens committed per denoising step are separate variables.
 - Preserve the predecessor's soft top-k diffusion structure as the block-denoising baseline: candidate feedback and revisable proposals remain separate from permanent observations. Its feedback math follows the soft-masking paper: latest detached probabilities, normalized top-3, and a learned constrained entropy coefficient. Ordinary training mixes soft/binary students with probability 0.8; remasking retains candidate information and learned feedback. Hard-mask-only feedback remains an ablation.
 - Energy-guided stochastic remasking is the user's research proposal against pure random remasking. It must not be replaced by confidence ranking or a deterministic correction-value predictor.
 - Preserve the specified architecture while optimizing execution time and memory. Verify numerical correctness; do not require components to earn inclusion through quality comparisons.
+- Explicit combined training design: retain Codpula joint conditional NLL and add coordination/correction token CE for CoCommit/TCT. Sum event statistics from both terms with one traversal reach/count per logical branch-chain. Standalone Codpula remains joint-only; the composition is user-selected, not a paper reproduction.
 
 ## 2. Sources and evidence boundaries
 
@@ -412,3 +413,26 @@ These are execution proofs, not quality results. Keep negative radial-stress
 evidence separate from actual normalized-objective acceptance. No quality
 study, sweep, calibration grid, lower batch/context or extra training is
 authorized by this status correction.
+
+### Resumed focused acceptance
+
+The corrected equations and explicit combined joint-plus-token objective now
+pass all applicable requested CPU/local Vulkan references; the earlier passed
+focused tests and CPU Kron gate were not rerun. The short D256/four-layer/B1/
+context32, seed-4 source trained 96 target tokens in three updates and completed
+saved evaluation/generation, real trajectory collection, energy fitting and
+pairwise guided generation. An initial 8×2 collection had no eligible labels and
+fitting correctly rejected it. The user-authorized 64×4/H2 collection from the
+same checkpoint yielded 35 eligible pairs out of 256; no 40-step fallback,
+fabricated supervision or tolerance change was used.
+
+TCT executed five warm-start updates/160 visits. Its final duplicate-save
+failure exposed raw JSON f64 comparison of declared f32 state; typed comparison
+fixed the cause. Completing checkpoint-5 took zero new updates, and a genuine
+checkpoint-4→5 CLI resume reproduced model, optimizer and chain SHA-256 exactly.
+The source optimizer offset/horizon remained 3/3.
+
+The exact command/status/failure ledger is in `artifacts/resume-acceptance/`.
+The publication failures above remain historical evidence. No full suite, new
+B8/T512 diagnostic, live B8/T1024 timing, CUDA run, timing study or quality
+training was performed; current oHC synchronization costs are unmeasured.

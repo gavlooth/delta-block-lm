@@ -204,6 +204,11 @@ pub fn reference(
     small.value_dim = 64;
     small.context = 16;
     small.batch_size = 1;
+    // The missing-gradient rejection fixture is a tiny causal backbone, not
+    // the caller's dimension-dependent Lngram or denoising configuration.
+    small.lngram_layers.clear();
+    small.wavelet_layers.clear();
+    small.sbd = None;
     for backend in [UpdateBackend::Tensor, UpdateBackend::FusedGpu] {
         small.update_backend = backend;
         let model = LanguageModel::new(&small, &small.arms[0], &device)?;

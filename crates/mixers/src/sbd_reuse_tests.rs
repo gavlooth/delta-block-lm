@@ -24,6 +24,23 @@ fn capture(mixer:&Mixer,input:Tensor<3>,starts:&[usize])->CleanMixer {
     trace.clean.unwrap()
 }
 
+fn compare_parameter_gradients(model: &impl burn::module::Module, actual: &GradientsParams,
+    expected: &GradientsParams, minimum: usize) {
+    struct Compare<'a>(&'a GradientsParams,&'a GradientsParams,usize);
+    impl ModuleVisitor for Compare<'_> {
+        fn visit_float<const D:usize>(&mut self,p:&Param<Tensor<D>>) {
+            match (self.0.get::<D>(p.id),self.1.get::<D>(p.id)) {
+                (Some(a),Some(b))=>{compare(a,b);self.2+=1;},
+                (None,None)=>{},
+                _=>panic!("gradient presence differs"),
+            }
+        }
+    }
+    let mut check=Compare(actual,expected,0);
+    model.visit(&mut check);
+    assert!(check.2>=minimum);
+}
+
 #[test]
 fn prepared_cache_retains_the_clean_projection_convolution_and_scan() {
     let device=Device::ndarray().autodiff();device.seed(8101);
@@ -71,16 +88,66 @@ fn merged_noisy_projections_preserve_outputs_and_all_parameter_vjps() {
             compare(noisy.grad(&a).unwrap(),noisy.grad(&b).unwrap());
             compare(clean_input.grad(&a).unwrap(),clean_input.grad(&b).unwrap());
             let a=GradientsParams::from_grads(a,&merged);let b=GradientsParams::from_grads(b,&separate);
-            struct Compare<'a>(&'a GradientsParams,&'a GradientsParams,usize);
-            impl ModuleVisitor for Compare<'_> {
-                fn visit_float<const D:usize>(&mut self,p:&Param<Tensor<D>>) {
-                    match (self.0.get::<D>(p.id),self.1.get::<D>(p.id)) {
-                        (Some(a),Some(b))=>{compare(a,b);self.2+=1;},
-                        (None,None)=>{},
-                        _=>panic!("gradient presence differs"),
-                    }
-                }
-            }
-            let mut check=Compare(&a,&b,0);merged.visit(&mut check);assert!(check.2>=10);
+            compare_parameter_gradients(&merged,&a,&b,10);
         }
+}
+
+#[test]
+fn batched_mixer_cache_accepts_the_full_clean_prefix_with_matching_vjps() {
+    for time in [1,4,5] {
+        for policy in [crate::CachePolicy::None,crate::CachePolicy::Surprise] {
+            let device=Device::ndarray().autodiff();
+            device.seed(8500+time as u64);
+            let mixer=MixerConfig {d_model:8,heads:2,key_dim:3,value_dim:5,chunk_size:4,
+                cache_capacity:2,cache_policy:policy,..Default::default()}.init(&device)
+                .with_sbd_reads(if policy==crate::CachePolicy::None {InBlockReads::None}
+                    else {InBlockReads::HolaRead},NoisyReadBackend::Tensor);
+            let input=Tensor::<3>::random([2,time,8],burn::tensor::Distribution::Uniform(-0.5,0.5),&device).require_grad();
+            let noisy=Tensor::<3>::random([3,1,8],burn::tensor::Distribution::Uniform(-0.5,0.5),&device).require_grad();
+            let blocks=[(1,time),(0,0),(0,time)];
+            for captured in [false,true] {
+                let cache=if captured {
+                    let clean=capture(&mixer,input.clone(),&[0,time]);
+                    mixer.prepare_sbd_batched_from_clean(&clean,&blocks)
+                } else {mixer.prepare_sbd_batched(input.clone(),&blocks)};
+                let actual=mixer.forward_sbd_batched(noisy.clone(),&cache,Tensor::ones([3,1],&device));
+                let expected=Tensor::cat(blocks.iter().enumerate().map(|(index,&(row,start))| {
+                    let clean=mixer.prepare_sbd(input.clone().slice([row..row+1,0..time,0..8]),&[start]);
+                    mixer.forward_sbd_cached(noisy.clone().slice([index..index+1,0..1,0..8]),
+                        &clean,0,Tensor::ones([1,1],&device))
+                }).collect(),0);
+                compare(actual.clone(),expected.clone());
+                let actual=actual.square().mean().backward();
+                let expected=expected.square().mean().backward();
+                compare(input.grad(&actual).unwrap(),input.grad(&expected).unwrap());
+                compare(noisy.grad(&actual).unwrap(),noisy.grad(&expected).unwrap());
+                compare_parameter_gradients(&mixer,&GradientsParams::from_grads(actual,&mixer),
+                    &GradientsParams::from_grads(expected,&mixer),10);
+            }
+        }
+    }
+}
+
+#[test]
+fn batched_wavelet_cache_accepts_the_full_clean_prefix_with_matching_vjps() {
+    for time in [1,4,5] {
+        let device=Device::ndarray().autodiff();
+        device.seed(8600+time as u64);
+        let wavelet=crate::WaveletDyn::new(8,3,2,crate::WaveletBackend::Tensor,&device);
+        let input=Tensor::<3>::random([2,time,8],burn::tensor::Distribution::Uniform(-0.5,0.5),&device).require_grad();
+        let noisy=Tensor::<3>::random([3,1,8],burn::tensor::Distribution::Uniform(-0.5,0.5),&device).require_grad();
+        let blocks=[(1,time),(0,0),(0,time)];
+        let actual=wavelet.forward_sbd_batched(noisy.clone(),&wavelet.prepare_sbd_batched(input.clone(),&blocks));
+        let expected=Tensor::cat(blocks.iter().enumerate().map(|(index,&(row,start))| {
+            let clean=wavelet.prepare_sbd(input.clone().slice([row..row+1,0..time,0..8]));
+            wavelet.forward_sbd_cached(noisy.clone().slice([index..index+1,0..1,0..8]),&clean,start)
+        }).collect(),0);
+        compare(actual.clone(),expected.clone());
+        let actual=actual.square().mean().backward();
+        let expected=expected.square().mean().backward();
+        compare(input.grad(&actual).unwrap(),input.grad(&expected).unwrap());
+        compare(noisy.grad(&actual).unwrap(),noisy.grad(&expected).unwrap());
+        compare_parameter_gradients(&wavelet,&GradientsParams::from_grads(actual,&wavelet),
+            &GradientsParams::from_grads(expected,&wavelet),5);
+    }
 }

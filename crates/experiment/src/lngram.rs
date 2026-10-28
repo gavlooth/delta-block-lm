@@ -62,6 +62,9 @@ fn compare(a: &[Vec<f32>], b: &[Vec<f32>]) -> Result<f64> {
 #[cfg(feature = "cpu")]
 fn model_gate(c: &Config, device: &Device) -> Result<Value> {
     let mut config = c.clone();
+    // This gate exercises the causal forward/loss, not the SBD denoising graph.
+    // Do not allocate inherited SBD-only parameters that this objective cannot train.
+    config.sbd = None;
     config.backend = "cpu".into();
     config.fusion = false;
     config.autotune = false;
@@ -174,9 +177,11 @@ fn model_gate(c: &Config, device: &Device) -> Result<Value> {
     }
     model.visit(&mut Zeros(&mut grads));
     let mut before = Vec::new();
+    let mut table_gradient_elements=0usize;
     for block in &model.blocks {
         for table in &block.lngram.as_ref().unwrap().tables {
             let dims = table.weight.val().dims();
+            table_gradient_elements+=dims[1];
             let g = Tensor::<2>::zeros(dims, &target)
                 .slice_assign([1..2, 0..dims[1]], Tensor::ones([1, dims[1]], &target));
             grads.register(table.weight.id, g.inner());
@@ -185,7 +190,16 @@ fn model_gate(c: &Config, device: &Device) -> Result<Value> {
     }
     let mut optimizer_config = config.clone();
     optimizer_config.update_backend = c.update_backend;
-    let updated = train::optimizer(&optimizer_config).step(config.learning_rate, model, grads);
+    let mut optimizer=train::optimizer(&optimizer_config);
+    let rate_factor=crate::update::learning_rate_factor(
+        optimizer.completed_steps(),optimizer.schedule_steps(),
+        config.warmup_fraction,config.min_learning_rate_ratio);
+    let table_rate=5.0*config.learning_rate*rate_factor;
+    // Fresh Adam moments bias-correct to g and g². The global clip sees
+    // one all-one row per table, with zero gradients on every other parameter.
+    let clipped_gradient=(f64::from(config.gradient_clip)/(table_gradient_elements as f64).sqrt()).min(1.0);
+    let expected_delta=table_rate*clipped_gradient/(clipped_gradient+f64::from(config.optimizer_epsilon));
+    let updated = optimizer.step(config.learning_rate, model, grads);
     let mut index = 0;
     for block in &updated.blocks {
         for table in &block.lngram.as_ref().unwrap().tables {
@@ -199,9 +213,9 @@ fn model_gate(c: &Config, device: &Device) -> Result<Value> {
                 if i / width == 1 {
                     let delta = (before[index][i] - after[i]) as f64;
                     ensure!(
-                        (delta - 5.0 * config.learning_rate).abs()
-                            <= 2e-5 + 3e-4 * (5.0 * config.learning_rate),
-                        "Lngram table learning-rate multiplier was not applied"
+                        (delta - expected_delta).abs()
+                            <= 2e-5 + 3e-4 * expected_delta.abs(),
+                        "Lngram table learning-rate multiplier was not applied: delta {delta}, expected scheduled/clipped Adam delta {expected_delta}"
                     );
                 }
             }
@@ -209,7 +223,7 @@ fn model_gate(c: &Config, device: &Device) -> Result<Value> {
         }
     }
     Ok(
-        json!({"passed":true,"modes":modes,"parameter_tensors":reference_gradients.len(),"table_parameter_ids":table_ids.len(),"fresh_state_only_indexed_rows_changed":true,"table_learning_rate_multiplier":5,"table_weight_decay":0}),
+        json!({"passed":true,"modes":modes,"parameter_tensors":reference_gradients.len(),"table_parameter_ids":table_ids.len(),"fresh_state_only_indexed_rows_changed":true,"table_learning_rate_multiplier":5,"table_weight_decay":0,"table_scheduled_learning_rate":table_rate,"table_clipped_gradient":clipped_gradient,"table_first_step_expected_delta":expected_delta}),
     )
 }
 #[cfg(not(feature = "cpu"))]

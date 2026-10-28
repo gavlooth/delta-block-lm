@@ -189,8 +189,8 @@ fn retrieval_case(device: &Device, with_moba: bool, doubled: bool) -> Result<Val
         let selected=Tensor::<2,Bool>::from_data([[true,false,true,false,true,false,true,false]],target);
         let (circuit_a,observed_a)=sbd::prepare_distribution(model,a,soft,1.0)?;
         let (circuit_b,observed_b)=sbd::prepare_distribution(model,b,soft,1.0)?;
-        let loss=circuit_a.marginal_ce(clean.clone(),clean.clone(),observed_a,Tensor::ones([1,8],target),8.0)?.loss
-            +circuit_b.marginal_ce(clean.clone(),clean,observed_b,selected.float(),8.0)?.loss;
+        let loss=circuit_a.joint_marginal_ce(clean.clone(),clean.clone(),observed_a,Tensor::ones([1,8],target),8.0)?.loss
+            +circuit_b.joint_marginal_ce(clean.clone(),clean,observed_b,selected.float(),8.0)?.loss;
         let value=model::scalar(loss.clone())? as f32;
         let unused=model::unused_soft_parameters();
         let (checked,_) = model::checked_gradients_with_unused(model,loss,&unused,&mut Unprofiled)?;
@@ -201,7 +201,7 @@ fn retrieval_case(device: &Device, with_moba: bool, doubled: bool) -> Result<Val
     let (gpu_loss,gpu_gradient)=normalized(&gpu_model,&gpu_soft,&gpu)?;
     let gradients=json!({"loss":compare(&[gpu_loss],&[cpu_loss])?,
         "all_neural_and_circuit_gradients":compare_parameter_gradients(&gpu_gradient,&cpu_gradient).context("contextual CoCommit normalized event objective all gradients")?,
-        "objective":"sum of A marginal token CE on all eight free positions and B marginal token CE on announced positions, normalized by eight",
+        "objective":"A joint conditional NLL plus token CE on all eight free positions; B joint event plus token CE on announced positions, normalized by eight; reach/count once per branch-chain",
         "same_prefix_length":219,"same_active_length":8,"same_parameters":true});
     let outputs=json!({
         "A_logits":compare(&values(gpu_a.logits),&values(cpu_a.logits)).context("contextual CPU/Vulkan A")?,
@@ -283,7 +283,7 @@ fn cocommit_checkpoint_continuation(c:&Config,device:&Device,seed:u64)->Result<V
         Example{input:sequence[..8].to_vec(),target:sequence[1..].to_vec(),weight:vec![1.0;8],groups:vec![None;8]}
     }).collect::<Vec<_>>();
     let train_device=device.clone().autodiff(); train_device.seed(seed);
-    let step=|model:LanguageModel,optimizer:&mut train::NeuralOptimizer,rows:&[Example],step_seed:u64|->Result<(LanguageModel,f64,usize)> {
+    let step=|model:LanguageModel,optimizer:&mut crate::update::NeuralOptimizer,rows:&[Example],step_seed:u64|->Result<(LanguageModel,f64,usize)> {
         let batch=Batch::new(rows,&train_device);
         let result=crate::sbd_step::backward(&model,&cfg,rows,&batch,step_seed)?;
         ensure!(result.passes==2 && result.rows_per_pass==1,"checkpoint fixture did not accumulate both single-row passes");
@@ -624,7 +624,8 @@ fn scalar_kron_temporary_reference(
         for key in 0..2 {for value in 0..2 {
             next[key*2+value]+=k[key]*correction*v[value];
         }}
-        for value in 0..2 {output.push((0..2).map(|key|q[key]*next[key*2+value]).sum());}
+        // Query-only scaling must not change the stored state or physical edit norm.
+        for value in 0..2 {output.push((0..2).map(|key|q[key]*next[key*2+value]/2.0f64.sqrt()).sum());}
         scores.push((k.iter().map(|x|x*x).sum::<f64>()
             *v.iter().map(|x|(correction*x).powi(2)).sum::<f64>()).sqrt());
         states.extend(next);previous=next;
@@ -680,7 +681,7 @@ fn kron_temporary_tail_case(device:&Device)->Result<Value> {
     ensure!(chain_gap>1.0e-3,"Kron tail fixture does not distinguish incorrect sequential chaining");
     ensure!(marker_gap>1.0e-3,"Kron tail fixture does not exercise a nonzero marker effect");
     Ok(json!({"passed":true,"device":crate::runtime::identity(device),"backend":"tensor_solver",
-        "reference":"independent f64 Kron decay, scalar prediction/erase/write, outer-product edit and query read",
+        "reference":"independent f64 Kron decay, scalar prediction/erase/write, outer-product edit and query-only 1/sqrt(key_dim) read",
         "shape":{"active_positions":3,"heads":1,"keys":2,"values":2,"time_per_temporary_scan":1},
         "A":report(a,&expected_a)?,"B":report(b,&expected_b)?,
         "A_B_saved_hidden_and_clean_state_bitwise_unchanged":true,"duplicated_initial_snapshots_bitwise_unchanged":true,

@@ -769,6 +769,16 @@ impl PreparedCircuit {
     /// over weighted targets, with traversal reach/count once per logical chain.
     pub fn marginal_ce(&self, clean: Tensor<2, Int>, evidence_values: Tensor<2, Int>,
         observed: Tensor<2, Bool>, weights: Tensor<2>, denominator: f64) -> Result<CircuitLoss> {
+        self.token_objective(clean, evidence_values, observed, weights, denominator, false)
+    }
+    /// Explicit combined design: one joint conditional event plus weighted token CE.
+    /// Both terms share one traversal reach and one active-chain normalization count.
+    pub fn joint_marginal_ce(&self, clean: Tensor<2, Int>, evidence_values: Tensor<2, Int>,
+        observed: Tensor<2, Bool>, weights: Tensor<2>, denominator: f64) -> Result<CircuitLoss> {
+        self.token_objective(clean, evidence_values, observed, weights, denominator, true)
+    }
+    fn token_objective(&self, clean: Tensor<2, Int>, evidence_values: Tensor<2, Int>,
+        observed: Tensor<2, Bool>, weights: Tensor<2>, denominator: f64, joint: bool) -> Result<CircuitLoss> {
         let (rows, width, _, _) = self.shape();
         ensure!(clean.dims() == [rows, width] && evidence_values.dims() == [rows, width]
             && observed.dims() == [rows, width] && weights.dims() == [rows, width],
@@ -785,7 +795,10 @@ impl PreparedCircuit {
         let values = clean.mask_where(observed.clone(), evidence_values);
         let negative = self.statistics(values.clone(), observed.clone())?;
         let positions = Tensor::<1, Int>::arange(0..width as i64, &self.logits.device()).reshape([1,width]);
-        let mut total: Option<CircuitLoss> = None;
+        let mut total = if joint {
+            Some(self.event_nll_weighted(values.clone(), observed.clone(), weights.clone().greater_elem(0.0),
+                denominator, None, Some((&negative,&reach)))?)
+        } else { None };
         for position in 0..width {
             if count != 0 && !(0..rows).any(|row| host_weights[row*width+position] > 0.0) { continue; }
             if count == 0 && position != 0 { break; }

@@ -70,11 +70,11 @@ pub(crate) fn add_branch_losses(
         mutable.observed.fill(None);
         let (a_circuit,observed)=sbd::prepare_distribution(model,a,&mutable,1.0)?;
         let weights=Tensor::from_data(TensorData::new(a_weights,[rows,width]),&targets.device());
-        result.add_circuit_loss(a_circuit.marginal_ce(targets.clone(),targets.clone(),observed,weights,denominator)?);
+        result.add_circuit_loss(a_circuit.joint_marginal_ce(targets.clone(),targets.clone(),observed,weights,denominator)?);
         if any_b {
             let (b_circuit,observed)=sbd::prepare_distribution(model,b,&mutable,1.0)?;
             let weights=Tensor::from_data(TensorData::new(b_weights,[rows,width]),&targets.device());
-            result.add_circuit_loss(b_circuit.marginal_ce(targets.clone(),targets,observed,weights,denominator)?);
+            result.add_circuit_loss(b_circuit.joint_marginal_ce(targets.clone(),targets,observed,weights,denominator)?);
             Ok(Some(b_circuit))
         } else {Ok(Some(a_circuit))}
     } else {

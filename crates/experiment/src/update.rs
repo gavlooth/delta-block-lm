@@ -63,10 +63,14 @@ impl Optimizer for AdamW {
 /// Only present, trainable neural gradients participate. Frozen circuit probability state
 /// is not a neural parameter; its separate flow optimizer is unchanged.
 pub fn global_clip<M: Module>(model: &M, gradients: &mut GradientsParams, threshold: f32, fused: bool) -> Result<f64> {
-    struct Norms<'a> { gradients: &'a GradientsParams, seen: HashSet<ParamId>, values: Vec<Tensor<1>>, fused: bool }
+    struct Norms<'a> { gradients: &'a mut GradientsParams, seen: HashSet<ParamId>, values: Vec<Tensor<1>>, fused: bool }
     impl ModuleVisitor for Norms<'_> {
         fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
-            if !param.val().is_require_grad() || !self.seen.insert(param.id) { return; }
+            if !self.seen.insert(param.id) { return; }
+            if !param.val().is_require_grad() {
+                let _ = self.gradients.remove::<D>(param.id);
+                return;
+            }
             if let Some(g) = self.gradients.get::<D>(param.id) {
                 let count: usize = g.dims().iter().product();
                 self.values.push(if self.fused { square_sum(g) }
@@ -118,7 +122,9 @@ pub fn learning_rate_factor(completed: usize, steps: usize, warmup_fraction: f64
 }
 
 pub fn soft_confidence_rate(completed: usize, peak: f64, warmup_steps: usize) -> f64 {
-    peak*(completed.saturating_add(1) as f64/warmup_steps.max(1) as f64).min(1.0)
+    let update=completed.saturating_add(1);
+    if update>=warmup_steps { peak }
+    else { (peak*update as f64)/warmup_steps as f64 }
 }
 
 /// Module-level boundary: all callers get exactly one global clip and one schedule
@@ -186,6 +192,14 @@ impl NeuralOptimizer {
     }
     pub fn into_bytes(&self) -> Result<burn::tensor::Bytes> { Ok(self.writer()?.into_bytes()?) }
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> { Ok(self.writer()?.write_to_file(path)?) }
+    pub fn from_bytes(mut self, bytes: burn::tensor::Bytes) -> Result<Self> {
+        let reader = burn_pack::Reader::from_bytes(bytes.clone())?;
+        self.restore_recipe(reader.metadata().get(RECIPE_KEY)
+            .context("optimizer predates global clipping/Kron recipe; restart from scratch")?,
+            reader.metadata().get(STEP_KEY).context("optimizer is missing global schedule counter")?, false)?;
+        self.inner = self.inner.from_bytes(bytes)?;
+        Ok(self)
+    }
     pub fn load(self, path: impl AsRef<Path>) -> Result<Self> {
         self.load_recipe(path.as_ref(), false)
     }
@@ -195,15 +209,19 @@ impl NeuralOptimizer {
     }
     fn load_recipe(mut self, path: &Path, source_horizon: bool) -> Result<Self> {
         let reader = burn_pack::Reader::from_file(path)?;
-        let recipe: Recipe = serde_json::from_str(reader.metadata().get(RECIPE_KEY)
-            .context("optimizer predates global clipping/Kron recipe; restart from scratch")?)?;
-        if source_horizon { self.recipe.steps = recipe.steps; }
-        ensure!(recipe == self.recipe, "optimizer recipe/schedule mismatch; restart from scratch");
-        self.completed_steps = reader.metadata().get(STEP_KEY)
-            .context("optimizer is missing global schedule counter")?.parse()?;
-        self.recipe = recipe;
+        self.restore_recipe(reader.metadata().get(RECIPE_KEY)
+            .context("optimizer predates global clipping/Kron recipe; restart from scratch")?,
+            reader.metadata().get(STEP_KEY).context("optimizer is missing global schedule counter")?, source_horizon)?;
         self.inner = self.inner.load(path)?;
         Ok(self)
+    }
+    fn restore_recipe(&mut self, serialized: &str, completed_steps: &str, source_horizon: bool) -> Result<()> {
+        let recipe: Recipe = serde_json::from_str(serialized)?;
+        if source_horizon { self.recipe.steps = recipe.steps; }
+        ensure!(recipe == self.recipe, "optimizer recipe/schedule mismatch; restart from scratch");
+        self.completed_steps = completed_steps.parse()?;
+        self.recipe = recipe;
+        Ok(())
     }
 }
 
@@ -283,7 +301,7 @@ pub fn optimizer_group_checks(c: &crate::config::Config, device: &Device) -> Res
         decay_scale: one(), decay_bias: one(), a_log: one(), b_delta: one(), gate_bias: one(),
         lngram: Tables { tables: vec![Table { weight: Param::from_tensor(Tensor::<2>::ones([1,1], &device)) }] },
         soft_confidence: SoftConfidence { raw_scale: one(), raw_centre_neg: one(), raw_steep: one() },
-        frozen: Param::from_tensor(Tensor::<1>::ones([1], &device).set_require_grad(false)) };
+        frozen: Param::from_tensor(Tensor::<1>::ones([1], &device)).set_require_grad(false) };
     #[derive(Default)]
     struct Values { path: Vec<String>, values: std::collections::BTreeMap<String, Vec<f32>> }
     impl ModuleVisitor for Values {
@@ -308,6 +326,9 @@ pub fn optimizer_group_checks(c: &crate::config::Config, device: &Device) -> Res
     }
     let mut gradients = Gradients { values: GradientsParams::new() }; parameters.visit(&mut gradients);
     let count = gradients.values.len();
+    // Simulate an externally supplied stale derivative for an actually frozen parameter.
+    // The optimizer boundary must discard it before both norm clipping and AdamW.
+    gradients.values.register(parameters.frozen.id, Tensor::<1>::full([1], 99.0, &device));
     let elements = before.values.iter().filter(|(name,_)|name.as_str()!="frozen")
         .map(|(_,values)|values.len()).sum::<usize>();
     let g = (f64::from(c.gradient_clip)/(elements as f64).sqrt()).min(1.0);

@@ -165,10 +165,9 @@ impl Episode {
 
 
 fn select_branch_output(a: crate::model::DenoisingOutput, b: crate::model::DenoisingOutput,
-    use_b: &[bool], device: &Device) -> crate::model::DenoisingOutput {
+    selected: Tensor<2,Bool>) -> crate::model::DenoisingOutput {
     let [rows,width,vocab]=a.logits.dims();
     let depth=a.features.dims()[2];
-    let selected=Tensor::<2,Bool>::from_data(TensorData::new(use_b.to_vec(),[rows,width]),device);
     crate::model::DenoisingOutput {
         logits:a.logits.mask_where(selected.clone().unsqueeze_dim::<3>(2).expand([rows,width,vocab]),b.logits),
         features:a.features.mask_where(selected.unsqueeze_dim::<3>(2).expand([rows,width,depth]),b.features),
@@ -234,6 +233,7 @@ fn coordinated_output(model: &LanguageModel, c: &Config, cache: &BatchedTraining
 struct Prediction {
     hidden: Tensor<3>,
     logs: Tensor<2>,
+    proposal_logs: Tensor<2>,
     input_visibility: Tensor<2>,
     input_revealed: Vec<bool>,
     work: crate::cocommit::CoordinationWork,
@@ -257,23 +257,49 @@ fn predict(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, stat
     let fixed=Tensor::<2,Bool>::from_data(TensorData::new(state.soft.observed.iter().zip(&revealed)
         .map(|(o,&r)|o.is_some() || (!correction && r)).collect::<Vec<_>>(),[rows,width]),device);
     let values=Tensor::<2,Int>::from_data(TensorData::new(state.values.iter().map(|&v|v as i32).collect::<Vec<_>>(),[rows,width]),device);
-    let mut probabilities=|output:crate::model::DenoisingOutput|->Result<crate::model::DenoisingOutput> {
-        let logs=if model.codpula.is_some() {
+    let permanent=Tensor::<2,Bool>::from_data(TensorData::new(state.soft.observed.iter()
+        .map(Option::is_some).collect::<Vec<_>>(),[rows,width]),device);
+    let retained_evidence=!correction && revealed.iter().any(|&r|r);
+    let mut probabilities=|output:crate::model::DenoisingOutput|->Result<(crate::model::DenoisingOutput,Tensor<3>)> {
+        let (logs,proposal_logs)=if model.codpula.is_some() {
             let (circuit,_,_)=crate::sbd::prepare_circuit(model,output.clone(),&state.soft,c.soft_temperature)?;
             work.circuit_preparations+=1;
             work.message_passes+=1;
             work.evidence_queries+=1;
             work.circuit_query_dispatched_rows+=rows;
             work.circuit_query_used_rows+=rows;
-            circuit.marginals(values.clone(),fixed.clone())?.log()
-        }else{log_softmax(output.logits/c.soft_temperature,2)};
-        Ok(crate::model::DenoisingOutput{logits:logs,features:output.features})
+            // Feedback and energy features must keep full support outside O,
+            // even when the standard carry proposal conditions on O plus R.
+            let logs=circuit.marginals(values.clone(),permanent.clone())?.log();
+            let proposal_logs=if retained_evidence {
+                work.message_passes+=1;
+                work.evidence_queries+=1;
+                work.circuit_query_dispatched_rows+=rows;
+                work.circuit_query_used_rows+=rows;
+                circuit.marginals(values.clone(),fixed.clone())?.log()
+            }else{logs.clone()};
+            (logs,proposal_logs)
+        }else{
+            let logs=log_softmax(output.logits/c.soft_temperature,2);
+            (logs.clone(),logs)
+        };
+        Ok((crate::model::DenoisingOutput{logits:logs,features:output.features},proposal_logs))
     };
-    let a=probabilities(a)?;
-    let output=if let Some(b)=b {select_branch_output(a,probabilities(b)?,&use_b,device)}else{a};
+    let (a,a_proposals)=probabilities(a)?;
+    let (output,proposal_logs)=if let Some(b)=b {
+        let (b,b_proposals)=probabilities(b)?;
+        let selected=Tensor::<2,Bool>::from_data(TensorData::new(use_b,[rows,width]),device);
+        let output=select_branch_output(a,b,selected.clone());
+        let proposal_logs=if retained_evidence {
+            a_proposals.mask_where(
+                selected.unsqueeze_dim::<3>(2).expand([rows,width,c.vocab()]),b_proposals)
+        }else{output.logits.clone()};
+        (output,proposal_logs)
+    }else{(a,a_proposals)};
     let logs=output.logits.reshape([rows*width,c.vocab()]);
-    let best=crate::soft::ids_host(logs.clone().argmax(1));
-    let host_logs=host(logs.clone())?;
+    let proposal_logs=proposal_logs.reshape([rows*width,c.vocab()]);
+    let best=crate::soft::ids_host(proposal_logs.clone().argmax(1));
+    let host_logs=host(proposal_logs.clone())?;
     for i in 0..state.values.len() {
         if state.soft.active[i] && state.soft.observed[i].is_none() && (correction || !revealed[i]) {
             state.values[i]=best[i] as usize;
@@ -288,7 +314,7 @@ fn predict(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, stat
         model.soft_confidence.as_ref().context("soft feedback head missing")?)?;
     state.previous_candidates=Some(previous);
     state.validate(c.vocab())?;
-    Ok(Prediction{hidden:output.features,logs,input_visibility:visibility,input_revealed:revealed,work})
+    Ok(Prediction{hidden:output.features,logs,proposal_logs,input_visibility:visibility,input_revealed:revealed,work})
 }
 
 fn features(model: &LanguageModel, c: &Config, state: &Episode, output: &Prediction,
@@ -623,7 +649,11 @@ fn endpoint_losses(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCac
     let denominators=Tensor::<1>::from_data(TensorData::new((0..rows).map(|r|state.eligible(r).len().max(1) as f32).collect::<Vec<_>>(),[rows]),device);
     // A mixed greedy readout has no single circuit joint event. Score its
     // O-only endpoint denoiser marginal CE, not a joint likelihood of writes.
-    let loss=-(output.logs.gather(1,targets).reshape([rows,width])*weights).sum_dim(1).reshape([rows])/denominators;
+    // Observed/padded targets may have log probability -inf. Select them out
+    // before multiplying, so zero-weight rows cannot form 0 * -inf.
+    let selected=output.logs.gather(1,targets).reshape([rows,width])
+        .mask_fill(weights.clone().equal_elem(0.0),0.0);
+    let loss=-(selected*weights).sum_dim(1).reshape([rows])/denominators;
     let values=host(loss)?;
     ensure!(values.iter().all(|value|value.is_finite()),"endpoint has nonfinite marginal token CE");
     Ok((values,output.work))
@@ -697,7 +727,7 @@ pub fn collect(model: &LanguageModel, c: &Config, rows: &[Example], checkpoint_i
         let decision = decision.unwrap();
         let feature_values = host(features(&model,c,&state,&decision,&vec![r;count],&vec![r as f32/length as f32;count],device)?)?;
         ensure!(feature_values.iter().all(|value|value.is_finite()),"nonfinite trajectory feature");
-        let proposal_logs = host(decision.logs.clone())?;
+        let proposal_logs = host(decision.proposal_logs.clone())?;
         let candidate_ids = crate::soft::ids_host(state.soft.candidates.ids.clone());
         let candidate_weights = host(state.soft.candidates.weights.clone())?;
         let candidate_visibility = host(state.soft.visibility.clone())?;
@@ -793,7 +823,7 @@ pub fn collect(model: &LanguageModel, c: &Config, rows: &[Example], checkpoint_i
         "temperature":c.soft_temperature,"candidate_width":c.sbd.as_ref().unwrap().candidate_width,
         "source_model_identity":model_identity(&model)?,"collection_mask_policy":"uniform",
         "outcome":"mean_clean_target_denoiser_marginal_ce","endpoint_evidence":"permanent_O_only_with_provisional_neural_inputs",
-        "proposal_evidence":"O_only_for_correction_edits_O_plus_R_for_standard_carry","feature_and_feedback_evidence":"same_branch_and_evidence_as_greedy_proposal",
+        "proposal_evidence":"O_only_for_correction_edits_O_plus_R_for_standard_carry","feature_and_feedback_evidence":"permanent_O_only_same_selected_A_B_branch",
         "source_split":"train","source_calls":source_calls,"branch_calls":branch_calls,"endpoint_calls":endpoint_calls,
         "device_noisy_dispatches":device_dispatch_calls,"horizon":refinement.horizon,"pairs_per_state":refinement.pairs_per_state,
         "coordination_work":{"source":source_work,"branch":branch_work,"endpoint":endpoint_work},
@@ -992,7 +1022,6 @@ fn reference_features(model: &LanguageModel, c: &Config, state: &Episode, output
     let hidden = host(output.hidden.clone())?;
     let logs = host(output.logs.clone())?;
     let table = host(model.embedding.weight.val())?;
-    let mask = host(model.sbd_mask.as_ref().unwrap().val())?;
     let ids = crate::soft::ids_host(state.soft.candidates.ids.clone());
     let weights = host(state.soft.candidates.weights.clone())?;
     let mass = host(state.soft.candidates.retained_mass.clone())?;
@@ -1011,8 +1040,8 @@ fn reference_features(model: &LanguageModel, c: &Config, state: &Episode, output
         }
         result.extend(hidden[flat*depth..(flat+1)*depth].iter().map(|&x|x as f64));
         for d in 0..depth {
-            let expectation = (0..k).map(|j|weights[flat*k+j] as f64*table[ids[flat*k+j] as usize*depth+d] as f64).sum::<f64>()
-                +(1.0-mass[flat] as f64)*mask[d] as f64;
+            // The unit-visibility feature uses normalized top-k weights; mass is a separate scalar.
+            let expectation = (0..k).map(|j|weights[flat*k+j] as f64*table[ids[flat*k+j] as usize*depth+d] as f64).sum::<f64>();
             result.push(expectation);
         }
         let probabilities = &logs[flat*c.vocab()..(flat+1)*c.vocab()];
@@ -1046,6 +1075,7 @@ pub fn numerical_checks(c: &Config, device: &Device) -> Result<Value> {
     check.sbd.as_mut().unwrap().refinement=Some(RefinementConfig::default());
     // Preserve the standalone proofs, then exercise composition independently below.
     check.sbd.as_mut().unwrap().cocommit=None;
+    check.sbd.as_mut().unwrap().training_mode=crate::tct::TrainingMode::Sbd;
     device.seed(check.seed);
     let model = LanguageModel::new(&check,arm,device)?.valid();
     let width = 4;
@@ -1068,11 +1098,25 @@ pub fn numerical_checks(c: &Config, device: &Device) -> Result<Value> {
     ensure!(candidate_ids==crate::soft::ids_host(state.soft.candidates.ids.clone())
         && candidate_weights==host(state.soft.candidates.weights.clone())?,"remasking deleted retained candidates");
     remember(&mut state,&first);
+    let carried_values=state.values.clone();
     let second = predict(&model,&check,&cache,&mut state,&keys,check.seed,1,device)?;
     let second_actual = host(features(&model,&check,&state,&second,&cardinalities,&noise,device)?)?;
     let second_reference = reference_features(&model,&check,&state,&second,&cardinalities,&noise)?;
     let second_report = crate::sbd::compare(&second_actual,&second_reference)?;
     ensure!(first_actual.iter().chain(&second_actual).all(|value|value.is_finite()),"feature reference produced a nonfinite valid feature");
+    ensure!(second.input_revealed[2] && state.values[2]==carried_values[2],
+        "standard carry fixture did not preserve its revealed R token");
+    if model.codpula.is_some() {
+        let full=host(second.logs.clone())?;
+        let proposals=host(second.proposal_logs.clone())?;
+        let range=2*check.vocab()..3*check.vocab();
+        ensure!(full[range.clone()].iter().all(|value|value.is_finite())
+            && proposals[range].iter().filter(|value|value.is_finite()).count()==1,
+            "revealed R must retain full-support O-only features but O+R proposal evidence");
+        ensure!(second.work.circuit_preparations==1 && second.work.evidence_queries==2
+            && second.work.message_passes==2,
+            "standard carry tables must reuse one circuit and charge both evidence queries");
+    }
     ensure!(state.soft.observed==observed && state.values[0]==1,"provisional refinement changed permanent evidence");
     ensure!(state.apply_sets(&[vec![0],vec![0]],&cardinalities,&check,device).is_err(),"immutable evidence entered remask support");
     ensure!(state.apply_sets(&[vec![1,1],vec![0]],&[2,1],&check,device).is_err(),"duplicate remask positions accepted");
@@ -1097,7 +1141,7 @@ pub fn numerical_checks(c: &Config, device: &Device) -> Result<Value> {
     }
     let prefix_after = host(model.forward_output_profiled(&Batch::new(&[prefix_fixture(prefix.clone())],device),&mut delta_mixers::profile::Unprofiled).logits)?;
     ensure!(prefix_before.iter().zip(&prefix_after).all(|(a,b)|a.to_bits()==b.to_bits()),"noisy refinement changed the clean prefix");
-    let candidate_logs = host(second.logs.clone())?;
+    let candidate_logs = host(second.proposal_logs.clone())?;
     let eligible = state.eligible(0);
     let mut swap_rng=Rng(7);
     let mut independent_rng=Rng(9);
@@ -1269,6 +1313,7 @@ pub fn numerical_checks(c: &Config, device: &Device) -> Result<Value> {
     }
     Ok(json!({"first_call_features":first_report,"previous_call_features":second_report,"endpoint_conditional_nll":endpoint_report,
         "coordination":coordinated_report,
+        "revealed_R_features_finite_with_separate_proposal_evidence":true,
         "feature_definition":FEATURE_VERSION,"feature_width":2*check.d_model+12,"immutable_O":true,"immutable_prefix":true,
         "candidates_retained":true,"right_padding_ignored":true,"invalid_sets_rejected":true,"paired_indexed_uniforms":true,
         "independent_row_rng":true,"weighted_swap_and_independent_distinct":true,"l1_noisy_cache_reconstruction":true,

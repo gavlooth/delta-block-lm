@@ -102,6 +102,8 @@ fn model_gate(c: &Config, device: &Device) -> Result<Value> {
     small.epilogue_backend = crate::config::EpilogueBackend::Native;
     small.loss_backend = crate::config::LossBackend::Tensor;
     small.update_backend = crate::config::UpdateBackend::Tensor;
+    // This is a causal backbone gate, not an SBD/coordination objective.
+    small.sbd = None;
     // Component gate: other Step 7 sublayers are covered by their own gates and kron-model-check.
     small.wavelet_layers.clear();
     small.lngram_layers.clear();

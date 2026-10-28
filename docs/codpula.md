@@ -1,5 +1,13 @@
 # Step 9: Codpula joint block denoising
 
+**Current singleton semantics (2026-10-28):** the SBD correction removes the
+historical clean-causal singleton bypass described below. Length-one blocks now
+run the noisy network and the one-position HMM, including circuit learning.
+Model references compare the full-vocabulary singleton mixture to independent
+f64 sums and compare per-block/batched losses, flows and gradients. Legacy
+transition-only gates have no learning path in an all-singleton draw; contextual
+root gates remain active and required.
+
 ## Status and reading guide
 
 This document records the paper equations, the model-specific decisions in §5, and the implementation and measurement evidence below. The earlier specification-only pass made no code changes; the implementation pass uses the explicitly recorded decisions rather than silently choosing alternatives.
@@ -323,8 +331,11 @@ Soft feedback detaches the probability calculation while retaining live
 confidence-head and selected embedding gradients. Binary ordinary-training
 draws skip the optional feedback teacher. See the current [SBD](sbd.md) contract
 for the pre-teacher draw. CoCommit additionally uses required detached own-draft
-corruption; its and TCT's objectives are weighted marginal token CE, not this
-standalone module's conditional joint NLL.
+corruption. The approved CoCommit/TCT composition retains joint conditional NLL
+and adds weighted marginal token CE. It sums both terms' positive/negative circuit
+statistics with reach/count once per branch-chain. This explicit combined design
+does not replace standalone Codpula's joint-only objective or claim paper fidelity
+for the composed objective.
 
 At generation, each pass similarly uses full joint marginals for the soft belief update; committed tokens become immutable observations, while deferred positions retain soft beliefs and do not become hard evidence. The categorical proposal selected for a commitment is separate from its marginal feedback distribution. Append/replay the completed block into clean recurrence only after all positions are committed, as now. A partially visible soft embedding does **not** imply a fractional observed token in `Z_e`: only explicit observations supply evidence indicators. Conditioning the circuit a second time on its own soft beliefs would define another model and is not implied by this mapping.
 

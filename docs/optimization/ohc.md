@@ -6,7 +6,7 @@ The implementation originated in `reuse/crates/dre-ohc/src/{streams,stage,rotati
 
 `ohc_streams: true` changes the model architecture. Each active wavelet, Lngram, mixer and MLP sublayer has its own wrapper. The combined four-block profile has 14 wrappers. Each wrapper reads four streams, runs its existing operator (including the operator's normalization), and writes the result back. This replaces ordinary residual addition; it does not add another one. Final learned stream contraction is followed by exactly the existing model final norm and vocabulary head.
 
-The default is `ohc_streams: false`, `ohc_backend: "tensor"`. Both fields are absent from default serialization. Enabled models require the new `paper-local-math-v2` model math identity: old checkpoints are incompatible, including old oHC records with affine stream expansion, stream-read gain, write scalar or readout norm. There is no conversion or compatibility shim. Backends retain identical parameter semantics. Fused selectors require Vulkan or CUDA; there is no CPU fallback. The central identity check covers the coordinated paper corrections, not merely tensor dimensions.
+The default is `ohc_streams: false`, `ohc_backend: "tensor"`. Both fields are absent from default serialization. Enabled models require the current `paper-local-math-joint-plus-token-v3` model math identity: old checkpoints are incompatible, including old oHC records with affine stream expansion, stream-read gain, write scalar or readout norm. There is no conversion or compatibility shim. Backends retain identical parameter semantics. Fused selectors require Vulkan or CUDA; there is no CPU fallback. The central identity check covers the coordinated paper corrections and combined objective, not merely tensor dimensions.
 
 ### Current equations
 
@@ -30,7 +30,7 @@ The operator reads **raw** streams, `u = sum_s a_s X_s`. Its output is written a
 
 Three plausible approaches were considered: dropping fused paths and relying entirely on tensor operations, retaining compatibility parameters fixed at constants, or correcting tensor and fused equations together. The last keeps existing execution choices without obsolete parameters or a second convention, and is the selected implementation.
 
-1. **`tensor`** uses Burn projection, stable flattened RMS, raw weighted sum, sigmoid, quaternion construction, batched `Q X` and broadcast write.
+1. **`tensor`** uses Burn projection with a compensated skinny-contraction VJP, stable flattened RMS, raw weighted sum, sigmoid, quaternion construction, batched `Q X` and broadcast write.
 2. **`fused_gpu`** keeps tensor reads but fuses `Q X + b F(u)` and its existing analytic VJP.
 3. **`fused_read_write`**, **`fused_gate`**, and **`transposed_gate`** preserve the same equations. Raw fused reads retain only streams and weights, with two adjoints; removed inverse norms and gain adjoints are not cached. Fused gate normalization/projection VJPs place epsilon outside the root and handle zero RMS explicitly. Quaternion and write VJPs are unchanged.
 
@@ -41,7 +41,10 @@ Strided streams, matrices, projections, gates, operator outputs and adjoints rem
 `ohc-reference` runs an independent scalar f64 sequential oracle with its own reverse-mode tape and Hamilton-product rotations. It checks outputs, feature/operator gradients, all nine remaining stage/readout parameter tensors and the single model-final-norm gain. Tolerance remains `2e-5 + 3e-4 * abs(reference)`. Cases include zero and near-zero projection inputs with **nonzero weights**, noncontiguous inputs, raw reads from unequal streams, exact replication, ordinary exact-identity rotation with active writes, raw learned contraction and one final norm with non-unit gains. Lengths 1/5/17, batch two, widths 3/7, padding, empty rows, NaN/Inf padding and token locality remain covered. Separate primitive checks exercise every retained input gradient. Projection checks cover 129-token reduction tails and repeated deterministic gradients.
 
 A complete tiny causal LM is also compared between CPU tensor execution and GPU fused-write execution: logits, every parameter gradient, and the first AdamW update are checked at the same tolerance. Internal document resets, padding, tail length nine, future-token perturbations and cross-document perturbations are exercised. Separate per-token checks ensure that changing one input position cannot change any other oHC position.
-These updated checks have not been executed by the equation-correction worker. The integrator owns one combined build/reference/regression run after all slices land.
+Current CPU and local Vulkan `ohc-reference` runs passed during resumed acceptance on 2026-10-28, with the independent f64 reference and its tolerance unchanged. Command/status/stdout/stderr evidence is under `artifacts/resume-acceptance/commands/` (`cpu-ohc-final` and `vulkan-ohc-shared-split`); numerical reports are in the backend subdirectories.
+The first resumed CPU run exposed input-gradient cancellation at zero and near-zero gate inputs: the inverse RMS approaches `1e6`, amplifying the rounding of the 16-term `dy Wᵀ` contraction. The tensor path now normalizes before projection and uses product-residual plus TwoSum compensation for that contraction. The fused VJP contracts unscaled adjoints, compensates the same products/sums, and applies inverse RMS last. Register-only compensation failed on local Vulkan; explicit shared-memory rounding boundaries passed. All stage selectors use the corrected projection entry point. The tiny causal full-model fixture explicitly disables inherited SBD-only parameters instead of asking a causal loss for their gradients.
+
+No current performance measurement was run for this precision repair. The added compensation and Vulkan synchronization invalidate any assumption that historical gate-projection timing remains unchanged.
 
 ## Historical measurements — superseded equations
 

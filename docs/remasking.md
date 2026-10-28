@@ -23,20 +23,40 @@ and generated-token scoring use that same branch at each position. No full-row B
 masked writes or visible-token announcements remain. Current-block visible edits
 can settle without reopening a completed block.
 
-TCT A correction is token CE on all mutable positions, including wrong reveals:
-token losses sum within a chain and average over the **full logical batch's
-chain count**, not B*T. Row accumulation uses that same denominator through every
-pass, including short final passes. A separate clean causal SBD term remains.
-When CoCommit is enabled, B adds a named auxiliary coordination CE on masked S
-and visible mutable positions; it is not presented as TCT Eq. (2) alone. Circuit
-CE uses conditional marginals and weighted nonzero manual probability flows,
-while standalone Codpula retains its joint objective.
+The approved combined TCT objective retains joint conditional Codpula NLL and
+adds token CE on all mutable positions, including wrong reveals. Token losses
+sum within a chain; both terms use the **full logical batch's chain count**,
+not B*T. Row accumulation keeps that denominator through every pass, including
+short final passes. A separate clean causal SBD term remains. Optional CoCommit
+B adds a joint event and auxiliary coordination CE on masked S and visible
+mutable positions. This is an explicit combined design, not TCT Eq. (2) alone.
+Circuit positive/negative statistics sum both terms, with traversal reach/count
+once per branch-chain; standalone Codpula remains joint-only.
 
 Soft feedback uses latest normalized top-k predictions and a learned entropy
 coefficient, retained across remasking. TCT checkpoints store detached entropy
 and prediction availability and reconstruct the live coefficient at each student
 input. Provisional hard embeddings are temporary and never permanent circuit
 evidence. The old `soft_eta`/`soft_steps` schedule is removed.
+The candidate-embedding feature at unit visibility is the normalized top-k
+expectation `sum_k w_k E[id_k]`. Retained probability mass remains a separate
+scalar feature; it does not add residual mask-embedding mass to that expectation.
+The independent host-f64 feature reference uses this same declared definition.
+Saved TCT candidate weights sum to one, including the initial uniform top-k
+state. Retained mass separately records the probability selected before that
+normalization and must be finite and positive, at most one within the existing
+floating-point allowance. Resume rejects unnormalized weights and invalid mass
+rather than treating these two quantities as interchangeable. Batching gradient
+comparisons use the actual draw's named unused-parameter list: binary and
+all-observed draws do not fabricate confidence-head gradients, while soft draws
+still require them.
+Checkpoint collision checks deserialize the declared `TrainingState`, preserving
+its f32 candidate/visibility/entropy fields exactly. Comparing an expanded f32
+decimal after JSON infers f64 can spuriously reject the same state by a final
+f64 ULP. The typed comparison still rejects a one-bit f32 change, RNG changes,
+and any other actual chain-state change; model/optimizer collision checks remain
+unchanged. Existing saved chains load without a compatibility alias or payload
+rewrite.
 
 Warm-starting TCT retains source optimizer moments, resolved schedule horizon and
 global learning-rate clock. The new target budget limits additional TCT updates;
@@ -54,8 +74,9 @@ same scorer; targets enter only the CE gather. Feature/scorer version
 `remask-2d12-greedy-marginal-v2` rejects old collected labels and fitted energies.
 Actual generated-token validation remains separate.
 
-No worker tests/builds/formatting or quality runs were executed for this change.
-The integrator owns final reference, restart and CLI acceptance.
+Current focused CPU/Vulkan, restart and actual CLI acceptance outcomes are
+recorded in [RESULTS](../RESULTS.md); historical results below certify only their
+original equations. No quality or new timing study is implied.
 
 ## Historical design and execution record
 
@@ -488,6 +509,20 @@ Additional references, not wholesale ports: `diffusion_scheduler.rs:125–216,26
 Later that day exact row-chunk gradient/flow accumulation was selected under the user's standing optimization authorization. The director requested the largest candidate that fits at B8/T512, trying4 then2 then1 only if needed. Four rows fit on the first corrected diagnostic, so the selected config records `tct.rows_per_pass:4`; no smaller candidate was run. The new contextual Codpula profile is implemented separately; this feature's joint dispatch uses `model.codpula`/`!is_factorized`, and its merged profile receives separate parent integration gates.
 
 Implementation clarification: standard FFBS proposals condition on O plus provisional reveals, while feedback/energy features use the prepared circuit's **O-only full-support marginals**. Otherwise the same-current-token previous-log feature can become log zero after a provisional reveal changes. This adds a circuit marginal query, not a backbone call, and is charged in execution cost. It avoids arbitrary floors while retaining all 524 feature entries.
+
+Resumed acceptance found that the current greedy standard-carry path had reused
+the O+R proposal table as feature/feedback logs, making the revealed-R top-two
+log gap infinite. The implementation now keeps separate proposal and O-only
+feature/feedback tables, reuses each prepared circuit, and applies the identical
+A/B position-selection mask to both tables. The additional standard-carry query
+is charged; correction and endpoint scoring remain O-only and do not duplicate
+an identical query. The targeted remasking reference checks finite features at
+revealed R, point-mass O+R proposal support, preserved carried values and one
+preparation/two evidence-query accounting. No infinity clamp or tolerance change
+is used.
+Endpoint marginal CE likewise selects zero-weight observed/padded positions to
+zero before multiplication, preventing `0 * -inf` without hiding nonfinite
+scores on active mutable targets.
 
 ## 10. Cost at B8/T512/L8 and later
 
