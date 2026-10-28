@@ -84,6 +84,13 @@ fn feedback(model: &LanguageModel, c: &Config, prefix: &[i32], soft: &mut SoftSt
     }
     Ok(())
 }
+pub(super) fn prepare_generation_feedback(model: &LanguageModel, c: &Config, cache: &crate::sbd_training::TrainingCache, soft: &mut SoftState) -> Result<()> {
+    if c.sbd.as_ref().unwrap().feedback == SbdFeedback::SoftFeedback && soft.observed.len()>1 {
+        let teacher=model.cached_block_profiled(cache,0,soft,false,&mut delta_mixers::profile::Unprofiled);
+        update_feedback(model,c,teacher,soft,1.0)?;
+    }
+    Ok(())
+}
 
 pub struct SbdTrainingResult {
     pub loss: Tensor<1>,
@@ -373,7 +380,7 @@ pub(super) fn advance_generation_state(
     let n = soft.observed.len();
     ensure!(proposals.len() == n && commits.iter().all(|&i| i < n), "invalid SBD proposal layout");
     if s.feedback == SbdFeedback::SoftFeedback {
-        soft.update(feedback_logits.detach(),c.soft_eta,feedback_temperature,c.soft_steps,s.candidate_width)?;
+        soft.replace_feedback(feedback_logits.detach(),feedback_temperature,c.soft_steps,s.candidate_width)?;
     }
     let mut observed = soft.observed.clone();
     for &i in commits {
@@ -414,10 +421,13 @@ pub fn generate(model: &LanguageModel, c: &Config, prompt: &[i32], device: &Devi
         let mut soft = state(c,vec![None;n],device)?;
         let mut final_values = vec![None;n];
         let mut block_passes = 0;
-        let coordination_cache = if s.cocommit.is_some() && n>1 {
-            coordinated_blocks+=1;
+        let coordination_cache = if n>1 {
+            coordinated_blocks+=usize::from(s.cocommit.is_some());
             Some(crate::cocommit::prepare_clean_cache(&model,&clean.tokens,device))
         } else {None};
+        if let Some(cache)=&coordination_cache {
+            prepare_generation_feedback(&model,c,cache,&mut soft)?;
+        }
         while final_values.iter().any(Option::is_none) {
             if s.cocommit.is_some() && n>1 {
                 passes+=1;
@@ -822,5 +832,27 @@ mod tests {
         let example = Example {input:vec![256,65,66,67],target:vec![65,66,67,68],weight:vec![1.0;4],groups:vec![None;4]};
         let report = evaluate(&model,&c,&[example],&device).unwrap();
         assert_eq!(report["predicted_tokens"],8);
+    }
+    #[test]
+    fn decoder_fix_first_assignment_matches_teacher_feedback_and_later_schedule() {
+        let device=Device::ndarray();
+        device.seed(139);
+        let c=Config {task:"lm".into(),d_model:16,layers:1,soft_eta:0.3,soft_steps:4,
+            sbd:Some(crate::config::SbdConfig {feedback:SbdFeedback::SoftFeedback,..Default::default()}),..Config::default()};
+        let arm=Arm {name:"warmup".into(),mixer:"gdn2".into(),cache:"none".into()};
+        let model=LanguageModel::new(&c,&arm,&device).unwrap();
+        let prefix=[256,11,19];
+        let cache=crate::cocommit::prepare_clean_cache(&model,&prefix,&device);
+        let mut training=state(&c,vec![None;4],&device).unwrap();
+        let teacher=model.cached_block(&cache,0,&training,false);
+        update_feedback(&model,&c,teacher.clone(),&mut training,1.0).unwrap();
+        let mut generation=state(&c,vec![None;4],&device).unwrap();
+        prepare_generation_feedback(&model,&c,&cache,&mut generation).unwrap();
+        identical(&values(training.candidates.dense(c.vocab())),&values(generation.candidates.dense(c.vocab())),"first assignment posterior").unwrap();
+        identical(&values(training.visibility.clone()),&values(generation.visibility.clone()),"first assignment visibility").unwrap();
+        let logits=teacher.logits.reshape([4,c.vocab()]);
+        advance_generation_state(&c,&mut generation,&[3;4],&[0],logits,1.0,&device).unwrap();
+        let visibility=values(generation.visibility);
+        assert_eq!(visibility,vec![1.0,0.25,0.25,0.25]);
     }
 }

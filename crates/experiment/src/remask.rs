@@ -330,7 +330,7 @@ fn predict(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, stat
         logs
     };
     let previous = state.soft.candidates.clone();
-    state.soft.update(logs.clone().detach(),c.soft_eta,1.0,c.soft_steps,c.sbd.as_ref().unwrap().candidate_width)?;
+    state.soft.replace_feedback(logs.clone().detach(),1.0,c.soft_steps,c.sbd.as_ref().unwrap().candidate_width)?;
     state.previous_candidates = Some(previous);
     state.validate(c.vocab())?;
     Ok(Prediction {hidden,logs,input_visibility:visibility,input_revealed:revealed,work})
@@ -404,8 +404,19 @@ fn energy_terms(energy: &MaskEnergy, input: Tensor<3>, state: &Episode, policy: 
 }
 
 struct EpisodeResult { state: Episode, calls: usize, row_calls: Vec<usize>, work: crate::cocommit::CoordinationWork }
+fn prepare_episode_feedback(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, state: &mut Episode) -> Result<()> {
+    if c.sbd.as_ref().unwrap().feedback == crate::config::SbdFeedback::SoftFeedback
+        && c.sbd.as_ref().unwrap().training_mode != crate::tct::TrainingMode::Tct
+        && !state.revealed.iter().any(|&revealed|revealed)
+        && host(state.soft.visibility.clone())?.iter().zip(&state.soft.observed).all(|(&visibility,observed)|observed.is_some() || visibility==0.0) {
+        let teacher=model.cached_blocks(cache,&state.soft,false);
+        crate::sbd::update_feedback(model,c,teacher,&mut state.soft,1.0)?;
+    }
+    Ok(())
+}
 fn episode(model: &LanguageModel, c: &Config, cache: &BatchedTrainingCache, mut state: Episode,
     keys: &[u64], seed: u64, energy: Option<&MaskEnergy>, adaptive: bool, device: &Device) -> Result<EpisodeResult> {
+    prepare_episode_feedback(model,c,cache,&mut state)?;
     let policy = settings(c)?.policy;
     let rows = state.lengths.len();
     let free = (0..rows).map(|row|state.eligible(row).len()).collect::<Vec<_>>();

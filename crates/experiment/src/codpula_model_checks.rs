@@ -909,7 +909,7 @@ fn rollout_run(model: &LanguageModel, cfg: &Config, device: &Device, width: usiz
         ensure!(!commits.is_empty(),"rollout selector does not make progress");
         let feedback_logits = marginals.clone().log().reshape([width,VOCAB]);
         let mut feedback_only = state.clone();
-        feedback_only.update(feedback_logits.clone().detach(),cfg.soft_eta,1.0,cfg.soft_steps,cfg.sbd.as_ref().unwrap().candidate_width)?;
+        feedback_only.update(feedback_logits.clone().detach(),1.0,1.0,cfg.soft_steps,cfg.sbd.as_ref().unwrap().candidate_width)?;
         let mut stored_proposals = proposals.clone();
         stored_proposals.resize(width,0);
         sbd::advance_generation_state(cfg,&mut state,&stored_proposals,&commits,feedback_logits.clone(),1.0,device)?;
@@ -930,6 +930,8 @@ fn rollout_run(model: &LanguageModel, cfg: &Config, device: &Device, width: usiz
                     "committed evidence is not a visible immutable point mass");
             } else if !state.active[position] {
                 ensure!(visibility[position] == 0.0 && dense[position*VOCAB..(position+1)*VOCAB].iter().all(|&p|p == 0.0),"padding acquires beliefs or visibility");
+            } else {
+                ensure!(visibility[position] == 1.0/cfg.soft_steps as f32,"deferred visibility differs from training");
             }
         }
         let mut attempted_revision = state.clone();

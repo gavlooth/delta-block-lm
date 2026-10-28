@@ -446,6 +446,12 @@ impl SoftState {
         )?;
         Ok(())
     }
+    /// Denoising consumes one detached posterior, not an accumulated decode-only history.
+    pub(crate) fn replace_feedback(&mut self, logits: Tensor<2>, temperature: f64, steps: usize, width: usize) -> Result<()> {
+        self.update(logits,1.0,temperature,steps,width)?;
+        self.visibility = self.visibility.clone().mask_fill(self.mutable.clone(),1.0/steps as f64);
+        Ok(())
+    }
     pub fn remask(&mut self, positions: &[usize]) {
         let mask = self.positions(positions).bool_and(self.mutable.clone());
         self.visibility = self.visibility.clone().mask_fill(mask, 0.0);
